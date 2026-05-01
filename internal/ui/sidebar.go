@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"sync"
 
 	"fyne.io/fyne/v2"
 	"fyne.io/fyne/v2/container"
@@ -18,9 +19,21 @@ import (
 // shows directories. onSelect is called with the absolute path each time the
 // user clicks a node.
 func NewSidebar(libraryRoot string, idx *cache.Index, onSelect func(path string)) *widget.Tree {
+	var mu sync.Mutex
+	childCache := make(map[string][]widget.TreeNodeID)
+	statCache := make(map[string]bool)
+	countCache := make(map[string]int)
+
 	tree := widget.NewTree(
 		func(uid widget.TreeNodeID) []widget.TreeNodeID {
 			dir := nodePath(libraryRoot, uid)
+			mu.Lock()
+			if c, ok := childCache[dir]; ok {
+				mu.Unlock()
+				return c
+			}
+			mu.Unlock()
+
 			entries, err := os.ReadDir(dir)
 			if err != nil {
 				return nil
@@ -37,11 +50,28 @@ func NewSidebar(libraryRoot string, idx *cache.Index, onSelect func(path string)
 				children = append(children, filepath.Join(uid, name))
 			}
 			sort.Strings(children)
+
+			mu.Lock()
+			childCache[dir] = children
+			mu.Unlock()
 			return children
 		},
 		func(uid widget.TreeNodeID) bool {
-			info, err := os.Stat(nodePath(libraryRoot, uid))
-			return err == nil && info.IsDir()
+			p := nodePath(libraryRoot, uid)
+			mu.Lock()
+			if b, ok := statCache[p]; ok {
+				mu.Unlock()
+				return b
+			}
+			mu.Unlock()
+
+			info, err := os.Stat(p)
+			b := err == nil && info.IsDir()
+
+			mu.Lock()
+			statCache[p] = b
+			mu.Unlock()
+			return b
 		},
 		func(branch bool) fyne.CanvasObject {
 			return container.NewHBox(
@@ -53,14 +83,27 @@ func NewSidebar(libraryRoot string, idx *cache.Index, onSelect func(path string)
 			row := obj.(*fyne.Container)
 			label := row.Objects[1].(*widget.Label)
 			var text string
-			var count int
+			var p string
+
 			if uid == "" {
 				text = filepath.Base(libraryRoot)
-				count = idx.CountDir(libraryRoot)
+				p = libraryRoot
 			} else {
 				text = filepath.Base(uid)
-				count = idx.CountDir(nodePath(libraryRoot, uid))
+				p = nodePath(libraryRoot, uid)
 			}
+
+			mu.Lock()
+			count, ok := countCache[p]
+			mu.Unlock()
+
+			if !ok {
+				count = idx.CountDir(p)
+				mu.Lock()
+				countCache[p] = count
+				mu.Unlock()
+			}
+
 			if count > 0 {
 				label.SetText(fmt.Sprintf("%s (%d)", text, count))
 			} else {

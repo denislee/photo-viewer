@@ -38,9 +38,10 @@ func (c *Controller) runImport() {
 	logEntry.Wrapping = fyne.TextWrapWord
 
 	appendLog := func(msg string) {
-		logText += msg + "\n"
-		logEntry.SetText(logText)
-		// MultiLineEntry will automatically update its display
+		fyne.Do(func() {
+			logText += msg + "\n"
+			logEntry.SetText(logText)
+		})
 	}
 
 	copyBtn := widget.NewButton("Copy to Clipboard", func() {
@@ -56,28 +57,28 @@ func (c *Controller) runImport() {
 	go func() {
 		appendLog(fmt.Sprintf("Starting import from %s to %s", inboxDir, outboxDir))
 
+		baseDates := make(map[string]time.Time)
+
+		// First pass: find the oldest date for each base name
 		for _, e := range entries {
 			if e.IsDir() {
 				continue
 			}
 
 			srcPath := filepath.Join(inboxDir, e.Name())
-			file, err := os.Open(srcPath)
-			if err != nil {
-				appendLog(fmt.Sprintf("[ERROR] Could not open %s: %v", e.Name(), err))
-				continue
-			}
-
-			// Try to get EXIF
 			var mediaDate time.Time
-			x, err := exif.Decode(file)
+
+			file, err := os.Open(srcPath)
 			if err == nil {
-				tm, err := x.DateTime()
+				x, err := exif.Decode(file)
 				if err == nil {
-					mediaDate = tm
+					tm, err := x.DateTime()
+					if err == nil {
+						mediaDate = tm
+					}
 				}
+				file.Close()
 			}
-			file.Close()
 
 			// Fallback to file mod time
 			if mediaDate.IsZero() {
@@ -88,6 +89,22 @@ func (c *Controller) runImport() {
 					mediaDate = time.Now()
 				}
 			}
+
+			base := strings.TrimSuffix(e.Name(), filepath.Ext(e.Name()))
+			if existingDate, ok := baseDates[base]; !ok || mediaDate.Before(existingDate) {
+				baseDates[base] = mediaDate
+			}
+		}
+
+		// Second pass: move files to the folder of their base name's oldest date
+		for _, e := range entries {
+			if e.IsDir() {
+				continue
+			}
+
+			srcPath := filepath.Join(inboxDir, e.Name())
+			base := strings.TrimSuffix(e.Name(), filepath.Ext(e.Name()))
+			mediaDate := baseDates[base]
 
 			dateFolder := mediaDate.Format("2006-01-02")
 			destDirPath := filepath.Join(outboxDir, dateFolder)
@@ -101,11 +118,10 @@ func (c *Controller) runImport() {
 			// Handle duplicate names if necessary
 			if _, err := os.Stat(destPath); err == nil {
 				ext := filepath.Ext(e.Name())
-				base := strings.TrimSuffix(e.Name(), ext)
-				destPath = filepath.Join(destDirPath, fmt.Sprintf("%s_%d%s", base, time.Now().Unix(), ext))
+				destPath = filepath.Join(destDirPath, fmt.Sprintf("%s_%d%s", base, time.Now().UnixNano(), ext))
 			}
 
-			err = os.Rename(srcPath, destPath)
+			err := os.Rename(srcPath, destPath)
 			if err != nil {
 				appendLog(fmt.Sprintf("[ERROR] Could not move %s: %v", e.Name(), err))
 			} else {
