@@ -87,13 +87,6 @@ func (c *Controller) Build() fyne.CanvasObject {
 	split := container.NewHSplit(c.sidebar, right)
 	split.SetOffset(0.22)
 	c.mainContent = split
-	fyne.Do(func() {
-		if c.grid != nil && c.grid.grid != nil {
-			c.window.Canvas().Focus(c.grid.grid)
-		} else {
-			c.window.Canvas().Focus(c.sidebar)
-		}
-	})
 	return split
 }
 

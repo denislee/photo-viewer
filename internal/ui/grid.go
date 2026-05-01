@@ -355,7 +355,9 @@ func (g *ThumbGrid) SetEntries(entries []cache.Entry) {
 	if len(entries) > 0 {
 		g.grid.Select(0)
 		g.grid.ScrollToTop()
-		g.focusGrid()
+		if g.window != nil && g.window.Canvas().Focused() == nil {
+			g.focusGrid()
+		}
 	}
 }
 
