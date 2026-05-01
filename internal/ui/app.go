@@ -134,6 +134,7 @@ func (c *Controller) SelectDir(path string) {
 
 	fyne.Do(func() {
 		c.toolbar.SetPath(path)
+		c.toolbar.SetFavoritesActive(false)
 	})
 	go c.refreshFromIndex(path)
 	go c.scanInto(ctx, path, false)
@@ -147,6 +148,10 @@ func (c *Controller) toggleFavoritesView() {
 	on := c.favoritesView
 	dir := c.currentDir
 	c.mu.Unlock()
+
+	fyne.Do(func() {
+		c.toolbar.SetFavoritesActive(on)
+	})
 
 	if on {
 		go c.refreshFavorites()

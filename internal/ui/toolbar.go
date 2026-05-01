@@ -41,6 +41,49 @@ func (t *tappableActivity) Cursor() desktop.Cursor { return desktop.PointerCurso
 func (t *tappableActivity) Start() { t.activity.Start() }
 func (t *tappableActivity) Stop()  { t.activity.Stop() }
 
+// tappableStar renders a star glyph at a chosen size and toggles its color
+// when "active" — used for the favorites filter button on the toolbar.
+type tappableStar struct {
+	widget.BaseWidget
+	text  *canvas.Text
+	onTap func()
+}
+
+var (
+	starInactive = color.NRGBA{R: 0x80, G: 0x84, B: 0x8c, A: 0xff}
+	starActive   = color.NRGBA{R: 0xff, G: 0xd7, B: 0x00, A: 0xff}
+)
+
+func newTappableStar(onTap func()) *tappableStar {
+	t := canvas.NewText("★", starInactive)
+	t.TextSize = 20
+	t.Alignment = fyne.TextAlignCenter
+	s := &tappableStar{text: t, onTap: onTap}
+	s.ExtendBaseWidget(s)
+	return s
+}
+
+func (s *tappableStar) CreateRenderer() fyne.WidgetRenderer {
+	return widget.NewSimpleRenderer(container.NewPadded(s.text))
+}
+
+func (s *tappableStar) Tapped(*fyne.PointEvent) {
+	if s.onTap != nil {
+		s.onTap()
+	}
+}
+
+func (s *tappableStar) Cursor() desktop.Cursor { return desktop.PointerCursor }
+
+func (s *tappableStar) SetActive(active bool) {
+	if active {
+		s.text.Color = starActive
+	} else {
+		s.text.Color = starInactive
+	}
+	s.text.Refresh()
+}
+
 // Toolbar groups the path label, count, busy indicator, and action buttons.
 // Visually it is one thin row with subtle separators below.
 type Toolbar struct {
@@ -54,7 +97,7 @@ type Toolbar struct {
 	settings   *widget.Button
 	importBtn  *widget.Button
 	dupBtn     *widget.Button
-	favBtn     *widget.Button
+	favBtn     *tappableStar
 }
 
 func NewToolbar(onFilter func(string), onRebuild func(), onSettings func(), onImport func(), onDuplicates func(), onFavorites func(), onScanInfo func()) *Toolbar {
@@ -77,7 +120,7 @@ func NewToolbar(onFilter func(string), onRebuild func(), onSettings func(), onIm
 		settings:   iconButton(theme.SettingsIcon(), onSettings),
 		importBtn:  iconButton(theme.DownloadIcon(), onImport),
 		dupBtn:     iconButton(theme.ContentCopyIcon(), onDuplicates),
-		favBtn:     starButton(onFavorites),
+		favBtn:     newTappableStar(onFavorites),
 	}
 	t.progress.Hide()
 
@@ -100,12 +143,6 @@ func iconButton(icon fyne.Resource, fn func()) *widget.Button {
 	return b
 }
 
-func starButton(fn func()) *widget.Button {
-	b := widget.NewButton("★", fn)
-	b.Importance = widget.LowImportance
-	return b
-}
-
 func (t *Toolbar) Widget() fyne.CanvasObject { return t.root }
 
 // SetPath / SetCount / ShowBusy mutate widget state directly. Callers running
@@ -118,6 +155,10 @@ func (t *Toolbar) SetPath(p string) {
 func (t *Toolbar) SetCount(n int) {
 	t.countLabel.Text = formatCount(n)
 	t.countLabel.Refresh()
+}
+
+func (t *Toolbar) SetFavoritesActive(active bool) {
+	t.favBtn.SetActive(active)
 }
 
 func (t *Toolbar) ShowBusy(busy bool) {
