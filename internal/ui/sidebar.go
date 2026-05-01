@@ -19,38 +19,102 @@ type SidebarTree struct {
 	widget.Tree
 	OnTab      func()
 	OnEnterOrL func()
+	currentID  widget.TreeNodeID
 }
 
+func (s *SidebarTree) AcceptsTab() bool { return true }
+
 func (s *SidebarTree) TypedKey(e *fyne.KeyEvent) {
-	if e.Name == fyne.KeyTab {
+	switch e.Name {
+	case fyne.KeyTab:
 		if s.OnTab != nil {
 			s.OnTab()
 		}
 		return
-	}
-	if e.Name == fyne.KeyReturn || e.Name == fyne.KeyEnter {
-		s.Tree.TypedKey(e)
+	case fyne.KeyReturn, fyne.KeyEnter:
 		if s.OnEnterOrL != nil {
 			s.OnEnterOrL()
 		}
+		return
+	case fyne.KeyDown:
+		s.moveBy(1)
+		return
+	case fyne.KeyUp:
+		s.moveBy(-1)
 		return
 	}
 	s.Tree.TypedKey(e)
 }
 
 func (s *SidebarTree) TypedRune(r rune) {
-	if r == 'l' {
+	switch r {
+	case 'l':
 		if s.OnEnterOrL != nil {
 			s.OnEnterOrL()
 		}
+	case 'j':
+		s.moveBy(1)
+	case 'k':
+		s.moveBy(-1)
+	case 'h':
+		if s.currentID != "" && s.IsBranch != nil && s.IsBranch(s.currentID) && s.IsBranchOpen(s.currentID) {
+			s.CloseBranch(s.currentID)
+			s.Refresh()
+			return
+		}
+		parent := filepath.Dir(string(s.currentID))
+		if parent == "." || parent == string(filepath.Separator) {
+			return
+		}
+		s.Select(widget.TreeNodeID(parent))
+	default:
+		s.Tree.TypedRune(r)
+	}
+}
+
+func (s *SidebarTree) visibleIDs() []widget.TreeNodeID {
+	var ids []widget.TreeNodeID
+	var walk func(uid widget.TreeNodeID)
+	walk = func(uid widget.TreeNodeID) {
+		if s.ChildUIDs == nil {
+			return
+		}
+		for _, c := range s.ChildUIDs(uid) {
+			ids = append(ids, c)
+			if s.IsBranch != nil && s.IsBranch(c) && s.IsBranchOpen(c) {
+				walk(c)
+			}
+		}
+	}
+	walk("")
+	return ids
+}
+
+func (s *SidebarTree) moveBy(delta int) {
+	ids := s.visibleIDs()
+	if len(ids) == 0 {
 		return
 	}
-	s.Tree.TypedRune(r)
+	idx := -1
+	for i, id := range ids {
+		if id == s.currentID {
+			idx = i
+			break
+		}
+	}
+	next := idx + delta
+	if next < 0 {
+		next = 0
+	}
+	if next >= len(ids) {
+		next = len(ids) - 1
+	}
+	s.Select(ids[next])
 }
 
 // NewSidebar builds a directory tree rooted at libraryRoot. The tree only
 // shows directories. onSelect is called with the absolute path each time the
-// user clicks a node.
+// user picks a node (via click or keyboard navigation).
 func NewSidebar(libraryRoot string, idx *cache.Index, onSelect func(path string)) *SidebarTree {
 	var mu sync.Mutex
 	childCache := make(map[string][]widget.TreeNodeID)
@@ -143,10 +207,11 @@ func NewSidebar(libraryRoot string, idx *cache.Index, onSelect func(path string)
 			label.SetText(text)
 		}
 	}
-	
+
 	tree.ExtendBaseWidget(tree)
 
 	tree.OnSelected = func(uid widget.TreeNodeID) {
+		tree.currentID = uid
 		onSelect(nodePath(libraryRoot, uid))
 	}
 	tree.OpenBranch("")

@@ -58,6 +58,8 @@ func newCustomGridWrap(g *ThumbGrid, length func() int, createItem func() fyne.C
 	return cg
 }
 
+func (c *customGridWrap) AcceptsTab() bool { return true }
+
 func (c *customGridWrap) TypedKey(e *fyne.KeyEvent) {
 	if e.Name == fyne.KeyTab {
 		if c.g.OnTab != nil {
