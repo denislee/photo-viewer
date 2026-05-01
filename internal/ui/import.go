@@ -38,6 +38,24 @@ func copyFile(src, dst string) error {
 	return out.Close()
 }
 
+// uniqueInboxPath returns a path inside dir that does not yet exist, by
+// appending an incrementing suffix to the base name on collision. This
+// guarantees imports never overwrite an existing inbox file.
+func uniqueInboxPath(dir, base string) string {
+	p := filepath.Join(dir, base)
+	if _, err := os.Stat(p); os.IsNotExist(err) {
+		return p
+	}
+	ext := filepath.Ext(base)
+	name := strings.TrimSuffix(base, ext)
+	for i := 1; ; i++ {
+		c := filepath.Join(dir, fmt.Sprintf("%s_%d%s", name, i, ext))
+		if _, err := os.Stat(c); os.IsNotExist(err) {
+			return c
+		}
+	}
+}
+
 func (c *Controller) runImport() {
 	prefs := fyne.CurrentApp().Preferences()
 	inboxDir := prefs.StringWithFallback("InboxDir", "")
@@ -104,9 +122,7 @@ func (c *Controller) runImport() {
 	var startBtn *widget.Button
 	var importZipBtn *widget.Button
 
-	runImportLogic := func(entriesToProcess []string, onComplete func()) {
-		appendLog(fmt.Sprintf("Starting import from %s to %s", inboxDir, outboxDir))
-
+	processBatch := func(entriesToProcess []string) {
 		baseDates := make(map[string]time.Time)
 
 		// First pass: find the oldest date for each base name
@@ -176,16 +192,6 @@ func (c *Controller) runImport() {
 				progressBar.SetValue(float64(processed))
 			})
 		}
-		appendLog("Import process finished.")
-		fyne.Do(func() {
-			statusLabel.SetText("Finished importing.")
-			if onComplete != nil {
-				onComplete()
-			} else {
-				copyBtn.Enable()
-				importAgainBtn.Enable()
-			}
-		})
 	}
 
 	var zipFiles []string
@@ -219,6 +225,9 @@ func (c *Controller) runImport() {
 		statusLabel.SetText("Processing...")
 
 		go func() {
+			appendLog(fmt.Sprintf("Starting import to %s", outboxDir))
+
+			// Phase 1: extract ZIPs into the inbox.
 			for _, zipPath := range zipFiles {
 				appendLog("Extracting " + zipPath + " ...")
 				r, err := zip.OpenReader(zipPath)
@@ -241,13 +250,7 @@ func (c *Controller) runImport() {
 						continue
 					}
 
-					base := filepath.Base(f.Name)
-					destPath := filepath.Join(inboxDir, base)
-					if _, err := os.Stat(destPath); err == nil {
-						ext := filepath.Ext(base)
-						name := strings.TrimSuffix(base, ext)
-						destPath = filepath.Join(inboxDir, fmt.Sprintf("%s_%d%s", name, time.Now().UnixNano(), ext))
-					}
+					destPath := uniqueInboxPath(inboxDir, filepath.Base(f.Name))
 
 					outFile, err := os.Create(destPath)
 					if err != nil {
@@ -268,9 +271,39 @@ func (c *Controller) runImport() {
 				appendLog(fmt.Sprintf("Extracted %d media files from %s to Inbox.", extractedCount, filepath.Base(zipPath)))
 			}
 
+			processedAny := false
+
+			// Phase 2: process whatever is currently in the inbox (pre-existing
+			// files plus anything just extracted from ZIPs) as one batch.
+			var inboxEntries []string
+			if walkErr := filepath.WalkDir(inboxDir, func(path string, dEntry fs.DirEntry, err error) error {
+				if err != nil || dEntry.IsDir() {
+					return nil
+				}
+				if scan.DetectType(path) != scan.TypeUnknown {
+					inboxEntries = append(inboxEntries, path)
+				}
+				return nil
+			}); walkErr != nil {
+				appendLog("[ERROR] Failed to read inbox: " + walkErr.Error())
+			}
+			if len(inboxEntries) > 0 {
+				appendLog(fmt.Sprintf("Processing %d files already in Inbox...", len(inboxEntries)))
+				fyne.Do(func() {
+					progressBar.Max = float64(len(inboxEntries))
+					progressBar.SetValue(0)
+					statusLabel.SetText(fmt.Sprintf("Importing %d inbox files...", len(inboxEntries)))
+				})
+				processBatch(inboxEntries)
+				processedAny = true
+			}
+
+			// Phase 3: for each chosen directory, copy and process one
+			// subdirectory at a time so the inbox never holds the whole tree.
 			for _, srcDir := range importDirs {
-				appendLog("Copying from " + srcDir + " ...")
-				copiedCount := 0
+				appendLog("Scanning " + srcDir + " ...")
+				subdirFiles := map[string][]string{}
+				var subdirOrder []string
 				walkErr := filepath.WalkDir(srcDir, func(path string, dEntry fs.DirEntry, err error) error {
 					if err != nil || dEntry.IsDir() {
 						return nil
@@ -278,61 +311,60 @@ func (c *Controller) runImport() {
 					if scan.DetectType(path) == scan.TypeUnknown {
 						return nil
 					}
-					base := filepath.Base(path)
-					destPath := filepath.Join(inboxDir, base)
-					if _, err := os.Stat(destPath); err == nil {
-						ext := filepath.Ext(base)
-						name := strings.TrimSuffix(base, ext)
-						destPath = filepath.Join(inboxDir, fmt.Sprintf("%s_%d%s", name, time.Now().UnixNano(), ext))
+					parent := filepath.Dir(path)
+					if _, ok := subdirFiles[parent]; !ok {
+						subdirOrder = append(subdirOrder, parent)
 					}
-					if err := copyFile(path, destPath); err != nil {
-						appendLog("[ERROR] Copy failed for " + path + ": " + err.Error())
-						return nil
-					}
-					copiedCount++
+					subdirFiles[parent] = append(subdirFiles[parent], path)
 					return nil
 				})
 				if walkErr != nil {
 					appendLog("[ERROR] Walking " + srcDir + ": " + walkErr.Error())
 				}
-				appendLog(fmt.Sprintf("Copied %d media files from %s to Inbox.", copiedCount, srcDir))
+
+				for _, subdir := range subdirOrder {
+					files := subdirFiles[subdir]
+					appendLog(fmt.Sprintf("Copying %d files from %s to Inbox...", len(files), subdir))
+					var batch []string
+					for _, src := range files {
+						destPath := uniqueInboxPath(inboxDir, filepath.Base(src))
+						if err := copyFile(src, destPath); err != nil {
+							appendLog("[ERROR] Copy failed for " + src + ": " + err.Error())
+							continue
+						}
+						batch = append(batch, destPath)
+					}
+					if len(batch) == 0 {
+						continue
+					}
+					fyne.Do(func() {
+						progressBar.Max = float64(len(batch))
+						progressBar.SetValue(0)
+						statusLabel.SetText(fmt.Sprintf("Importing %d files from %s...", len(batch), filepath.Base(subdir)))
+					})
+					processBatch(batch)
+					processedAny = true
+				}
 			}
 
-			// Now read the inbox to process files
-			var validEntries []string
-			walkErr := filepath.WalkDir(inboxDir, func(path string, dEntry fs.DirEntry, err error) error {
-				if err != nil || dEntry.IsDir() {
-					return nil
-				}
-				if scan.DetectType(path) != scan.TypeUnknown {
-					validEntries = append(validEntries, path)
-				}
-				return nil
-			})
-			if walkErr != nil {
-				appendLog("[ERROR] Failed to read inbox: " + walkErr.Error())
-				fyne.Do(func() { statusLabel.SetText("Import failed.") })
-				return
-			}
-
-			if len(validEntries) == 0 {
-				appendLog("No media files found to import.")
-				fyne.Do(func() {
+			appendLog("Import process finished.")
+			fyne.Do(func() {
+				if processedAny {
+					statusLabel.SetText("Finished importing.")
+				} else {
 					statusLabel.SetText("Finished. Nothing to import.")
+				}
+			})
+
+			finish := func() {
+				fyne.Do(func() {
 					copyBtn.Enable()
 					importAgainBtn.Enable()
 				})
-				return
 			}
 
-			fyne.Do(func() {
-				progressBar.Max = float64(len(validEntries))
-				progressBar.SetValue(0)
-				statusLabel.SetText("Importing...")
-			})
-
-			runImportLogic(validEntries, func() {
-				if len(zipFiles) > 0 {
+			if len(zipFiles) > 0 {
+				fyne.Do(func() {
 					msg := fmt.Sprintf("Import is complete.\nDo you want to delete the %d original ZIP files?", len(zipFiles))
 					if len(zipFiles) == 1 {
 						msg = fmt.Sprintf("Import is complete.\nDo you want to delete the original ZIP file (%s)?", filepath.Base(zipFiles[0]))
@@ -351,11 +383,10 @@ func (c *Controller) runImport() {
 						copyBtn.Enable()
 						importAgainBtn.Enable()
 					}, c.window)
-				} else {
-					copyBtn.Enable()
-					importAgainBtn.Enable()
-				}
-			})
+				})
+			} else {
+				finish()
+			}
 		}()
 	})
 	startBtn.Importance = widget.HighImportance
