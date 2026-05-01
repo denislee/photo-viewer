@@ -69,6 +69,12 @@ func (c *customGridWrap) TypedKey(e *fyne.KeyEvent) {
 	} else if e.Name == fyne.KeyReturn || e.Name == fyne.KeyEnter || e.Name == fyne.KeySpace {
 		c.g.OpenSelected()
 	} else if e.Name == fyne.KeyLeft {
+		if c.g.AtLeftEdge() {
+			if c.g.OnTab != nil {
+				c.g.OnTab()
+			}
+			return
+		}
 		c.g.MoveSelection(-1)
 	} else if e.Name == fyne.KeyRight {
 		c.g.MoveSelection(1)
@@ -84,6 +90,12 @@ func (c *customGridWrap) TypedKey(e *fyne.KeyEvent) {
 func (c *customGridWrap) TypedRune(r rune) {
 	switch r {
 	case 'h':
+		if c.g.AtLeftEdge() {
+			if c.g.OnTab != nil {
+				c.g.OnTab()
+			}
+			return
+		}
 		c.g.MoveSelection(-1)
 	case 'j':
 		c.g.MoveSelection(c.g.ColumnCount())
@@ -173,6 +185,17 @@ func (g *ThumbGrid) MoveSelection(delta int) {
 	}
 	g.grid.Select(widget.GridWrapItemID(next))
 	g.grid.ScrollTo(widget.GridWrapItemID(next))
+}
+
+func (g *ThumbGrid) AtLeftEdge() bool {
+	g.mu.Lock()
+	idx := g.selectedIndex
+	empty := len(g.entries) == 0
+	g.mu.Unlock()
+	if empty {
+		return true
+	}
+	return idx%g.ColumnCount() == 0
 }
 
 func (g *ThumbGrid) ColumnCount() int {
