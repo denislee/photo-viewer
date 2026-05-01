@@ -166,58 +166,23 @@ func (c *Controller) runImport() {
 		})
 	}
 
+	var zipFiles []string
+
 	startBtn = widget.NewButton("Start Import", func() {
 		startBtn.Disable()
 		if importZipBtn != nil {
 			importZipBtn.Disable()
 		}
-		statusLabel.SetText("Importing...")
+		statusLabel.SetText("Processing...")
 
 		go func() {
-			entries, err := os.ReadDir(inboxDir)
-			if err != nil {
-				appendLog("[ERROR] Failed to read inbox: " + err.Error())
-				return
-			}
-			var validEntries []os.DirEntry
-			for _, e := range entries {
-				if !e.IsDir() {
-					validEntries = append(validEntries, e)
-				}
-			}
-			fyne.Do(func() {
-				progressBar.Max = float64(len(validEntries))
-				progressBar.SetValue(0)
-			})
-			runImportLogic(validEntries, nil)
-		}()
-	})
-	startBtn.Importance = widget.HighImportance
-	if fileCount == 0 {
-		startBtn.Disable()
-	}
-
-	importZipBtn = widget.NewButton("Import ZIP", func() {
-		fd := dialog.NewFileOpen(func(uc fyne.URIReadCloser, err error) {
-			if err != nil || uc == nil {
-				return
-			}
-			zipPath := uc.URI().Path()
-			uc.Close()
-
-			startBtn.Disable()
-			importZipBtn.Disable()
-			statusLabel.SetText("Extracting ZIP...")
-
-			go func() {
+			for _, zipPath := range zipFiles {
 				appendLog("Extracting " + zipPath + " ...")
 				r, err := zip.OpenReader(zipPath)
 				if err != nil {
 					appendLog("[ERROR] Failed to open ZIP: " + err.Error())
-					fyne.Do(func() { statusLabel.SetText("Extraction failed.") })
-					return
+					continue
 				}
-				defer r.Close()
 
 				extractedCount := 0
 				for _, f := range r.File {
@@ -253,43 +218,99 @@ func (c *Controller) runImport() {
 						extractedCount++
 					}
 				}
-				appendLog(fmt.Sprintf("Extracted %d files to Inbox.", extractedCount))
+				r.Close()
+				appendLog(fmt.Sprintf("Extracted %d files from %s to Inbox.", extractedCount, filepath.Base(zipPath)))
+			}
 
-				// Now read the inbox to process files
-				entries, err := os.ReadDir(inboxDir)
-				if err != nil {
-					appendLog("[ERROR] Failed to read inbox: " + err.Error())
-					return
+			// Now read the inbox to process files
+			entries, err := os.ReadDir(inboxDir)
+			if err != nil {
+				appendLog("[ERROR] Failed to read inbox: " + err.Error())
+				fyne.Do(func() { statusLabel.SetText("Import failed.") })
+				return
+			}
+			var validEntries []os.DirEntry
+			for _, e := range entries {
+				if !e.IsDir() {
+					validEntries = append(validEntries, e)
 				}
+			}
 
-				var validEntries []os.DirEntry
-				for _, e := range entries {
-					if !e.IsDir() {
-						validEntries = append(validEntries, e)
-					}
-				}
-
+			if len(validEntries) == 0 {
+				appendLog("No files found to import.")
 				fyne.Do(func() {
-					progressBar.Max = float64(len(validEntries))
-					progressBar.SetValue(0)
-					statusLabel.SetText("Importing...")
+					statusLabel.SetText("Finished. Nothing to import.")
+					copyBtn.Enable()
+					importAgainBtn.Enable()
 				})
+				return
+			}
 
-				runImportLogic(validEntries, func() {
-					dialog.ShowConfirm("Delete ZIP?", fmt.Sprintf("Import from %s is complete.\nDo you want to delete the original ZIP file?", filepath.Base(zipPath)), func(del bool) {
+			fyne.Do(func() {
+				progressBar.Max = float64(len(validEntries))
+				progressBar.SetValue(0)
+				statusLabel.SetText("Importing...")
+			})
+
+			runImportLogic(validEntries, func() {
+				if len(zipFiles) > 0 {
+					msg := fmt.Sprintf("Import is complete.\nDo you want to delete the %d original ZIP files?", len(zipFiles))
+					if len(zipFiles) == 1 {
+						msg = fmt.Sprintf("Import is complete.\nDo you want to delete the original ZIP file (%s)?", filepath.Base(zipFiles[0]))
+					}
+					dialog.ShowConfirm("Delete ZIP(s)?", msg, func(del bool) {
 						if del {
-							if err := os.Remove(zipPath); err != nil {
-								appendLog("[ERROR] Failed to delete ZIP: " + err.Error())
-								dialog.ShowError(err, c.window)
-							} else {
-								appendLog("[OK] Deleted ZIP file: " + zipPath)
+							for _, z := range zipFiles {
+								if err := os.Remove(z); err != nil {
+									appendLog("[ERROR] Failed to delete ZIP: " + err.Error())
+									dialog.ShowError(err, c.window)
+								} else {
+									appendLog("[OK] Deleted ZIP file: " + z)
+								}
 							}
 						}
 						copyBtn.Enable()
 						importAgainBtn.Enable()
 					}, c.window)
+				} else {
+					copyBtn.Enable()
+					importAgainBtn.Enable()
+				}
+			})
+		}()
+	})
+	startBtn.Importance = widget.HighImportance
+	if fileCount == 0 {
+		startBtn.Disable()
+	}
+
+	importZipBtn = widget.NewButton("Add ZIP", func() {
+		fd := dialog.NewFileOpen(func(uc fyne.URIReadCloser, err error) {
+			if err != nil || uc == nil {
+				return
+			}
+			zipPath := uc.URI().Path()
+			uc.Close()
+
+			alreadyAdded := false
+			for _, z := range zipFiles {
+				if z == zipPath {
+					alreadyAdded = true
+					break
+				}
+			}
+			
+			if !alreadyAdded {
+				zipFiles = append(zipFiles, zipPath)
+				fyne.Do(func() {
+					if len(zipFiles) == 1 {
+						statusLabel.SetText(fmt.Sprintf("Ready. %d files in Inbox, 1 ZIP selected.", fileCount))
+					} else {
+						statusLabel.SetText(fmt.Sprintf("Ready. %d files in Inbox, %d ZIPs selected.", fileCount, len(zipFiles)))
+					}
+					startBtn.Enable()
 				})
-			}()
+			}
 		}, c.window)
 		fd.SetFilter(storage.NewExtensionFileFilter([]string{".zip"}))
 		fd.Show()
