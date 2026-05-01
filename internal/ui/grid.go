@@ -125,6 +125,7 @@ type ThumbGrid struct {
 	loaded        map[int]bool
 	selectedIndex int
 	cellSize      float32
+	isActive      bool
 
 	onActivate func(int, []cache.Entry)
 	OnTab      func()
@@ -138,15 +139,31 @@ func NewThumbGrid(window fyne.Window, store *cache.ThumbStore, onActivate func(i
 		loaded:     map[int]bool{},
 		onActivate: onActivate,
 		cellSize:   float32(size),
+		isActive:   true,
 	}
 	g.container = container.NewStack()
 	g.rebuildGrid()
 	return g
 }
 
+// SetActive controls whether the grid attempts to grab focus automatically.
+func (g *ThumbGrid) SetActive(active bool) {
+	g.mu.Lock()
+	g.isActive = active
+	g.mu.Unlock()
+}
+
 // focusGrid grabs keyboard focus so TypedRune (h/j/k/l, space) and TypedKey
 // (arrows, enter) reach the GridWrap.
 func (g *ThumbGrid) focusGrid() {
+	g.mu.Lock()
+	active := g.isActive
+	g.mu.Unlock()
+
+	if !active {
+		return
+	}
+
 	if g.window == nil || g.grid == nil {
 		return
 	}

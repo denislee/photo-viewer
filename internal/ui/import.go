@@ -316,7 +316,7 @@ func (c *Controller) runImport() {
 		fd.Show()
 	})
 
-	buttons := container.NewHBox(startBtn, importZipBtn, copyBtn, importAgainBtn)
+	buttons := container.NewHBox(importAgainBtn, startBtn, importZipBtn, copyBtn)
 	topContent := container.NewVBox(statusLabel, progressBar)
 	content := container.NewBorder(topContent, buttons, nil, nil, logEntry)
 

@@ -135,8 +135,10 @@ func (c *Controller) rebuildIndex() {
 }
 
 func (c *Controller) showDuplicates() {
+	c.grid.SetActive(false)
 	ShowDuplicates(c.window, c.index, c.store, func() {
 		c.window.SetContent(c.mainContent)
+		c.grid.SetActive(true)
 	})
 }
 
