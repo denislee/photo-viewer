@@ -61,5 +61,11 @@ func main() {
 	// Trigger an initial scan/refresh from the library root.
 	go ctrl.SelectDir(abs)
 
+	w.Canvas().SetOnTypedRune(func(r rune) {
+		if r == 'q' {
+			a.Quit()
+		}
+	})
+
 	w.ShowAndRun()
 }

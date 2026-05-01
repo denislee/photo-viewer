@@ -86,6 +86,8 @@ func (c *customGridWrap) TypedRune(r rune) {
 		c.g.MoveSelection(1)
 	case ' ':
 		c.g.OpenSelected()
+	case 'q':
+		fyne.CurrentApp().Quit()
 	default:
 		c.GridWrap.TypedRune(r)
 	}
@@ -354,8 +356,5 @@ func findBadge(padded *fyne.Container) *fyne.Container {
 		return nil
 	}
 	badge, _ := hbox.Objects[1].(*fyne.Container)
-	return badge
-}
-ne.Container)
 	return badge
 }
