@@ -15,19 +15,23 @@ type Toolbar struct {
 	countLabel *widget.Label
 	progress   *widget.ProgressBarInfinite
 	rebuild    *widget.Button
+	settings   *widget.Button
+	importBtn  *widget.Button
 }
 
-func NewToolbar(onRebuild func()) *Toolbar {
+func NewToolbar(onRebuild func(), onSettings func(), onImport func()) *Toolbar {
 	t := &Toolbar{
 		pathLabel:  widget.NewLabel(""),
 		countLabel: widget.NewLabel(""),
 		progress:   widget.NewProgressBarInfinite(),
 		rebuild:    widget.NewButtonWithIcon("Rebuild index", theme.ViewRefreshIcon(), onRebuild),
+		settings:   widget.NewButtonWithIcon("Settings", theme.SettingsIcon(), onSettings),
+		importBtn:  widget.NewButtonWithIcon("Import", theme.DownloadIcon(), onImport),
 	}
 	t.progress.Hide()
 	t.root = container.NewBorder(
 		nil, nil,
-		container.NewHBox(t.rebuild),
+		container.NewHBox(t.settings, t.importBtn, t.rebuild),
 		container.NewHBox(t.countLabel, t.progress),
 		t.pathLabel,
 	)

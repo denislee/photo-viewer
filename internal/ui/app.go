@@ -42,17 +42,24 @@ func NewController(window fyne.Window, libraryRoot string, idx *cache.Index, sto
 		store:       store,
 		currentDir:  libraryRoot,
 	}
-	c.toolbar = NewToolbar(c.rebuildIndex)
+	c.toolbar = NewToolbar(c.rebuildIndex, c.showSettings, c.runImport)
 	c.grid = NewThumbGrid(store, func(index int, entries []cache.Entry) {
 		Open(c.window, index, entries, c.store)
 	})
 	
 	window.Canvas().AddShortcut(&desktop.CustomShortcut{KeyName: fyne.KeyMinus, Modifier: fyne.KeyModifierShortcutDefault}, func(shortcut fyne.Shortcut) {
-		c.grid.handleZoom(false)
+		c.grid.HandleZoom(false)
 	})
 	window.Canvas().AddShortcut(&desktop.CustomShortcut{KeyName: fyne.KeyEqual, Modifier: fyne.KeyModifierShortcutDefault}, func(shortcut fyne.Shortcut) {
-		c.grid.handleZoom(true)
+		c.grid.HandleZoom(true)
 	})
+	
+	window.Canvas().AddShortcut(&desktop.CustomShortcut{KeyName: fyne.KeyH, Modifier: 0}, func(shortcut fyne.Shortcut) { c.grid.MoveSelection(-1) })
+	window.Canvas().AddShortcut(&desktop.CustomShortcut{KeyName: fyne.KeyJ, Modifier: 0}, func(shortcut fyne.Shortcut) { c.grid.MoveSelection(c.grid.ColumnCount()) })
+	window.Canvas().AddShortcut(&desktop.CustomShortcut{KeyName: fyne.KeyK, Modifier: 0}, func(shortcut fyne.Shortcut) { c.grid.MoveSelection(-c.grid.ColumnCount()) })
+	window.Canvas().AddShortcut(&desktop.CustomShortcut{KeyName: fyne.KeyL, Modifier: 0}, func(shortcut fyne.Shortcut) { c.grid.MoveSelection(1) })
+	window.Canvas().AddShortcut(&desktop.CustomShortcut{KeyName: fyne.KeyReturn, Modifier: 0}, func(shortcut fyne.Shortcut) { c.grid.OpenSelected() })
+	window.Canvas().AddShortcut(&desktop.CustomShortcut{KeyName: fyne.KeySpace, Modifier: 0}, func(shortcut fyne.Shortcut) { c.grid.OpenSelected() })
 	
 	c.toolbar.SetPath(libraryRoot)
 	return c

@@ -8,7 +8,7 @@ all: build
 
 build:
 	go build -o $(APP_BIN) main.go
-	go build -o $(SCAN_BIN) ./cmd/pv-scan/main.go
+	@if [ -f "./cmd/pv-scan/main.go" ]; then go build -o $(SCAN_BIN) ./cmd/pv-scan/main.go; fi
 
 test:
 	go test ./...

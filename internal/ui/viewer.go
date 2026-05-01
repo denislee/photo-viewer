@@ -136,6 +136,8 @@ func Open(parent fyne.Window, startIndex int, entries []cache.Entry, store *cach
 			navNext()
 		} else if r == 'k' || r == 'K' {
 			navPrev()
+		} else if r == 'q' || r == 'Q' {
+			d.Hide()
 		}
 	})
 

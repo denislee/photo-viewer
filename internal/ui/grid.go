@@ -9,7 +9,6 @@ import (
 	"fyne.io/fyne/v2/container"
 	"fyne.io/fyne/v2/theme"
 	"fyne.io/fyne/v2/widget"
-	"fyne.io/fyne/v2/driver/desktop"
 
 	"github.com/dns/photo-viewer/internal/cache"
 	"github.com/dns/photo-viewer/internal/scan"
@@ -31,80 +30,6 @@ func (t *tappableCell) Tapped(*fyne.PointEvent) {}
 func (t *tappableCell) DoubleTapped(*fyne.PointEvent) {
 	if t.onDouble != nil {
 		t.onDouble()
-	}
-}
-
-type gridKeyHandler struct {
-	widget.BaseWidget
-	grid *widget.GridWrap
-	g    *ThumbGrid
-}
-
-func newGridKeyHandler(g *ThumbGrid) *gridKeyHandler {
-	k := &gridKeyHandler{grid: g.grid, g: g}
-	k.ExtendBaseWidget(k)
-	return k
-}
-func (k *gridKeyHandler) CreateRenderer() fyne.WidgetRenderer { return widget.NewSimpleRenderer(k.grid) }
-
-func (k *gridKeyHandler) moveSelection(delta int) {
-	k.g.mu.Lock()
-	cur := k.g.selectedIndex
-	max := len(k.g.entries) - 1
-	k.g.mu.Unlock()
-	
-	if max < 0 {
-		return
-	}
-	next := cur + delta
-	if next < 0 {
-		next = 0
-	}
-	if next > max {
-		next = max
-	}
-	k.grid.Select(widget.GridWrapItemID(next))
-	k.grid.ScrollTo(widget.GridWrapItemID(next))
-}
-
-func (k *gridKeyHandler) TypedKey(e *fyne.KeyEvent) {
-	if e.Name == fyne.KeyReturn || e.Name == fyne.KeyEnter || e.Name == fyne.KeySpace {
-		k.g.openSelected()
-	} else if e.Name == fyne.KeyLeft {
-		k.moveSelection(-1)
-	} else if e.Name == fyne.KeyRight {
-		k.moveSelection(1)
-	} else if e.Name == fyne.KeyUp {
-		k.moveSelection(-k.grid.ColumnCount())
-	} else if e.Name == fyne.KeyDown {
-		k.moveSelection(k.grid.ColumnCount())
-	} else {
-		k.grid.TypedKey(e)
-	}
-}
-func (k *gridKeyHandler) TypedRune(r rune) {
-	switch r {
-	case 'h':
-		k.moveSelection(-1)
-	case 'j':
-		k.moveSelection(k.grid.ColumnCount())
-	case 'k':
-		k.moveSelection(-k.grid.ColumnCount())
-	case 'l':
-		k.moveSelection(1)
-	case ' ':
-		k.g.openSelected()
-	}
-}
-func (k *gridKeyHandler) FocusGained() { k.grid.FocusGained() }
-func (k *gridKeyHandler) FocusLost()   { k.grid.FocusLost() }
-func (k *gridKeyHandler) TypedShortcut(s fyne.Shortcut) {
-	if _, ok := s.(*desktop.CustomShortcut); ok {
-		cs := s.(*desktop.CustomShortcut)
-		if cs.KeyName == fyne.KeyMinus || cs.KeyName == fyne.KeyEqual {
-			k.g.handleZoom(cs.KeyName == fyne.KeyEqual)
-			return
-		}
 	}
 }
 
@@ -137,7 +62,7 @@ func NewThumbGrid(store *cache.ThumbStore, onActivate func(int, []cache.Entry)) 
 	return g
 }
 
-func (g *ThumbGrid) openSelected() {
+func (g *ThumbGrid) OpenSelected() {
 	g.mu.Lock()
 	id := g.selectedIndex
 	ok := id >= 0 && id < len(g.entries)
@@ -151,7 +76,38 @@ func (g *ThumbGrid) openSelected() {
 	}
 }
 
-func (g *ThumbGrid) handleZoom(in bool) {
+func (g *ThumbGrid) MoveSelection(delta int) {
+	g.mu.Lock()
+	cur := g.selectedIndex
+	max := len(g.entries) - 1
+	g.mu.Unlock()
+	
+	if max < 0 {
+		return
+	}
+	next := cur + delta
+	if next < 0 {
+		next = 0
+	}
+	if next > max {
+		next = max
+	}
+	g.grid.Select(widget.GridWrapItemID(next))
+	g.grid.ScrollTo(widget.GridWrapItemID(next))
+}
+
+func (g *ThumbGrid) ColumnCount() int {
+	if g.grid == nil {
+		return 1
+	}
+	cols := g.grid.ColumnCount()
+	if cols < 1 {
+		return 1
+	}
+	return cols
+}
+
+func (g *ThumbGrid) HandleZoom(in bool) {
 	if in {
 		g.cellSize += 20
 	} else {
@@ -190,7 +146,7 @@ func (g *ThumbGrid) rebuildGrid() {
 				g.mu.Lock()
 				g.selectedIndex = cellID
 				g.mu.Unlock()
-				g.openSelected()
+				g.OpenSelected()
 			})
 		},
 		func(id widget.GridWrapItemID, obj fyne.CanvasObject) {
@@ -212,7 +168,7 @@ func (g *ThumbGrid) rebuildGrid() {
 				g.mu.Lock()
 				g.selectedIndex = int(id)
 				g.mu.Unlock()
-				g.openSelected()
+				g.OpenSelected()
 			}
 
 			img := stack.Objects[0].(*canvas.Image)
@@ -239,8 +195,7 @@ func (g *ThumbGrid) rebuildGrid() {
 		g.mu.Unlock()
 	}
 	
-	kh := newGridKeyHandler(g)
-	g.container.Objects = []fyne.CanvasObject{kh}
+	g.container.Objects = []fyne.CanvasObject{g.grid}
 	g.container.Refresh()
 }
 
