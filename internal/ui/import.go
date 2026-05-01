@@ -2,6 +2,7 @@ package ui
 
 import (
 	"archive/zip"
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
@@ -10,6 +11,8 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"fyne.io/fyne/v2"
@@ -100,6 +103,15 @@ func (c *Controller) runImport() {
 	c.runImportFromDirs(nil)
 }
 
+// importLogVisibleLines caps how many trailing lines are kept in the visible
+// log widget. The full log is still preserved for the clipboard copy.
+const importLogVisibleLines = 1000
+
+// importUITickInterval is the cadence at which buffered log lines and the
+// progress bar value are pushed to the UI thread during an import. Per-file
+// fyne.Do calls are too expensive at high file counts.
+const importUITickInterval = 200 * time.Millisecond
+
 // runImportFromDirs opens the import dialog with an optional list of source
 // directories already added — used by the SD-card flow to hand off a freshly
 // mounted volume.
@@ -128,21 +140,44 @@ func (c *Controller) runImportFromDirs(initialDirs []string) {
 		return
 	}
 
-	logText := ""
-
 	logEntry := widget.NewMultiLineEntry()
-	// Disable typing, but allow text selection and scrolling
 	logEntry.Wrapping = fyne.TextWrapWord
 
-	var d dialog.Dialog
+	// Log writes are buffered; a ticker drains them onto the UI thread so a
+	// large import doesn't trigger one widget refresh per file.
+	var (
+		logMu       sync.Mutex
+		logPending  []string
+		logVisible  []string
+		logFullCopy strings.Builder
+	)
 
 	appendLog := func(msg string) {
-		fyne.Do(func() {
-			logText += msg + "\n"
-			logEntry.SetText(logText)
-			logEntry.CursorRow = strings.Count(logText, "\n")
-			logEntry.Refresh()
-		})
+		logMu.Lock()
+		logPending = append(logPending, msg)
+		logFullCopy.WriteString(msg)
+		logFullCopy.WriteByte('\n')
+		logMu.Unlock()
+	}
+
+	// flushLog must run on the UI thread.
+	flushLog := func() {
+		logMu.Lock()
+		if len(logPending) == 0 {
+			logMu.Unlock()
+			return
+		}
+		logVisible = append(logVisible, logPending...)
+		logPending = logPending[:0]
+		if len(logVisible) > importLogVisibleLines {
+			logVisible = logVisible[len(logVisible)-importLogVisibleLines:]
+		}
+		text := strings.Join(logVisible, "\n")
+		rows := len(logVisible)
+		logMu.Unlock()
+		logEntry.SetText(text)
+		logEntry.CursorRow = rows
+		logEntry.Refresh()
 	}
 
 	statusLabel := widget.NewLabelWithStyle(fmt.Sprintf("Ready to import %d files.", fileCount), fyne.TextAlignCenter, fyne.TextStyle{Bold: true})
@@ -153,8 +188,19 @@ func (c *Controller) runImportFromDirs(initialDirs []string) {
 	progressBar.Max = float64(fileCount)
 	progressBar.SetValue(0)
 
+	var (
+		progressMax atomic.Int64
+		progressVal atomic.Int64
+	)
+	progressMax.Store(int64(fileCount))
+
+	var d dialog.Dialog
+
 	copyBtn := widget.NewButton("Copy to Clipboard", func() {
-		c.window.Clipboard().SetContent(logText)
+		logMu.Lock()
+		s := logFullCopy.String()
+		logMu.Unlock()
+		c.window.Clipboard().SetContent(s)
 	})
 	copyBtn.Disable()
 
@@ -166,14 +212,37 @@ func (c *Controller) runImportFromDirs(initialDirs []string) {
 	})
 	importAgainBtn.Disable()
 
-	var startBtn *widget.Button
-	var importZipBtn *widget.Button
+	var (
+		startBtn     *widget.Button
+		importZipBtn *widget.Button
+		importDirBtn *widget.Button
+		cancelBtn    *widget.Button
+	)
+
+	var (
+		ctxMu        sync.Mutex
+		importCtx    context.Context
+		cancelImport context.CancelFunc
+	)
+
+	currentCtx := func() context.Context {
+		ctxMu.Lock()
+		defer ctxMu.Unlock()
+		if importCtx == nil {
+			return context.Background()
+		}
+		return importCtx
+	}
 
 	processBatch := func(entriesToProcess []string) {
+		ctx := currentCtx()
 		baseDates := make(map[string]time.Time)
 
-		// First pass: find the oldest date for each base name
+		// First pass: find the oldest date for each base name.
 		for _, srcPath := range entriesToProcess {
+			if ctx.Err() != nil {
+				return
+			}
 			var mediaDate time.Time
 
 			file, err := os.Open(srcPath)
@@ -188,7 +257,6 @@ func (c *Controller) runImportFromDirs(initialDirs []string) {
 				file.Close()
 			}
 
-			// Fallback to file mod time
 			if mediaDate.IsZero() {
 				info, err := os.Stat(srcPath)
 				if err == nil {
@@ -205,9 +273,11 @@ func (c *Controller) runImportFromDirs(initialDirs []string) {
 			}
 		}
 
-		processed := 0
-		// Second pass: move files to the folder of their base name's oldest date
+		// Second pass: move files to the folder of their base name's oldest date.
 		for _, srcPath := range entriesToProcess {
+			if ctx.Err() != nil {
+				return
+			}
 			baseName := filepath.Base(srcPath)
 			base := strings.TrimSuffix(baseName, filepath.Ext(baseName))
 			mediaDate := baseDates[base]
@@ -235,10 +305,7 @@ func (c *Controller) runImportFromDirs(initialDirs []string) {
 					} else {
 						appendLog(fmt.Sprintf("[SKIP] %s already in %s (identical)", baseName, dateFolder))
 					}
-					processed++
-					fyne.Do(func() {
-						progressBar.SetValue(float64(processed))
-					})
+					progressVal.Add(1)
 					continue
 				}
 				ext := filepath.Ext(baseName)
@@ -252,10 +319,7 @@ func (c *Controller) runImportFromDirs(initialDirs []string) {
 				appendLog(fmt.Sprintf("[OK] Moved %s -> %s", baseName, filepath.Join(dateFolder, filepath.Base(destPath))))
 			}
 
-			processed++
-			fyne.Do(func() {
-				progressBar.SetValue(float64(processed))
-			})
+			progressVal.Add(1)
 		}
 	}
 
@@ -277,8 +341,6 @@ func (c *Controller) runImportFromDirs(initialDirs []string) {
 		statusLabel.SetText("Ready. " + strings.Join(parts, ", ") + ".")
 	}
 
-	var importDirBtn *widget.Button
-
 	startBtn = widget.NewButton("Start Import", func() {
 		startBtn.Disable()
 		if importZipBtn != nil {
@@ -287,13 +349,49 @@ func (c *Controller) runImportFromDirs(initialDirs []string) {
 		if importDirBtn != nil {
 			importDirBtn.Disable()
 		}
+		cancelBtn.Enable()
 		statusLabel.SetText("Processing...")
 
+		ctxMu.Lock()
+		importCtx, cancelImport = context.WithCancel(context.Background())
+		ctx := importCtx
+		ctxMu.Unlock()
+
+		tickerStop := make(chan struct{})
 		go func() {
+			t := time.NewTicker(importUITickInterval)
+			defer t.Stop()
+			for {
+				select {
+				case <-tickerStop:
+					return
+				case <-t.C:
+					fyne.Do(func() {
+						flushLog()
+						progressBar.Max = float64(progressMax.Load())
+						progressBar.SetValue(float64(progressVal.Load()))
+					})
+				}
+			}
+		}()
+
+		go func() {
+			defer func() {
+				close(tickerStop)
+				fyne.Do(func() {
+					flushLog()
+					progressBar.Max = float64(progressMax.Load())
+					progressBar.SetValue(float64(progressVal.Load()))
+				})
+			}()
+
 			appendLog(fmt.Sprintf("Starting import to %s", outboxDir))
 
 			// Phase 1: extract ZIPs into the inbox.
 			for _, zipPath := range zipFiles {
+				if ctx.Err() != nil {
+					break
+				}
 				appendLog("Extracting " + zipPath + " ...")
 				r, err := zip.OpenReader(zipPath)
 				if err != nil {
@@ -303,6 +401,9 @@ func (c *Controller) runImportFromDirs(initialDirs []string) {
 
 				extractedCount := 0
 				for _, f := range r.File {
+					if ctx.Err() != nil {
+						break
+					}
 					if f.FileInfo().IsDir() {
 						continue
 					}
@@ -340,32 +441,38 @@ func (c *Controller) runImportFromDirs(initialDirs []string) {
 
 			// Phase 2: process whatever is currently in the inbox (pre-existing
 			// files plus anything just extracted from ZIPs) as one batch.
-			var inboxEntries []string
-			if walkErr := filepath.WalkDir(inboxDir, func(path string, dEntry fs.DirEntry, err error) error {
-				if err != nil || dEntry.IsDir() {
+			if ctx.Err() == nil {
+				var inboxEntries []string
+				if walkErr := filepath.WalkDir(inboxDir, func(path string, dEntry fs.DirEntry, err error) error {
+					if err != nil || dEntry.IsDir() {
+						return nil
+					}
+					if scan.DetectType(path) != scan.TypeUnknown {
+						inboxEntries = append(inboxEntries, path)
+					}
 					return nil
+				}); walkErr != nil {
+					appendLog("[ERROR] Failed to read inbox: " + walkErr.Error())
 				}
-				if scan.DetectType(path) != scan.TypeUnknown {
-					inboxEntries = append(inboxEntries, path)
+				if len(inboxEntries) > 0 {
+					appendLog(fmt.Sprintf("Processing %d files already in Inbox...", len(inboxEntries)))
+					progressMax.Store(int64(len(inboxEntries)))
+					progressVal.Store(0)
+					n := len(inboxEntries)
+					fyne.Do(func() {
+						statusLabel.SetText(fmt.Sprintf("Importing %d inbox files...", n))
+					})
+					processBatch(inboxEntries)
+					processedAny = true
 				}
-				return nil
-			}); walkErr != nil {
-				appendLog("[ERROR] Failed to read inbox: " + walkErr.Error())
-			}
-			if len(inboxEntries) > 0 {
-				appendLog(fmt.Sprintf("Processing %d files already in Inbox...", len(inboxEntries)))
-				fyne.Do(func() {
-					progressBar.Max = float64(len(inboxEntries))
-					progressBar.SetValue(0)
-					statusLabel.SetText(fmt.Sprintf("Importing %d inbox files...", len(inboxEntries)))
-				})
-				processBatch(inboxEntries)
-				processedAny = true
 			}
 
 			// Phase 3: for each chosen directory, copy and process one
 			// subdirectory at a time so the inbox never holds the whole tree.
 			for _, srcDir := range importDirs {
+				if ctx.Err() != nil {
+					break
+				}
 				appendLog("Scanning " + srcDir + " ...")
 				subdirFiles := map[string][]string{}
 				var subdirOrder []string
@@ -388,10 +495,16 @@ func (c *Controller) runImportFromDirs(initialDirs []string) {
 				}
 
 				for _, subdir := range subdirOrder {
+					if ctx.Err() != nil {
+						break
+					}
 					files := subdirFiles[subdir]
 					appendLog(fmt.Sprintf("Copying %d files from %s to Inbox...", len(files), subdir))
 					var batch []string
 					for _, src := range files {
+						if ctx.Err() != nil {
+							break
+						}
 						destPath := uniqueInboxPath(inboxDir, filepath.Base(src))
 						if err := copyFile(src, destPath); err != nil {
 							appendLog("[ERROR] Copy failed for " + src + ": " + err.Error())
@@ -402,19 +515,29 @@ func (c *Controller) runImportFromDirs(initialDirs []string) {
 					if len(batch) == 0 {
 						continue
 					}
+					progressMax.Store(int64(len(batch)))
+					progressVal.Store(0)
+					n := len(batch)
+					sd := subdir
 					fyne.Do(func() {
-						progressBar.Max = float64(len(batch))
-						progressBar.SetValue(0)
-						statusLabel.SetText(fmt.Sprintf("Importing %d files from %s...", len(batch), filepath.Base(subdir)))
+						statusLabel.SetText(fmt.Sprintf("Importing %d files from %s...", n, filepath.Base(sd)))
 					})
 					processBatch(batch)
 					processedAny = true
 				}
 			}
 
-			appendLog("Import process finished.")
+			cancelled := ctx.Err() != nil
+			if cancelled {
+				appendLog("Import cancelled.")
+			} else {
+				appendLog("Import process finished.")
+			}
 			fyne.Do(func() {
-				if processedAny {
+				cancelBtn.Disable()
+				if cancelled {
+					statusLabel.SetText("Cancelled.")
+				} else if processedAny {
 					statusLabel.SetText("Finished importing.")
 				} else {
 					statusLabel.SetText("Finished. Nothing to import.")
@@ -428,7 +551,7 @@ func (c *Controller) runImportFromDirs(initialDirs []string) {
 				})
 			}
 
-			if len(zipFiles) > 0 {
+			if !cancelled && len(zipFiles) > 0 {
 				fyne.Do(func() {
 					msg := fmt.Sprintf("Import is complete.\nDo you want to delete the %d original ZIP files?", len(zipFiles))
 					if len(zipFiles) == 1 {
@@ -461,6 +584,18 @@ func (c *Controller) runImportFromDirs(initialDirs []string) {
 	if len(importDirs) > 0 {
 		updateReadyStatus()
 	}
+
+	cancelBtn = widget.NewButton("Cancel", func() {
+		ctxMu.Lock()
+		cancel := cancelImport
+		ctxMu.Unlock()
+		if cancel != nil {
+			cancel()
+		}
+		cancelBtn.Disable()
+		statusLabel.SetText("Cancelling...")
+	})
+	cancelBtn.Disable()
 
 	importZipBtn = widget.NewButton("Add ZIP", func() {
 		fd := dialog.NewFileOpen(func(uc fyne.URIReadCloser, err error) {
@@ -505,7 +640,7 @@ func (c *Controller) runImportFromDirs(initialDirs []string) {
 		}, c.window)
 	})
 
-	buttons := container.NewHBox(importAgainBtn, startBtn, importZipBtn, importDirBtn, copyBtn)
+	buttons := container.NewHBox(importAgainBtn, startBtn, cancelBtn, importZipBtn, importDirBtn, copyBtn)
 	topContent := container.NewVBox(statusLabel, progressBar)
 	content := container.NewBorder(topContent, buttons, nil, nil, logEntry)
 
