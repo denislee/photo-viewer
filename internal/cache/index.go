@@ -44,11 +44,18 @@ func Load(dbPath string) (*Index, error) {
 			type INTEGER,
 			size INTEGER,
 			mtime INTEGER,
-			thumb_id TEXT
+			thumb_id TEXT,
+			content_hash TEXT
 		);
 		CREATE INDEX IF NOT EXISTS idx_entries_path ON entries(path);
 	`)
 	if err != nil {
+		return nil, err
+	}
+	// Migrate older databases that pre-date the content_hash column. The
+	// "duplicate column name" error is ignored on purpose.
+	_, _ = db.Exec("ALTER TABLE entries ADD COLUMN content_hash TEXT")
+	if _, err := db.Exec("CREATE INDEX IF NOT EXISTS idx_entries_hash ON entries(content_hash)"); err != nil {
 		return nil, err
 	}
 

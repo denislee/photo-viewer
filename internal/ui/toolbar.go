@@ -24,9 +24,10 @@ type Toolbar struct {
 	rebuild    *widget.Button
 	settings   *widget.Button
 	importBtn  *widget.Button
+	dupBtn     *widget.Button
 }
 
-func NewToolbar(onFilter func(string), onRebuild func(), onSettings func(), onImport func()) *Toolbar {
+func NewToolbar(onFilter func(string), onRebuild func(), onSettings func(), onImport func(), onDuplicates func()) *Toolbar {
 	pathLabel := canvas.NewText("", color.NRGBA{R: 0xc8, G: 0xcc, B: 0xd2, A: 0xff})
 	pathLabel.TextSize = 11
 
@@ -45,10 +46,11 @@ func NewToolbar(onFilter func(string), onRebuild func(), onSettings func(), onIm
 		rebuild:    iconButton(theme.ViewRefreshIcon(), onRebuild),
 		settings:   iconButton(theme.SettingsIcon(), onSettings),
 		importBtn:  iconButton(theme.DownloadIcon(), onImport),
+		dupBtn:     iconButton(theme.ContentCopyIcon(), onDuplicates),
 	}
 	t.progress.Hide()
 
-	actions := container.NewHBox(t.countLabel, t.filterBtn, t.progress, t.importBtn, t.settings, t.rebuild)
+	actions := container.NewHBox(t.countLabel, t.filterBtn, t.progress, t.importBtn, t.dupBtn, t.settings, t.rebuild)
 	row := container.New(layout.NewBorderLayout(nil, nil, nil, actions),
 		actions,
 		container.NewPadded(t.pathLabel),

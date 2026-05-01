@@ -46,7 +46,7 @@ func NewController(window fyne.Window, libraryRoot string, idx *cache.Index, sto
 		currentDir:  libraryRoot,
 		mediaFilter: "All",
 	}
-	c.toolbar = NewToolbar(c.setFilter, c.rebuildIndex, c.showSettings, c.runImport)
+	c.toolbar = NewToolbar(c.setFilter, c.rebuildIndex, c.showSettings, c.runImport, c.showDuplicates)
 	c.grid = NewThumbGrid(window, store, func(index int, entries []cache.Entry) {
 		Open(c.window, index, entries, c.store)
 	})
@@ -132,6 +132,10 @@ func (c *Controller) rebuildIndex() {
 	c.grid.SetEntries(nil)
 	c.toolbar.SetCount(0)
 	go c.scanInto(ctx, c.libraryRoot, true)
+}
+
+func (c *Controller) showDuplicates() {
+	ShowDuplicates(c.window, c.index, c.store)
 }
 
 func (c *Controller) setFilter(f string) {
