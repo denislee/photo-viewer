@@ -27,6 +27,7 @@ type Controller struct {
 	store *cache.ThumbStore
 
 	toolbar *Toolbar
+	sidebar *SidebarTree
 	grid    *ThumbGrid
 
 	mu          sync.Mutex
@@ -50,6 +51,12 @@ func NewController(window fyne.Window, libraryRoot string, idx *cache.Index, sto
 		Open(c.window, index, entries, c.store)
 	})
 
+	c.grid.OnTab = func() {
+		if c.sidebar != nil {
+			c.window.Canvas().Focus(c.sidebar)
+		}
+	}
+
 	window.Canvas().AddShortcut(&desktop.CustomShortcut{KeyName: fyne.KeyMinus, Modifier: fyne.KeyModifierShortcutDefault}, func(shortcut fyne.Shortcut) {
 		c.grid.HandleZoom(false)
 	})
@@ -58,16 +65,24 @@ func NewController(window fyne.Window, libraryRoot string, idx *cache.Index, sto
 	})
 
 	c.toolbar.SetPath(libraryRoot)
-	return c
-}
+	c.sidebar = NewSidebar(c.libraryRoot, c.index, c.SelectDir)
+	c.sidebar.OnTab = func() {
+		if c.grid != nil && c.grid.grid != nil {
+			c.window.Canvas().Focus(c.grid.grid)
+		}
+	}
+	c.sidebar.OnEnterOrL = func() {
+		if c.grid != nil && c.grid.grid != nil {
+			c.window.Canvas().Focus(c.grid.grid)
+		}
+	}
 
-func (c *Controller) Sidebar() fyne.CanvasObject {
-	return NewSidebar(c.libraryRoot, c.index, c.SelectDir)
+	return c
 }
 
 func (c *Controller) Build() fyne.CanvasObject {
 	right := container.NewBorder(c.toolbar.Widget(), nil, nil, nil, c.grid.Widget())
-	split := container.NewHSplit(c.Sidebar(), right)
+	split := container.NewHSplit(c.sidebar, right)
 	split.SetOffset(0.22)
 	return split
 }

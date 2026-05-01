@@ -59,7 +59,12 @@ func newCustomGridWrap(g *ThumbGrid, length func() int, createItem func() fyne.C
 }
 
 func (c *customGridWrap) TypedKey(e *fyne.KeyEvent) {
-	if e.Name == fyne.KeyReturn || e.Name == fyne.KeyEnter || e.Name == fyne.KeySpace {
+	if e.Name == fyne.KeyTab {
+		if c.g.OnTab != nil {
+			c.g.OnTab()
+		}
+		return
+	} else if e.Name == fyne.KeyReturn || e.Name == fyne.KeyEnter || e.Name == fyne.KeySpace {
 		c.g.OpenSelected()
 	} else if e.Name == fyne.KeyLeft {
 		c.g.MoveSelection(-1)
@@ -108,6 +113,7 @@ type ThumbGrid struct {
 	cellSize      float32
 
 	onActivate func(int, []cache.Entry)
+	OnTab      func()
 }
 
 func NewThumbGrid(window fyne.Window, store *cache.ThumbStore, onActivate func(int, []cache.Entry)) *ThumbGrid {
@@ -325,7 +331,6 @@ func (g *ThumbGrid) SetEntries(entries []cache.Entry) {
 		g.grid.Select(0)
 		g.grid.ScrollToTop()
 	}
-	g.focusGrid()
 }
 
 // Append adds entries to the displayed set. Same threading rules as SetEntries.
