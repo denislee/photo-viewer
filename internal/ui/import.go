@@ -299,7 +299,7 @@ func (c *Controller) runImport() {
 					break
 				}
 			}
-			
+
 			if !alreadyAdded {
 				zipFiles = append(zipFiles, zipPath)
 				fyne.Do(func() {

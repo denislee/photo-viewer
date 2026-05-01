@@ -6,6 +6,8 @@ import (
 	"encoding/hex"
 	"io"
 	"os"
+	"runtime"
+	"sync"
 	"time"
 )
 
@@ -66,22 +68,60 @@ func (i *Index) EnsureHashes(ctx context.Context, progress func(done, total int)
 	if progress != nil {
 		progress(0, total)
 	}
-	for idx, t := range todo {
-		if ctx.Err() != nil {
-			return ctx.Err()
+
+	numWorkers := runtime.NumCPU()
+	if numWorkers > 8 {
+		numWorkers = 8
+	}
+
+	type result struct {
+		path string
+		hash string
+		err  error
+	}
+
+	jobs := make(chan string, total)
+	results := make(chan result, total)
+
+	for _, t := range todo {
+		jobs <- t.path
+	}
+	close(jobs)
+
+	var wg sync.WaitGroup
+	for w := 0; w < numWorkers; w++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for path := range jobs {
+				if ctx.Err() != nil {
+					continue
+				}
+				h, err := hashFile(path)
+				results <- result{path: path, hash: h, err: err}
+			}
+		}()
+	}
+
+	go func() {
+		wg.Wait()
+		close(results)
+	}()
+
+	done := 0
+	for res := range results {
+		done++
+		if res.err == nil && ctx.Err() == nil {
+			i.mu.Lock()
+			_, _ = i.db.Exec("UPDATE entries SET content_hash = ? WHERE path = ?", res.hash, res.path)
+			i.mu.Unlock()
 		}
-		h, err := hashFile(t.path)
-		if err != nil {
-			continue
-		}
-		i.mu.Lock()
-		_, _ = i.db.Exec("UPDATE entries SET content_hash = ? WHERE path = ?", h, t.path)
-		i.mu.Unlock()
 		if progress != nil {
-			progress(idx+1, total)
+			progress(done, total)
 		}
 	}
-	return nil
+
+	return ctx.Err()
 }
 
 // FindDuplicates returns groups of entries (size >= 2) that share content
