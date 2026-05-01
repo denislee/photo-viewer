@@ -7,7 +7,6 @@ import (
 	"fyne.io/fyne/v2"
 	"fyne.io/fyne/v2/canvas"
 	"fyne.io/fyne/v2/container"
-	"fyne.io/fyne/v2/dialog"
 	"fyne.io/fyne/v2/widget"
 
 	"github.com/dns/photo-viewer/internal/cache"
@@ -75,7 +74,7 @@ func Open(parent fyne.Window, startIndex int, entries []cache.Entry, store *cach
 	bg := canvas.NewRectangle(color.NRGBA{R: 0x0a, G: 0x0b, B: 0x0d, A: 0xff})
 	stack := container.NewStack(bg, img, container.NewCenter(loadingLabel))
 
-	var d dialog.Dialog
+	var d *widget.PopUp
 
 	loadPhoto := func(idx int) {
 		entry := entries[idx]
@@ -144,9 +143,9 @@ func Open(parent fyne.Window, startIndex int, entries []cache.Entry, store *cach
 		}
 	})
 
-	d = dialog.NewCustomWithoutButtons("", kh, parent)
+	d = widget.NewModalPopUp(kh, parent.Canvas())
 	winSize := parent.Canvas().Size()
-	d.Resize(fyne.NewSize(winSize.Width*0.95, winSize.Height*0.95))
+	d.Resize(fyne.NewSize(winSize.Width*0.98, winSize.Height*0.98))
 	d.Show()
 	parent.Canvas().Focus(kh)
 

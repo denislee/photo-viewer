@@ -166,6 +166,25 @@ func (i *Index) ListDir(dir string) []Entry {
 	return out
 }
 
+// CountDir returns the number of entries under the specific directory prefix.
+func (i *Index) CountDir(dir string) int {
+	i.mu.Lock()
+	defer i.mu.Unlock()
+
+	prefix := dir
+	if len(prefix) > 0 && prefix[len(prefix)-1] != filepath.Separator {
+		prefix += string(filepath.Separator)
+	}
+	likePattern := prefix + "%"
+
+	var count int
+	err := i.db.QueryRow("SELECT COUNT(*) FROM entries WHERE path LIKE ? OR path = ?", likePattern, dir).Scan(&count)
+	if err != nil {
+		return 0
+	}
+	return count
+}
+
 // All returns a snapshot of the entire index.
 func (i *Index) All() []Entry {
 	i.mu.Lock()

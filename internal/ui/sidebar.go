@@ -1,6 +1,7 @@
 package ui
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"sort"
@@ -9,12 +10,14 @@ import (
 	"fyne.io/fyne/v2/container"
 	"fyne.io/fyne/v2/theme"
 	"fyne.io/fyne/v2/widget"
+
+	"github.com/dns/photo-viewer/internal/cache"
 )
 
 // NewSidebar builds a directory tree rooted at libraryRoot. The tree only
 // shows directories. onSelect is called with the absolute path each time the
 // user clicks a node.
-func NewSidebar(libraryRoot string, onSelect func(path string)) *widget.Tree {
+func NewSidebar(libraryRoot string, idx *cache.Index, onSelect func(path string)) *widget.Tree {
 	tree := widget.NewTree(
 		func(uid widget.TreeNodeID) []widget.TreeNodeID {
 			dir := nodePath(libraryRoot, uid)
@@ -49,11 +52,20 @@ func NewSidebar(libraryRoot string, onSelect func(path string)) *widget.Tree {
 		func(uid widget.TreeNodeID, branch bool, obj fyne.CanvasObject) {
 			row := obj.(*fyne.Container)
 			label := row.Objects[1].(*widget.Label)
+			var text string
+			var count int
 			if uid == "" {
-				label.SetText(filepath.Base(libraryRoot))
-				return
+				text = filepath.Base(libraryRoot)
+				count = idx.CountDir(libraryRoot)
+			} else {
+				text = filepath.Base(uid)
+				count = idx.CountDir(nodePath(libraryRoot, uid))
 			}
-			label.SetText(filepath.Base(uid))
+			if count > 0 {
+				label.SetText(fmt.Sprintf("%s (%d)", text, count))
+			} else {
+				label.SetText(text)
+			}
 		},
 	)
 	tree.OnSelected = func(uid widget.TreeNodeID) {

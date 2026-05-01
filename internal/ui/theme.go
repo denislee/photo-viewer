@@ -69,7 +69,7 @@ func (minimalTheme) Icon(n fyne.ThemeIconName) fyne.Resource {
 func (minimalTheme) Size(name fyne.ThemeSizeName) float32 {
 	switch name {
 	case theme.SizeNameText:
-		return 12
+		return 10
 	case theme.SizeNamePadding:
 		return 6
 	case theme.SizeNameInnerPadding:

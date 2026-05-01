@@ -19,23 +19,28 @@ type Toolbar struct {
 
 	pathLabel  *canvas.Text
 	countLabel *canvas.Text
+	filterBtn  *widget.Select
 	progress   *widget.Activity
 	rebuild    *widget.Button
 	settings   *widget.Button
 	importBtn  *widget.Button
 }
 
-func NewToolbar(onRebuild func(), onSettings func(), onImport func()) *Toolbar {
+func NewToolbar(onFilter func(string), onRebuild func(), onSettings func(), onImport func()) *Toolbar {
 	pathLabel := canvas.NewText("", color.NRGBA{R: 0xc8, G: 0xcc, B: 0xd2, A: 0xff})
-	pathLabel.TextSize = 13
+	pathLabel.TextSize = 11
 
 	countLabel := canvas.NewText("", color.NRGBA{R: 0x80, G: 0x84, B: 0x8c, A: 0xff})
-	countLabel.TextSize = 12
+	countLabel.TextSize = 10
 	countLabel.Alignment = fyne.TextAlignTrailing
+
+	filterBtn := widget.NewSelect([]string{"All", "Photos", "Videos"}, onFilter)
+	filterBtn.SetSelected("All")
 
 	t := &Toolbar{
 		pathLabel:  pathLabel,
 		countLabel: countLabel,
+		filterBtn:  filterBtn,
 		progress:   widget.NewActivity(),
 		rebuild:    iconButton(theme.ViewRefreshIcon(), onRebuild),
 		settings:   iconButton(theme.SettingsIcon(), onSettings),
@@ -43,7 +48,7 @@ func NewToolbar(onRebuild func(), onSettings func(), onImport func()) *Toolbar {
 	}
 	t.progress.Hide()
 
-	actions := container.NewHBox(t.countLabel, t.progress, t.importBtn, t.settings, t.rebuild)
+	actions := container.NewHBox(t.countLabel, t.filterBtn, t.progress, t.importBtn, t.settings, t.rebuild)
 	row := container.New(layout.NewBorderLayout(nil, nil, nil, actions),
 		actions,
 		container.NewPadded(t.pathLabel),

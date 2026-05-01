@@ -206,8 +206,11 @@ func (g *ThumbGrid) rebuildGrid() {
 			img.FillMode = canvas.ImageFillContain
 			img.SetMinSize(fyne.NewSize(g.cellSize, g.cellSize))
 
-			// Play badge: small dark pill with white triangle, parked in
-			// the bottom-right corner. Hidden for non-video entries.
+			// Wrap img in padding so the grid selection highlight is visible
+			// around the outside of the thumbnail.
+			paddedImg := container.NewPadded(img)
+
+			// Play badge: small dark pill with white triangle, parked in			// the bottom-right corner. Hidden for non-video entries.
 			pill := canvas.NewRectangle(color.NRGBA{R: 0, G: 0, B: 0, A: 0xb0})
 			pill.CornerRadius = 4
 			pill.SetMinSize(fyne.NewSize(22, 16))
@@ -222,7 +225,7 @@ func (g *ThumbGrid) rebuildGrid() {
 				container.NewHBox(layout.NewSpacer(), badge),
 			)
 
-			stack := container.NewStack(img, container.NewPadded(corner))
+			stack := container.NewStack(paddedImg, container.NewPadded(corner))
 			return newTappableCell(stack, nil, nil)
 		},
 		func(id widget.GridWrapItemID, obj fyne.CanvasObject) {
@@ -259,7 +262,8 @@ func (g *ThumbGrid) rebuildGrid() {
 			}
 			tc.boundPath = entry.Path
 
-			img := stack.Objects[0].(*canvas.Image)
+			paddedImg := stack.Objects[0].(*fyne.Container)
+			img := paddedImg.Objects[0].(*canvas.Image)
 			badge := findBadge(stack.Objects[1].(*fyne.Container))
 
 			if badge != nil {

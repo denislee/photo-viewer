@@ -29,9 +29,10 @@ type Controller struct {
 	toolbar *Toolbar
 	grid    *ThumbGrid
 
-	mu         sync.Mutex
-	currentDir string
-	scanCancel context.CancelFunc
+	mu          sync.Mutex
+	currentDir  string
+	mediaFilter string
+	scanCancel  context.CancelFunc
 }
 
 func NewController(window fyne.Window, libraryRoot string, idx *cache.Index, store *cache.ThumbStore, cacheDir string) *Controller {
@@ -42,8 +43,9 @@ func NewController(window fyne.Window, libraryRoot string, idx *cache.Index, sto
 		index:       idx,
 		store:       store,
 		currentDir:  libraryRoot,
+		mediaFilter: "All",
 	}
-	c.toolbar = NewToolbar(c.rebuildIndex, c.showSettings, c.runImport)
+	c.toolbar = NewToolbar(c.setFilter, c.rebuildIndex, c.showSettings, c.runImport)
 	c.grid = NewThumbGrid(window, store, func(index int, entries []cache.Entry) {
 		Open(c.window, index, entries, c.store)
 	})
@@ -60,7 +62,7 @@ func NewController(window fyne.Window, libraryRoot string, idx *cache.Index, sto
 }
 
 func (c *Controller) Sidebar() fyne.CanvasObject {
-	return NewSidebar(c.libraryRoot, c.SelectDir)
+	return NewSidebar(c.libraryRoot, c.index, c.SelectDir)
 }
 
 func (c *Controller) Build() fyne.CanvasObject {
@@ -114,9 +116,32 @@ func (c *Controller) rebuildIndex() {
 	go c.scanInto(ctx, c.libraryRoot, true)
 }
 
+func (c *Controller) setFilter(f string) {
+	c.mu.Lock()
+	c.mediaFilter = f
+	c.mu.Unlock()
+	go c.refreshFromIndex(c.activeDir())
+}
+
 // refreshFromIndex pushes the cached entries that live under dir to the grid.
 func (c *Controller) refreshFromIndex(dir string) {
-	filtered := c.index.ListDir(dir)
+	entries := c.index.ListDir(dir)
+
+	c.mu.Lock()
+	filter := c.mediaFilter
+	c.mu.Unlock()
+
+	var filtered []cache.Entry
+	for _, e := range entries {
+		if filter == "Photos" && e.Type == scan.TypeVideo {
+			continue
+		}
+		if filter == "Videos" && e.Type != scan.TypeVideo {
+			continue
+		}
+		filtered = append(filtered, e)
+	}
+
 	sortEntries(filtered)
 	fyne.Do(func() {
 		c.grid.SetEntries(filtered)
