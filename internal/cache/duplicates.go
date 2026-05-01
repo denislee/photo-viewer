@@ -30,43 +30,78 @@ func hashFile(path string) (string, error) {
 	return hex.EncodeToString(h.Sum(nil)), nil
 }
 
-// EnsureHashes computes a SHA-256 content hash for entries that don't have
-// one yet, restricted to files whose size is shared with at least one other
-// entry (a unique-size file cannot be a duplicate). progress is invoked with
-// (done, total) where total is the number of files that need hashing.
+// quickHash hashes the first and last 64 KiB of a file. Two files that share
+// size but produce different quick hashes cannot be byte-identical, so they
+// can skip the full SHA-256 read.
+func quickHash(path string, size int64) (string, error) {
+	const window = 64 * 1024
+	f, err := os.Open(path)
+	if err != nil {
+		return "", err
+	}
+	defer f.Close()
+	h := sha256.New()
+	if size <= int64(window)*2 {
+		if _, err := io.Copy(h, f); err != nil {
+			return "", err
+		}
+	} else {
+		buf := make([]byte, window)
+		if _, err := io.ReadFull(f, buf); err != nil {
+			return "", err
+		}
+		h.Write(buf)
+		if _, err := f.Seek(size-int64(window), io.SeekStart); err != nil {
+			return "", err
+		}
+		if _, err := io.ReadFull(f, buf); err != nil {
+			return "", err
+		}
+		h.Write(buf)
+	}
+	return hex.EncodeToString(h.Sum(nil)), nil
+}
+
+// EnsureHashes computes a SHA-256 content hash for entries that may be
+// duplicates of another entry. It runs in two passes: a quick hash of the
+// first and last 64 KiB to prune size collisions that aren't real duplicates,
+// then a full SHA-256 only on files that survived the prune. Updates are
+// committed in a single transaction.
 func (i *Index) EnsureHashes(ctx context.Context, progress func(done, total int)) error {
-	type info struct {
+	type cand struct {
 		path string
+		size int64
 	}
 
 	i.mu.Lock()
-	q := `
-		SELECT path 
-		FROM entries 
+	rows, err := i.db.Query(`
+		SELECT path, size
+		FROM entries
 		WHERE (content_hash IS NULL OR content_hash = '')
 		  AND size IN (
 			  SELECT size FROM entries GROUP BY size HAVING COUNT(*) > 1
 		  )
-	`
-	rows, err := i.db.Query(q)
+	`)
 	if err != nil {
 		i.mu.Unlock()
 		return err
 	}
-	var todo []info
+	var todo []cand
 	for rows.Next() {
-		var p info
-		if err := rows.Scan(&p.path); err != nil {
+		var c cand
+		if err := rows.Scan(&c.path, &c.size); err != nil {
 			continue
 		}
-		todo = append(todo, p)
+		todo = append(todo, c)
 	}
 	rows.Close()
 	i.mu.Unlock()
 
-	total := len(todo)
 	if progress != nil {
-		progress(0, total)
+		progress(0, len(todo))
+	}
+	if len(todo) == 0 {
+		return ctx.Err()
 	}
 
 	numWorkers := runtime.NumCPU()
@@ -74,50 +109,134 @@ func (i *Index) EnsureHashes(ctx context.Context, progress func(done, total int)
 		numWorkers = 8
 	}
 
-	type result struct {
-		path string
-		hash string
-		err  error
+	// Phase 1: quick-hash every candidate.
+	type qres struct {
+		path  string
+		size  int64
+		quick string
+		err   error
 	}
-
-	jobs := make(chan string, total)
-	results := make(chan result, total)
-
+	jobs := make(chan cand, len(todo))
 	for _, t := range todo {
-		jobs <- t.path
+		jobs <- t
 	}
 	close(jobs)
-
+	qResults := make(chan qres, len(todo))
 	var wg sync.WaitGroup
 	for w := 0; w < numWorkers; w++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			for path := range jobs {
+			for t := range jobs {
 				if ctx.Err() != nil {
 					continue
 				}
-				h, err := hashFile(path)
-				results <- result{path: path, hash: h, err: err}
+				q, err := quickHash(t.path, t.size)
+				qResults <- qres{path: t.path, size: t.size, quick: q, err: err}
 			}
 		}()
 	}
+	go func() { wg.Wait(); close(qResults) }()
 
-	go func() {
-		wg.Wait()
-		close(results)
-	}()
-
+	type key struct {
+		size  int64
+		quick string
+	}
+	groups := map[key][]string{}
 	done := 0
-	for res := range results {
+	for r := range qResults {
 		done++
-		if res.err == nil && ctx.Err() == nil {
-			i.mu.Lock()
-			_, _ = i.db.Exec("UPDATE entries SET content_hash = ? WHERE path = ?", res.hash, res.path)
-			i.mu.Unlock()
-		}
 		if progress != nil {
-			progress(done, total)
+			progress(done, len(todo))
+		}
+		if r.err != nil {
+			continue
+		}
+		k := key{size: r.size, quick: r.quick}
+		groups[k] = append(groups[k], r.path)
+	}
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
+
+	// Phase 2: only files whose (size, quick) collides with another need a full hash.
+	var toFull []string
+	for _, paths := range groups {
+		if len(paths) >= 2 {
+			toFull = append(toFull, paths...)
+		}
+	}
+
+	fullHashes := make(map[string]string, len(toFull))
+	if len(toFull) > 0 {
+		if progress != nil {
+			progress(0, len(toFull))
+		}
+		jobs2 := make(chan string, len(toFull))
+		for _, p := range toFull {
+			jobs2 <- p
+		}
+		close(jobs2)
+		type fres struct {
+			path string
+			hash string
+			err  error
+		}
+		results2 := make(chan fres, len(toFull))
+		var wg2 sync.WaitGroup
+		for w := 0; w < numWorkers; w++ {
+			wg2.Add(1)
+			go func() {
+				defer wg2.Done()
+				for path := range jobs2 {
+					if ctx.Err() != nil {
+						continue
+					}
+					h, err := hashFile(path)
+					results2 <- fres{path: path, hash: h, err: err}
+				}
+			}()
+		}
+		go func() { wg2.Wait(); close(results2) }()
+
+		done = 0
+		for r := range results2 {
+			done++
+			if progress != nil {
+				progress(done, len(toFull))
+			}
+			if r.err == nil && ctx.Err() == nil {
+				fullHashes[r.path] = r.hash
+			}
+		}
+	}
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
+
+	// Phase 3: commit every full hash in a single transaction.
+	if len(fullHashes) > 0 {
+		i.mu.Lock()
+		defer i.mu.Unlock()
+		tx, err := i.db.Begin()
+		if err != nil {
+			return err
+		}
+		stmt, err := tx.Prepare("UPDATE entries SET content_hash = ? WHERE path = ?")
+		if err != nil {
+			tx.Rollback()
+			return err
+		}
+		for path, hash := range fullHashes {
+			if _, err := stmt.Exec(hash, path); err != nil {
+				stmt.Close()
+				tx.Rollback()
+				return err
+			}
+		}
+		stmt.Close()
+		if err := tx.Commit(); err != nil {
+			return err
 		}
 	}
 

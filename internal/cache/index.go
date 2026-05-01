@@ -121,7 +121,29 @@ func (i *Index) Prune(seen map[string]struct{}) []string {
 	i.mu.Lock()
 	defer i.mu.Unlock()
 
-	rows, err := i.db.Query("SELECT path FROM entries")
+	tx, err := i.db.Begin()
+	if err != nil {
+		return nil
+	}
+	defer tx.Rollback()
+
+	if _, err := tx.Exec("CREATE TEMP TABLE IF NOT EXISTS prune_seen (path TEXT PRIMARY KEY)"); err != nil {
+		return nil
+	}
+	if _, err := tx.Exec("DELETE FROM prune_seen"); err != nil {
+		return nil
+	}
+
+	ins, err := tx.Prepare("INSERT OR IGNORE INTO prune_seen (path) VALUES (?)")
+	if err != nil {
+		return nil
+	}
+	for p := range seen {
+		_, _ = ins.Exec(p)
+	}
+	ins.Close()
+
+	rows, err := tx.Query("SELECT e.path FROM entries e LEFT JOIN prune_seen s ON s.path = e.path WHERE s.path IS NULL")
 	if err != nil {
 		return nil
 	}
@@ -129,25 +151,19 @@ func (i *Index) Prune(seen map[string]struct{}) []string {
 	for rows.Next() {
 		var p string
 		if err := rows.Scan(&p); err == nil {
-			if _, ok := seen[p]; !ok {
-				toDelete = append(toDelete, p)
-			}
+			toDelete = append(toDelete, p)
 		}
 	}
 	rows.Close()
 
 	if len(toDelete) > 0 {
-		tx, _ := i.db.Begin()
-		if tx != nil {
-			stmt, err := tx.Prepare("DELETE FROM entries WHERE path = ?")
-			if err == nil {
-				for _, p := range toDelete {
-					_, _ = stmt.Exec(p)
-				}
-				stmt.Close()
-			}
-			_ = tx.Commit()
+		if _, err := tx.Exec("DELETE FROM entries WHERE path NOT IN (SELECT path FROM prune_seen)"); err != nil {
+			return nil
 		}
+	}
+
+	if err := tx.Commit(); err != nil {
+		return nil
 	}
 	return toDelete
 }

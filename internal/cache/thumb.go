@@ -15,9 +15,16 @@ const ThumbSize = 256
 
 // ThumbStore turns Entry → on-disk thumbnail JPEG path. It generates the
 // thumbnail on demand if the file does not yet exist.
+//
+// Two semaphores split CPU-bound decoders (native Go image package) from
+// external-tool decoders (heif-convert, exiftool, ffmpeg). The external
+// decoders spend most of their time waiting on a child process, so capping
+// them at NumCPU under-utilises hardware; CPU-bound decoders, on the other
+// hand, must stay capped or the system bogs down under rapid scrolling.
 type ThumbStore struct {
-	dir string // <cache>/thumbs
-	sem chan struct{}
+	dir    string // <cache>/thumbs
+	cpuSem chan struct{}
+	extSem chan struct{}
 }
 
 func NewThumbStore(cacheDir string) (*ThumbStore, error) {
@@ -25,14 +32,18 @@ func NewThumbStore(cacheDir string) (*ThumbStore, error) {
 	if err := os.MkdirAll(d, 0o755); err != nil {
 		return nil, err
 	}
-	// Limit concurrent generation to CPU count so rapid scrolling doesn't overload system
-	numWorkers := runtime.NumCPU()
-	if numWorkers < 2 {
-		numWorkers = 2
+	cpu := runtime.NumCPU()
+	if cpu < 2 {
+		cpu = 2
+	}
+	ext := cpu * 3
+	if ext < 6 {
+		ext = 6
 	}
 	return &ThumbStore{
-		dir: d,
-		sem: make(chan struct{}, numWorkers),
+		dir:    d,
+		cpuSem: make(chan struct{}, cpu),
+		extSem: make(chan struct{}, ext),
 	}, nil
 }
 
@@ -60,9 +71,10 @@ func (s *ThumbStore) Path(e Entry) (string, error) {
 	}
 	tmp := dst + ".tmp"
 
-	s.sem <- struct{}{}
+	sem := s.semFor(e.Type)
+	sem <- struct{}{}
 	err := s.generate(e, tmp)
-	<-s.sem
+	<-sem
 
 	if err != nil {
 		os.Remove(tmp)
@@ -72,6 +84,15 @@ func (s *ThumbStore) Path(e Entry) (string, error) {
 		return "", err
 	}
 	return dst, nil
+}
+
+func (s *ThumbStore) semFor(t scan.MediaType) chan struct{} {
+	switch t {
+	case scan.TypeRAW, scan.TypeHEIC, scan.TypeVideo:
+		return s.extSem
+	default:
+		return s.cpuSem
+	}
 }
 
 func (s *ThumbStore) generate(e Entry, dst string) error {
