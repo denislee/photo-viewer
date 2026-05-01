@@ -4,6 +4,7 @@ import (
 	"archive/zip"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
@@ -17,6 +18,23 @@ import (
 
 	"github.com/rwcarlsen/goexif/exif"
 )
+
+func copyFile(src, dst string) error {
+	in, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer in.Close()
+	out, err := os.Create(dst)
+	if err != nil {
+		return err
+	}
+	if _, err := io.Copy(out, in); err != nil {
+		out.Close()
+		return err
+	}
+	return out.Close()
+}
 
 func (c *Controller) runImport() {
 	prefs := fyne.CurrentApp().Preferences()
@@ -167,11 +185,32 @@ func (c *Controller) runImport() {
 	}
 
 	var zipFiles []string
+	var importDirs []string
+
+	updateReadyStatus := func() {
+		parts := []string{fmt.Sprintf("%d files in Inbox", fileCount)}
+		if len(zipFiles) == 1 {
+			parts = append(parts, "1 ZIP")
+		} else if len(zipFiles) > 1 {
+			parts = append(parts, fmt.Sprintf("%d ZIPs", len(zipFiles)))
+		}
+		if len(importDirs) == 1 {
+			parts = append(parts, "1 directory")
+		} else if len(importDirs) > 1 {
+			parts = append(parts, fmt.Sprintf("%d directories", len(importDirs)))
+		}
+		statusLabel.SetText("Ready. " + strings.Join(parts, ", ") + ".")
+	}
+
+	var importDirBtn *widget.Button
 
 	startBtn = widget.NewButton("Start Import", func() {
 		startBtn.Disable()
 		if importZipBtn != nil {
 			importZipBtn.Disable()
+		}
+		if importDirBtn != nil {
+			importDirBtn.Disable()
 		}
 		statusLabel.SetText("Processing...")
 
@@ -220,6 +259,33 @@ func (c *Controller) runImport() {
 				}
 				r.Close()
 				appendLog(fmt.Sprintf("Extracted %d files from %s to Inbox.", extractedCount, filepath.Base(zipPath)))
+			}
+
+			for _, srcDir := range importDirs {
+				appendLog("Copying from " + srcDir + " ...")
+				copiedCount := 0
+				walkErr := filepath.WalkDir(srcDir, func(path string, dEntry fs.DirEntry, err error) error {
+					if err != nil || dEntry.IsDir() {
+						return nil
+					}
+					base := filepath.Base(path)
+					destPath := filepath.Join(inboxDir, base)
+					if _, err := os.Stat(destPath); err == nil {
+						ext := filepath.Ext(base)
+						name := strings.TrimSuffix(base, ext)
+						destPath = filepath.Join(inboxDir, fmt.Sprintf("%s_%d%s", name, time.Now().UnixNano(), ext))
+					}
+					if err := copyFile(path, destPath); err != nil {
+						appendLog("[ERROR] Copy failed for " + path + ": " + err.Error())
+						return nil
+					}
+					copiedCount++
+					return nil
+				})
+				if walkErr != nil {
+					appendLog("[ERROR] Walking " + srcDir + ": " + walkErr.Error())
+				}
+				appendLog(fmt.Sprintf("Copied %d files from %s to Inbox.", copiedCount, srcDir))
 			}
 
 			// Now read the inbox to process files
@@ -292,31 +358,42 @@ func (c *Controller) runImport() {
 			zipPath := uc.URI().Path()
 			uc.Close()
 
-			alreadyAdded := false
 			for _, z := range zipFiles {
 				if z == zipPath {
-					alreadyAdded = true
-					break
+					return
 				}
 			}
 
-			if !alreadyAdded {
-				zipFiles = append(zipFiles, zipPath)
-				fyne.Do(func() {
-					if len(zipFiles) == 1 {
-						statusLabel.SetText(fmt.Sprintf("Ready. %d files in Inbox, 1 ZIP selected.", fileCount))
-					} else {
-						statusLabel.SetText(fmt.Sprintf("Ready. %d files in Inbox, %d ZIPs selected.", fileCount, len(zipFiles)))
-					}
-					startBtn.Enable()
-				})
-			}
+			zipFiles = append(zipFiles, zipPath)
+			fyne.Do(func() {
+				updateReadyStatus()
+				startBtn.Enable()
+			})
 		}, c.window)
 		fd.SetFilter(storage.NewExtensionFileFilter([]string{".zip"}))
 		fd.Show()
 	})
 
-	buttons := container.NewHBox(importAgainBtn, startBtn, importZipBtn, copyBtn)
+	importDirBtn = widget.NewButton("Add Directory", func() {
+		dialog.ShowFolderOpen(func(list fyne.ListableURI, err error) {
+			if err != nil || list == nil {
+				return
+			}
+			dirPath := list.Path()
+			for _, p := range importDirs {
+				if p == dirPath {
+					return
+				}
+			}
+			importDirs = append(importDirs, dirPath)
+			fyne.Do(func() {
+				updateReadyStatus()
+				startBtn.Enable()
+			})
+		}, c.window)
+	})
+
+	buttons := container.NewHBox(importAgainBtn, startBtn, importZipBtn, importDirBtn, copyBtn)
 	topContent := container.NewVBox(statusLabel, progressBar)
 	content := container.NewBorder(topContent, buttons, nil, nil, logEntry)
 

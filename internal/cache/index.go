@@ -16,11 +16,12 @@ import (
 
 // Entry is one media file recorded in the index.
 type Entry struct {
-	Path    string         `json:"path"`
-	Type    scan.MediaType `json:"type"`
-	Size    int64          `json:"size"`
-	ModTime time.Time      `json:"mtime"`
-	ThumbID string         `json:"thumb_id"`
+	Path     string         `json:"path"`
+	Type     scan.MediaType `json:"type"`
+	Size     int64          `json:"size"`
+	ModTime  time.Time      `json:"mtime"`
+	ThumbID  string         `json:"thumb_id"`
+	Favorite bool           `json:"favorite"`
 }
 
 // Index is the SQLite database representation of the media cache.
@@ -59,6 +60,10 @@ func Load(dbPath string) (*Index, error) {
 	if _, err := db.Exec("CREATE INDEX IF NOT EXISTS idx_entries_hash ON entries(content_hash)"); err != nil {
 		return nil, err
 	}
+	_, _ = db.Exec("ALTER TABLE entries ADD COLUMN favorite INTEGER NOT NULL DEFAULT 0")
+	if _, err := db.Exec("CREATE INDEX IF NOT EXISTS idx_entries_favorite ON entries(favorite)"); err != nil {
+		return nil, err
+	}
 
 	return &Index{db: db}, nil
 }
@@ -84,7 +89,12 @@ func (i *Index) ReconcileBatch(results []scan.Result) []Entry {
 	}
 	defer tx.Rollback()
 
-	stmt, err := tx.Prepare("INSERT OR REPLACE INTO entries (path, type, size, mtime, thumb_id) VALUES (?, ?, ?, ?, ?)")
+	stmt, err := tx.Prepare(`INSERT INTO entries (path, type, size, mtime, thumb_id) VALUES (?, ?, ?, ?, ?)
+		ON CONFLICT(path) DO UPDATE SET
+			type = excluded.type,
+			size = excluded.size,
+			mtime = excluded.mtime,
+			thumb_id = excluded.thumb_id`)
 	if err != nil {
 		return out
 	}
@@ -154,7 +164,7 @@ func (i *Index) ListDir(dir string) []Entry {
 	}
 	likePattern := prefix + "%"
 
-	rows, err := i.db.Query("SELECT path, type, size, mtime, thumb_id FROM entries WHERE path LIKE ? OR path = ? ORDER BY path", likePattern, dir)
+	rows, err := i.db.Query("SELECT path, type, size, mtime, thumb_id, favorite FROM entries WHERE path LIKE ? OR path = ? ORDER BY path", likePattern, dir)
 	if err != nil {
 		return nil
 	}
@@ -164,8 +174,10 @@ func (i *Index) ListDir(dir string) []Entry {
 	for rows.Next() {
 		var e Entry
 		var mtimeUnix int64
-		if err := rows.Scan(&e.Path, &e.Type, &e.Size, &mtimeUnix, &e.ThumbID); err == nil {
+		var fav int
+		if err := rows.Scan(&e.Path, &e.Type, &e.Size, &mtimeUnix, &e.ThumbID, &fav); err == nil {
 			e.ModTime = time.Unix(mtimeUnix, 0)
+			e.Favorite = fav != 0
 			if e.Path == dir || strings.HasPrefix(e.Path, prefix) || filepath.Dir(e.Path) == dir {
 				out = append(out, e)
 			}
@@ -198,7 +210,7 @@ func (i *Index) All() []Entry {
 	i.mu.Lock()
 	defer i.mu.Unlock()
 
-	rows, err := i.db.Query("SELECT path, type, size, mtime, thumb_id FROM entries ORDER BY path")
+	rows, err := i.db.Query("SELECT path, type, size, mtime, thumb_id, favorite FROM entries ORDER BY path")
 	if err != nil {
 		return nil
 	}
@@ -208,12 +220,62 @@ func (i *Index) All() []Entry {
 	for rows.Next() {
 		var e Entry
 		var mtimeUnix int64
-		if err := rows.Scan(&e.Path, &e.Type, &e.Size, &mtimeUnix, &e.ThumbID); err == nil {
+		var fav int
+		if err := rows.Scan(&e.Path, &e.Type, &e.Size, &mtimeUnix, &e.ThumbID, &fav); err == nil {
 			e.ModTime = time.Unix(mtimeUnix, 0)
+			e.Favorite = fav != 0
 			out = append(out, e)
 		}
 	}
 	return out
+}
+
+// ListFavorites returns all entries flagged as favorites.
+func (i *Index) ListFavorites() []Entry {
+	i.mu.Lock()
+	defer i.mu.Unlock()
+
+	rows, err := i.db.Query("SELECT path, type, size, mtime, thumb_id, favorite FROM entries WHERE favorite = 1 ORDER BY path")
+	if err != nil {
+		return nil
+	}
+	defer rows.Close()
+
+	var out []Entry
+	for rows.Next() {
+		var e Entry
+		var mtimeUnix int64
+		var fav int
+		if err := rows.Scan(&e.Path, &e.Type, &e.Size, &mtimeUnix, &e.ThumbID, &fav); err == nil {
+			e.ModTime = time.Unix(mtimeUnix, 0)
+			e.Favorite = fav != 0
+			out = append(out, e)
+		}
+	}
+	return out
+}
+
+// SetFavorite toggles the favorite flag for the given path.
+func (i *Index) SetFavorite(path string, favorite bool) error {
+	i.mu.Lock()
+	defer i.mu.Unlock()
+	v := 0
+	if favorite {
+		v = 1
+	}
+	_, err := i.db.Exec("UPDATE entries SET favorite = ? WHERE path = ?", v, path)
+	return err
+}
+
+// IsFavorite reports whether a path is flagged as a favorite.
+func (i *Index) IsFavorite(path string) bool {
+	i.mu.Lock()
+	defer i.mu.Unlock()
+	var v int
+	if err := i.db.QueryRow("SELECT favorite FROM entries WHERE path = ?", path).Scan(&v); err != nil {
+		return false
+	}
+	return v != 0
 }
 
 // Wipe deletes the database and thumbs folder.

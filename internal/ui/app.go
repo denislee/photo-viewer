@@ -30,10 +30,11 @@ type Controller struct {
 	sidebar *SidebarTree
 	grid    *ThumbGrid
 
-	mu          sync.Mutex
-	currentDir  string
-	mediaFilter string
-	scanCancel  context.CancelFunc
+	mu             sync.Mutex
+	currentDir     string
+	mediaFilter    string
+	favoritesView  bool
+	scanCancel     context.CancelFunc
 
 	mainContent fyne.CanvasObject
 }
@@ -48,9 +49,19 @@ func NewController(window fyne.Window, libraryRoot string, idx *cache.Index, sto
 		currentDir:  libraryRoot,
 		mediaFilter: "All",
 	}
-	c.toolbar = NewToolbar(c.setFilter, c.rebuildIndex, c.showSettings, c.runImport, c.showDuplicates)
+	c.toolbar = NewToolbar(c.setFilter, c.rebuildIndex, c.showSettings, c.runImport, c.showDuplicates, c.toggleFavoritesView)
 	c.grid = NewThumbGrid(window, store, func(index int, entries []cache.Entry) {
-		Open(c.window, index, entries, c.store)
+		Open(c.window, index, entries, c.store, c.index, func() {
+			c.mu.Lock()
+			fav := c.favoritesView
+			dir := c.currentDir
+			c.mu.Unlock()
+			if fav {
+				go c.refreshFavorites()
+			} else {
+				go c.refreshFromIndex(dir)
+			}
+		})
 	})
 
 	c.grid.OnTab = func() {
@@ -100,6 +111,7 @@ func (c *Controller) SelectDir(path string) {
 	ctx, cancel := context.WithCancel(context.Background())
 	c.scanCancel = cancel
 	c.currentDir = path
+	c.favoritesView = false
 	c.mu.Unlock()
 
 	fyne.Do(func() {
@@ -107,6 +119,34 @@ func (c *Controller) SelectDir(path string) {
 	})
 	go c.refreshFromIndex(path)
 	go c.scanInto(ctx, path, false)
+}
+
+// toggleFavoritesView switches between the directory view and a flat list of
+// every entry flagged as a favorite.
+func (c *Controller) toggleFavoritesView() {
+	c.mu.Lock()
+	c.favoritesView = !c.favoritesView
+	on := c.favoritesView
+	dir := c.currentDir
+	c.mu.Unlock()
+
+	if on {
+		go c.refreshFavorites()
+	} else {
+		fyne.Do(func() { c.toolbar.SetPath(dir) })
+		go c.refreshFromIndex(dir)
+	}
+}
+
+// refreshFavorites pushes every favorite entry into the grid.
+func (c *Controller) refreshFavorites() {
+	entries := c.index.ListFavorites()
+	sortEntries(entries)
+	fyne.Do(func() {
+		c.grid.SetEntries(entries)
+		c.toolbar.SetCount(len(entries))
+		c.toolbar.SetPath("★ Favorites")
+	})
 }
 
 // rebuildIndex wipes the cache and rescans the library root.

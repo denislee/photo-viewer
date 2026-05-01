@@ -25,9 +25,10 @@ type Toolbar struct {
 	settings   *widget.Button
 	importBtn  *widget.Button
 	dupBtn     *widget.Button
+	favBtn     *widget.Button
 }
 
-func NewToolbar(onFilter func(string), onRebuild func(), onSettings func(), onImport func(), onDuplicates func()) *Toolbar {
+func NewToolbar(onFilter func(string), onRebuild func(), onSettings func(), onImport func(), onDuplicates func(), onFavorites func()) *Toolbar {
 	pathLabel := canvas.NewText("", color.NRGBA{R: 0xc8, G: 0xcc, B: 0xd2, A: 0xff})
 	pathLabel.TextSize = 11
 
@@ -47,10 +48,11 @@ func NewToolbar(onFilter func(string), onRebuild func(), onSettings func(), onIm
 		settings:   iconButton(theme.SettingsIcon(), onSettings),
 		importBtn:  iconButton(theme.DownloadIcon(), onImport),
 		dupBtn:     iconButton(theme.ContentCopyIcon(), onDuplicates),
+		favBtn:     starButton(onFavorites),
 	}
 	t.progress.Hide()
 
-	actions := container.NewHBox(t.countLabel, t.filterBtn, t.progress, t.importBtn, t.dupBtn, t.settings, t.rebuild)
+	actions := container.NewHBox(t.countLabel, t.filterBtn, t.progress, t.importBtn, t.favBtn, t.dupBtn, t.settings, t.rebuild)
 	row := container.New(layout.NewBorderLayout(nil, nil, nil, actions),
 		actions,
 		container.NewPadded(t.pathLabel),
@@ -65,6 +67,12 @@ func NewToolbar(onFilter func(string), onRebuild func(), onSettings func(), onIm
 
 func iconButton(icon fyne.Resource, fn func()) *widget.Button {
 	b := widget.NewButtonWithIcon("", icon, fn)
+	b.Importance = widget.LowImportance
+	return b
+}
+
+func starButton(fn func()) *widget.Button {
+	b := widget.NewButton("★", fn)
 	b.Importance = widget.LowImportance
 	return b
 }
