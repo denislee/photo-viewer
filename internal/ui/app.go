@@ -84,8 +84,8 @@ func (c *Controller) SelectDir(path string) {
 
 	fyne.Do(func() {
 		c.toolbar.SetPath(path)
-		c.refreshFromIndex(path)
 	})
+	go c.refreshFromIndex(path)
 	go c.scanInto(ctx, path, false)
 }
 
@@ -118,8 +118,10 @@ func (c *Controller) rebuildIndex() {
 func (c *Controller) refreshFromIndex(dir string) {
 	filtered := c.index.ListDir(dir)
 	sortEntries(filtered)
-	c.grid.SetEntries(filtered)
-	c.toolbar.SetCount(len(filtered))
+	fyne.Do(func() {
+		c.grid.SetEntries(filtered)
+		c.toolbar.SetCount(len(filtered))
+	})
 }
 
 // scanInto walks dir, reconciles results into the index, updates the grid,
@@ -157,7 +159,7 @@ func (c *Controller) scanInto(ctx context.Context, dir string, fullRebuild bool)
 		}
 
 		if needsRefresh {
-			fyne.Do(func() { c.refreshFromIndex(active) })
+			c.refreshFromIndex(active)
 		}
 		
 		resultsBatch = resultsBatch[:0]

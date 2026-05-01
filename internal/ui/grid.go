@@ -258,7 +258,7 @@ func (g *ThumbGrid) rebuildGrid() {
 			img.File = ""
 			img.Refresh()
 
-			go g.loadThumb(int(id), entry, img)
+			go g.loadThumb(int(id), entry, tc, img)
 		},
 	)
 	g.grid.OnSelected = func(id widget.GridWrapItemID) {
@@ -272,7 +272,7 @@ func (g *ThumbGrid) rebuildGrid() {
 	g.focusGrid()
 }
 
-func (g *ThumbGrid) loadThumb(id int, e cache.Entry, img *canvas.Image) {
+func (g *ThumbGrid) loadThumb(id int, e cache.Entry, tc *tappableCell, img *canvas.Image) {
 	path, err := g.store.Path(e)
 	if err != nil || path == "" {
 		return
@@ -284,6 +284,9 @@ func (g *ThumbGrid) loadThumb(id int, e cache.Entry, img *canvas.Image) {
 		return
 	}
 	fyne.Do(func() {
+		if tc.boundPath != e.Path {
+			return
+		}
 		img.Resource = nil
 		img.File = path
 		img.Refresh()

@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 
 	"github.com/dns/photo-viewer/internal/scan"
 	"github.com/dns/photo-viewer/internal/thumb"
@@ -16,6 +17,7 @@ const ThumbSize = 256
 // thumbnail on demand if the file does not yet exist.
 type ThumbStore struct {
 	dir string // <cache>/thumbs
+	sem chan struct{}
 }
 
 func NewThumbStore(cacheDir string) (*ThumbStore, error) {
@@ -23,7 +25,15 @@ func NewThumbStore(cacheDir string) (*ThumbStore, error) {
 	if err := os.MkdirAll(d, 0o755); err != nil {
 		return nil, err
 	}
-	return &ThumbStore{dir: d}, nil
+	// Limit concurrent generation to CPU count so rapid scrolling doesn't overload system
+	numWorkers := runtime.NumCPU()
+	if numWorkers < 2 {
+		numWorkers = 2
+	}
+	return &ThumbStore{
+		dir: d,
+		sem: make(chan struct{}, numWorkers),
+	}, nil
 }
 
 func (s *ThumbStore) thumbPath(id string) string {
@@ -49,7 +59,12 @@ func (s *ThumbStore) Path(e Entry) (string, error) {
 		return "", err
 	}
 	tmp := dst + ".tmp"
-	if err := s.generate(e, tmp); err != nil {
+
+	s.sem <- struct{}{}
+	err := s.generate(e, tmp)
+	<-s.sem
+
+	if err != nil {
 		os.Remove(tmp)
 		return "", err
 	}
