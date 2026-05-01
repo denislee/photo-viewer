@@ -21,7 +21,7 @@ func (c *Controller) showSettings() {
 			}
 		}, c.window)
 	})
-	
+
 	outboxBrowse := widget.NewButton("Browse", func() {
 		dialog.ShowFolderOpen(func(list fyne.ListableURI, err error) {
 			if list != nil {

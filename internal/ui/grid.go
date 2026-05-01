@@ -1,12 +1,13 @@
 package ui
 
 import (
-	"path/filepath"
+	"image/color"
 	"sync"
 
 	"fyne.io/fyne/v2"
 	"fyne.io/fyne/v2/canvas"
 	"fyne.io/fyne/v2/container"
+	"fyne.io/fyne/v2/layout"
 	"fyne.io/fyne/v2/theme"
 	"fyne.io/fyne/v2/widget"
 
@@ -27,7 +28,9 @@ func newTappableCell(c fyne.CanvasObject, onTap, onDouble func()) *tappableCell 
 	t.ExtendBaseWidget(t)
 	return t
 }
-func (t *tappableCell) CreateRenderer() fyne.WidgetRenderer { return widget.NewSimpleRenderer(t.content) }
+func (t *tappableCell) CreateRenderer() fyne.WidgetRenderer {
+	return widget.NewSimpleRenderer(t.content)
+}
 
 func (t *tappableCell) Tapped(*fyne.PointEvent) {
 	if t.onTap != nil {
@@ -147,7 +150,7 @@ func (g *ThumbGrid) MoveSelection(delta int) {
 	cur := g.selectedIndex
 	max := len(g.entries) - 1
 	g.mu.Unlock()
-	
+
 	if max < 0 {
 		return
 	}
@@ -200,13 +203,24 @@ func (g *ThumbGrid) rebuildGrid() {
 			img := canvas.NewImageFromResource(theme.FileImageIcon())
 			img.FillMode = canvas.ImageFillContain
 			img.SetMinSize(fyne.NewSize(g.cellSize, g.cellSize))
-			badge := widget.NewLabel("")
-			badge.Alignment = fyne.TextAlignCenter
-			
-			s := canvas.NewRectangle(nil)
-			s.SetMinSize(fyne.NewSize(0, g.cellSize-24))
-			
-			stack := container.NewStack(img, container.NewVBox(s, badge))
+
+			// Play badge: small dark pill with white triangle, parked in
+			// the bottom-right corner. Hidden for non-video entries.
+			pill := canvas.NewRectangle(color.NRGBA{R: 0, G: 0, B: 0, A: 0xb0})
+			pill.CornerRadius = 4
+			pill.SetMinSize(fyne.NewSize(22, 16))
+			tri := canvas.NewText("▶", color.NRGBA{R: 0xff, G: 0xff, B: 0xff, A: 0xff})
+			tri.TextSize = 9
+			tri.Alignment = fyne.TextAlignCenter
+			badge := container.NewStack(pill, container.NewCenter(tri))
+			badge.Hide()
+
+			// Float the badge in the bottom-right corner using spacers.
+			corner := container.NewVBox(layout.NewSpacer(),
+				container.NewHBox(layout.NewSpacer(), badge),
+			)
+
+			stack := container.NewStack(img, container.NewPadded(corner))
 			return newTappableCell(stack, nil, nil)
 		},
 		func(id widget.GridWrapItemID, obj fyne.CanvasObject) {
@@ -244,14 +258,14 @@ func (g *ThumbGrid) rebuildGrid() {
 			tc.boundPath = entry.Path
 
 			img := stack.Objects[0].(*canvas.Image)
-			vbox := stack.Objects[1].(*fyne.Container)
-			badge := vbox.Objects[1].(*widget.Label)
+			badge := findBadge(stack.Objects[1].(*fyne.Container))
 
-			switch entry.Type {
-			case scan.TypeVideo:
-				badge.SetText("▶  " + shortName(entry.Path))
-			default:
-				badge.SetText("")
+			if badge != nil {
+				if entry.Type == scan.TypeVideo {
+					badge.Show()
+				} else {
+					badge.Hide()
+				}
 			}
 
 			img.Resource = theme.FileImageIcon()
@@ -266,10 +280,9 @@ func (g *ThumbGrid) rebuildGrid() {
 		g.selectedIndex = int(id)
 		g.mu.Unlock()
 	}
-	
+
 	g.container.Objects = []fyne.CanvasObject{g.grid}
 	g.container.Refresh()
-	g.focusGrid()
 }
 
 func (g *ThumbGrid) loadThumb(id int, e cache.Entry, tc *tappableCell, img *canvas.Image) {
@@ -329,4 +342,20 @@ func (g *ThumbGrid) Count() int {
 	return len(g.entries)
 }
 
-func shortName(path string) string { return filepath.Base(path) }
+// findBadge walks the known cell structure to retrieve the play badge so we
+// can show/hide it per-entry without recomputing layout.
+func findBadge(padded *fyne.Container) *fyne.Container {
+	corner, _ := padded.Objects[0].(*fyne.Container)
+	if corner == nil || len(corner.Objects) < 2 {
+		return nil
+	}
+	hbox, _ := corner.Objects[1].(*fyne.Container)
+	if hbox == nil || len(hbox.Objects) < 2 {
+		return nil
+	}
+	badge, _ := hbox.Objects[1].(*fyne.Container)
+	return badge
+}
+ne.Container)
+	return badge
+}

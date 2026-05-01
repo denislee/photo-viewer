@@ -68,10 +68,11 @@ func Open(parent fyne.Window, startIndex int, entries []cache.Entry, store *cach
 	img.FillMode = canvas.ImageFillContain
 	img.SetMinSize(fyne.NewSize(600, 400))
 
-	loadingLabel := widget.NewLabel("Loading...")
+	loadingLabel := canvas.NewText("Loading…", color.NRGBA{R: 0xa0, G: 0xa4, B: 0xab, A: 0xff})
+	loadingLabel.TextSize = 13
 	loadingLabel.Alignment = fyne.TextAlignCenter
 
-	bg := canvas.NewRectangle(color.Black)
+	bg := canvas.NewRectangle(color.NRGBA{R: 0x0a, G: 0x0b, B: 0x0d, A: 0xff})
 	stack := container.NewStack(bg, img, container.NewCenter(loadingLabel))
 
 	var d dialog.Dialog
@@ -81,6 +82,7 @@ func Open(parent fyne.Window, startIndex int, entries []cache.Entry, store *cach
 
 		img.Hide()
 		loadingLabel.Show()
+		loadingLabel.Refresh()
 		img.Refresh()
 
 		go func() {
@@ -97,6 +99,7 @@ func Open(parent fyne.Window, startIndex int, entries []cache.Entry, store *cach
 					img.File = displayPath
 					img.Show()
 					loadingLabel.Hide()
+					loadingLabel.Refresh()
 					img.Refresh()
 				}
 			})
@@ -141,9 +144,9 @@ func Open(parent fyne.Window, startIndex int, entries []cache.Entry, store *cach
 		}
 	})
 
-	d = dialog.NewCustomWithoutButtons("Photo Viewer", kh, parent)
+	d = dialog.NewCustomWithoutButtons("", kh, parent)
 	winSize := parent.Canvas().Size()
-	d.Resize(fyne.NewSize(winSize.Width*0.9, winSize.Height*0.9))
+	d.Resize(fyne.NewSize(winSize.Width*0.95, winSize.Height*0.95))
 	d.Show()
 	parent.Canvas().Focus(kh)
 

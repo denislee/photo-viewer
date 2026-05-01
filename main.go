@@ -34,7 +34,8 @@ func main() {
 	}
 
 	a := app.NewWithID("com.github.dns.photoviewer")
-	w := a.NewWindow("Photo Viewer — " + abs)
+	a.Settings().SetTheme(ui.MinimalTheme())
+	w := a.NewWindow("Photo Viewer")
 	w.Resize(fyne.NewSize(1200, 800))
 
 	cacheDir, err := cache.CacheDir(abs)

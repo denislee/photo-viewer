@@ -32,11 +32,11 @@ func (c *Controller) runImport() {
 	}
 
 	logText := ""
-	
+
 	logEntry := widget.NewMultiLineEntry()
 	// Disable typing, but allow text selection and scrolling
 	logEntry.Wrapping = fyne.TextWrapWord
-	
+
 	appendLog := func(msg string) {
 		logText += msg + "\n"
 		logEntry.SetText(logText)
@@ -48,14 +48,14 @@ func (c *Controller) runImport() {
 	})
 
 	content := container.NewBorder(nil, copyBtn, nil, nil, logEntry)
-	
+
 	d := dialog.NewCustom("Import Process", "Close", content, c.window)
 	d.Resize(fyne.NewSize(650, 500))
 	d.Show()
 
 	go func() {
 		appendLog(fmt.Sprintf("Starting import from %s to %s", inboxDir, outboxDir))
-		
+
 		for _, e := range entries {
 			if e.IsDir() {
 				continue
@@ -97,7 +97,7 @@ func (c *Controller) runImport() {
 			}
 
 			destPath := filepath.Join(destDirPath, e.Name())
-			
+
 			// Handle duplicate names if necessary
 			if _, err := os.Stat(destPath); err == nil {
 				ext := filepath.Ext(e.Name())

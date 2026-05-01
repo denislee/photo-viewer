@@ -29,9 +29,9 @@ type Controller struct {
 	toolbar *Toolbar
 	grid    *ThumbGrid
 
-	mu          sync.Mutex
-	currentDir  string
-	scanCancel  context.CancelFunc
+	mu         sync.Mutex
+	currentDir string
+	scanCancel context.CancelFunc
 }
 
 func NewController(window fyne.Window, libraryRoot string, idx *cache.Index, store *cache.ThumbStore, cacheDir string) *Controller {
@@ -47,14 +47,14 @@ func NewController(window fyne.Window, libraryRoot string, idx *cache.Index, sto
 	c.grid = NewThumbGrid(window, store, func(index int, entries []cache.Entry) {
 		Open(c.window, index, entries, c.store)
 	})
-	
+
 	window.Canvas().AddShortcut(&desktop.CustomShortcut{KeyName: fyne.KeyMinus, Modifier: fyne.KeyModifierShortcutDefault}, func(shortcut fyne.Shortcut) {
 		c.grid.HandleZoom(false)
 	})
 	window.Canvas().AddShortcut(&desktop.CustomShortcut{KeyName: fyne.KeyEqual, Modifier: fyne.KeyModifierShortcutDefault}, func(shortcut fyne.Shortcut) {
 		c.grid.HandleZoom(true)
 	})
-	
+
 	c.toolbar.SetPath(libraryRoot)
 	return c
 }
@@ -145,9 +145,9 @@ func (c *Controller) scanInto(ctx context.Context, dir string, fullRebuild bool)
 		if !force && time.Since(lastFlush) < time.Second {
 			return
 		}
-		
+
 		entries := c.index.ReconcileBatch(resultsBatch)
-		
+
 		active := c.activeDir()
 		needsRefresh := false
 		prefix := withSep(active)
@@ -161,7 +161,7 @@ func (c *Controller) scanInto(ctx context.Context, dir string, fullRebuild bool)
 		if needsRefresh {
 			c.refreshFromIndex(active)
 		}
-		
+
 		resultsBatch = resultsBatch[:0]
 		lastFlush = time.Now()
 	}

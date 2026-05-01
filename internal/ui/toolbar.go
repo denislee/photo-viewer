@@ -1,49 +1,81 @@
 package ui
 
 import (
+	"image/color"
+	"path/filepath"
+
 	"fyne.io/fyne/v2"
+	"fyne.io/fyne/v2/canvas"
 	"fyne.io/fyne/v2/container"
+	"fyne.io/fyne/v2/layout"
 	"fyne.io/fyne/v2/theme"
 	"fyne.io/fyne/v2/widget"
 )
 
-// Toolbar groups the path label, count, progress, and rebuild button.
+// Toolbar groups the path label, count, busy indicator, and action buttons.
+// Visually it is one thin row with subtle separators below.
 type Toolbar struct {
 	root *fyne.Container
 
-	pathLabel  *widget.Label
-	countLabel *widget.Label
-	progress   *widget.ProgressBarInfinite
+	pathLabel  *canvas.Text
+	countLabel *canvas.Text
+	progress   *widget.Activity
 	rebuild    *widget.Button
 	settings   *widget.Button
 	importBtn  *widget.Button
 }
 
 func NewToolbar(onRebuild func(), onSettings func(), onImport func()) *Toolbar {
+	pathLabel := canvas.NewText("", color.NRGBA{R: 0xc8, G: 0xcc, B: 0xd2, A: 0xff})
+	pathLabel.TextSize = 13
+
+	countLabel := canvas.NewText("", color.NRGBA{R: 0x80, G: 0x84, B: 0x8c, A: 0xff})
+	countLabel.TextSize = 12
+	countLabel.Alignment = fyne.TextAlignTrailing
+
 	t := &Toolbar{
-		pathLabel:  widget.NewLabel(""),
-		countLabel: widget.NewLabel(""),
-		progress:   widget.NewProgressBarInfinite(),
-		rebuild:    widget.NewButtonWithIcon("Rebuild index", theme.ViewRefreshIcon(), onRebuild),
-		settings:   widget.NewButtonWithIcon("Settings", theme.SettingsIcon(), onSettings),
-		importBtn:  widget.NewButtonWithIcon("Import", theme.DownloadIcon(), onImport),
+		pathLabel:  pathLabel,
+		countLabel: countLabel,
+		progress:   widget.NewActivity(),
+		rebuild:    iconButton(theme.ViewRefreshIcon(), onRebuild),
+		settings:   iconButton(theme.SettingsIcon(), onSettings),
+		importBtn:  iconButton(theme.DownloadIcon(), onImport),
 	}
 	t.progress.Hide()
-	t.root = container.NewBorder(
-		nil, nil,
-		container.NewHBox(t.settings, t.importBtn, t.rebuild),
-		container.NewHBox(t.countLabel, t.progress),
-		t.pathLabel,
+
+	actions := container.NewHBox(t.countLabel, t.progress, t.importBtn, t.settings, t.rebuild)
+	row := container.New(layout.NewBorderLayout(nil, nil, nil, actions),
+		actions,
+		container.NewPadded(t.pathLabel),
 	)
+
+	sep := canvas.NewRectangle(color.NRGBA{R: 0x26, G: 0x2a, B: 0x31, A: 0xff})
+	sep.SetMinSize(fyne.NewSize(0, 1))
+
+	t.root = container.NewVBox(container.NewPadded(row), sep)
 	return t
+}
+
+func iconButton(icon fyne.Resource, fn func()) *widget.Button {
+	b := widget.NewButtonWithIcon("", icon, fn)
+	b.Importance = widget.LowImportance
+	return b
 }
 
 func (t *Toolbar) Widget() fyne.CanvasObject { return t.root }
 
 // SetPath / SetCount / ShowBusy mutate widget state directly. Callers running
 // off the main goroutine must wrap the call in fyne.Do.
-func (t *Toolbar) SetPath(p string) { t.pathLabel.SetText(p) }
-func (t *Toolbar) SetCount(n int)   { t.countLabel.SetText(formatCount(n)) }
+func (t *Toolbar) SetPath(p string) {
+	t.pathLabel.Text = prettyPath(p)
+	t.pathLabel.Refresh()
+}
+
+func (t *Toolbar) SetCount(n int) {
+	t.countLabel.Text = formatCount(n)
+	t.countLabel.Refresh()
+}
+
 func (t *Toolbar) ShowBusy(busy bool) {
 	if busy {
 		t.progress.Show()
@@ -56,10 +88,30 @@ func (t *Toolbar) ShowBusy(busy bool) {
 	}
 }
 
+// prettyPath shortens a path for display: it keeps at most the trailing two
+// segments, prefixed by "…/" if the original was deeper.
+func prettyPath(p string) string {
+	if p == "" {
+		return ""
+	}
+	cleaned := filepath.Clean(p)
+	parent, leaf := filepath.Split(cleaned)
+	parent = filepath.Clean(parent)
+	if parent == "." || parent == string(filepath.Separator) || parent == cleaned {
+		return cleaned
+	}
+	parentParent, parentLeaf := filepath.Split(parent)
+	parentParent = filepath.Clean(parentParent)
+	if parentParent == "." || parentParent == string(filepath.Separator) || parentParent == parent {
+		return filepath.Join(parentLeaf, leaf)
+	}
+	return "…/" + filepath.Join(parentLeaf, leaf)
+}
+
 func formatCount(n int) string {
 	switch n {
 	case 0:
-		return "no items"
+		return "empty"
 	case 1:
 		return "1 item"
 	}
