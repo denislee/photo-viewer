@@ -2,14 +2,16 @@ package cache
 
 import (
 	"crypto/sha1"
+	"database/sql"
 	"encoding/hex"
-	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/dns/photo-viewer/internal/scan"
+	_ "github.com/mattn/go-sqlite3"
 )
 
 // Entry is one media file recorded in the index.
@@ -21,83 +23,79 @@ type Entry struct {
 	ThumbID string         `json:"thumb_id"`
 }
 
-// fresh reports whether r matches e on the inputs that affect the thumbnail.
-func (e Entry) fresh(r scan.Result) bool {
-	return e.Size == r.Size && e.ModTime.Equal(r.ModTime) && e.Type == r.Type
-}
-
-// Index is the in-memory representation of <cache>/index.json.
+// Index is the SQLite database representation of the media cache.
 type Index struct {
-	mu      sync.Mutex
-	dir     string
-	entries map[string]Entry
+	mu sync.Mutex
+	db *sql.DB
 }
 
-// Load reads the index from dir. A missing file returns an empty index.
-func Load(dir string) (*Index, error) {
-	idx := &Index{dir: dir, entries: map[string]Entry{}}
-	f, err := os.Open(filepath.Join(dir, "index.json"))
+// Load opens the SQLite database index.
+func Load(dbPath string) (*Index, error) {
+	db, err := sql.Open("sqlite3", dbPath)
 	if err != nil {
-		if os.IsNotExist(err) {
-			return idx, nil
-		}
 		return nil, err
 	}
-	defer f.Close()
-	var on []Entry
-	if err := json.NewDecoder(f).Decode(&on); err != nil {
-		return idx, nil
-	}
-	for _, e := range on {
-		idx.entries[e.Path] = e
-	}
-	return idx, nil
-}
 
-// Save writes the index to <dir>/index.json atomically.
-func (i *Index) Save() error {
-	i.mu.Lock()
-	defer i.mu.Unlock()
-	list := make([]Entry, 0, len(i.entries))
-	for _, e := range i.entries {
-		list = append(list, e)
-	}
-	tmp := filepath.Join(i.dir, "index.json.tmp")
-	f, err := os.Create(tmp)
+	_, err = db.Exec(`
+		PRAGMA journal_mode = WAL;
+		PRAGMA synchronous = NORMAL;
+		CREATE TABLE IF NOT EXISTS entries (
+			path TEXT PRIMARY KEY,
+			type INTEGER,
+			size INTEGER,
+			mtime INTEGER,
+			thumb_id TEXT
+		);
+		CREATE INDEX IF NOT EXISTS idx_entries_path ON entries(path);
+	`)
 	if err != nil {
-		return err
+		return nil, err
 	}
-	enc := json.NewEncoder(f)
-	enc.SetIndent("", "  ")
-	if err := enc.Encode(list); err != nil {
-		f.Close()
-		os.Remove(tmp)
-		return err
-	}
-	if err := f.Close(); err != nil {
-		return err
-	}
-	return os.Rename(tmp, filepath.Join(i.dir, "index.json"))
+
+	return &Index{db: db}, nil
 }
 
-// Reconcile updates the index against a fresh walk result. It returns the
-// merged entry: if the file was already known and unchanged, the existing
-// entry (with its ThumbID) is reused; otherwise a new entry is recorded.
-func (i *Index) Reconcile(r scan.Result) Entry {
+// Save is a no-op for SQLite as transactions handle persistence.
+func (i *Index) Save() error {
+	return nil
+}
+
+// ReconcileBatch inserts or updates a slice of scan results in a single transaction.
+func (i *Index) ReconcileBatch(results []scan.Result) []Entry {
 	i.mu.Lock()
 	defer i.mu.Unlock()
-	if existing, ok := i.entries[r.Path]; ok && existing.fresh(r) {
-		return existing
+
+	out := make([]Entry, 0, len(results))
+	if len(results) == 0 {
+		return out
 	}
-	e := Entry{
-		Path:    r.Path,
-		Type:    r.Type,
-		Size:    r.Size,
-		ModTime: r.ModTime,
-		ThumbID: thumbID(r.Path),
+
+	tx, err := i.db.Begin()
+	if err != nil {
+		return out
 	}
-	i.entries[r.Path] = e
-	return e
+	defer tx.Rollback()
+
+	stmt, err := tx.Prepare("INSERT OR REPLACE INTO entries (path, type, size, mtime, thumb_id) VALUES (?, ?, ?, ?, ?)")
+	if err != nil {
+		return out
+	}
+	defer stmt.Close()
+
+	for _, r := range results {
+		e := Entry{
+			Path:    r.Path,
+			Type:    r.Type,
+			Size:    r.Size,
+			ModTime: r.ModTime,
+			ThumbID: ThumbIDFor(r.Path),
+		}
+		_, _ = stmt.Exec(e.Path, e.Type, e.Size, e.ModTime.Unix(), e.ThumbID)
+		out = append(out, e)
+	}
+	_ = tx.Commit()
+
+	return out
 }
 
 // Prune drops index entries whose path is not in the given set. Returns the
@@ -105,33 +103,96 @@ func (i *Index) Reconcile(r scan.Result) Entry {
 func (i *Index) Prune(seen map[string]struct{}) []string {
 	i.mu.Lock()
 	defer i.mu.Unlock()
-	var removed []string
-	for p := range i.entries {
-		if _, ok := seen[p]; !ok {
-			removed = append(removed, p)
-			delete(i.entries, p)
+
+	rows, err := i.db.Query("SELECT path FROM entries")
+	if err != nil {
+		return nil
+	}
+	var toDelete []string
+	for rows.Next() {
+		var p string
+		if err := rows.Scan(&p); err == nil {
+			if _, ok := seen[p]; !ok {
+				toDelete = append(toDelete, p)
+			}
 		}
 	}
-	return removed
+	rows.Close()
+
+	if len(toDelete) > 0 {
+		tx, _ := i.db.Begin()
+		if tx != nil {
+			stmt, err := tx.Prepare("DELETE FROM entries WHERE path = ?")
+			if err == nil {
+				for _, p := range toDelete {
+					_, _ = stmt.Exec(p)
+				}
+				stmt.Close()
+			}
+			_ = tx.Commit()
+		}
+	}
+	return toDelete
 }
 
-// All returns a snapshot of the index, sorted by path.
-func (i *Index) All() []Entry {
+// ListDir returns a slice of entries under the specific directory prefix.
+func (i *Index) ListDir(dir string) []Entry {
 	i.mu.Lock()
 	defer i.mu.Unlock()
-	out := make([]Entry, 0, len(i.entries))
-	for _, e := range i.entries {
-		out = append(out, e)
+
+	prefix := dir
+	if len(prefix) > 0 && prefix[len(prefix)-1] != filepath.Separator {
+		prefix += string(filepath.Separator)
+	}
+	likePattern := prefix + "%"
+
+	rows, err := i.db.Query("SELECT path, type, size, mtime, thumb_id FROM entries WHERE path LIKE ? OR path = ? ORDER BY path", likePattern, dir)
+	if err != nil {
+		return nil
+	}
+	defer rows.Close()
+
+	var out []Entry
+	for rows.Next() {
+		var e Entry
+		var mtimeUnix int64
+		if err := rows.Scan(&e.Path, &e.Type, &e.Size, &mtimeUnix, &e.ThumbID); err == nil {
+			e.ModTime = time.Unix(mtimeUnix, 0)
+			if e.Path == dir || strings.HasPrefix(e.Path, prefix) || filepath.Dir(e.Path) == dir {
+				out = append(out, e)
+			}
+		}
 	}
 	return out
 }
 
-// Wipe deletes the cache directory contents (index + thumbs).
-func Wipe(dir string) error {
-	if err := os.RemoveAll(filepath.Join(dir, "thumbs")); err != nil {
-		return err
+// All returns a snapshot of the entire index.
+func (i *Index) All() []Entry {
+	i.mu.Lock()
+	defer i.mu.Unlock()
+
+	rows, err := i.db.Query("SELECT path, type, size, mtime, thumb_id FROM entries ORDER BY path")
+	if err != nil {
+		return nil
 	}
-	return os.Remove(filepath.Join(dir, "index.json"))
+	defer rows.Close()
+
+	var out []Entry
+	for rows.Next() {
+		var e Entry
+		var mtimeUnix int64
+		if err := rows.Scan(&e.Path, &e.Type, &e.Size, &mtimeUnix, &e.ThumbID); err == nil {
+			e.ModTime = time.Unix(mtimeUnix, 0)
+			out = append(out, e)
+		}
+	}
+	return out
+}
+
+// Wipe deletes the database and thumbs folder.
+func Wipe(dbPath, cacheDir string) error {
+	os.RemoveAll(filepath.Join(cacheDir, "thumbs"))
+	return os.Remove(dbPath)
 }
 
 // ThumbIDFor returns the deterministic thumbnail identifier for a media path.
@@ -140,4 +201,12 @@ func ThumbIDFor(path string) string {
 	return hex.EncodeToString(sum[:])
 }
 
-func thumbID(path string) string { return ThumbIDFor(path) }
+// Close explicitly closes the database connection.
+func (i *Index) Close() error {
+	i.mu.Lock()
+	defer i.mu.Unlock()
+	if i.db != nil {
+		return i.db.Close()
+	}
+	return nil
+}

@@ -23,7 +23,8 @@ func TestPipeline(t *testing.T) {
 	}
 	defer os.RemoveAll(cacheDir)
 
-	idx, err := cache.Load(cacheDir)
+	dbPath := filepath.Join(cacheDir, "index.db")
+	idx, err := cache.Load(dbPath)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -35,7 +36,7 @@ func TestPipeline(t *testing.T) {
 	ctx := context.Background()
 	var entries []cache.Entry
 	for r := range scan.Walk(ctx, root) {
-		entries = append(entries, idx.Reconcile(r))
+		entries = append(entries, idx.ReconcileBatch([]scan.Result{r})[0])
 	}
 	if len(entries) == 0 {
 		t.Fatalf("no media found under %s", root)
@@ -60,19 +61,19 @@ func TestPipeline(t *testing.T) {
 	if err := idx.Save(); err != nil {
 		t.Fatalf("save: %v", err)
 	}
-	if _, err := os.Stat(filepath.Join(cacheDir, "index.json")); err != nil {
-		t.Fatalf("index.json missing: %v", err)
+	if _, err := os.Stat(dbPath); err != nil {
+		t.Fatalf("index.db missing: %v", err)
 	}
 
 	// Second pass: reload index, walk again, and ensure each result is fresh.
-	idx2, err := cache.Load(cacheDir)
+	idx2, err := cache.Load(dbPath)
 	if err != nil {
 		t.Fatal(err)
 	}
 	regen := 0
 	for r := range scan.Walk(ctx, root) {
 		before := idx2.All()
-		entry := idx2.Reconcile(r)
+		entry := idx2.ReconcileBatch([]scan.Result{r})[0]
 		_ = entry
 		after := idx2.All()
 		if len(after) != len(before) {

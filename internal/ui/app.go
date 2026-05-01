@@ -7,6 +7,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"time"
 
 	"fyne.io/fyne/v2"
 	"fyne.io/fyne/v2/container"
@@ -54,13 +55,6 @@ func NewController(window fyne.Window, libraryRoot string, idx *cache.Index, sto
 		c.grid.HandleZoom(true)
 	})
 	
-	window.Canvas().AddShortcut(&desktop.CustomShortcut{KeyName: fyne.KeyH, Modifier: 0}, func(shortcut fyne.Shortcut) { c.grid.MoveSelection(-1) })
-	window.Canvas().AddShortcut(&desktop.CustomShortcut{KeyName: fyne.KeyJ, Modifier: 0}, func(shortcut fyne.Shortcut) { c.grid.MoveSelection(c.grid.ColumnCount()) })
-	window.Canvas().AddShortcut(&desktop.CustomShortcut{KeyName: fyne.KeyK, Modifier: 0}, func(shortcut fyne.Shortcut) { c.grid.MoveSelection(-c.grid.ColumnCount()) })
-	window.Canvas().AddShortcut(&desktop.CustomShortcut{KeyName: fyne.KeyL, Modifier: 0}, func(shortcut fyne.Shortcut) { c.grid.MoveSelection(1) })
-	window.Canvas().AddShortcut(&desktop.CustomShortcut{KeyName: fyne.KeyReturn, Modifier: 0}, func(shortcut fyne.Shortcut) { c.grid.OpenSelected() })
-	window.Canvas().AddShortcut(&desktop.CustomShortcut{KeyName: fyne.KeySpace, Modifier: 0}, func(shortcut fyne.Shortcut) { c.grid.OpenSelected() })
-	
 	c.toolbar.SetPath(libraryRoot)
 	return c
 }
@@ -105,10 +99,11 @@ func (c *Controller) rebuildIndex() {
 	c.scanCancel = cancel
 	c.mu.Unlock()
 
-	if err := cache.Wipe(c.cacheDir); err != nil {
+	dbPath := filepath.Join(c.libraryRoot, ".photo-viewer.db")
+	if err := cache.Wipe(dbPath, c.cacheDir); err != nil {
 		log.Printf("wipe cache: %v", err)
 	}
-	idx, err := cache.Load(c.cacheDir)
+	idx, err := cache.Load(dbPath)
 	if err != nil {
 		log.Printf("reload index: %v", err)
 		return
@@ -121,14 +116,7 @@ func (c *Controller) rebuildIndex() {
 
 // refreshFromIndex pushes the cached entries that live under dir to the grid.
 func (c *Controller) refreshFromIndex(dir string) {
-	all := c.index.All()
-	prefix := withSep(dir)
-	filtered := all[:0]
-	for _, e := range all {
-		if strings.HasPrefix(e.Path, prefix) || filepath.Dir(e.Path) == dir {
-			filtered = append(filtered, e)
-		}
-	}
+	filtered := c.index.ListDir(dir)
 	sortEntries(filtered)
 	c.grid.SetEntries(filtered)
 	c.toolbar.SetCount(len(filtered))
@@ -140,32 +128,54 @@ func (c *Controller) scanInto(ctx context.Context, dir string, fullRebuild bool)
 	fyne.Do(func() { c.toolbar.ShowBusy(true) })
 	defer fyne.Do(func() { c.toolbar.ShowBusy(false) })
 
-	seen := map[string]struct{}{}
-	var batch []cache.Entry
-	flush := func() {
-		if len(batch) == 0 {
+	var seen map[string]struct{}
+	if fullRebuild {
+		seen = make(map[string]struct{})
+	}
+
+	var resultsBatch []scan.Result
+	lastFlush := time.Now()
+
+	flush := func(force bool) {
+		if len(resultsBatch) == 0 {
 			return
 		}
+		if !force && time.Since(lastFlush) < time.Second {
+			return
+		}
+		
+		entries := c.index.ReconcileBatch(resultsBatch)
+		
 		active := c.activeDir()
-		fyne.Do(func() { c.refreshFromIndex(active) })
-		batch = batch[:0]
+		needsRefresh := false
+		prefix := withSep(active)
+		for _, e := range entries {
+			if strings.HasPrefix(e.Path, prefix) || filepath.Dir(e.Path) == active {
+				needsRefresh = true
+				break
+			}
+		}
+
+		if needsRefresh {
+			fyne.Do(func() { c.refreshFromIndex(active) })
+		}
+		
+		resultsBatch = resultsBatch[:0]
+		lastFlush = time.Now()
 	}
 
 	results := scan.Walk(ctx, dir)
-	count := 0
 	for r := range results {
 		if ctx.Err() != nil {
 			return
 		}
-		entry := c.index.Reconcile(r)
-		seen[r.Path] = struct{}{}
-		batch = append(batch, entry)
-		count++
-		if count%32 == 0 {
-			flush()
+		if fullRebuild {
+			seen[r.Path] = struct{}{}
 		}
+		resultsBatch = append(resultsBatch, r)
+		flush(false)
 	}
-	flush()
+	flush(true)
 
 	if fullRebuild {
 		removed := c.index.Prune(seen)

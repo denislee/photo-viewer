@@ -26,10 +26,57 @@ func newTappableCell(c fyne.CanvasObject, onDouble func()) *tappableCell {
 	return t
 }
 func (t *tappableCell) CreateRenderer() fyne.WidgetRenderer { return widget.NewSimpleRenderer(t.content) }
-func (t *tappableCell) Tapped(*fyne.PointEvent) {}
+
 func (t *tappableCell) DoubleTapped(*fyne.PointEvent) {
 	if t.onDouble != nil {
 		t.onDouble()
+	}
+}
+
+type customGridWrap struct {
+	widget.GridWrap
+	g *ThumbGrid
+}
+
+func newCustomGridWrap(g *ThumbGrid, length func() int, createItem func() fyne.CanvasObject, updateItem func(id widget.GridWrapItemID, obj fyne.CanvasObject)) *customGridWrap {
+	cg := &customGridWrap{g: g}
+	cg.Length = length
+	cg.CreateItem = createItem
+	cg.UpdateItem = updateItem
+	cg.ExtendBaseWidget(cg)
+	return cg
+}
+
+func (c *customGridWrap) TypedKey(e *fyne.KeyEvent) {
+	if e.Name == fyne.KeyReturn || e.Name == fyne.KeyEnter || e.Name == fyne.KeySpace {
+		c.g.OpenSelected()
+	} else if e.Name == fyne.KeyLeft {
+		c.g.MoveSelection(-1)
+	} else if e.Name == fyne.KeyRight {
+		c.g.MoveSelection(1)
+	} else if e.Name == fyne.KeyUp {
+		c.g.MoveSelection(-c.g.ColumnCount())
+	} else if e.Name == fyne.KeyDown {
+		c.g.MoveSelection(c.g.ColumnCount())
+	} else {
+		c.GridWrap.TypedKey(e)
+	}
+}
+
+func (c *customGridWrap) TypedRune(r rune) {
+	switch r {
+	case 'h':
+		c.g.MoveSelection(-1)
+	case 'j':
+		c.g.MoveSelection(c.g.ColumnCount())
+	case 'k':
+		c.g.MoveSelection(-c.g.ColumnCount())
+	case 'l':
+		c.g.MoveSelection(1)
+	case ' ':
+		c.g.OpenSelected()
+	default:
+		c.GridWrap.TypedRune(r)
 	}
 }
 
@@ -37,7 +84,7 @@ func (t *tappableCell) DoubleTapped(*fyne.PointEvent) {
 // entries. Thumbnails are loaded lazily on the first time each cell is bound.
 type ThumbGrid struct {
 	container *fyne.Container
-	grid      *widget.GridWrap
+	grid      *customGridWrap
 	store     *cache.ThumbStore
 
 	mu            sync.Mutex
@@ -124,7 +171,7 @@ func (g *ThumbGrid) HandleZoom(in bool) {
 }
 
 func (g *ThumbGrid) rebuildGrid() {
-	g.grid = widget.NewGridWrap(
+	g.grid = newCustomGridWrap(g,
 		func() int {
 			g.mu.Lock()
 			defer g.mu.Unlock()

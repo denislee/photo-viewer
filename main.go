@@ -43,10 +43,11 @@ func main() {
 		w.ShowAndRun()
 		return
 	}
-	idx, err := cache.Load(cacheDir)
+	dbPath := filepath.Join(abs, ".photo-viewer.db")
+	idx, err := cache.Load(dbPath)
 	if err != nil {
 		log.Printf("load index: %v", err)
-		idx, _ = cache.Load(cacheDir)
+		idx, _ = cache.Load(dbPath)
 	}
 	store, err := cache.NewThumbStore(cacheDir)
 	if err != nil {
