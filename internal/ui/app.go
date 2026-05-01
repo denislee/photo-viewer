@@ -67,7 +67,7 @@ func NewController(window fyne.Window, libraryRoot string, idx *cache.Index, sto
 		currentDir:  libraryRoot,
 		mediaFilter: "All",
 	}
-	c.toolbar = NewToolbar(c.setFilter, c.rebuildIndex, c.showSettings, c.runImport, c.showDuplicates, c.toggleFavoritesView, c.showScanInfo)
+	c.toolbar = NewToolbar(c.setFilter, c.rebuildIndex, c.showSettings, c.runImport, c.runSDCardImport, c.showDuplicates, c.toggleFavoritesView, c.showScanInfo)
 	c.grid = NewThumbGrid(window, store, func(index int, entries []cache.Entry) {
 		Open(c.window, index, entries, c.store, c.index, func() {
 			c.mu.Lock()

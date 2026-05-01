@@ -2,6 +2,8 @@ package ui
 
 import (
 	"archive/zip"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"io"
 	"io/fs"
@@ -20,6 +22,44 @@ import (
 
 	"github.com/dns/photo-viewer/internal/scan"
 )
+
+func sha256File(path string) (string, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return "", err
+	}
+	defer f.Close()
+	h := sha256.New()
+	if _, err := io.Copy(h, f); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(h.Sum(nil)), nil
+}
+
+// sameContent reports whether a and b have identical bytes. Size mismatch
+// short-circuits before hashing.
+func sameContent(a, b string) (bool, error) {
+	ai, err := os.Stat(a)
+	if err != nil {
+		return false, err
+	}
+	bi, err := os.Stat(b)
+	if err != nil {
+		return false, err
+	}
+	if ai.Size() != bi.Size() {
+		return false, nil
+	}
+	ha, err := sha256File(a)
+	if err != nil {
+		return false, err
+	}
+	hb, err := sha256File(b)
+	if err != nil {
+		return false, err
+	}
+	return ha == hb, nil
+}
 
 func copyFile(src, dst string) error {
 	in, err := os.Open(src)
@@ -57,6 +97,13 @@ func uniqueInboxPath(dir, base string) string {
 }
 
 func (c *Controller) runImport() {
+	c.runImportFromDirs(nil)
+}
+
+// runImportFromDirs opens the import dialog with an optional list of source
+// directories already added — used by the SD-card flow to hand off a freshly
+// mounted volume.
+func (c *Controller) runImportFromDirs(initialDirs []string) {
 	prefs := fyne.CurrentApp().Preferences()
 	inboxDir := prefs.StringWithFallback("InboxDir", "")
 	outboxDir := prefs.StringWithFallback("OutboxDir", "")
@@ -174,8 +221,26 @@ func (c *Controller) runImport() {
 
 			destPath := filepath.Join(destDirPath, baseName)
 
-			// Handle duplicate names if necessary
+			// Handle duplicate names: if the existing file has identical content,
+			// the source has already been imported — drop it. Otherwise, keep
+			// both by appending a unique suffix.
 			if _, err := os.Stat(destPath); err == nil {
+				same, cmpErr := sameContent(srcPath, destPath)
+				if cmpErr != nil {
+					appendLog(fmt.Sprintf("[ERROR] Could not compare %s with existing file: %v", baseName, cmpErr))
+				}
+				if same {
+					if rmErr := os.Remove(srcPath); rmErr != nil {
+						appendLog(fmt.Sprintf("[ERROR] Could not remove duplicate %s: %v", baseName, rmErr))
+					} else {
+						appendLog(fmt.Sprintf("[SKIP] %s already in %s (identical)", baseName, dateFolder))
+					}
+					processed++
+					fyne.Do(func() {
+						progressBar.SetValue(float64(processed))
+					})
+					continue
+				}
 				ext := filepath.Ext(baseName)
 				destPath = filepath.Join(destDirPath, fmt.Sprintf("%s_%d%s", base, time.Now().UnixNano(), ext))
 			}
@@ -195,7 +260,7 @@ func (c *Controller) runImport() {
 	}
 
 	var zipFiles []string
-	var importDirs []string
+	importDirs := append([]string(nil), initialDirs...)
 
 	updateReadyStatus := func() {
 		parts := []string{fmt.Sprintf("%d files in Inbox", fileCount)}
@@ -390,8 +455,11 @@ func (c *Controller) runImport() {
 		}()
 	})
 	startBtn.Importance = widget.HighImportance
-	if fileCount == 0 {
+	if fileCount == 0 && len(importDirs) == 0 {
 		startBtn.Disable()
+	}
+	if len(importDirs) > 0 {
+		updateReadyStatus()
 	}
 
 	importZipBtn = widget.NewButton("Add ZIP", func() {
