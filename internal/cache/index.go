@@ -6,7 +6,6 @@ import (
 	"encoding/hex"
 	"os"
 	"path/filepath"
-	"strings"
 	"sync"
 	"time"
 
@@ -153,18 +152,29 @@ func (i *Index) Prune(seen map[string]struct{}) []string {
 	return toDelete
 }
 
+// dirRange returns the [lower, upper) string range that captures every path
+// strictly under dir. With dir="/foo" the bounds are "/foo/" and "/foo0",
+// which is index-friendly because the path column is the primary key.
+func dirRange(dir string) (string, string) {
+	prefix := dir
+	if len(prefix) == 0 || prefix[len(prefix)-1] != filepath.Separator {
+		prefix += string(filepath.Separator)
+	}
+	upper := prefix[:len(prefix)-1] + string(rune(filepath.Separator)+1)
+	return prefix, upper
+}
+
 // ListDir returns a slice of entries under the specific directory prefix.
 func (i *Index) ListDir(dir string) []Entry {
 	i.mu.Lock()
 	defer i.mu.Unlock()
 
-	prefix := dir
-	if len(prefix) > 0 && prefix[len(prefix)-1] != filepath.Separator {
-		prefix += string(filepath.Separator)
-	}
-	likePattern := prefix + "%"
+	lower, upper := dirRange(dir)
 
-	rows, err := i.db.Query("SELECT path, type, size, mtime, thumb_id, favorite FROM entries WHERE path LIKE ? OR path = ? ORDER BY path", likePattern, dir)
+	rows, err := i.db.Query(
+		"SELECT path, type, size, mtime, thumb_id, favorite FROM entries WHERE (path >= ? AND path < ?) OR path = ? ORDER BY path",
+		lower, upper, dir,
+	)
 	if err != nil {
 		return nil
 	}
@@ -178,9 +188,7 @@ func (i *Index) ListDir(dir string) []Entry {
 		if err := rows.Scan(&e.Path, &e.Type, &e.Size, &mtimeUnix, &e.ThumbID, &fav); err == nil {
 			e.ModTime = time.Unix(mtimeUnix, 0)
 			e.Favorite = fav != 0
-			if e.Path == dir || strings.HasPrefix(e.Path, prefix) || filepath.Dir(e.Path) == dir {
-				out = append(out, e)
-			}
+			out = append(out, e)
 		}
 	}
 	return out
@@ -191,14 +199,13 @@ func (i *Index) CountDir(dir string) int {
 	i.mu.Lock()
 	defer i.mu.Unlock()
 
-	prefix := dir
-	if len(prefix) > 0 && prefix[len(prefix)-1] != filepath.Separator {
-		prefix += string(filepath.Separator)
-	}
-	likePattern := prefix + "%"
+	lower, upper := dirRange(dir)
 
 	var count int
-	err := i.db.QueryRow("SELECT COUNT(*) FROM entries WHERE path LIKE ? OR path = ?", likePattern, dir).Scan(&count)
+	err := i.db.QueryRow(
+		"SELECT COUNT(*) FROM entries WHERE (path >= ? AND path < ?) OR path = ?",
+		lower, upper, dir,
+	).Scan(&count)
 	if err != nil {
 		return 0
 	}

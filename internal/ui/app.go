@@ -280,20 +280,30 @@ func (c *Controller) scanInto(ctx context.Context, dir string, fullRebuild bool)
 		c.mu.Lock()
 		c.scanState.BatchesFlushed++
 		c.scanState.LastBatchSize = batchSize
+		filter := c.mediaFilter
 		c.mu.Unlock()
 
 		active := c.activeDir()
-		needsRefresh := false
 		prefix := withSep(active)
+		var forGrid []cache.Entry
 		for _, e := range entries {
-			if strings.HasPrefix(e.Path, prefix) || filepath.Dir(e.Path) == active {
-				needsRefresh = true
-				break
+			if !strings.HasPrefix(e.Path, prefix) {
+				continue
 			}
+			if filter == "Photos" && e.Type == scan.TypeVideo {
+				continue
+			}
+			if filter == "Videos" && e.Type != scan.TypeVideo {
+				continue
+			}
+			forGrid = append(forGrid, e)
 		}
 
-		if needsRefresh {
-			c.refreshFromIndex(active)
+		if len(forGrid) > 0 {
+			fyne.Do(func() {
+				c.grid.MergeEntries(forGrid)
+				c.toolbar.SetCount(c.grid.Count())
+			})
 		}
 
 		resultsBatch = resultsBatch[:0]

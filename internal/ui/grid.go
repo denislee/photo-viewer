@@ -2,6 +2,7 @@ package ui
 
 import (
 	"image/color"
+	"sort"
 	"sync"
 
 	"fyne.io/fyne/v2"
@@ -122,6 +123,7 @@ type ThumbGrid struct {
 
 	mu            sync.Mutex
 	entries       []cache.Entry
+	pathIndex     map[string]int
 	loaded        map[int]bool
 	selectedIndex int
 	cellSize      float32
@@ -137,6 +139,7 @@ func NewThumbGrid(window fyne.Window, store *cache.ThumbStore, onActivate func(i
 		window:     window,
 		store:      store,
 		loaded:     map[int]bool{},
+		pathIndex:  map[string]int{},
 		onActivate: onActivate,
 		cellSize:   float32(size),
 		isActive:   true,
@@ -366,6 +369,10 @@ func (g *ThumbGrid) loadThumb(id int, e cache.Entry, tc *tappableCell, img *canv
 func (g *ThumbGrid) SetEntries(entries []cache.Entry) {
 	g.mu.Lock()
 	g.entries = entries
+	g.pathIndex = make(map[string]int, len(entries))
+	for i, e := range entries {
+		g.pathIndex[e.Path] = i
+	}
 	g.selectedIndex = 0
 	g.mu.Unlock()
 	g.grid.Refresh()
@@ -381,7 +388,38 @@ func (g *ThumbGrid) SetEntries(entries []cache.Entry) {
 // Append adds entries to the displayed set. Same threading rules as SetEntries.
 func (g *ThumbGrid) Append(more ...cache.Entry) {
 	g.mu.Lock()
-	g.entries = append(g.entries, more...)
+	for _, e := range more {
+		if _, ok := g.pathIndex[e.Path]; ok {
+			continue
+		}
+		g.pathIndex[e.Path] = len(g.entries)
+		g.entries = append(g.entries, e)
+	}
+	g.mu.Unlock()
+	g.grid.Refresh()
+}
+
+// MergeEntries upserts entries by path: existing paths are updated in place,
+// new paths are inserted in sorted position. Refreshes the grid once at the
+// end. Caller must invoke on the Fyne main goroutine.
+func (g *ThumbGrid) MergeEntries(more []cache.Entry) {
+	if len(more) == 0 {
+		return
+	}
+	g.mu.Lock()
+	for _, e := range more {
+		if idx, ok := g.pathIndex[e.Path]; ok {
+			g.entries[idx] = e
+			continue
+		}
+		ins := sort.Search(len(g.entries), func(i int) bool { return g.entries[i].Path >= e.Path })
+		g.entries = append(g.entries, cache.Entry{})
+		copy(g.entries[ins+1:], g.entries[ins:])
+		g.entries[ins] = e
+		for i := ins; i < len(g.entries); i++ {
+			g.pathIndex[g.entries[i].Path] = i
+		}
+	}
 	g.mu.Unlock()
 	g.grid.Refresh()
 }
