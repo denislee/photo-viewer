@@ -37,10 +37,14 @@ func (c *Controller) runImport() {
 	// Disable typing, but allow text selection and scrolling
 	logEntry.Wrapping = fyne.TextWrapWord
 
+	var d dialog.Dialog
+
 	appendLog := func(msg string) {
 		fyne.Do(func() {
 			logText += msg + "\n"
 			logEntry.SetText(logText)
+			logEntry.CursorRow = strings.Count(logText, "\n")
+			logEntry.Refresh()
 		})
 	}
 
@@ -48,9 +52,17 @@ func (c *Controller) runImport() {
 		c.window.Clipboard().SetContent(logText)
 	})
 
-	content := container.NewBorder(nil, copyBtn, nil, nil, logEntry)
+	importAgainBtn := widget.NewButton("Import Again", func() {
+		if d != nil {
+			d.Hide()
+		}
+		c.runImport()
+	})
 
-	d := dialog.NewCustom("Import Process", "Close", content, c.window)
+	buttons := container.NewHBox(copyBtn, importAgainBtn)
+	content := container.NewBorder(nil, buttons, nil, nil, logEntry)
+
+	d = dialog.NewCustom("Import Process", "Close", content, c.window)
 	d.Resize(fyne.NewSize(650, 500))
 	d.Show()
 
