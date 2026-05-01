@@ -44,7 +44,7 @@ func NewController(window fyne.Window, libraryRoot string, idx *cache.Index, sto
 		currentDir:  libraryRoot,
 	}
 	c.toolbar = NewToolbar(c.rebuildIndex, c.showSettings, c.runImport)
-	c.grid = NewThumbGrid(store, func(index int, entries []cache.Entry) {
+	c.grid = NewThumbGrid(window, store, func(index int, entries []cache.Entry) {
 		Open(c.window, index, entries, c.store)
 	})
 	

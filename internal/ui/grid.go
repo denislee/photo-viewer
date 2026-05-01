@@ -16,16 +16,24 @@ import (
 
 type tappableCell struct {
 	widget.BaseWidget
-	content  fyne.CanvasObject
-	onDouble func()
+	content   fyne.CanvasObject
+	boundPath string
+	onTap     func()
+	onDouble  func()
 }
 
-func newTappableCell(c fyne.CanvasObject, onDouble func()) *tappableCell {
-	t := &tappableCell{content: c, onDouble: onDouble}
+func newTappableCell(c fyne.CanvasObject, onTap, onDouble func()) *tappableCell {
+	t := &tappableCell{content: c, onTap: onTap, onDouble: onDouble}
 	t.ExtendBaseWidget(t)
 	return t
 }
 func (t *tappableCell) CreateRenderer() fyne.WidgetRenderer { return widget.NewSimpleRenderer(t.content) }
+
+func (t *tappableCell) Tapped(*fyne.PointEvent) {
+	if t.onTap != nil {
+		t.onTap()
+	}
+}
 
 func (t *tappableCell) DoubleTapped(*fyne.PointEvent) {
 	if t.onDouble != nil {
@@ -86,6 +94,7 @@ type ThumbGrid struct {
 	container *fyne.Container
 	grid      *customGridWrap
 	store     *cache.ThumbStore
+	window    fyne.Window
 
 	mu            sync.Mutex
 	entries       []cache.Entry
@@ -96,9 +105,10 @@ type ThumbGrid struct {
 	onActivate func(int, []cache.Entry)
 }
 
-func NewThumbGrid(store *cache.ThumbStore, onActivate func(int, []cache.Entry)) *ThumbGrid {
+func NewThumbGrid(window fyne.Window, store *cache.ThumbStore, onActivate func(int, []cache.Entry)) *ThumbGrid {
 	size := fyne.CurrentApp().Preferences().FloatWithFallback("ThumbSize", 160)
 	g := &ThumbGrid{
+		window:     window,
 		store:      store,
 		loaded:     map[int]bool{},
 		onActivate: onActivate,
@@ -107,6 +117,15 @@ func NewThumbGrid(store *cache.ThumbStore, onActivate func(int, []cache.Entry)) 
 	g.container = container.NewStack()
 	g.rebuildGrid()
 	return g
+}
+
+// focusGrid grabs keyboard focus so TypedRune (h/j/k/l, space) and TypedKey
+// (arrows, enter) reach the GridWrap.
+func (g *ThumbGrid) focusGrid() {
+	if g.window == nil || g.grid == nil {
+		return
+	}
+	g.window.Canvas().Focus(g.grid)
 }
 
 func (g *ThumbGrid) OpenSelected() {
@@ -188,13 +207,7 @@ func (g *ThumbGrid) rebuildGrid() {
 			s.SetMinSize(fyne.NewSize(0, g.cellSize-24))
 			
 			stack := container.NewStack(img, container.NewVBox(s, badge))
-			var cellID int
-			return newTappableCell(stack, func() {
-				g.mu.Lock()
-				g.selectedIndex = cellID
-				g.mu.Unlock()
-				g.OpenSelected()
-			})
+			return newTappableCell(stack, nil, nil)
 		},
 		func(id widget.GridWrapItemID, obj fyne.CanvasObject) {
 			g.mu.Lock()
@@ -207,16 +220,28 @@ func (g *ThumbGrid) rebuildGrid() {
 
 			tc := obj.(*tappableCell)
 			stack := tc.content.(*fyne.Container)
-			
-			// We must inject the ID into the closure capture space via a dirty trick or just pointer
-			// Let's use a dynamic approach or bind via the struct. Wait, we can't change the closure.
-			// Let's store id on the cell.
+
+			tc.onTap = func() {
+				g.mu.Lock()
+				g.selectedIndex = int(id)
+				g.mu.Unlock()
+				g.grid.Select(id)
+				g.focusGrid()
+			}
 			tc.onDouble = func() {
 				g.mu.Lock()
 				g.selectedIndex = int(id)
 				g.mu.Unlock()
 				g.OpenSelected()
 			}
+
+			// Selection-induced refreshes call UpdateItem on every visible cell.
+			// If the cell is already bound to this entry, skip the image reset
+			// so the thumbnail doesn't flash back to the placeholder.
+			if tc.boundPath == entry.Path {
+				return
+			}
+			tc.boundPath = entry.Path
 
 			img := stack.Objects[0].(*canvas.Image)
 			vbox := stack.Objects[1].(*fyne.Container)
@@ -244,6 +269,7 @@ func (g *ThumbGrid) rebuildGrid() {
 	
 	g.container.Objects = []fyne.CanvasObject{g.grid}
 	g.container.Refresh()
+	g.focusGrid()
 }
 
 func (g *ThumbGrid) loadThumb(id int, e cache.Entry, img *canvas.Image) {
@@ -277,6 +303,7 @@ func (g *ThumbGrid) SetEntries(entries []cache.Entry) {
 		g.grid.Select(0)
 		g.grid.ScrollToTop()
 	}
+	g.focusGrid()
 }
 
 // Append adds entries to the displayed set. Same threading rules as SetEntries.
