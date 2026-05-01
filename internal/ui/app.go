@@ -2,6 +2,7 @@ package ui
 
 import (
 	"context"
+	"fmt"
 	"log"
 	"path/filepath"
 	"sort"
@@ -11,7 +12,10 @@ import (
 
 	"fyne.io/fyne/v2"
 	"fyne.io/fyne/v2/container"
+	"fyne.io/fyne/v2/dialog"
 	"fyne.io/fyne/v2/driver/desktop"
+	"fyne.io/fyne/v2/layout"
+	"fyne.io/fyne/v2/widget"
 
 	"github.com/dns/photo-viewer/internal/cache"
 	"github.com/dns/photo-viewer/internal/scan"
@@ -35,8 +39,22 @@ type Controller struct {
 	mediaFilter    string
 	favoritesView  bool
 	scanCancel     context.CancelFunc
+	scanState      ScanState
 
 	mainContent fyne.CanvasObject
+}
+
+// ScanState is a snapshot of an in-progress index scan.
+type ScanState struct {
+	Active         bool
+	Dir            string
+	FullRebuild    bool
+	FilesSeen      int
+	BatchesFlushed int
+	LastBatchSize  int
+	StartTime      time.Time
+	EndTime        time.Time
+	LastPath       string
 }
 
 func NewController(window fyne.Window, libraryRoot string, idx *cache.Index, store *cache.ThumbStore, cacheDir string) *Controller {
@@ -49,7 +67,7 @@ func NewController(window fyne.Window, libraryRoot string, idx *cache.Index, sto
 		currentDir:  libraryRoot,
 		mediaFilter: "All",
 	}
-	c.toolbar = NewToolbar(c.setFilter, c.rebuildIndex, c.showSettings, c.runImport, c.showDuplicates, c.toggleFavoritesView)
+	c.toolbar = NewToolbar(c.setFilter, c.rebuildIndex, c.showSettings, c.runImport, c.showDuplicates, c.toggleFavoritesView, c.showScanInfo)
 	c.grid = NewThumbGrid(window, store, func(index int, entries []cache.Entry) {
 		Open(c.window, index, entries, c.store, c.index, func() {
 			c.mu.Lock()
@@ -219,7 +237,21 @@ func (c *Controller) refreshFromIndex(dir string) {
 // and persists the index. Always runs in a background goroutine.
 func (c *Controller) scanInto(ctx context.Context, dir string, fullRebuild bool) {
 	fyne.Do(func() { c.toolbar.ShowBusy(true) })
-	defer fyne.Do(func() { c.toolbar.ShowBusy(false) })
+	c.mu.Lock()
+	c.scanState = ScanState{
+		Active:      true,
+		Dir:         dir,
+		FullRebuild: fullRebuild,
+		StartTime:   time.Now(),
+	}
+	c.mu.Unlock()
+	defer func() {
+		c.mu.Lock()
+		c.scanState.Active = false
+		c.scanState.EndTime = time.Now()
+		c.mu.Unlock()
+		fyne.Do(func() { c.toolbar.ShowBusy(false) })
+	}()
 
 	var seen map[string]struct{}
 	if fullRebuild {
@@ -237,7 +269,13 @@ func (c *Controller) scanInto(ctx context.Context, dir string, fullRebuild bool)
 			return
 		}
 
+		batchSize := len(resultsBatch)
 		entries := c.index.ReconcileBatch(resultsBatch)
+
+		c.mu.Lock()
+		c.scanState.BatchesFlushed++
+		c.scanState.LastBatchSize = batchSize
+		c.mu.Unlock()
 
 		active := c.activeDir()
 		needsRefresh := false
@@ -266,6 +304,10 @@ func (c *Controller) scanInto(ctx context.Context, dir string, fullRebuild bool)
 			seen[r.Path] = struct{}{}
 		}
 		resultsBatch = append(resultsBatch, r)
+		c.mu.Lock()
+		c.scanState.FilesSeen++
+		c.scanState.LastPath = r.Path
+		c.mu.Unlock()
 		flush(false)
 	}
 	flush(true)
@@ -281,6 +323,96 @@ func (c *Controller) scanInto(ctx context.Context, dir string, fullRebuild bool)
 	}
 	active := c.activeDir()
 	fyne.Do(func() { c.refreshFromIndex(active) })
+}
+
+// snapshotScanState returns a copy of the current scan state.
+func (c *Controller) snapshotScanState() ScanState {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.scanState
+}
+
+// showScanInfo opens a dialog with live indexing status. The dialog refreshes
+// every 250ms while open and stops once the user closes it.
+func (c *Controller) showScanInfo() {
+	statusVal := widget.NewLabel("")
+	dirVal := widget.NewLabel("")
+	modeVal := widget.NewLabel("")
+	startedVal := widget.NewLabel("")
+	elapsedVal := widget.NewLabel("")
+	seenVal := widget.NewLabel("")
+	flushedVal := widget.NewLabel("")
+	lastBatchVal := widget.NewLabel("")
+	lastPathVal := widget.NewLabel("")
+	lastPathVal.Wrapping = fyne.TextWrapWord
+
+	form := container.New(layout.NewFormLayout(),
+		widget.NewLabelWithStyle("Status:", fyne.TextAlignTrailing, fyne.TextStyle{Bold: true}), statusVal,
+		widget.NewLabelWithStyle("Directory:", fyne.TextAlignTrailing, fyne.TextStyle{Bold: true}), dirVal,
+		widget.NewLabelWithStyle("Mode:", fyne.TextAlignTrailing, fyne.TextStyle{Bold: true}), modeVal,
+		widget.NewLabelWithStyle("Started:", fyne.TextAlignTrailing, fyne.TextStyle{Bold: true}), startedVal,
+		widget.NewLabelWithStyle("Elapsed:", fyne.TextAlignTrailing, fyne.TextStyle{Bold: true}), elapsedVal,
+		widget.NewLabelWithStyle("Files seen:", fyne.TextAlignTrailing, fyne.TextStyle{Bold: true}), seenVal,
+		widget.NewLabelWithStyle("Batches flushed:", fyne.TextAlignTrailing, fyne.TextStyle{Bold: true}), flushedVal,
+		widget.NewLabelWithStyle("Last batch size:", fyne.TextAlignTrailing, fyne.TextStyle{Bold: true}), lastBatchVal,
+		widget.NewLabelWithStyle("Last file:", fyne.TextAlignTrailing, fyne.TextStyle{Bold: true}), lastPathVal,
+	)
+
+	refresh := func() {
+		s := c.snapshotScanState()
+		if s.Active {
+			statusVal.SetText("Indexing…")
+		} else if s.StartTime.IsZero() {
+			statusVal.SetText("Idle (no scan run yet)")
+		} else {
+			statusVal.SetText("Idle (last scan finished)")
+		}
+		dirVal.SetText(s.Dir)
+		if s.FullRebuild {
+			modeVal.SetText("Full rebuild")
+		} else {
+			modeVal.SetText("Incremental")
+		}
+		if s.StartTime.IsZero() {
+			startedVal.SetText("—")
+			elapsedVal.SetText("—")
+		} else {
+			startedVal.SetText(s.StartTime.Format("15:04:05"))
+			end := s.EndTime
+			if s.Active || end.IsZero() {
+				end = time.Now()
+			}
+			elapsedVal.SetText(end.Sub(s.StartTime).Round(time.Millisecond).String())
+		}
+		seenVal.SetText(fmt.Sprintf("%d", s.FilesSeen))
+		flushedVal.SetText(fmt.Sprintf("%d", s.BatchesFlushed))
+		lastBatchVal.SetText(fmt.Sprintf("%d", s.LastBatchSize))
+		if s.LastPath == "" {
+			lastPathVal.SetText("—")
+		} else {
+			lastPathVal.SetText(s.LastPath)
+		}
+	}
+	refresh()
+
+	stop := make(chan struct{})
+	go func() {
+		ticker := time.NewTicker(250 * time.Millisecond)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-stop:
+				return
+			case <-ticker.C:
+				fyne.Do(refresh)
+			}
+		}
+	}()
+
+	d := dialog.NewCustom("Indexing", "Close", form, c.window)
+	d.Resize(fyne.NewSize(520, 360))
+	d.SetOnClosed(func() { close(stop) })
+	d.Show()
 }
 
 func (c *Controller) activeDir() string {

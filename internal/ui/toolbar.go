@@ -7,10 +7,39 @@ import (
 	"fyne.io/fyne/v2"
 	"fyne.io/fyne/v2/canvas"
 	"fyne.io/fyne/v2/container"
+	"fyne.io/fyne/v2/driver/desktop"
 	"fyne.io/fyne/v2/layout"
 	"fyne.io/fyne/v2/theme"
 	"fyne.io/fyne/v2/widget"
 )
+
+// tappableActivity is a spinning Activity widget that fires onTap when clicked.
+type tappableActivity struct {
+	widget.BaseWidget
+	activity *widget.Activity
+	onTap    func()
+}
+
+func newTappableActivity(onTap func()) *tappableActivity {
+	t := &tappableActivity{activity: widget.NewActivity(), onTap: onTap}
+	t.ExtendBaseWidget(t)
+	return t
+}
+
+func (t *tappableActivity) CreateRenderer() fyne.WidgetRenderer {
+	return widget.NewSimpleRenderer(t.activity)
+}
+
+func (t *tappableActivity) Tapped(*fyne.PointEvent) {
+	if t.onTap != nil {
+		t.onTap()
+	}
+}
+
+func (t *tappableActivity) Cursor() desktop.Cursor { return desktop.PointerCursor }
+
+func (t *tappableActivity) Start() { t.activity.Start() }
+func (t *tappableActivity) Stop()  { t.activity.Stop() }
 
 // Toolbar groups the path label, count, busy indicator, and action buttons.
 // Visually it is one thin row with subtle separators below.
@@ -20,7 +49,7 @@ type Toolbar struct {
 	pathLabel  *canvas.Text
 	countLabel *canvas.Text
 	filterBtn  *widget.Select
-	progress   *widget.Activity
+	progress   *tappableActivity
 	rebuild    *widget.Button
 	settings   *widget.Button
 	importBtn  *widget.Button
@@ -28,7 +57,7 @@ type Toolbar struct {
 	favBtn     *widget.Button
 }
 
-func NewToolbar(onFilter func(string), onRebuild func(), onSettings func(), onImport func(), onDuplicates func(), onFavorites func()) *Toolbar {
+func NewToolbar(onFilter func(string), onRebuild func(), onSettings func(), onImport func(), onDuplicates func(), onFavorites func(), onScanInfo func()) *Toolbar {
 	pathLabel := canvas.NewText("", color.NRGBA{R: 0xc8, G: 0xcc, B: 0xd2, A: 0xff})
 	pathLabel.TextSize = 11
 
@@ -43,7 +72,7 @@ func NewToolbar(onFilter func(string), onRebuild func(), onSettings func(), onIm
 		pathLabel:  pathLabel,
 		countLabel: countLabel,
 		filterBtn:  filterBtn,
-		progress:   widget.NewActivity(),
+		progress:   newTappableActivity(onScanInfo),
 		rebuild:    iconButton(theme.ViewRefreshIcon(), onRebuild),
 		settings:   iconButton(theme.SettingsIcon(), onSettings),
 		importBtn:  iconButton(theme.DownloadIcon(), onImport),
