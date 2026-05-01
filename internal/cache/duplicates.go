@@ -3,7 +3,6 @@ package cache
 import (
 	"context"
 	"crypto/sha256"
-	"database/sql"
 	"encoding/hex"
 	"io"
 	"os"
@@ -36,46 +35,32 @@ func hashFile(path string) (string, error) {
 func (i *Index) EnsureHashes(ctx context.Context, progress func(done, total int)) error {
 	type info struct {
 		path string
-		size int64
-		hash string
 	}
 
 	i.mu.Lock()
-	rows, err := i.db.Query("SELECT path, size, content_hash FROM entries")
+	q := `
+		SELECT path 
+		FROM entries 
+		WHERE (content_hash IS NULL OR content_hash = '')
+		  AND size IN (
+			  SELECT size FROM entries GROUP BY size HAVING COUNT(*) > 1
+		  )
+	`
+	rows, err := i.db.Query(q)
 	if err != nil {
 		i.mu.Unlock()
 		return err
 	}
-	var all []info
+	var todo []info
 	for rows.Next() {
 		var p info
-		var h sql.NullString
-		if err := rows.Scan(&p.path, &p.size, &h); err != nil {
-			continue
-		}
-		if h.Valid {
-			p.hash = h.String
-		}
-		all = append(all, p)
-	}
-	rows.Close()
-	i.mu.Unlock()
-
-	sizeCounts := map[int64]int{}
-	for _, p := range all {
-		sizeCounts[p.size]++
-	}
-
-	var todo []info
-	for _, p := range all {
-		if sizeCounts[p.size] < 2 {
-			continue
-		}
-		if p.hash != "" {
+		if err := rows.Scan(&p.path); err != nil {
 			continue
 		}
 		todo = append(todo, p)
 	}
+	rows.Close()
+	i.mu.Unlock()
 
 	total := len(todo)
 	if progress != nil {

@@ -48,6 +48,7 @@ func Load(dbPath string) (*Index, error) {
 			content_hash TEXT
 		);
 		CREATE INDEX IF NOT EXISTS idx_entries_path ON entries(path);
+		CREATE INDEX IF NOT EXISTS idx_entries_size ON entries(size);
 	`)
 	if err != nil {
 		return nil, err

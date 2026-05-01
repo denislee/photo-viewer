@@ -34,6 +34,8 @@ type Controller struct {
 	currentDir  string
 	mediaFilter string
 	scanCancel  context.CancelFunc
+
+	mainContent fyne.CanvasObject
 }
 
 func NewController(window fyne.Window, libraryRoot string, idx *cache.Index, store *cache.ThumbStore, cacheDir string) *Controller {
@@ -84,8 +86,13 @@ func (c *Controller) Build() fyne.CanvasObject {
 	right := container.NewBorder(c.toolbar.Widget(), nil, nil, nil, c.grid.Widget())
 	split := container.NewHSplit(c.sidebar, right)
 	split.SetOffset(0.22)
+	c.mainContent = split
 	fyne.Do(func() {
-		c.window.Canvas().Focus(c.sidebar)
+		if c.grid != nil && c.grid.grid != nil {
+			c.window.Canvas().Focus(c.grid.grid)
+		} else {
+			c.window.Canvas().Focus(c.sidebar)
+		}
 	})
 	return split
 }
@@ -135,7 +142,9 @@ func (c *Controller) rebuildIndex() {
 }
 
 func (c *Controller) showDuplicates() {
-	ShowDuplicates(c.window, c.index, c.store)
+	ShowDuplicates(c.window, c.index, c.store, func() {
+		c.window.SetContent(c.mainContent)
+	})
 }
 
 func (c *Controller) setFilter(f string) {

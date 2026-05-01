@@ -15,45 +15,84 @@ import (
 	"github.com/dns/photo-viewer/internal/cache"
 )
 
-// ShowDuplicates opens a window that hashes any files missing a content hash,
+// ShowDuplicates opens a view that hashes any files missing a content hash,
 // then lists groups of files with identical content. Each group offers a
 // "Delete newer (keep oldest)" action that removes every file in the group
 // except the one with the earliest mtime.
-func ShowDuplicates(parent fyne.Window, idx *cache.Index, store *cache.ThumbStore) {
-	win := fyne.CurrentApp().NewWindow("Duplicates")
-	win.Resize(fyne.NewSize(900, 700))
-
+func ShowDuplicates(win fyne.Window, idx *cache.Index, store *cache.ThumbStore, onClose func()) {
 	progress := widget.NewProgressBar()
 	statusLbl := widget.NewLabel("Hashing files…")
-	groupsBox := container.NewVBox()
-	scroll := container.NewVScroll(groupsBox)
+
+	var groups []cache.DuplicateGroup
+
+	list := widget.NewList(
+		func() int { return len(groups) },
+		func() fyne.CanvasObject {
+			return widget.NewLabel("Template Group Label Template Group Label")
+		},
+		func(id widget.ListItemID, obj fyne.CanvasObject) {
+			lbl := obj.(*widget.Label)
+			g := groups[id]
+			lbl.SetText(fmt.Sprintf("%d copies — %s", len(g.Entries), formatBytes(g.Entries[0].Size)))
+		},
+	)
+
+	detailBox := container.NewVBox(widget.NewLabel("Select a group to view details."))
+	detailScroll := container.NewVScroll(detailBox)
+
+	split := container.NewHSplit(list, detailScroll)
+	split.SetOffset(0.3)
+	split.Hide()
+
+	ctx, cancel := context.WithCancel(context.Background())
+
+	closeBtn := widget.NewButtonWithIcon("Back to Gallery", theme.NavigateBackIcon(), func() {
+		cancel()
+		if onClose != nil {
+			onClose()
+		}
+	})
+
+	topBox := container.NewVBox(
+		container.NewHBox(closeBtn),
+		statusLbl,
+		progress,
+	)
 
 	body := container.NewBorder(
-		container.NewVBox(statusLbl, progress),
+		topBox,
 		nil, nil, nil,
-		scroll,
+		split,
 	)
 	win.SetContent(body)
 
-	ctx, cancel := context.WithCancel(context.Background())
-	win.SetOnClosed(cancel)
-
 	var render func()
+
+	renderDetail := func(id widget.ListItemID) {
+		detailBox.Objects = nil
+		if id < 0 || int(id) >= len(groups) {
+			detailBox.Add(widget.NewLabel("Select a group to view details."))
+			detailBox.Refresh()
+			return
+		}
+		g := groups[id]
+		card := buildGroupCard(win, idx, store, g, func() {
+			render()
+		})
+		detailBox.Add(card)
+		detailBox.Refresh()
+	}
+
+	list.OnSelected = func(id widget.ListItemID) {
+		renderDetail(id)
+	}
+
 	render = func() {
-		groupsBox.Objects = nil
-		groups := idx.FindDuplicates()
+		groups = idx.FindDuplicates()
 		statusLbl.SetText(fmt.Sprintf("%d duplicate group(s)", len(groups)))
-		if len(groups) == 0 {
-			groupsBox.Add(widget.NewLabel("No duplicates found."))
-		}
-		for i := range groups {
-			g := groups[i]
-			card := buildGroupCard(win, idx, store, g, func() {
-				render()
-			})
-			groupsBox.Add(card)
-		}
-		groupsBox.Refresh()
+		list.Refresh()
+		list.UnselectAll()
+		renderDetail(-1)
 	}
 
 	go func() {
@@ -73,11 +112,10 @@ func ShowDuplicates(parent fyne.Window, idx *cache.Index, store *cache.ThumbStor
 		}
 		fyne.Do(func() {
 			progress.Hide()
+			split.Show()
 			render()
 		})
 	}()
-
-	win.Show()
 }
 
 func buildGroupCard(win fyne.Window, idx *cache.Index, store *cache.ThumbStore, group cache.DuplicateGroup, onChange func()) fyne.CanvasObject {
