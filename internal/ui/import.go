@@ -17,6 +17,8 @@ import (
 	"fyne.io/fyne/v2/widget"
 
 	"github.com/rwcarlsen/goexif/exif"
+
+	"github.com/dns/photo-viewer/internal/scan"
 )
 
 func copyFile(src, dst string) error {
@@ -46,17 +48,19 @@ func (c *Controller) runImport() {
 		return
 	}
 
-	entries, err := os.ReadDir(inboxDir)
+	fileCount := 0
+	err := filepath.WalkDir(inboxDir, func(path string, dEntry fs.DirEntry, walkErr error) error {
+		if walkErr != nil || dEntry.IsDir() {
+			return nil
+		}
+		if scan.DetectType(path) != scan.TypeUnknown {
+			fileCount++
+		}
+		return nil
+	})
 	if err != nil {
 		dialog.ShowError(err, c.window)
 		return
-	}
-
-	fileCount := 0
-	for _, e := range entries {
-		if !e.IsDir() {
-			fileCount++
-		}
 	}
 
 	logText := ""
@@ -100,14 +104,13 @@ func (c *Controller) runImport() {
 	var startBtn *widget.Button
 	var importZipBtn *widget.Button
 
-	runImportLogic := func(entriesToProcess []os.DirEntry, onComplete func()) {
+	runImportLogic := func(entriesToProcess []string, onComplete func()) {
 		appendLog(fmt.Sprintf("Starting import from %s to %s", inboxDir, outboxDir))
 
 		baseDates := make(map[string]time.Time)
 
 		// First pass: find the oldest date for each base name
-		for _, e := range entriesToProcess {
-			srcPath := filepath.Join(inboxDir, e.Name())
+		for _, srcPath := range entriesToProcess {
 			var mediaDate time.Time
 
 			file, err := os.Open(srcPath)
@@ -124,7 +127,7 @@ func (c *Controller) runImport() {
 
 			// Fallback to file mod time
 			if mediaDate.IsZero() {
-				info, err := e.Info()
+				info, err := os.Stat(srcPath)
 				if err == nil {
 					mediaDate = info.ModTime()
 				} else {
@@ -132,7 +135,8 @@ func (c *Controller) runImport() {
 				}
 			}
 
-			base := strings.TrimSuffix(e.Name(), filepath.Ext(e.Name()))
+			baseName := filepath.Base(srcPath)
+			base := strings.TrimSuffix(baseName, filepath.Ext(baseName))
 			if existingDate, ok := baseDates[base]; !ok || mediaDate.Before(existingDate) {
 				baseDates[base] = mediaDate
 			}
@@ -140,9 +144,9 @@ func (c *Controller) runImport() {
 
 		processed := 0
 		// Second pass: move files to the folder of their base name's oldest date
-		for _, e := range entriesToProcess {
-			srcPath := filepath.Join(inboxDir, e.Name())
-			base := strings.TrimSuffix(e.Name(), filepath.Ext(e.Name()))
+		for _, srcPath := range entriesToProcess {
+			baseName := filepath.Base(srcPath)
+			base := strings.TrimSuffix(baseName, filepath.Ext(baseName))
 			mediaDate := baseDates[base]
 
 			dateFolder := mediaDate.Format("2006-01-02")
@@ -152,19 +156,19 @@ func (c *Controller) runImport() {
 				continue
 			}
 
-			destPath := filepath.Join(destDirPath, e.Name())
+			destPath := filepath.Join(destDirPath, baseName)
 
 			// Handle duplicate names if necessary
 			if _, err := os.Stat(destPath); err == nil {
-				ext := filepath.Ext(e.Name())
+				ext := filepath.Ext(baseName)
 				destPath = filepath.Join(destDirPath, fmt.Sprintf("%s_%d%s", base, time.Now().UnixNano(), ext))
 			}
 
 			err := os.Rename(srcPath, destPath)
 			if err != nil {
-				appendLog(fmt.Sprintf("[ERROR] Could not move %s: %v", e.Name(), err))
+				appendLog(fmt.Sprintf("[ERROR] Could not move %s: %v", baseName, err))
 			} else {
-				appendLog(fmt.Sprintf("[OK] Moved %s -> %s", e.Name(), filepath.Join(dateFolder, filepath.Base(destPath))))
+				appendLog(fmt.Sprintf("[OK] Moved %s -> %s", baseName, filepath.Join(dateFolder, filepath.Base(destPath))))
 			}
 
 			processed++
@@ -228,6 +232,9 @@ func (c *Controller) runImport() {
 					if f.FileInfo().IsDir() {
 						continue
 					}
+					if scan.DetectType(f.Name) == scan.TypeUnknown {
+						continue
+					}
 					rc, err := f.Open()
 					if err != nil {
 						appendLog("[ERROR] Failed to open file in ZIP: " + err.Error())
@@ -258,7 +265,7 @@ func (c *Controller) runImport() {
 					}
 				}
 				r.Close()
-				appendLog(fmt.Sprintf("Extracted %d files from %s to Inbox.", extractedCount, filepath.Base(zipPath)))
+				appendLog(fmt.Sprintf("Extracted %d media files from %s to Inbox.", extractedCount, filepath.Base(zipPath)))
 			}
 
 			for _, srcDir := range importDirs {
@@ -266,6 +273,9 @@ func (c *Controller) runImport() {
 				copiedCount := 0
 				walkErr := filepath.WalkDir(srcDir, func(path string, dEntry fs.DirEntry, err error) error {
 					if err != nil || dEntry.IsDir() {
+						return nil
+					}
+					if scan.DetectType(path) == scan.TypeUnknown {
 						return nil
 					}
 					base := filepath.Base(path)
@@ -285,25 +295,28 @@ func (c *Controller) runImport() {
 				if walkErr != nil {
 					appendLog("[ERROR] Walking " + srcDir + ": " + walkErr.Error())
 				}
-				appendLog(fmt.Sprintf("Copied %d files from %s to Inbox.", copiedCount, srcDir))
+				appendLog(fmt.Sprintf("Copied %d media files from %s to Inbox.", copiedCount, srcDir))
 			}
 
 			// Now read the inbox to process files
-			entries, err := os.ReadDir(inboxDir)
-			if err != nil {
-				appendLog("[ERROR] Failed to read inbox: " + err.Error())
+			var validEntries []string
+			walkErr := filepath.WalkDir(inboxDir, func(path string, dEntry fs.DirEntry, err error) error {
+				if err != nil || dEntry.IsDir() {
+					return nil
+				}
+				if scan.DetectType(path) != scan.TypeUnknown {
+					validEntries = append(validEntries, path)
+				}
+				return nil
+			})
+			if walkErr != nil {
+				appendLog("[ERROR] Failed to read inbox: " + walkErr.Error())
 				fyne.Do(func() { statusLabel.SetText("Import failed.") })
 				return
 			}
-			var validEntries []os.DirEntry
-			for _, e := range entries {
-				if !e.IsDir() {
-					validEntries = append(validEntries, e)
-				}
-			}
 
 			if len(validEntries) == 0 {
-				appendLog("No files found to import.")
+				appendLog("No media files found to import.")
 				fyne.Do(func() {
 					statusLabel.SetText("Finished. Nothing to import.")
 					copyBtn.Enable()
