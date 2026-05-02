@@ -180,9 +180,15 @@ func (c *Controller) runImportFromDirs(initialDirs []string) {
 		logEntry.Refresh()
 	}
 
+	deleteSourceCheck := widget.NewCheck("Delete source files after import", nil)
+	deleteSourceCheck.SetChecked(prefs.BoolWithFallback("ImportDeleteSource", false))
+	deleteSourceCheck.OnChanged = func(v bool) {
+		prefs.SetBool("ImportDeleteSource", v)
+	}
+
 	statusLabel := widget.NewLabelWithStyle(fmt.Sprintf("Ready to import %d files.", fileCount), fyne.TextAlignCenter, fyne.TextStyle{Bold: true})
 	if fileCount == 0 {
-		statusLabel.SetText("Ready. Inbox is empty. Select a ZIP file.")
+		statusLabel.SetText("Ready. Inbox is empty. Add a source.")
 	}
 	progressBar := widget.NewProgressBar()
 	progressBar.Max = float64(fileCount)
@@ -214,8 +220,7 @@ func (c *Controller) runImportFromDirs(initialDirs []string) {
 
 	var (
 		startBtn     *widget.Button
-		importZipBtn *widget.Button
-		importDirBtn *widget.Button
+		addSourceBtn *widget.Button
 		cancelBtn    *widget.Button
 	)
 
@@ -343,19 +348,20 @@ func (c *Controller) runImportFromDirs(initialDirs []string) {
 
 	startBtn = widget.NewButton("Start Import", func() {
 		startBtn.Disable()
-		if importZipBtn != nil {
-			importZipBtn.Disable()
+		if addSourceBtn != nil {
+			addSourceBtn.Disable()
 		}
-		if importDirBtn != nil {
-			importDirBtn.Disable()
-		}
+		deleteSourceCheck.Disable()
 		cancelBtn.Enable()
 		statusLabel.SetText("Processing...")
+		deleteSource := deleteSourceCheck.Checked
 
 		ctxMu.Lock()
 		importCtx, cancelImport = context.WithCancel(context.Background())
 		ctx := importCtx
 		ctxMu.Unlock()
+
+		c.pauseScans()
 
 		tickerStop := make(chan struct{})
 		go func() {
@@ -383,26 +389,24 @@ func (c *Controller) runImportFromDirs(initialDirs []string) {
 					progressBar.Max = float64(progressMax.Load())
 					progressBar.SetValue(float64(progressVal.Load()))
 				})
+				c.resumeScans()
 			}()
 
 			appendLog(fmt.Sprintf("Starting import to %s", outboxDir))
 
-			// Phase 1: extract ZIPs into the inbox.
-			for _, zipPath := range zipFiles {
-				if ctx.Err() != nil {
-					break
-				}
-				appendLog("Extracting " + zipPath + " ...")
+			// extractZipToInbox extracts media files from zipPath into the
+			// inbox and returns their absolute paths.
+			extractZipToInbox := func(zipPath string) []string {
 				r, err := zip.OpenReader(zipPath)
 				if err != nil {
 					appendLog("[ERROR] Failed to open ZIP: " + err.Error())
-					continue
+					return nil
 				}
-
-				extractedCount := 0
+				defer r.Close()
+				var extracted []string
 				for _, f := range r.File {
 					if ctx.Err() != nil {
-						break
+						return extracted
 					}
 					if f.FileInfo().IsDir() {
 						continue
@@ -415,9 +419,7 @@ func (c *Controller) runImportFromDirs(initialDirs []string) {
 						appendLog("[ERROR] Failed to open file in ZIP: " + err.Error())
 						continue
 					}
-
 					destPath := uniqueInboxPath(inboxDir, filepath.Base(f.Name))
-
 					outFile, err := os.Create(destPath)
 					if err != nil {
 						appendLog("[ERROR] Failed to create file: " + err.Error())
@@ -429,12 +431,22 @@ func (c *Controller) runImportFromDirs(initialDirs []string) {
 					rc.Close()
 					if err != nil {
 						appendLog("[ERROR] Failed to extract file: " + err.Error())
-					} else {
-						extractedCount++
+						os.Remove(destPath)
+						continue
 					}
+					extracted = append(extracted, destPath)
 				}
-				r.Close()
-				appendLog(fmt.Sprintf("Extracted %d media files from %s to Inbox.", extractedCount, filepath.Base(zipPath)))
+				return extracted
+			}
+
+			// Phase 1: extract ZIPs into the inbox.
+			for _, zipPath := range zipFiles {
+				if ctx.Err() != nil {
+					break
+				}
+				appendLog("Extracting " + zipPath + " ...")
+				extracted := extractZipToInbox(zipPath)
+				appendLog(fmt.Sprintf("Extracted %d media files from %s to Inbox.", len(extracted), filepath.Base(zipPath)))
 			}
 
 			processedAny := false
@@ -469,6 +481,9 @@ func (c *Controller) runImportFromDirs(initialDirs []string) {
 
 			// Phase 3: for each chosen directory, copy and process one
 			// subdirectory at a time so the inbox never holds the whole tree.
+			// ZIP files found inside the directory are treated as if they were
+			// subdirectories — extracted into the inbox and processed as their
+			// own batch.
 			for _, srcDir := range importDirs {
 				if ctx.Err() != nil {
 					break
@@ -476,8 +491,13 @@ func (c *Controller) runImportFromDirs(initialDirs []string) {
 				appendLog("Scanning " + srcDir + " ...")
 				subdirFiles := map[string][]string{}
 				var subdirOrder []string
+				var zipsInDir []string
 				walkErr := filepath.WalkDir(srcDir, func(path string, dEntry fs.DirEntry, err error) error {
 					if err != nil || dEntry.IsDir() {
+						return nil
+					}
+					if strings.EqualFold(filepath.Ext(path), ".zip") {
+						zipsInDir = append(zipsInDir, path)
 						return nil
 					}
 					if scan.DetectType(path) == scan.TypeUnknown {
@@ -492,6 +512,31 @@ func (c *Controller) runImportFromDirs(initialDirs []string) {
 				})
 				if walkErr != nil {
 					appendLog("[ERROR] Walking " + srcDir + ": " + walkErr.Error())
+				}
+
+				for _, zipPath := range zipsInDir {
+					if ctx.Err() != nil {
+						break
+					}
+					appendLog("Extracting " + zipPath + " ...")
+					extracted := extractZipToInbox(zipPath)
+					if len(extracted) == 0 {
+						continue
+					}
+					progressMax.Store(int64(len(extracted)))
+					progressVal.Store(0)
+					n := len(extracted)
+					zp := zipPath
+					fyne.Do(func() {
+						statusLabel.SetText(fmt.Sprintf("Importing %d files from %s...", n, filepath.Base(zp)))
+					})
+					processBatch(extracted)
+					processedAny = true
+					if deleteSource {
+						if err := os.Remove(zipPath); err != nil {
+							appendLog("[ERROR] Failed to delete source ZIP " + zipPath + ": " + err.Error())
+						}
+					}
 				}
 
 				for _, subdir := range subdirOrder {
@@ -511,6 +556,11 @@ func (c *Controller) runImportFromDirs(initialDirs []string) {
 							continue
 						}
 						batch = append(batch, destPath)
+						if deleteSource {
+							if err := os.Remove(src); err != nil {
+								appendLog("[ERROR] Failed to delete source " + src + ": " + err.Error())
+							}
+						}
 					}
 					if len(batch) == 0 {
 						continue
@@ -597,20 +647,18 @@ func (c *Controller) runImportFromDirs(initialDirs []string) {
 	})
 	cancelBtn.Disable()
 
-	importZipBtn = widget.NewButton("Add ZIP", func() {
+	addZip := func() {
 		fd := dialog.NewFileOpen(func(uc fyne.URIReadCloser, err error) {
 			if err != nil || uc == nil {
 				return
 			}
 			zipPath := uc.URI().Path()
 			uc.Close()
-
 			for _, z := range zipFiles {
 				if z == zipPath {
 					return
 				}
 			}
-
 			zipFiles = append(zipFiles, zipPath)
 			fyne.Do(func() {
 				updateReadyStatus()
@@ -619,9 +667,9 @@ func (c *Controller) runImportFromDirs(initialDirs []string) {
 		}, c.window)
 		fd.SetFilter(storage.NewExtensionFileFilter([]string{".zip"}))
 		fd.Show()
-	})
+	}
 
-	importDirBtn = widget.NewButton("Add Directory", func() {
+	addFolder := func() {
 		dialog.ShowFolderOpen(func(list fyne.ListableURI, err error) {
 			if err != nil || list == nil {
 				return
@@ -638,11 +686,23 @@ func (c *Controller) runImportFromDirs(initialDirs []string) {
 				startBtn.Enable()
 			})
 		}, c.window)
+	}
+
+	addSourceBtn = widget.NewButton("Add Source...", func() {
+		menu := fyne.NewMenu("",
+			fyne.NewMenuItem("Folder...", addFolder),
+			fyne.NewMenuItem("ZIP File...", addZip),
+		)
+		canvas := fyne.CurrentApp().Driver().CanvasForObject(addSourceBtn)
+		pos := fyne.CurrentApp().Driver().AbsolutePositionForObject(addSourceBtn)
+		pos.Y += addSourceBtn.Size().Height
+		widget.ShowPopUpMenuAtPosition(menu, canvas, pos)
 	})
 
-	buttons := container.NewHBox(importAgainBtn, startBtn, cancelBtn, importZipBtn, importDirBtn, copyBtn)
+	buttons := container.NewHBox(importAgainBtn, startBtn, cancelBtn, addSourceBtn, copyBtn)
+	bottom := container.NewVBox(deleteSourceCheck, buttons)
 	topContent := container.NewVBox(statusLabel, progressBar)
-	content := container.NewBorder(topContent, buttons, nil, nil, logEntry)
+	content := container.NewBorder(topContent, bottom, nil, nil, logEntry)
 
 	d = dialog.NewCustom("Import Process", "Close", content, c.window)
 	d.Resize(fyne.NewSize(650, 500))

@@ -1,0 +1,311 @@
+package cache
+
+import (
+	"database/sql"
+	"encoding/binary"
+	"math"
+	"time"
+)
+
+// Face is one face detection stored in the index.
+type Face struct {
+	ID         int64
+	Path       string
+	ThumbMtime int64
+	BBox       [4]int // x, y, w, h in thumbnail pixel space
+	Embedding  []float32
+	ClusterID  sql.NullInt64
+}
+
+// Cluster is a group of faces that share an identity.
+type Cluster struct {
+	ID           int64
+	Label        sql.NullString
+	Centroid     []float32
+	SampleFaceID sql.NullInt64
+	Count        int
+}
+
+// EncodeEmbedding packs a float32 vector into a little-endian BLOB. 128 floats
+// produce 512 bytes; we don't validate the length so callers can experiment
+// with different embedding sizes.
+func EncodeEmbedding(v []float32) []byte {
+	buf := make([]byte, 4*len(v))
+	for i, f := range v {
+		binary.LittleEndian.PutUint32(buf[i*4:], math.Float32bits(f))
+	}
+	return buf
+}
+
+// DecodeEmbedding reverses EncodeEmbedding. Returns nil if the byte length is
+// not a multiple of 4.
+func DecodeEmbedding(b []byte) []float32 {
+	if len(b)%4 != 0 {
+		return nil
+	}
+	out := make([]float32, len(b)/4)
+	for i := range out {
+		out[i] = math.Float32frombits(binary.LittleEndian.Uint32(b[i*4:]))
+	}
+	return out
+}
+
+// HasFreshFaces reports whether the index already holds face rows for path
+// matching the given thumb mtime. Callers use this to skip re-detection when
+// the thumbnail hasn't changed.
+func (i *Index) HasFreshFaces(path string, thumbMtime int64) bool {
+	i.mu.Lock()
+	defer i.mu.Unlock()
+	var n int
+	err := i.db.QueryRow(
+		"SELECT COUNT(*) FROM faces WHERE path = ? AND thumb_mtime = ?",
+		path, thumbMtime,
+	).Scan(&n)
+	return err == nil && n > 0
+}
+
+// FaceOp is one face write decided by the caller. Exactly one of
+// ExistingClusterID or NewClusterCentroid is meaningful per op:
+//   - ExistingClusterID > 0 → assign the face to that cluster and replace its
+//     centroid with UpdatedCentroid.
+//   - ExistingClusterID == 0 → create a new cluster seeded by
+//     NewClusterCentroid, with sample_face_id pointing at the new face.
+type FaceOp struct {
+	Face               Face
+	ExistingClusterID  int64
+	UpdatedCentroid    []float32
+	NewClusterCentroid []float32
+}
+
+// FaceOpResult parallels the input slice from WriteFacesForPath.
+type FaceOpResult struct {
+	FaceID    int64
+	ClusterID int64
+}
+
+// WriteFacesForPath wipes existing face rows for path and writes the given
+// ops in a single transaction (1 fsync per image instead of ~3 per face).
+// Callers (the face pipeline) are expected to have already chosen
+// existing-cluster vs. new-cluster against an in-memory cache.
+func (i *Index) WriteFacesForPath(path string, ops []FaceOp) ([]FaceOpResult, error) {
+	i.mu.Lock()
+	defer i.mu.Unlock()
+	tx, err := i.db.Begin()
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+
+	if _, err := tx.Exec("DELETE FROM faces WHERE path = ?", path); err != nil {
+		return nil, err
+	}
+
+	results := make([]FaceOpResult, len(ops))
+	for k, op := range ops {
+		f := op.Face
+		res, err := tx.Exec(
+			`INSERT INTO faces (path, thumb_mtime, bbox_x, bbox_y, bbox_w, bbox_h, embedding) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+			f.Path, f.ThumbMtime, f.BBox[0], f.BBox[1], f.BBox[2], f.BBox[3], EncodeEmbedding(f.Embedding),
+		)
+		if err != nil {
+			return nil, err
+		}
+		faceID, err := res.LastInsertId()
+		if err != nil {
+			return nil, err
+		}
+		results[k].FaceID = faceID
+
+		clusterID := op.ExistingClusterID
+		if clusterID > 0 {
+			if _, err := tx.Exec("UPDATE face_clusters SET centroid = ? WHERE id = ?",
+				EncodeEmbedding(op.UpdatedCentroid), clusterID); err != nil {
+				return nil, err
+			}
+		} else {
+			cres, err := tx.Exec(
+				"INSERT INTO face_clusters (centroid, sample_face_id) VALUES (?, ?)",
+				EncodeEmbedding(op.NewClusterCentroid), faceID,
+			)
+			if err != nil {
+				return nil, err
+			}
+			clusterID, err = cres.LastInsertId()
+			if err != nil {
+				return nil, err
+			}
+		}
+		if _, err := tx.Exec("UPDATE faces SET cluster_id = ? WHERE id = ?", clusterID, faceID); err != nil {
+			return nil, err
+		}
+		results[k].ClusterID = clusterID
+	}
+
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+	return results, nil
+}
+
+// AllClusters returns every cluster with its current face count.
+func (i *Index) AllClusters() []Cluster {
+	i.mu.Lock()
+	defer i.mu.Unlock()
+	rows, err := i.db.Query(`
+		SELECT c.id, c.label, c.centroid, c.sample_face_id,
+			(SELECT COUNT(*) FROM faces f WHERE f.cluster_id = c.id)
+		FROM face_clusters c
+		ORDER BY 5 DESC, c.id ASC`)
+	if err != nil {
+		return nil
+	}
+	defer rows.Close()
+	var out []Cluster
+	for rows.Next() {
+		var c Cluster
+		var blob []byte
+		if err := rows.Scan(&c.ID, &c.Label, &blob, &c.SampleFaceID, &c.Count); err == nil {
+			c.Centroid = DecodeEmbedding(blob)
+			out = append(out, c)
+		}
+	}
+	return out
+}
+
+// RenameCluster updates the user-visible label for a cluster.
+func (i *Index) RenameCluster(clusterID int64, label string) error {
+	i.mu.Lock()
+	defer i.mu.Unlock()
+	_, err := i.db.Exec("UPDATE face_clusters SET label = ? WHERE id = ?", label, clusterID)
+	return err
+}
+
+// PathsInCluster returns the distinct entry paths whose faces belong to a cluster.
+func (i *Index) PathsInCluster(clusterID int64) []string {
+	i.mu.Lock()
+	defer i.mu.Unlock()
+	rows, err := i.db.Query(
+		"SELECT DISTINCT path FROM faces WHERE cluster_id = ? ORDER BY path",
+		clusterID,
+	)
+	if err != nil {
+		return nil
+	}
+	defer rows.Close()
+	var out []string
+	for rows.Next() {
+		var p string
+		if rows.Scan(&p) == nil {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
+// SampleFace returns the face row used as a cluster's preview thumbnail.
+func (i *Index) SampleFace(faceID int64) (Face, bool) {
+	i.mu.Lock()
+	defer i.mu.Unlock()
+	var f Face
+	var blob []byte
+	err := i.db.QueryRow(
+		"SELECT id, path, thumb_mtime, bbox_x, bbox_y, bbox_w, bbox_h, embedding, cluster_id FROM faces WHERE id = ?",
+		faceID,
+	).Scan(&f.ID, &f.Path, &f.ThumbMtime, &f.BBox[0], &f.BBox[1], &f.BBox[2], &f.BBox[3], &blob, &f.ClusterID)
+	if err != nil {
+		return Face{}, false
+	}
+	f.Embedding = DecodeEmbedding(blob)
+	return f, true
+}
+
+// MergeClusters reassigns every face from src into dst, recomputes dst's
+// centroid as the count-weighted mean, and deletes the now-empty src cluster
+// in a single transaction.
+func (i *Index) MergeClusters(srcID, dstID int64) error {
+	if srcID == dstID {
+		return nil
+	}
+	i.mu.Lock()
+	defer i.mu.Unlock()
+	tx, err := i.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	var srcCentroid, dstCentroid []byte
+	var srcCount, dstCount int
+	if err := tx.QueryRow(
+		"SELECT centroid, (SELECT COUNT(*) FROM faces WHERE cluster_id = ?) FROM face_clusters WHERE id = ?",
+		srcID, srcID,
+	).Scan(&srcCentroid, &srcCount); err != nil {
+		return err
+	}
+	if err := tx.QueryRow(
+		"SELECT centroid, (SELECT COUNT(*) FROM faces WHERE cluster_id = ?) FROM face_clusters WHERE id = ?",
+		dstID, dstID,
+	).Scan(&dstCentroid, &dstCount); err != nil {
+		return err
+	}
+
+	merged := mergeCentroids(DecodeEmbedding(dstCentroid), dstCount, DecodeEmbedding(srcCentroid), srcCount)
+	if _, err := tx.Exec("UPDATE faces SET cluster_id = ? WHERE cluster_id = ?", dstID, srcID); err != nil {
+		return err
+	}
+	if _, err := tx.Exec("UPDATE face_clusters SET centroid = ? WHERE id = ?", EncodeEmbedding(merged), dstID); err != nil {
+		return err
+	}
+	if _, err := tx.Exec("DELETE FROM face_clusters WHERE id = ?", srcID); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+func mergeCentroids(a []float32, na int, b []float32, nb int) []float32 {
+	if len(a) == 0 {
+		return b
+	}
+	if len(b) != len(a) {
+		return a
+	}
+	total := float32(na + nb)
+	if total == 0 {
+		return a
+	}
+	out := make([]float32, len(a))
+	for i := range a {
+		out[i] = (a[i]*float32(na) + b[i]*float32(nb)) / total
+	}
+	return out
+}
+
+// GetEntry returns the index row for path, or (Entry{}, false) if unknown.
+func (i *Index) GetEntry(path string) (Entry, bool) {
+	i.mu.Lock()
+	defer i.mu.Unlock()
+	var e Entry
+	var mtimeUnix int64
+	var fav int
+	err := i.db.QueryRow(
+		"SELECT path, type, size, mtime, thumb_id, favorite FROM entries WHERE path = ?",
+		path,
+	).Scan(&e.Path, &e.Type, &e.Size, &mtimeUnix, &e.ThumbID, &fav)
+	if err != nil {
+		return Entry{}, false
+	}
+	e.ModTime = time.Unix(mtimeUnix, 0)
+	e.Favorite = fav != 0
+	return e, true
+}
+
+// WipeFaces drops every face row and cluster. Used by the rebuild path.
+func (i *Index) WipeFaces() error {
+	i.mu.Lock()
+	defer i.mu.Unlock()
+	if _, err := i.db.Exec("DELETE FROM faces"); err != nil {
+		return err
+	}
+	_, err := i.db.Exec("DELETE FROM face_clusters")
+	return err
+}

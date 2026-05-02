@@ -83,6 +83,8 @@ func (c *customGridWrap) TypedKey(e *fyne.KeyEvent) {
 		c.g.MoveSelection(-c.g.ColumnCount())
 	} else if e.Name == fyne.KeyDown {
 		c.g.MoveSelection(c.g.ColumnCount())
+	} else if e.Name == fyne.KeyDelete || e.Name == fyne.KeyBackspace {
+		c.g.DeleteSelected()
 	} else {
 		c.GridWrap.TypedKey(e)
 	}
@@ -106,6 +108,10 @@ func (c *customGridWrap) TypedRune(r rune) {
 		c.g.MoveSelection(1)
 	case ' ':
 		c.g.OpenSelected()
+	case 'f', 'F':
+		c.g.ToggleFavoriteSelected()
+	case 'd', 'D':
+		c.g.DeleteSelected()
 	case 'q':
 		fyne.CurrentApp().Quit()
 	default:
@@ -129,8 +135,10 @@ type ThumbGrid struct {
 	cellSize      float32
 	isActive      bool
 
-	onActivate func(int, []cache.Entry)
-	OnTab      func()
+	onActivate         func(int, []cache.Entry)
+	OnTab              func()
+	OnToggleFavorite   func(entry cache.Entry, index int)
+	OnDelete           func(entry cache.Entry, index int)
 }
 
 func NewThumbGrid(window fyne.Window, store *cache.ThumbStore, onActivate func(int, []cache.Entry)) *ThumbGrid {
@@ -187,6 +195,55 @@ func (g *ThumbGrid) OpenSelected() {
 	}
 }
 
+// ToggleFavoriteSelected fires the OnToggleFavorite callback for the
+// currently-selected cell. The callback is responsible for persisting state
+// and invoking UpdateEntry to refresh the cell.
+func (g *ThumbGrid) ToggleFavoriteSelected() {
+	g.mu.Lock()
+	id := g.selectedIndex
+	ok := id >= 0 && id < len(g.entries)
+	var entry cache.Entry
+	if ok {
+		entry = g.entries[id]
+	}
+	g.mu.Unlock()
+	if ok && g.OnToggleFavorite != nil {
+		g.OnToggleFavorite(entry, id)
+	}
+}
+
+// DeleteSelected fires the OnDelete callback for the currently-selected
+// cell. The callback is responsible for confirmation, deletion and triggering
+// a refresh.
+func (g *ThumbGrid) DeleteSelected() {
+	g.mu.Lock()
+	id := g.selectedIndex
+	ok := id >= 0 && id < len(g.entries)
+	var entry cache.Entry
+	if ok {
+		entry = g.entries[id]
+	}
+	g.mu.Unlock()
+	if ok && g.OnDelete != nil {
+		g.OnDelete(entry, id)
+	}
+}
+
+// UpdateEntry replaces the entry at the given path with e and refreshes the
+// affected cell. No-op if the path isn't currently displayed. Caller must run
+// on the Fyne main goroutine.
+func (g *ThumbGrid) UpdateEntry(e cache.Entry) {
+	g.mu.Lock()
+	idx, ok := g.pathIndex[e.Path]
+	if ok {
+		g.entries[idx] = e
+	}
+	g.mu.Unlock()
+	if ok {
+		g.grid.RefreshItem(widget.GridWrapItemID(idx))
+	}
+}
+
 func (g *ThumbGrid) MoveSelection(delta int) {
 	g.mu.Lock()
 	cur := g.selectedIndex
@@ -205,6 +262,26 @@ func (g *ThumbGrid) MoveSelection(delta int) {
 	}
 	g.grid.Select(widget.GridWrapItemID(next))
 	g.grid.ScrollTo(widget.GridWrapItemID(next))
+}
+
+// PageJump moves the selection down or up by approximately one visible page,
+// keeping one row of overlap for context.
+func (g *ThumbGrid) PageJump(forward bool) {
+	cols := g.ColumnCount()
+	if g.grid == nil {
+		return
+	}
+	h := g.grid.Size().Height
+	cellH := g.cellSize + 8 // approx cellSize + padding
+	rows := max(int(h/cellH), 1)
+	if rows > 1 {
+		rows--
+	}
+	delta := rows * cols
+	if !forward {
+		delta = -delta
+	}
+	g.MoveSelection(delta)
 }
 
 func (g *ThumbGrid) AtLeftEdge() bool {
@@ -271,12 +348,23 @@ func (g *ThumbGrid) rebuildGrid() {
 			badge := container.NewStack(pill, container.NewCenter(tri))
 			badge.Hide()
 
-			// Float the badge in the bottom-right corner using spacers.
+			// Float the play badge in the bottom-right corner using spacers.
 			corner := container.NewVBox(layout.NewSpacer(),
 				container.NewHBox(layout.NewSpacer(), badge),
 			)
 
-			stack := container.NewStack(paddedImg, container.NewPadded(corner))
+			// Favorite star, parked in the top-right corner. Hidden for
+			// non-favorited entries.
+			star := canvas.NewText("★", color.NRGBA{R: 0xff, G: 0xd7, B: 0x00, A: 0xff})
+			star.TextSize = 18
+			star.TextStyle = fyne.TextStyle{Bold: true}
+			star.Hide()
+			topRight := container.NewVBox(
+				container.NewHBox(layout.NewSpacer(), star),
+				layout.NewSpacer(),
+			)
+
+			stack := container.NewStack(paddedImg, container.NewPadded(corner), container.NewPadded(topRight))
 			return newTappableCell(stack, nil, nil)
 		},
 		func(id widget.GridWrapItemID, obj fyne.CanvasObject) {
@@ -305,18 +393,13 @@ func (g *ThumbGrid) rebuildGrid() {
 				g.OpenSelected()
 			}
 
-			// Selection-induced refreshes call UpdateItem on every visible cell.
-			// If the cell is already bound to this entry, skip the image reset
-			// so the thumbnail doesn't flash back to the placeholder.
-			if tc.boundPath == entry.Path {
-				return
-			}
-			tc.boundPath = entry.Path
-
 			paddedImg := stack.Objects[0].(*fyne.Container)
 			img := paddedImg.Objects[0].(*canvas.Image)
 			badge := findBadge(stack.Objects[1].(*fyne.Container))
+			star := findStar(stack.Objects[2].(*fyne.Container))
 
+			// Always reflect the current entry's badge state — these can
+			// change without the path changing (e.g. favorite toggle).
 			if badge != nil {
 				if entry.Type == scan.TypeVideo {
 					badge.Show()
@@ -324,6 +407,22 @@ func (g *ThumbGrid) rebuildGrid() {
 					badge.Hide()
 				}
 			}
+			if star != nil {
+				if entry.Favorite {
+					star.Show()
+				} else {
+					star.Hide()
+				}
+				star.Refresh()
+			}
+
+			// Selection-induced refreshes call UpdateItem on every visible cell.
+			// If the cell is already bound to this entry, skip the image reset
+			// so the thumbnail doesn't flash back to the placeholder.
+			if tc.boundPath == entry.Path {
+				return
+			}
+			tc.boundPath = entry.Path
 
 			img.Resource = theme.FileImageIcon()
 			img.File = ""
@@ -449,4 +548,18 @@ func findBadge(padded *fyne.Container) *fyne.Container {
 	}
 	badge, _ := hbox.Objects[1].(*fyne.Container)
 	return badge
+}
+
+// findStar walks the known cell structure to retrieve the favorite star.
+func findStar(padded *fyne.Container) *canvas.Text {
+	topRight, _ := padded.Objects[0].(*fyne.Container)
+	if topRight == nil || len(topRight.Objects) < 1 {
+		return nil
+	}
+	hbox, _ := topRight.Objects[0].(*fyne.Container)
+	if hbox == nil || len(hbox.Objects) < 2 {
+		return nil
+	}
+	star, _ := hbox.Objects[1].(*canvas.Text)
+	return star
 }

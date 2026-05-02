@@ -2,6 +2,7 @@ package thumb
 
 import (
 	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -19,10 +20,27 @@ func HEIC(src, dst string, size int) error {
 	}
 	defer os.RemoveAll(tmpDir)
 	intermediate := filepath.Join(tmpDir, "out.jpg")
-	cmd := exec.Command("heif-convert", "-q", "85", src, intermediate)
-	cmd.Stderr = os.Stderr
+	cmd := exec.Command("heif-convert", "--quiet", "-q", "85", src, intermediate)
 	if err := cmd.Run(); err != nil {
 		return err
 	}
-	return Image(intermediate, dst, size)
+	// For multi-image HEIC (Apple live photos, HDR pairs, image stacks),
+	// heif-convert writes out-1.jpg, out-2.jpg, ... and never creates the
+	// requested name. Pick whichever JPEG it actually produced.
+	jpg, err := pickHeifOutput(tmpDir, intermediate)
+	if err != nil {
+		return err
+	}
+	return Image(jpg, dst, size)
+}
+
+func pickHeifOutput(dir, preferred string) (string, error) {
+	if _, err := os.Stat(preferred); err == nil {
+		return preferred, nil
+	}
+	matches, _ := filepath.Glob(filepath.Join(dir, "*.jpg"))
+	if len(matches) == 0 {
+		return "", fmt.Errorf("heif-convert produced no jpeg output")
+	}
+	return matches[0], nil
 }

@@ -57,6 +57,8 @@ var extensions = map[string]MediaType{
 	".webm": TypeVideo,
 	".avi":  TypeVideo,
 	".m4v":  TypeVideo,
+	".mts":  TypeVideo,
+	".m2ts": TypeVideo,
 }
 
 func DetectType(path string) MediaType {

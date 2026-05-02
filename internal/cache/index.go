@@ -6,6 +6,9 @@ import (
 	"encoding/hex"
 	"os"
 	"path/filepath"
+	"sort"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -63,6 +66,32 @@ func Load(dbPath string) (*Index, error) {
 	if _, err := db.Exec("CREATE INDEX IF NOT EXISTS idx_entries_favorite ON entries(favorite)"); err != nil {
 		return nil, err
 	}
+	_, _ = db.Exec("ALTER TABLE entries ADD COLUMN quick_hash TEXT")
+
+	_, err = db.Exec(`
+		CREATE TABLE IF NOT EXISTS face_clusters (
+			id             INTEGER PRIMARY KEY AUTOINCREMENT,
+			label          TEXT,
+			centroid       BLOB NOT NULL,
+			sample_face_id INTEGER
+		);
+		CREATE TABLE IF NOT EXISTS faces (
+			id          INTEGER PRIMARY KEY AUTOINCREMENT,
+			path        TEXT NOT NULL,
+			thumb_mtime INTEGER NOT NULL,
+			bbox_x      INTEGER NOT NULL,
+			bbox_y      INTEGER NOT NULL,
+			bbox_w      INTEGER NOT NULL,
+			bbox_h      INTEGER NOT NULL,
+			embedding   BLOB NOT NULL,
+			cluster_id  INTEGER
+		);
+		CREATE INDEX IF NOT EXISTS idx_faces_path ON faces(path);
+		CREATE INDEX IF NOT EXISTS idx_faces_cluster ON faces(cluster_id);
+	`)
+	if err != nil {
+		return nil, err
+	}
 
 	return &Index{db: db}, nil
 }
@@ -88,12 +117,21 @@ func (i *Index) ReconcileBatch(results []scan.Result) []Entry {
 	}
 	defer tx.Rollback()
 
+	// On update, clear quick_hash and content_hash whenever size or mtime
+	// changed so a re-hash kicks in on the next duplicate scan. (SQLite's
+	// `entries.column` inside DO UPDATE refers to the existing row.)
 	stmt, err := tx.Prepare(`INSERT INTO entries (path, type, size, mtime, thumb_id) VALUES (?, ?, ?, ?, ?)
 		ON CONFLICT(path) DO UPDATE SET
 			type = excluded.type,
 			size = excluded.size,
 			mtime = excluded.mtime,
-			thumb_id = excluded.thumb_id`)
+			thumb_id = excluded.thumb_id,
+			quick_hash = CASE
+				WHEN entries.size != excluded.size OR entries.mtime != excluded.mtime
+				THEN NULL ELSE entries.quick_hash END,
+			content_hash = CASE
+				WHEN entries.size != excluded.size OR entries.mtime != excluded.mtime
+				THEN NULL ELSE entries.content_hash END`)
 	if err != nil {
 		return out
 	}
@@ -212,20 +250,154 @@ func (i *Index) ListDir(dir string) []Entry {
 
 // CountDir returns the number of entries under the specific directory prefix.
 func (i *Index) CountDir(dir string) int {
+	return i.CountDirFiltered(dir, "All", true)
+}
+
+// CountDirFiltered returns the number of entries under dir that match the
+// given media-type filter ("All" / "Photos" / "Videos") and showRAW toggle —
+// the same semantics as ui.passesFilter.
+func (i *Index) CountDirFiltered(dir, filter string, showRAW bool) int {
 	i.mu.Lock()
 	defer i.mu.Unlock()
 
 	lower, upper := dirRange(dir)
+	where, args := typeFilterClause(filter, showRAW)
+	q := "SELECT COUNT(*) FROM entries WHERE ((path >= ? AND path < ?) OR path = ?)" + where
+	queryArgs := append([]any{lower, upper, dir}, args...)
 
 	var count int
-	err := i.db.QueryRow(
-		"SELECT COUNT(*) FROM entries WHERE (path >= ? AND path < ?) OR path = ?",
-		lower, upper, dir,
-	).Scan(&count)
-	if err != nil {
+	if err := i.db.QueryRow(q, queryArgs...).Scan(&count); err != nil {
 		return 0
 	}
 	return count
+}
+
+// YearStat is a (year, count) pair for the year-grouped sidebar.
+type YearStat struct {
+	Year  int
+	Count int
+}
+
+// pathYear returns the year encoded in the immediate parent directory name
+// when it matches YYYY-MM-DD, else 0. The import flow names destination
+// folders by capture date, but file mtimes get bumped to the import time as
+// data flows through the inbox — so the folder name is a more reliable
+// source of "when was this taken" than mtime for imported photos.
+func pathYear(path string) int {
+	dir := filepath.Base(filepath.Dir(path))
+	if len(dir) != 10 || dir[4] != '-' || dir[7] != '-' {
+		return 0
+	}
+	y, err := strconv.Atoi(dir[:4])
+	if err != nil || y < 1900 || y > 9999 {
+		return 0
+	}
+	if _, err := strconv.Atoi(dir[5:7]); err != nil {
+		return 0
+	}
+	if _, err := strconv.Atoi(dir[8:10]); err != nil {
+		return 0
+	}
+	return y
+}
+
+// entryYear returns pathYear(path) when non-zero, else the year of mtime in UTC.
+func entryYear(path string, mtime int64) int {
+	if y := pathYear(path); y != 0 {
+		return y
+	}
+	return time.Unix(mtime, 0).UTC().Year()
+}
+
+// Years returns the distinct years (descending) present in the index, with
+// per-year counts that respect the current filter and showRAW toggle. Year
+// is derived from the YYYY-MM-DD parent folder when present, else from mtime.
+func (i *Index) Years(filter string, showRAW bool) []YearStat {
+	i.mu.Lock()
+	defer i.mu.Unlock()
+
+	where, args := typeFilterClause(filter, showRAW)
+	q := "SELECT path, mtime FROM entries WHERE 1=1" + where
+
+	rows, err := i.db.Query(q, args...)
+	if err != nil {
+		return nil
+	}
+	defer rows.Close()
+
+	counts := make(map[int]int)
+	for rows.Next() {
+		var path string
+		var mtimeUnix int64
+		if err := rows.Scan(&path, &mtimeUnix); err == nil {
+			counts[entryYear(path, mtimeUnix)]++
+		}
+	}
+
+	out := make([]YearStat, 0, len(counts))
+	for y, c := range counts {
+		out = append(out, YearStat{Year: y, Count: c})
+	}
+	sort.Slice(out, func(a, b int) bool { return out[a].Year > out[b].Year })
+	return out
+}
+
+// ListByYear returns entries whose year (per entryYear) equals year, filtered
+// by the same media-type rules as ui.passesFilter.
+func (i *Index) ListByYear(year int, filter string, showRAW bool) []Entry {
+	i.mu.Lock()
+	defer i.mu.Unlock()
+
+	where, args := typeFilterClause(filter, showRAW)
+	q := "SELECT path, type, size, mtime, thumb_id, favorite FROM entries WHERE 1=1" + where + " ORDER BY path"
+
+	rows, err := i.db.Query(q, args...)
+	if err != nil {
+		return nil
+	}
+	defer rows.Close()
+
+	var out []Entry
+	for rows.Next() {
+		var e Entry
+		var mtimeUnix int64
+		var fav int
+		if err := rows.Scan(&e.Path, &e.Type, &e.Size, &mtimeUnix, &e.ThumbID, &fav); err != nil {
+			continue
+		}
+		if entryYear(e.Path, mtimeUnix) != year {
+			continue
+		}
+		e.ModTime = time.Unix(mtimeUnix, 0)
+		e.Favorite = fav != 0
+		out = append(out, e)
+	}
+	return out
+}
+
+// typeFilterClause builds an SQL fragment ("" or " AND ...") and the
+// corresponding bound args for the media-type filter. MediaType values come
+// from internal/scan: TypeRAW=2, TypeVideo=4. The clause is mirrored to
+// ui.passesFilter so SQL- and in-memory filtering agree.
+func typeFilterClause(filter string, showRAW bool) (string, []any) {
+	var parts []string
+	var args []any
+	if !showRAW {
+		parts = append(parts, "type != ?")
+		args = append(args, int(scan.TypeRAW))
+	}
+	switch filter {
+	case "Photos":
+		parts = append(parts, "type != ?")
+		args = append(args, int(scan.TypeVideo))
+	case "Videos":
+		parts = append(parts, "type = ?")
+		args = append(args, int(scan.TypeVideo))
+	}
+	if len(parts) == 0 {
+		return "", nil
+	}
+	return " AND " + strings.Join(parts, " AND "), args
 }
 
 // All returns a snapshot of the entire index.
