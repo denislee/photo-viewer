@@ -59,12 +59,22 @@ type Viewer struct {
 	dimCache map[string]string
 	dimAsked map[string]bool
 
-	// Creation dates are fetched in the background to avoid blocking.
-	createdMu    sync.Mutex
-	createdCache map[string]string
-	createdAsked map[string]bool
+	// Media info (created, camera, lens) is fetched in the background.
+	infoMu    sync.Mutex
+	infoCache map[string]cachedInfo
+	infoAsked map[string]bool
 
 	invalidate func()
+}
+
+type cachedInfo struct {
+	Created      string
+	Camera       string
+	Lens         string
+	Aperture     string
+	ShutterSpeed string
+	ISO          string
+	FocalLength  string
 }
 
 // SetInvalidate wires a callback used to wake the Gio frame loop after the
@@ -247,6 +257,7 @@ func (v *Viewer) layoutInfoPanel(gtx layout.Context, th *Theme, e cache.Entry, r
 	bg.Pop()
 
 	dims := v.dimensionsFor(e)
+	info := v.mediaInfoFor(e)
 
 	pad := gtx.Dp(unit.Dp(12))
 	innerW := rect.Dx() - pad*2
@@ -295,9 +306,21 @@ func (v *Viewer) layoutInfoPanel(gtx layout.Context, th *Theme, e cache.Entry, r
 	addRow("Path", e.Path)
 	addRow("Type", titleCaseGio(e.Type.String()))
 	addRow("Size", formatBytesGio(e.Size))
-	addRow("Created", v.creationDateFor(e))
+	addRow("Created", info.Created)
 	addRow("Modified", e.ModTime.Local().Format("2006-01-02 15:04:05"))
 	addRow("Dimensions", dims)
+	addRow("Camera", info.Camera)
+	addRow("Lens", info.Lens)
+
+	if info.Aperture != "—" || info.ShutterSpeed != "—" || info.ISO != "—" || info.FocalLength != "—" {
+		config := fmt.Sprintf("%s  %s  ISO %s  %s",
+			fallback(info.Aperture, "—"),
+			fallback(info.ShutterSpeed, "—"),
+			fallback(info.ISO, "—"),
+			fallback(info.FocalLength, "—"))
+		addRow("Settings", config)
+	}
+
 	if e.Favorite {
 		addRow("Favorite", "Yes")
 	} else {
@@ -355,36 +378,62 @@ func decodeDimensions(path string) string {
 	return fmt.Sprintf("%d × %d", cfg.Width, cfg.Height)
 }
 
-// creationDateFor returns the best creation date found in the file's metadata
-// as a formatted string, or "…" while a background fetch is still running.
-func (v *Viewer) creationDateFor(e cache.Entry) string {
-	v.createdMu.Lock()
-	if v.createdCache == nil {
-		v.createdCache = map[string]string{}
-		v.createdAsked = map[string]bool{}
+// mediaInfoFor returns the extended metadata for the entry, or empty/placeholder
+// values while a background fetch is still running.
+func (v *Viewer) mediaInfoFor(e cache.Entry) cachedInfo {
+	v.infoMu.Lock()
+	if v.infoCache == nil {
+		v.infoCache = map[string]cachedInfo{}
+		v.infoAsked = map[string]bool{}
 	}
-	if cached, ok := v.createdCache[e.Path]; ok {
-		v.createdMu.Unlock()
+	if cached, ok := v.infoCache[e.Path]; ok {
+		v.infoMu.Unlock()
 		return cached
 	}
-	if v.createdAsked[e.Path] {
-		v.createdMu.Unlock()
-		return "…"
+	if v.infoAsked[e.Path] {
+		v.infoMu.Unlock()
+		return cachedInfo{Created: "…", Camera: "…", Lens: "…", Aperture: "…", ShutterSpeed: "…", ISO: "…", FocalLength: "…"}
 	}
-	v.createdAsked[e.Path] = true
-	v.createdMu.Unlock()
+	v.infoAsked[e.Path] = true
+	v.infoMu.Unlock()
 
 	go func(path string) {
-		date := scan.GetMediaDate(path)
-		formatted := date.Local().Format("2006-01-02 15:04:05")
-		v.createdMu.Lock()
-		v.createdCache[path] = formatted
-		v.createdMu.Unlock()
+		info := scan.GetMediaInfo(path)
+		c := cachedInfo{
+			Created:      info.Created.Local().Format("2006-01-02 15:04:05"),
+			Camera:       info.Camera,
+			Lens:         info.Lens,
+			Aperture:     info.Aperture,
+			ShutterSpeed: info.ShutterSpeed,
+			ISO:          info.ISO,
+			FocalLength:  info.FocalLength,
+		}
+		if c.Camera == "" {
+			c.Camera = "—"
+		}
+		if c.Lens == "" {
+			c.Lens = "—"
+		}
+		if c.Aperture == "" {
+			c.Aperture = "—"
+		}
+		if c.ShutterSpeed == "" {
+			c.ShutterSpeed = "—"
+		}
+		if c.ISO == "" {
+			c.ISO = "—"
+		}
+		if c.FocalLength == "" {
+			c.FocalLength = "—"
+		}
+		v.infoMu.Lock()
+		v.infoCache[path] = c
+		v.infoMu.Unlock()
 		if v.invalidate != nil {
 			v.invalidate()
 		}
 	}(e.Path)
-	return "…"
+	return cachedInfo{Created: "…", Camera: "…", Lens: "…", Aperture: "…", ShutterSpeed: "…", ISO: "…", FocalLength: "…"}
 }
 
 // opOffset is a thin wrapper around op.Offset so defer Pop() reads cleanly
