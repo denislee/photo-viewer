@@ -4,7 +4,9 @@ import (
 	"context"
 	"io/fs"
 	"path/filepath"
+	"runtime"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -21,9 +23,45 @@ type Result struct {
 // (.photo-viewer-cache) is never picked up.
 // The channel is closed when the walk finishes or ctx is cancelled.
 func Walk(ctx context.Context, root string) <-chan Result {
-	out := make(chan Result, 64)
+	out := make(chan Result, 1024)
+
+	type work struct {
+		path string
+		t    MediaType
+		d    fs.DirEntry
+	}
+	jobs := make(chan work, 1024)
+	var wg sync.WaitGroup
+
+	numWorkers := runtime.NumCPU() * 2
+	if numWorkers < 16 {
+		numWorkers = 16
+	}
+
+	for i := 0; i < numWorkers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for w := range jobs {
+				info, err := w.d.Info()
+				if err == nil {
+					r := Result{
+						Path:    w.path,
+						Type:    w.t,
+						Size:    info.Size(),
+						ModTime: info.ModTime(),
+					}
+					select {
+					case out <- r:
+					case <-ctx.Done():
+						return
+					}
+				}
+			}
+		}()
+	}
+
 	go func() {
-		defer close(out)
 		_ = filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
 			if err != nil {
 				return nil
@@ -42,23 +80,17 @@ func Walk(ctx context.Context, root string) <-chan Result {
 			if t == TypeUnknown {
 				return nil
 			}
-			info, err := d.Info()
-			if err != nil {
-				return nil
-			}
-			r := Result{
-				Path:    path,
-				Type:    t,
-				Size:    info.Size(),
-				ModTime: info.ModTime(),
-			}
 			select {
-			case out <- r:
+			case jobs <- work{path: path, t: t, d: d}:
 			case <-ctx.Done():
 				return ctx.Err()
 			}
 			return nil
 		})
+		close(jobs)
+		wg.Wait()
+		close(out)
 	}()
+
 	return out
 }

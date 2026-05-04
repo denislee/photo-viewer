@@ -9,7 +9,6 @@ import (
 	"sort"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/dns/photo-viewer/internal/scan"
@@ -28,7 +27,6 @@ type Entry struct {
 
 // Index is the SQLite database representation of the media cache.
 type Index struct {
-	mu sync.Mutex
 	db *sql.DB
 }
 
@@ -42,6 +40,10 @@ func Load(dbPath string) (*Index, error) {
 	_, err = db.Exec(`
 		PRAGMA journal_mode = WAL;
 		PRAGMA synchronous = NORMAL;
+		PRAGMA mmap_size = 268435456;
+		PRAGMA cache_size = -64000;
+		PRAGMA busy_timeout = 5000;
+		PRAGMA temp_store = MEMORY;
 		CREATE TABLE IF NOT EXISTS entries (
 			path TEXT PRIMARY KEY,
 			type INTEGER,
@@ -103,8 +105,6 @@ func (i *Index) Save() error {
 
 // ReconcileBatch inserts or updates a slice of scan results in a single transaction.
 func (i *Index) ReconcileBatch(results []scan.Result) []Entry {
-	i.mu.Lock()
-	defer i.mu.Unlock()
 
 	out := make([]Entry, 0, len(results))
 	if len(results) == 0 {
@@ -156,8 +156,6 @@ func (i *Index) ReconcileBatch(results []scan.Result) []Entry {
 // Prune drops index entries whose path is not in the given set. Returns the
 // list of removed paths so callers can delete their thumbnail files.
 func (i *Index) Prune(seen map[string]struct{}) []string {
-	i.mu.Lock()
-	defer i.mu.Unlock()
 
 	tx, err := i.db.Begin()
 	if err != nil {
@@ -220,8 +218,6 @@ func dirRange(dir string) (string, string) {
 
 // ListDir returns a slice of entries under the specific directory prefix.
 func (i *Index) ListDir(dir string) []Entry {
-	i.mu.Lock()
-	defer i.mu.Unlock()
 
 	lower, upper := dirRange(dir)
 
@@ -257,8 +253,6 @@ func (i *Index) CountDir(dir string) int {
 // given media-type filter ("All" / "Photos" / "Videos") and showRAW toggle —
 // the same semantics as ui.passesFilter.
 func (i *Index) CountDirFiltered(dir, filter string, showRAW bool) int {
-	i.mu.Lock()
-	defer i.mu.Unlock()
 
 	lower, upper := dirRange(dir)
 	where, args := typeFilterClause(filter, showRAW)
@@ -313,8 +307,6 @@ func entryYear(path string, mtime int64) int {
 // per-year counts that respect the current filter and showRAW toggle. Year
 // is derived from the YYYY-MM-DD parent folder when present, else from mtime.
 func (i *Index) Years(filter string, showRAW bool) []YearStat {
-	i.mu.Lock()
-	defer i.mu.Unlock()
 
 	where, args := typeFilterClause(filter, showRAW)
 	q := "SELECT path, mtime FROM entries WHERE 1=1" + where
@@ -345,8 +337,6 @@ func (i *Index) Years(filter string, showRAW bool) []YearStat {
 // ListByYear returns entries whose year (per entryYear) equals year, filtered
 // by the same media-type rules as ui.passesFilter.
 func (i *Index) ListByYear(year int, filter string, showRAW bool) []Entry {
-	i.mu.Lock()
-	defer i.mu.Unlock()
 
 	where, args := typeFilterClause(filter, showRAW)
 	q := "SELECT path, type, size, mtime, thumb_id, favorite FROM entries WHERE 1=1" + where + " ORDER BY path"
@@ -402,8 +392,6 @@ func typeFilterClause(filter string, showRAW bool) (string, []any) {
 
 // All returns a snapshot of the entire index.
 func (i *Index) All() []Entry {
-	i.mu.Lock()
-	defer i.mu.Unlock()
 
 	rows, err := i.db.Query("SELECT path, type, size, mtime, thumb_id, favorite FROM entries ORDER BY path")
 	if err != nil {
@@ -427,8 +415,6 @@ func (i *Index) All() []Entry {
 
 // ListFavorites returns all entries flagged as favorites.
 func (i *Index) ListFavorites() []Entry {
-	i.mu.Lock()
-	defer i.mu.Unlock()
 
 	rows, err := i.db.Query("SELECT path, type, size, mtime, thumb_id, favorite FROM entries WHERE favorite = 1 ORDER BY path")
 	if err != nil {
@@ -450,10 +436,20 @@ func (i *Index) ListFavorites() []Entry {
 	return out
 }
 
+// CountFavorites returns the number of entries flagged as favorites that
+// also pass the given media-type filter and showRAW toggle.
+func (i *Index) CountFavorites(filter string, showRAW bool) int {
+	where, args := typeFilterClause(filter, showRAW)
+	q := "SELECT COUNT(*) FROM entries WHERE favorite = 1" + where
+	var count int
+	if err := i.db.QueryRow(q, args...).Scan(&count); err != nil {
+		return 0
+	}
+	return count
+}
+
 // SetFavorite toggles the favorite flag for the given path.
 func (i *Index) SetFavorite(path string, favorite bool) error {
-	i.mu.Lock()
-	defer i.mu.Unlock()
 	v := 0
 	if favorite {
 		v = 1
@@ -464,8 +460,6 @@ func (i *Index) SetFavorite(path string, favorite bool) error {
 
 // IsFavorite reports whether a path is flagged as a favorite.
 func (i *Index) IsFavorite(path string) bool {
-	i.mu.Lock()
-	defer i.mu.Unlock()
 	var v int
 	if err := i.db.QueryRow("SELECT favorite FROM entries WHERE path = ?", path).Scan(&v); err != nil {
 		return false
@@ -487,8 +481,6 @@ func ThumbIDFor(path string) string {
 
 // Close explicitly closes the database connection.
 func (i *Index) Close() error {
-	i.mu.Lock()
-	defer i.mu.Unlock()
 	if i.db != nil {
 		return i.db.Close()
 	}

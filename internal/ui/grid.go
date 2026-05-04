@@ -1,565 +1,472 @@
 package ui
 
 import (
+	"image"
 	"image/color"
-	"sort"
-	"sync"
 
-	"fyne.io/fyne/v2"
-	"fyne.io/fyne/v2/canvas"
-	"fyne.io/fyne/v2/container"
-	"fyne.io/fyne/v2/layout"
-	"fyne.io/fyne/v2/theme"
-	"fyne.io/fyne/v2/widget"
+	"gioui.org/f32"
+	"gioui.org/layout"
+	"gioui.org/op"
+	"gioui.org/op/clip"
+	"gioui.org/op/paint"
+	"gioui.org/unit"
+	"gioui.org/widget"
+	"gioui.org/widget/material"
 
 	"github.com/dns/photo-viewer/internal/cache"
 	"github.com/dns/photo-viewer/internal/scan"
 )
 
-type tappableCell struct {
-	widget.BaseWidget
-	content   fyne.CanvasObject
-	boundPath string
-	onTap     func()
-	onDouble  func()
+const (
+	defaultCellDp = 160
+	cellGapDp     = 6
+	selBorderPx   = 3
+	minCellDp     = 64
+	maxCellDp     = 384
+	zoomStepDp    = 24
+)
+
+// Grid renders the thumbnail grid in the right pane. It owns the scroll state
+// and a per-cell widget.Clickable so clicks are detected reliably alongside
+// the list's scroll gestures.
+type Grid struct {
+	list     widget.List
+	cellSize unit.Dp
+	cells    []*widget.Clickable
+	OnOpen   func(index int)
+
+	// Selection (set by Controller / window key handlers).
+	Selected     int
+	cols         int // last computed; used for hjkl movement
+	viewportRows int // last computed; used for page-up/down jumps
+
+	// pendingScroll is set whenever the selection moves; the next Layout
+	// call will scroll just enough to keep the selected row in view.
+	pendingScroll bool
+
+	// GPending tracks whether the previous keystroke was a lone 'g', so a
+	// follow-up 'g' completes the vim-style "gg" jump-to-top. Window's key
+	// handler clears it on any other key.
+	GPending bool
+
+	// Confirming is true while the delete-confirmation modal is up over the
+	// grid. ConfirmPath is the absolute path captured when the modal opened
+	// so it remains stable across refreshes that may reorder entries.
+	Confirming  bool
+	ConfirmPath string
 }
 
-func newTappableCell(c fyne.CanvasObject, onTap, onDouble func()) *tappableCell {
-	t := &tappableCell{content: c, onTap: onTap, onDouble: onDouble}
-	t.ExtendBaseWidget(t)
-	return t
-}
-func (t *tappableCell) CreateRenderer() fyne.WidgetRenderer {
-	return widget.NewSimpleRenderer(t.content)
-}
-
-func (t *tappableCell) Tapped(*fyne.PointEvent) {
-	if t.onTap != nil {
-		t.onTap()
-	}
-}
-
-func (t *tappableCell) DoubleTapped(*fyne.PointEvent) {
-	if t.onDouble != nil {
-		t.onDouble()
-	}
-}
-
-type customGridWrap struct {
-	widget.GridWrap
-	g *ThumbGrid
-}
-
-func newCustomGridWrap(g *ThumbGrid, length func() int, createItem func() fyne.CanvasObject, updateItem func(id widget.GridWrapItemID, obj fyne.CanvasObject)) *customGridWrap {
-	cg := &customGridWrap{g: g}
-	cg.Length = length
-	cg.CreateItem = createItem
-	cg.UpdateItem = updateItem
-	cg.ExtendBaseWidget(cg)
-	return cg
-}
-
-func (c *customGridWrap) AcceptsTab() bool { return true }
-
-func (c *customGridWrap) TypedKey(e *fyne.KeyEvent) {
-	if e.Name == fyne.KeyTab {
-		if c.g.OnTab != nil {
-			c.g.OnTab()
-		}
+// RequestDelete opens the delete-confirmation modal for the entry at idx.
+// No-op when the index is out of range.
+func (g *Grid) RequestDelete(entries []cache.Entry, idx int) {
+	if idx < 0 || idx >= len(entries) {
 		return
-	} else if e.Name == fyne.KeyReturn || e.Name == fyne.KeyEnter || e.Name == fyne.KeySpace {
-		c.g.OpenSelected()
-	} else if e.Name == fyne.KeyLeft {
-		if c.g.AtLeftEdge() {
-			if c.g.OnTab != nil {
-				c.g.OnTab()
-			}
-			return
-		}
-		c.g.MoveSelection(-1)
-	} else if e.Name == fyne.KeyRight {
-		c.g.MoveSelection(1)
-	} else if e.Name == fyne.KeyUp {
-		c.g.MoveSelection(-c.g.ColumnCount())
-	} else if e.Name == fyne.KeyDown {
-		c.g.MoveSelection(c.g.ColumnCount())
-	} else if e.Name == fyne.KeyDelete || e.Name == fyne.KeyBackspace {
-		c.g.DeleteSelected()
-	} else {
-		c.GridWrap.TypedKey(e)
 	}
+	g.Confirming = true
+	g.ConfirmPath = entries[idx].Path
 }
 
-func (c *customGridWrap) TypedRune(r rune) {
-	switch r {
-	case 'h':
-		if c.g.AtLeftEdge() {
-			if c.g.OnTab != nil {
-				c.g.OnTab()
-			}
-			return
-		}
-		c.g.MoveSelection(-1)
-	case 'j':
-		c.g.MoveSelection(c.g.ColumnCount())
-	case 'k':
-		c.g.MoveSelection(-c.g.ColumnCount())
-	case 'l':
-		c.g.MoveSelection(1)
-	case ' ':
-		c.g.OpenSelected()
-	case 'f', 'F':
-		c.g.ToggleFavoriteSelected()
-	case 'd', 'D':
-		c.g.DeleteSelected()
-	case 'q':
-		fyne.CurrentApp().Quit()
-	default:
-		c.GridWrap.TypedRune(r)
-	}
+// CancelDelete dismisses the confirmation modal without deleting anything.
+func (g *Grid) CancelDelete() {
+	g.Confirming = false
+	g.ConfirmPath = ""
 }
 
-// ThumbGrid renders a scrollable grid of thumbnails for a slice of cache
-// entries. Thumbnails are loaded lazily on the first time each cell is bound.
-type ThumbGrid struct {
-	container *fyne.Container
-	grid      *customGridWrap
-	store     *cache.ThumbStore
-	window    fyne.Window
-
-	mu            sync.Mutex
-	entries       []cache.Entry
-	pathIndex     map[string]int
-	loaded        map[int]bool
-	selectedIndex int
-	cellSize      float32
-	isActive      bool
-
-	onActivate         func(int, []cache.Entry)
-	OnTab              func()
-	OnToggleFavorite   func(entry cache.Entry, index int)
-	OnDelete           func(entry cache.Entry, index int)
+// ConfirmDelete invokes deleter against the captured path. The grid's
+// selection is left clamped by the next Layout pass via SelectedIndex.
+func (g *Grid) ConfirmDelete(deleter func(path string) error) {
+	path := g.ConfirmPath
+	g.Confirming = false
+	g.ConfirmPath = ""
+	if path == "" {
+		return
+	}
+	_ = deleter(path)
 }
 
-func NewThumbGrid(window fyne.Window, store *cache.ThumbStore, onActivate func(int, []cache.Entry)) *ThumbGrid {
-	size := fyne.CurrentApp().Preferences().FloatWithFallback("ThumbSize", 160)
-	g := &ThumbGrid{
-		window:     window,
-		store:      store,
-		loaded:     map[int]bool{},
-		pathIndex:  map[string]int{},
-		onActivate: onActivate,
-		cellSize:   float32(size),
-		isActive:   true,
-	}
-	g.container = container.NewStack()
-	g.rebuildGrid()
+func NewGrid() *Grid {
+	g := &Grid{cellSize: defaultCellDp}
+	g.list.Axis = layout.Vertical
 	return g
 }
 
-// SetActive controls whether the grid attempts to grab focus automatically.
-func (g *ThumbGrid) SetActive(active bool) {
-	g.mu.Lock()
-	g.isActive = active
-	g.mu.Unlock()
-}
-
-// focusGrid grabs keyboard focus so TypedRune (h/j/k/l, space) and TypedKey
-// (arrows, enter) reach the GridWrap.
-func (g *ThumbGrid) focusGrid() {
-	g.mu.Lock()
-	active := g.isActive
-	g.mu.Unlock()
-
-	if !active {
-		return
-	}
-
-	if g.window == nil || g.grid == nil {
-		return
-	}
-	g.window.Canvas().Focus(g.grid)
-}
-
-func (g *ThumbGrid) OpenSelected() {
-	g.mu.Lock()
-	id := g.selectedIndex
-	ok := id >= 0 && id < len(g.entries)
-	var entries []cache.Entry
-	if ok {
-		entries = g.entries
-	}
-	g.mu.Unlock()
-	if ok && g.onActivate != nil {
-		g.onActivate(id, entries)
-	}
-}
-
-// ToggleFavoriteSelected fires the OnToggleFavorite callback for the
-// currently-selected cell. The callback is responsible for persisting state
-// and invoking UpdateEntry to refresh the cell.
-func (g *ThumbGrid) ToggleFavoriteSelected() {
-	g.mu.Lock()
-	id := g.selectedIndex
-	ok := id >= 0 && id < len(g.entries)
-	var entry cache.Entry
-	if ok {
-		entry = g.entries[id]
-	}
-	g.mu.Unlock()
-	if ok && g.OnToggleFavorite != nil {
-		g.OnToggleFavorite(entry, id)
-	}
-}
-
-// DeleteSelected fires the OnDelete callback for the currently-selected
-// cell. The callback is responsible for confirmation, deletion and triggering
-// a refresh.
-func (g *ThumbGrid) DeleteSelected() {
-	g.mu.Lock()
-	id := g.selectedIndex
-	ok := id >= 0 && id < len(g.entries)
-	var entry cache.Entry
-	if ok {
-		entry = g.entries[id]
-	}
-	g.mu.Unlock()
-	if ok && g.OnDelete != nil {
-		g.OnDelete(entry, id)
-	}
-}
-
-// UpdateEntry replaces the entry at the given path with e and refreshes the
-// affected cell. No-op if the path isn't currently displayed. Caller must run
-// on the Fyne main goroutine.
-func (g *ThumbGrid) UpdateEntry(e cache.Entry) {
-	g.mu.Lock()
-	idx, ok := g.pathIndex[e.Path]
-	if ok {
-		g.entries[idx] = e
-	}
-	g.mu.Unlock()
-	if ok {
-		g.grid.RefreshItem(widget.GridWrapItemID(idx))
-	}
-}
-
-func (g *ThumbGrid) MoveSelection(delta int) {
-	g.mu.Lock()
-	cur := g.selectedIndex
-	max := len(g.entries) - 1
-	g.mu.Unlock()
-
-	if max < 0 {
-		return
-	}
-	next := cur + delta
-	if next < 0 {
-		next = 0
-	}
-	if next > max {
-		next = max
-	}
-	g.grid.Select(widget.GridWrapItemID(next))
-	g.grid.ScrollTo(widget.GridWrapItemID(next))
-}
-
-// PageJump moves the selection down or up by approximately one visible page,
-// keeping one row of overlap for context.
-func (g *ThumbGrid) PageJump(forward bool) {
-	cols := g.ColumnCount()
-	if g.grid == nil {
-		return
-	}
-	h := g.grid.Size().Height
-	cellH := g.cellSize + 8 // approx cellSize + padding
-	rows := max(int(h/cellH), 1)
-	if rows > 1 {
-		rows--
-	}
-	delta := rows * cols
-	if !forward {
-		delta = -delta
-	}
-	g.MoveSelection(delta)
-}
-
-func (g *ThumbGrid) AtLeftEdge() bool {
-	g.mu.Lock()
-	idx := g.selectedIndex
-	empty := len(g.entries) == 0
-	g.mu.Unlock()
-	if empty {
-		return true
-	}
-	return idx%g.ColumnCount() == 0
-}
-
-func (g *ThumbGrid) ColumnCount() int {
-	if g.grid == nil {
-		return 1
-	}
-	cols := g.grid.ColumnCount()
-	if cols < 1 {
-		return 1
-	}
-	return cols
-}
-
-func (g *ThumbGrid) HandleZoom(in bool) {
-	if in {
-		g.cellSize += 20
+func (g *Grid) ensureCells(n int) {
+	if cap(g.cells) < n {
+		g.cells = make([]*widget.Clickable, n)
 	} else {
-		g.cellSize -= 20
+		g.cells = g.cells[:n]
 	}
-	if g.cellSize < 60 {
-		g.cellSize = 60
-	}
-	if g.cellSize > 400 {
-		g.cellSize = 400
-	}
-	fyne.CurrentApp().Preferences().SetFloat("ThumbSize", float64(g.cellSize))
-	g.rebuildGrid()
-}
-
-func (g *ThumbGrid) rebuildGrid() {
-	g.grid = newCustomGridWrap(g,
-		func() int {
-			g.mu.Lock()
-			defer g.mu.Unlock()
-			return len(g.entries)
-		},
-		func() fyne.CanvasObject {
-			img := canvas.NewImageFromResource(theme.FileImageIcon())
-			img.FillMode = canvas.ImageFillContain
-			img.SetMinSize(fyne.NewSize(g.cellSize, g.cellSize))
-
-			// Wrap img in padding so the grid selection highlight is visible
-			// around the outside of the thumbnail.
-			paddedImg := container.NewPadded(img)
-
-			// Play badge: small dark pill with white triangle, parked in			// the bottom-right corner. Hidden for non-video entries.
-			pill := canvas.NewRectangle(color.NRGBA{R: 0, G: 0, B: 0, A: 0xb0})
-			pill.CornerRadius = 4
-			pill.SetMinSize(fyne.NewSize(22, 16))
-			tri := canvas.NewText("▶", color.NRGBA{R: 0xff, G: 0xff, B: 0xff, A: 0xff})
-			tri.TextSize = 9
-			tri.Alignment = fyne.TextAlignCenter
-			badge := container.NewStack(pill, container.NewCenter(tri))
-			badge.Hide()
-
-			// Float the play badge in the bottom-right corner using spacers.
-			corner := container.NewVBox(layout.NewSpacer(),
-				container.NewHBox(layout.NewSpacer(), badge),
-			)
-
-			// Favorite star, parked in the top-right corner. Hidden for
-			// non-favorited entries.
-			star := canvas.NewText("★", color.NRGBA{R: 0xff, G: 0xd7, B: 0x00, A: 0xff})
-			star.TextSize = 18
-			star.TextStyle = fyne.TextStyle{Bold: true}
-			star.Hide()
-			topRight := container.NewVBox(
-				container.NewHBox(layout.NewSpacer(), star),
-				layout.NewSpacer(),
-			)
-
-			stack := container.NewStack(paddedImg, container.NewPadded(corner), container.NewPadded(topRight))
-			return newTappableCell(stack, nil, nil)
-		},
-		func(id widget.GridWrapItemID, obj fyne.CanvasObject) {
-			g.mu.Lock()
-			if id < 0 || int(id) >= len(g.entries) {
-				g.mu.Unlock()
-				return
-			}
-			entry := g.entries[id]
-			g.mu.Unlock()
-
-			tc := obj.(*tappableCell)
-			stack := tc.content.(*fyne.Container)
-
-			tc.onTap = func() {
-				g.mu.Lock()
-				g.selectedIndex = int(id)
-				g.mu.Unlock()
-				g.grid.Select(id)
-				g.focusGrid()
-			}
-			tc.onDouble = func() {
-				g.mu.Lock()
-				g.selectedIndex = int(id)
-				g.mu.Unlock()
-				g.OpenSelected()
-			}
-
-			paddedImg := stack.Objects[0].(*fyne.Container)
-			img := paddedImg.Objects[0].(*canvas.Image)
-			badge := findBadge(stack.Objects[1].(*fyne.Container))
-			star := findStar(stack.Objects[2].(*fyne.Container))
-
-			// Always reflect the current entry's badge state — these can
-			// change without the path changing (e.g. favorite toggle).
-			if badge != nil {
-				if entry.Type == scan.TypeVideo {
-					badge.Show()
-				} else {
-					badge.Hide()
-				}
-			}
-			if star != nil {
-				if entry.Favorite {
-					star.Show()
-				} else {
-					star.Hide()
-				}
-				star.Refresh()
-			}
-
-			// Selection-induced refreshes call UpdateItem on every visible cell.
-			// If the cell is already bound to this entry, skip the image reset
-			// so the thumbnail doesn't flash back to the placeholder.
-			if tc.boundPath == entry.Path {
-				return
-			}
-			tc.boundPath = entry.Path
-
-			img.Resource = theme.FileImageIcon()
-			img.File = ""
-			img.Refresh()
-
-			go g.loadThumb(int(id), entry, tc, img)
-		},
-	)
-	g.grid.OnSelected = func(id widget.GridWrapItemID) {
-		g.mu.Lock()
-		g.selectedIndex = int(id)
-		g.mu.Unlock()
-	}
-
-	g.container.Objects = []fyne.CanvasObject{g.grid}
-	g.container.Refresh()
-}
-
-func (g *ThumbGrid) loadThumb(id int, e cache.Entry, tc *tappableCell, img *canvas.Image) {
-	path, err := g.store.Path(e)
-	if err != nil || path == "" {
-		return
-	}
-	g.mu.Lock()
-	stillSame := id < len(g.entries) && g.entries[id].Path == e.Path
-	g.mu.Unlock()
-	if !stillSame {
-		return
-	}
-	fyne.Do(func() {
-		if tc.boundPath != e.Path {
-			return
+	for i := 0; i < n; i++ {
+		if g.cells[i] == nil {
+			g.cells[i] = &widget.Clickable{}
 		}
-		img.Resource = nil
-		img.File = path
-		img.Refresh()
+	}
+}
+
+// Cols returns the most recently computed column count. Used by hjkl handlers
+// to compute up/down moves.
+func (g *Grid) Cols() int {
+	if g.cols < 1 {
+		return 1
+	}
+	return g.cols
+}
+
+// Move adjusts the selection by dx columns and dy rows, clamping to bounds.
+// Returns true if the selection moved (so the caller can invalidate).
+func (g *Grid) Move(dx, dy, total int) bool {
+	if total == 0 {
+		return false
+	}
+	cols := g.Cols()
+	old := g.Selected
+	row := old / cols
+	col := old % cols
+	col += dx
+	row += dy
+	if col < 0 {
+		col = 0
+	}
+	if row < 0 {
+		row = 0
+	}
+	idx := row*cols + col
+	if idx >= total {
+		idx = total - 1
+	}
+	if idx == old {
+		return false
+	}
+	g.Selected = idx
+	g.pendingScroll = true
+	return true
+}
+
+// Zoom adjusts cell size by one step. dir>0 zooms in (larger cells), dir<0
+// zooms out. Clamped to [minCellDp, maxCellDp].
+func (g *Grid) Zoom(dir int) bool {
+	old := g.cellSize
+	if dir > 0 {
+		g.cellSize += zoomStepDp
+	} else if dir < 0 {
+		g.cellSize -= zoomStepDp
+	}
+	if g.cellSize < minCellDp {
+		g.cellSize = minCellDp
+	}
+	if g.cellSize > maxCellDp {
+		g.cellSize = maxCellDp
+	}
+	return g.cellSize != old
+}
+
+// PageMove jumps the selection by one viewport-worth of rows. dir>0 moves
+// down, dir<0 moves up. The viewport row count is computed from the last
+// drawn list size; if unknown, falls back to 4 rows.
+func (g *Grid) PageMove(dir, total int) bool {
+	rows := g.viewportRows
+	if rows < 1 {
+		rows = 4
+	}
+	var moved bool
+	if dir > 0 {
+		moved = g.Move(0, rows, total)
+	} else {
+		moved = g.Move(0, -rows, total)
+	}
+	if moved {
+		g.list.ScrollTo(g.Selected / g.Cols())
+	}
+	return moved
+}
+
+// JumpTop moves the selection to the very first cell. Returns true if it
+// changed.
+func (g *Grid) JumpTop(total int) bool {
+	if total == 0 || g.Selected == 0 {
+		return false
+	}
+	g.Selected = 0
+	g.pendingScroll = true
+	return true
+}
+
+// JumpBottom moves the selection to the very last cell.
+func (g *Grid) JumpBottom(total int) bool {
+	if total == 0 || g.Selected == total-1 {
+		return false
+	}
+	g.Selected = total - 1
+	g.pendingScroll = true
+	return true
+}
+
+// SelectedIndex clamps and returns the current selection.
+func (g *Grid) SelectedIndex(total int) int {
+	if g.Selected < 0 {
+		g.Selected = 0
+	}
+	if g.Selected >= total && total > 0 {
+		g.Selected = total - 1
+	}
+	return g.Selected
+}
+
+// Layout draws the grid for the supplied entries.
+func (g *Grid) Layout(gtx layout.Context, th *Theme, entries []cache.Entry, ctrl *Controller) layout.Dimensions {
+	g.ensureCells(len(entries))
+
+	// Drain click events.
+	for i, c := range g.cells {
+		if c.Clicked(gtx) {
+			g.Selected = i
+			if ctrl.SelectionMode {
+				ctrl.ToggleSelection(entries[i].Path)
+			} else if g.OnOpen != nil {
+				g.OnOpen(i)
+			}
+		}
+	}
+
+	cellPx := gtx.Dp(g.cellSize)
+	gapPx := gtx.Dp(cellGapDp)
+	width := gtx.Constraints.Max.X
+	cols := (width + gapPx) / (cellPx + gapPx)
+	if cols < 1 {
+		cols = 1
+	}
+	g.cols = cols
+	rowH := cellPx + gapPx
+	if rowH > 0 {
+		g.viewportRows = gtx.Constraints.Max.Y / rowH
+	}
+	rowCount := (len(entries) + cols - 1) / cols
+	g.SelectedIndex(len(entries))
+
+	if g.pendingScroll && rowCount > 0 {
+		const margin = 1
+		selRow := g.Selected / cols
+		first := g.list.Position.First
+		count := g.list.Position.Count
+		switch {
+		case count == 0:
+			// First frame — defer until we know the viewport.
+		case selRow-margin < first:
+			target := selRow - margin
+			if target < 0 {
+				target = 0
+			}
+			g.list.ScrollTo(target)
+			g.pendingScroll = false
+		case selRow+margin >= first+count:
+			// ScrollTo aligns the row to the top; bias by the visible row
+			// count so the selection lands one row above the bottom edge.
+			target := selRow + margin - count + 1
+			if target < 0 {
+				target = 0
+			}
+			g.list.ScrollTo(target)
+			g.pendingScroll = false
+		default:
+			g.pendingScroll = false
+		}
+	}
+
+	return g.list.Layout(gtx, rowCount, func(gtx layout.Context, row int) layout.Dimensions {
+		return g.layoutRow(gtx, th, entries, ctrl, row, cols, cellPx, gapPx)
 	})
 }
 
-// SetEntries replaces the displayed entries. The caller is responsible for
-// running on the Fyne main goroutine (wrap in fyne.Do if calling from a
-// background scan).
-func (g *ThumbGrid) SetEntries(entries []cache.Entry) {
-	g.mu.Lock()
-	g.entries = entries
-	g.pathIndex = make(map[string]int, len(entries))
-	for i, e := range entries {
-		g.pathIndex[e.Path] = i
+func (g *Grid) layoutRow(gtx layout.Context, th *Theme, entries []cache.Entry, ctrl *Controller, row, cols, cellPx, gapPx int) layout.Dimensions {
+	start := row * cols
+	end := start + cols
+	if end > len(entries) {
+		end = len(entries)
 	}
-	g.selectedIndex = 0
-	g.mu.Unlock()
-	g.grid.Refresh()
-	if len(entries) > 0 {
-		g.grid.Select(0)
-		g.grid.ScrollToTop()
-		if g.window != nil && g.window.Canvas().Focused() == nil {
-			g.focusGrid()
-		}
+	rowH := cellPx + gapPx
+	for i := start; i < end; i++ {
+		col := i - start
+		x := col * (cellPx + gapPx)
+		stack := op.Offset(image.Pt(x, gapPx/2)).Push(gtx.Ops)
+		// Constrain inner gtx to the cell, so Clickable's hit area matches.
+		cellGtx := gtx
+		cellGtx.Constraints.Max = image.Pt(cellPx, cellPx)
+		cellGtx.Constraints.Min = image.Pt(cellPx, cellPx)
+		isSelected := ctrl.IsSelected(entries[i].Path)
+		drawCell(cellGtx, th, entries[i], ctrl.Thumbs(), g.cells[i], cellPx, i == g.Selected, isSelected, ctrl.SelectionMode)
+		stack.Pop()
 	}
+	return layout.Dimensions{Size: image.Pt(gtx.Constraints.Max.X, rowH)}
 }
 
-// Append adds entries to the displayed set. Same threading rules as SetEntries.
-func (g *ThumbGrid) Append(more ...cache.Entry) {
-	g.mu.Lock()
-	for _, e := range more {
-		if _, ok := g.pathIndex[e.Path]; ok {
-			continue
+func drawCell(gtx layout.Context, th *Theme, e cache.Entry, tc *thumbCache, click *widget.Clickable, sizePx int, focused, selected, selectionMode bool) layout.Dimensions {
+	return click.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
+		rect := image.Rectangle{Max: image.Pt(sizePx, sizePx)}
+		clipArea := clip.Rect(rect).Push(gtx.Ops)
+		// background
+		paint.ColorOp{Color: th.CellBG}.Add(gtx.Ops)
+		paint.PaintOp{}.Add(gtx.Ops)
+
+		opImg, imgSz, ok := tc.Get(e)
+		if ok {
+			drawFitted(gtx, opImg, imgSz, rect)
 		}
-		g.pathIndex[e.Path] = len(g.entries)
-		g.entries = append(g.entries, e)
-	}
-	g.mu.Unlock()
-	g.grid.Refresh()
+
+		if selectionMode && selected {
+			// Dim the cell if selected in multi-selection mode.
+			paint.ColorOp{Color: color.NRGBA{A: 0x60}}.Add(gtx.Ops)
+			paint.PaintOp{}.Add(gtx.Ops)
+		}
+
+		clipArea.Pop()
+
+		if e.Favorite {
+			drawFavoriteBadge(gtx, th, rect)
+		}
+		if focused {
+			drawBorder(gtx, rect, selBorderPx, th.Accent)
+		} else if selectionMode && selected {
+			drawBorder(gtx, rect, selBorderPx, th.Muted)
+		}
+		if selectionMode && selected {
+			drawSelectionBadge(gtx, th, rect)
+		}
+		if e.Type == scan.TypeVideo {
+			drawVideoBadge(gtx, th, rect)
+		}
+
+		return layout.Dimensions{Size: rect.Max}
+	})
 }
 
-// MergeEntries upserts entries by path: existing paths are updated in place,
-// new paths are inserted in sorted position. Refreshes the grid once at the
-// end. Caller must invoke on the Fyne main goroutine.
-func (g *ThumbGrid) MergeEntries(more []cache.Entry) {
-	if len(more) == 0 {
+// favoriteGold is the badge fill colour used to mark a favorite. Hard-coded
+// rather than added to the theme because it should remain readable on top of
+// arbitrary thumbnail content.
+var (
+	favoriteGold       = color.NRGBA{R: 0xff, G: 0xc8, B: 0x3d, A: 0xff}
+	favoriteShadow     = color.NRGBA{R: 0, G: 0, B: 0, A: 0xb0}
+	favoriteBadgeSize  = unit.Dp(26)
+	favoriteBadgeInset = unit.Dp(6)
+)
+
+// drawFavoriteBadge renders a gold ★ in the top-right corner of cell. The
+// glyph is centered in a dark rounded square so it stays legible over any
+// thumbnail content.
+func drawFavoriteBadge(gtx layout.Context, th *Theme, cell image.Rectangle) {
+	pad := gtx.Dp(favoriteBadgeInset)
+	size := gtx.Dp(favoriteBadgeSize)
+	x1 := cell.Max.X - pad
+	y0 := cell.Min.Y + pad
+	x0 := x1 - size
+	y1 := y0 + size
+	bg := image.Rect(x0, y0, x1, y1)
+
+	// Dark backdrop so the gold star reads on bright thumbs.
+	ca := clip.Rect(bg).Push(gtx.Ops)
+	paint.ColorOp{Color: favoriteShadow}.Add(gtx.Ops)
+	paint.PaintOp{}.Add(gtx.Ops)
+	ca.Pop()
+
+	// Star glyph, sized to roughly fill the badge.
+	stack := op.Offset(image.Pt(x0, y0)).Push(gtx.Ops)
+	gtx2 := gtx
+	gtx2.Constraints.Max = image.Pt(size, size)
+	gtx2.Constraints.Min = image.Pt(size, size)
+	layout.Center.Layout(gtx2, func(gtx layout.Context) layout.Dimensions {
+		lbl := material.Label(th.Theme, unit.Sp(20), "★")
+		lbl.Color = favoriteGold
+		return lbl.Layout(gtx)
+	})
+	stack.Pop()
+}
+
+func drawSelectionBadge(gtx layout.Context, th *Theme, cell image.Rectangle) {
+	pad := gtx.Dp(favoriteBadgeInset)
+	size := gtx.Dp(favoriteBadgeSize)
+	x0 := cell.Min.X + pad
+	y0 := cell.Min.Y + pad
+	x1 := x0 + size
+	y1 := y0 + size
+	bg := image.Rect(x0, y0, x1, y1)
+
+	ca := clip.Rect(bg).Push(gtx.Ops)
+	paint.ColorOp{Color: favoriteShadow}.Add(gtx.Ops)
+	paint.PaintOp{}.Add(gtx.Ops)
+	ca.Pop()
+
+	stack := op.Offset(image.Pt(x0, y0)).Push(gtx.Ops)
+	gtx2 := gtx
+	gtx2.Constraints.Max = image.Pt(size, size)
+	gtx2.Constraints.Min = image.Pt(size, size)
+	layout.Center.Layout(gtx2, func(gtx layout.Context) layout.Dimensions {
+		lbl := material.Label(th.Theme, unit.Sp(16), "✓")
+		lbl.Color = th.Accent
+		return lbl.Layout(gtx)
+	})
+	stack.Pop()
+}
+
+func drawVideoBadge(gtx layout.Context, th *Theme, cell image.Rectangle) {
+	pad := gtx.Dp(favoriteBadgeInset)
+	size := gtx.Dp(favoriteBadgeSize)
+	x1 := cell.Max.X - pad
+	y1 := cell.Max.Y - pad
+	x0 := x1 - size
+	y0 := y1 - size
+	bg := image.Rect(x0, y0, x1, y1)
+
+	ca := clip.Rect(bg).Push(gtx.Ops)
+	paint.ColorOp{Color: favoriteShadow}.Add(gtx.Ops)
+	paint.PaintOp{}.Add(gtx.Ops)
+	ca.Pop()
+
+	stack := op.Offset(image.Pt(x0, y0)).Push(gtx.Ops)
+	gtx2 := gtx
+	gtx2.Constraints.Max = image.Pt(size, size)
+	gtx2.Constraints.Min = image.Pt(size, size)
+	layout.Center.Layout(gtx2, func(gtx layout.Context) layout.Dimensions {
+		lbl := material.Label(th.Theme, unit.Sp(16), "▶")
+		lbl.Color = th.Foreground
+		return lbl.Layout(gtx)
+	})
+	stack.Pop()
+}
+
+// drawBorder strokes a rectangular border `width` px thick on the inside of
+// rect using four filled rectangles. Used to highlight the keyboard-selected cell.
+func drawBorder(gtx layout.Context, rect image.Rectangle, width int, col color.NRGBA) {
+	stroke := func(r image.Rectangle) {
+		ca := clip.Rect(r).Push(gtx.Ops)
+		paint.ColorOp{Color: col}.Add(gtx.Ops)
+		paint.PaintOp{}.Add(gtx.Ops)
+		ca.Pop()
+	}
+	stroke(image.Rect(rect.Min.X, rect.Min.Y, rect.Max.X, rect.Min.Y+width))
+	stroke(image.Rect(rect.Min.X, rect.Max.Y-width, rect.Max.X, rect.Max.Y))
+	stroke(image.Rect(rect.Min.X, rect.Min.Y+width, rect.Min.X+width, rect.Max.Y-width))
+	stroke(image.Rect(rect.Max.X-width, rect.Min.Y+width, rect.Max.X, rect.Max.Y-width))
+}
+
+// drawFitted scales an image op to fit inside dst (preserving aspect ratio)
+// and centers it.
+func drawFitted(gtx layout.Context, img paint.ImageOp, imgSz image.Point, dst image.Rectangle) {
+	dstW := dst.Dx()
+	dstH := dst.Dy()
+	if imgSz.X == 0 || imgSz.Y == 0 || dstW == 0 || dstH == 0 {
 		return
 	}
-	g.mu.Lock()
-	for _, e := range more {
-		if idx, ok := g.pathIndex[e.Path]; ok {
-			g.entries[idx] = e
-			continue
-		}
-		ins := sort.Search(len(g.entries), func(i int) bool { return g.entries[i].Path >= e.Path })
-		g.entries = append(g.entries, cache.Entry{})
-		copy(g.entries[ins+1:], g.entries[ins:])
-		g.entries[ins] = e
-		for i := ins; i < len(g.entries); i++ {
-			g.pathIndex[g.entries[i].Path] = i
-		}
+	sx := float32(dstW) / float32(imgSz.X)
+	sy := float32(dstH) / float32(imgSz.Y)
+	s := sx
+	if sy < s {
+		s = sy
 	}
-	g.mu.Unlock()
-	g.grid.Refresh()
-}
+	drawnW := int(float32(imgSz.X) * s)
+	drawnH := int(float32(imgSz.Y) * s)
+	offX := dst.Min.X + (dstW-drawnW)/2
+	offY := dst.Min.Y + (dstH-drawnH)/2
 
-// Widget returns the underlying GridWrap for placement in a container.
-func (g *ThumbGrid) Widget() fyne.CanvasObject {
-	return g.container
-}
-
-// Count returns the number of items currently displayed.
-func (g *ThumbGrid) Count() int {
-	g.mu.Lock()
-	defer g.mu.Unlock()
-	return len(g.entries)
-}
-
-// findBadge walks the known cell structure to retrieve the play badge so we
-// can show/hide it per-entry without recomputing layout.
-func findBadge(padded *fyne.Container) *fyne.Container {
-	corner, _ := padded.Objects[0].(*fyne.Container)
-	if corner == nil || len(corner.Objects) < 2 {
-		return nil
-	}
-	hbox, _ := corner.Objects[1].(*fyne.Container)
-	if hbox == nil || len(hbox.Objects) < 2 {
-		return nil
-	}
-	badge, _ := hbox.Objects[1].(*fyne.Container)
-	return badge
-}
-
-// findStar walks the known cell structure to retrieve the favorite star.
-func findStar(padded *fyne.Container) *canvas.Text {
-	topRight, _ := padded.Objects[0].(*fyne.Container)
-	if topRight == nil || len(topRight.Objects) < 1 {
-		return nil
-	}
-	hbox, _ := topRight.Objects[0].(*fyne.Container)
-	if hbox == nil || len(hbox.Objects) < 2 {
-		return nil
-	}
-	star, _ := hbox.Objects[1].(*canvas.Text)
-	return star
+	defer op.Affine(f32.Affine2D{}.Scale(f32.Pt(0, 0), f32.Pt(s, s)).Offset(f32.Pt(float32(offX), float32(offY)))).Push(gtx.Ops).Pop()
+	img.Add(gtx.Ops)
+	paint.PaintOp{}.Add(gtx.Ops)
 }

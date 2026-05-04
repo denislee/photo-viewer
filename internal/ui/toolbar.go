@@ -1,235 +1,225 @@
 package ui
 
 import (
-	"image/color"
-	"path/filepath"
+	"fmt"
+	"image"
+	"math"
+	"time"
 
-	"fyne.io/fyne/v2"
-	"fyne.io/fyne/v2/canvas"
-	"fyne.io/fyne/v2/container"
-	"fyne.io/fyne/v2/driver/desktop"
-	"fyne.io/fyne/v2/layout"
-	"fyne.io/fyne/v2/theme"
-	"fyne.io/fyne/v2/widget"
+	"gioui.org/layout"
+	"gioui.org/op"
+	"gioui.org/op/clip"
+	"gioui.org/op/paint"
+	"gioui.org/unit"
+	"gioui.org/widget"
+	"gioui.org/widget/material"
 )
 
-// tappableActivity is a spinning Activity widget that fires onTap when clicked.
-type tappableActivity struct {
-	widget.BaseWidget
-	activity *widget.Activity
-	onTap    func()
-}
+const toolbarHeightDp = 48
 
-func newTappableActivity(onTap func()) *tappableActivity {
-	t := &tappableActivity{activity: widget.NewActivity(), onTap: onTap}
-	t.ExtendBaseWidget(t)
-	return t
-}
-
-func (t *tappableActivity) CreateRenderer() fyne.WidgetRenderer {
-	return widget.NewSimpleRenderer(t.activity)
-}
-
-func (t *tappableActivity) Tapped(*fyne.PointEvent) {
-	if t.onTap != nil {
-		t.onTap()
-	}
-}
-
-func (t *tappableActivity) Cursor() desktop.Cursor { return desktop.PointerCursor }
-
-func (t *tappableActivity) Start() { t.activity.Start() }
-func (t *tappableActivity) Stop()  { t.activity.Stop() }
-
-// tappableStar renders a star glyph at a chosen size and toggles its color
-// when "active" — used for the favorites filter button on the toolbar.
-type tappableStar struct {
-	widget.BaseWidget
-	text  *canvas.Text
-	onTap func()
-}
-
-var (
-	starInactive = color.NRGBA{R: 0x80, G: 0x84, B: 0x8c, A: 0xff}
-	starActive   = color.NRGBA{R: 0xff, G: 0xd7, B: 0x00, A: 0xff}
-)
-
-func newTappableStar(onTap func()) *tappableStar {
-	t := canvas.NewText("★", starInactive)
-	t.TextSize = 20
-	t.Alignment = fyne.TextAlignCenter
-	s := &tappableStar{text: t, onTap: onTap}
-	s.ExtendBaseWidget(s)
-	return s
-}
-
-func (s *tappableStar) CreateRenderer() fyne.WidgetRenderer {
-	return widget.NewSimpleRenderer(container.NewPadded(s.text))
-}
-
-func (s *tappableStar) Tapped(*fyne.PointEvent) {
-	if s.onTap != nil {
-		s.onTap()
-	}
-}
-
-func (s *tappableStar) Cursor() desktop.Cursor { return desktop.PointerCursor }
-
-func (s *tappableStar) SetActive(active bool) {
-	if active {
-		s.text.Color = starActive
-	} else {
-		s.text.Color = starInactive
-	}
-	s.text.Refresh()
-}
-
-// Toolbar groups the path label, count, busy indicator, and action buttons.
-// Visually it is one thin row with subtle separators below.
+// Toolbar is the slim top bar above the main split. Shows the active path,
+// the entry count, and a row of buttons that mirror the Fyne build's actions
+// (filter, RAW toggle, import, duplicates, settings, rebuild).
 type Toolbar struct {
-	root *fyne.Container
+	allBtn        widget.Clickable
+	photosBtn     widget.Clickable
+	videosBtn     widget.Clickable
+	rawCheck      widget.Bool
+	yearsCheck    widget.Bool
+	importBtn     widget.Clickable
+	duplicatesBtn widget.Clickable
+	settingsBtn   widget.Clickable
+	organizeBtn   widget.Clickable
+	rebuildBtn    widget.Clickable
+	spinnerBtn    widget.Clickable
 
-	pathLabel  *canvas.Text
-	countLabel *canvas.Text
-	filterBtn  *widget.Select
-	rawCheck   *widget.Check
-	progress   *tappableActivity
-	rebuild    *widget.Button
-	settings   *widget.Button
-	importBtn  *widget.Button
-	sdBtn      *widget.Button
-	dupBtn     *widget.Button
-	peopleBtn  *widget.Button
-	favBtn     *tappableStar
+	OnFilter      func(string)
+	OnShowRAW     func(bool)
+	OnGroupByYear func(bool)
+	OnImport      func()
+	OnDuplicates  func()
+	OnOrganize    func()
+	OnSettings    func()
+	OnRebuild     func()
+	OnIndexInfo   func()
+
+	// State mirrored from the controller; the active filter button is
+	// rendered with HighImportance so it stands out.
+	Filter      string
+	ShowRAW     bool
+	GroupByYear bool
+	Busy        bool
+
+	spinnerStart time.Time
 }
 
-func NewToolbar(onFilter func(string), onShowRAW func(bool), showRAW bool, onRebuild func(), onSettings func(), onImport func(), onSDCard func(), onDuplicates func(), onFavorites func(), onScanInfo func(), onPeople func()) *Toolbar {
-	pathLabel := canvas.NewText("", color.NRGBA{R: 0xc8, G: 0xcc, B: 0xd2, A: 0xff})
-	pathLabel.TextSize = 11
+func NewToolbar() *Toolbar { return &Toolbar{Filter: "All", spinnerStart: time.Now()} }
 
-	countLabel := canvas.NewText("", color.NRGBA{R: 0x80, G: 0x84, B: 0x8c, A: 0xff})
-	countLabel.TextSize = 10
-	countLabel.Alignment = fyne.TextAlignTrailing
-
-	filterBtn := widget.NewSelect([]string{"All", "Photos", "Videos"}, onFilter)
-	filterBtn.SetSelected("All")
-
-	rawCheck := widget.NewCheck("RAW", onShowRAW)
-	rawCheck.SetChecked(showRAW)
-
-	t := &Toolbar{
-		pathLabel:  pathLabel,
-		countLabel: countLabel,
-		filterBtn:  filterBtn,
-		rawCheck:   rawCheck,
-		progress:   newTappableActivity(onScanInfo),
-		rebuild:    iconButton(theme.ViewRefreshIcon(), onRebuild),
-		settings:   iconButton(theme.SettingsIcon(), onSettings),
-		importBtn:  iconButton(theme.DownloadIcon(), onImport),
-		sdBtn:      iconButton(theme.StorageIcon(), onSDCard),
-		dupBtn:     iconButton(theme.ContentCopyIcon(), onDuplicates),
-		peopleBtn:  iconButton(theme.AccountIcon(), onPeople),
-		favBtn:     newTappableStar(onFavorites),
+// Layout draws the toolbar background, labels, and action buttons. Drains
+// click events on each call so callbacks fire on the same frame.
+func (t *Toolbar) Layout(gtx layout.Context, th *Theme, path string, count int) layout.Dimensions {
+	if t.allBtn.Clicked(gtx) {
+		t.Filter = "All"
+		if t.OnFilter != nil {
+			t.OnFilter("All")
+		}
 	}
-	t.progress.Hide()
+	if t.photosBtn.Clicked(gtx) {
+		t.Filter = "Photos"
+		if t.OnFilter != nil {
+			t.OnFilter("Photos")
+		}
+	}
+	if t.videosBtn.Clicked(gtx) {
+		t.Filter = "Videos"
+		if t.OnFilter != nil {
+			t.OnFilter("Videos")
+		}
+	}
+	// Sync the checkbox state to the controller mirror so external changes
+	// (e.g. config reload) are reflected. Only fire the callback when the
+	// user actually toggles it via Update.
+	t.rawCheck.Value = t.ShowRAW
+	if t.rawCheck.Update(gtx) {
+		t.ShowRAW = t.rawCheck.Value
+		if t.OnShowRAW != nil {
+			t.OnShowRAW(t.rawCheck.Value)
+		}
+	}
+	t.yearsCheck.Value = t.GroupByYear
+	if t.yearsCheck.Update(gtx) {
+		t.GroupByYear = t.yearsCheck.Value
+		if t.OnGroupByYear != nil {
+			t.OnGroupByYear(t.yearsCheck.Value)
+		}
+	}
+	if t.importBtn.Clicked(gtx) && t.OnImport != nil {
+		t.OnImport()
+	}
+	if t.duplicatesBtn.Clicked(gtx) && t.OnDuplicates != nil {
+		t.OnDuplicates()
+	}
+	if t.organizeBtn.Clicked(gtx) && t.OnOrganize != nil {
+		t.OnOrganize()
+	}
+	if t.settingsBtn.Clicked(gtx) && t.OnSettings != nil {
+		t.OnSettings()
+	}
+	if t.rebuildBtn.Clicked(gtx) && t.OnRebuild != nil {
+		t.OnRebuild()
+	}
+	if t.spinnerBtn.Clicked(gtx) && t.OnIndexInfo != nil {
+		t.OnIndexInfo()
+	}
 
-	actions := container.NewHBox(t.countLabel, t.filterBtn, t.rawCheck, t.progress, t.sdBtn, t.importBtn, t.favBtn, t.peopleBtn, t.dupBtn, t.settings, t.rebuild)
-	row := container.New(layout.NewBorderLayout(nil, nil, nil, actions),
-		actions,
-		container.NewPadded(t.pathLabel),
-	)
+	h := gtx.Dp(unit.Dp(toolbarHeightDp))
+	w := gtx.Constraints.Max.X
 
-	sep := canvas.NewRectangle(color.NRGBA{R: 0x26, G: 0x2a, B: 0x31, A: 0xff})
-	sep.SetMinSize(fyne.NewSize(0, 1))
+	bg := image.Rect(0, 0, w, h)
+	clipArea := clip.Rect(bg).Push(gtx.Ops)
+	paint.ColorOp{Color: th.CellBG}.Add(gtx.Ops)
+	paint.PaintOp{}.Add(gtx.Ops)
+	clipArea.Pop()
 
-	t.root = container.NewVBox(container.NewPadded(row), sep)
-	return t
+	filterBtn := func(btn *widget.Clickable, label, name string) layout.FlexChild {
+		return layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+			b := material.Button(th.Theme, btn, label)
+			if t.Filter != name {
+				b.Background = th.CellBG
+				b.Color = th.Foreground
+			}
+			return b.Layout(gtx)
+		})
+	}
+
+	pad := layout.Inset{Top: unit.Dp(4), Bottom: unit.Dp(4), Left: unit.Dp(12), Right: unit.Dp(12)}
+	pad.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
+		return layout.Flex{Axis: layout.Horizontal, Alignment: layout.Middle}.Layout(gtx,
+			layout.Flexed(1, func(gtx layout.Context) layout.Dimensions {
+				lbl := material.Label(th.Theme, unit.Sp(13), path)
+				lbl.Color = th.Foreground
+				lbl.MaxLines = 1
+				return lbl.Layout(gtx)
+			}),
+			layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+				lbl := material.Label(th.Theme, unit.Sp(12), fmt.Sprintf("%d items", count))
+				lbl.Color = th.Foreground
+				return lbl.Layout(gtx)
+			}),
+			layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+				if !t.Busy {
+					return layout.Dimensions{}
+				}
+				return layout.Inset{Left: unit.Dp(8)}.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
+					return t.spinnerBtn.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
+						return t.layoutSpinner(gtx, th)
+					})
+				})
+			}),
+			layout.Rigid(layout.Spacer{Width: unit.Dp(10)}.Layout),
+			filterBtn(&t.allBtn, "All", "All"),
+			layout.Rigid(layout.Spacer{Width: unit.Dp(2)}.Layout),
+			filterBtn(&t.photosBtn, "Photos", "Photos"),
+			layout.Rigid(layout.Spacer{Width: unit.Dp(2)}.Layout),
+			filterBtn(&t.videosBtn, "Videos", "Videos"),
+			layout.Rigid(layout.Spacer{Width: unit.Dp(8)}.Layout),
+			layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+				cb := material.CheckBox(th.Theme, &t.rawCheck, "RAW")
+				cb.Color = th.Foreground
+				return cb.Layout(gtx)
+			}),
+			layout.Rigid(layout.Spacer{Width: unit.Dp(8)}.Layout),
+			layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+				cb := material.CheckBox(th.Theme, &t.yearsCheck, "Years")
+				cb.Color = th.Foreground
+				return cb.Layout(gtx)
+			}),
+			layout.Rigid(layout.Spacer{Width: unit.Dp(10)}.Layout),
+			layout.Rigid(material.Button(th.Theme, &t.importBtn, "Import").Layout),
+			layout.Rigid(layout.Spacer{Width: unit.Dp(4)}.Layout),
+			layout.Rigid(material.Button(th.Theme, &t.duplicatesBtn, "Duplicates").Layout),
+			layout.Rigid(layout.Spacer{Width: unit.Dp(4)}.Layout),
+			layout.Rigid(material.Button(th.Theme, &t.organizeBtn, "Organize").Layout),
+			layout.Rigid(layout.Spacer{Width: unit.Dp(4)}.Layout),
+			layout.Rigid(material.Button(th.Theme, &t.settingsBtn, "Settings").Layout),
+			layout.Rigid(layout.Spacer{Width: unit.Dp(4)}.Layout),
+			layout.Rigid(material.Button(th.Theme, &t.rebuildBtn, "Rebuild").Layout),
+		)
+	})
+
+	return layout.Dimensions{Size: image.Pt(w, h)}
 }
 
-func iconButton(icon fyne.Resource, fn func()) *widget.Button {
-	b := widget.NewButtonWithIcon("", icon, fn)
-	b.Importance = widget.LowImportance
-	return b
-}
+// layoutSpinner draws a rotating ring of fading dots, sized to fit alongside
+// the toolbar text. Schedules an immediate redraw so the rotation animates.
+func (t *Toolbar) layoutSpinner(gtx layout.Context, th *Theme) layout.Dimensions {
+	sz := gtx.Dp(unit.Dp(16))
+	cx := float32(sz) / 2
+	cy := float32(sz) / 2
+	radius := float32(sz)/2 - 1.5
+	dotR := float32(sz) / 7
 
-func (t *Toolbar) Widget() fyne.CanvasObject { return t.root }
+	const N = 8
+	elapsed := time.Since(t.spinnerStart).Seconds()
+	step := int(elapsed*float64(N)) % N // discrete rotation; one full turn per second
 
-// SetPath / SetCount / ShowBusy mutate widget state directly. Callers running
-// off the main goroutine must wrap the call in fyne.Do.
-func (t *Toolbar) SetPath(p string) {
-	t.pathLabel.Text = prettyPath(p)
-	t.pathLabel.Refresh()
-}
+	for i := 0; i < N; i++ {
+		// i==0 is the leading bright dot, then the trail fades.
+		idx := (step - i + N) % N
+		ang := float64(idx) * 2 * math.Pi / float64(N)
+		x := cx + radius*float32(math.Cos(ang))
+		y := cy + radius*float32(math.Sin(ang))
 
-func (t *Toolbar) SetCount(n int) {
-	t.countLabel.Text = formatCount(n)
-	t.countLabel.Refresh()
-}
+		col := th.Foreground
+		col.A = uint8(220 - i*26)
 
-func (t *Toolbar) SetFavoritesActive(active bool) {
-	t.favBtn.SetActive(active)
-}
+		ell := image.Rect(int(x-dotR), int(y-dotR), int(x+dotR+1), int(y+dotR+1))
+		stack := clip.Ellipse(ell).Push(gtx.Ops)
+		paint.ColorOp{Color: col}.Add(gtx.Ops)
+		paint.PaintOp{}.Add(gtx.Ops)
+		stack.Pop()
+	}
 
-func (t *Toolbar) ShowBusy(busy bool) {
-	if busy {
-		t.progress.Show()
-		t.progress.Start()
-		t.rebuild.Disable()
-	} else {
-		t.progress.Stop()
-		t.progress.Hide()
-		t.rebuild.Enable()
-	}
-}
-
-// prettyPath shortens a path for display: it keeps at most the trailing two
-// segments, prefixed by "…/" if the original was deeper.
-func prettyPath(p string) string {
-	if p == "" {
-		return ""
-	}
-	cleaned := filepath.Clean(p)
-	parent, leaf := filepath.Split(cleaned)
-	parent = filepath.Clean(parent)
-	if parent == "." || parent == string(filepath.Separator) || parent == cleaned {
-		return cleaned
-	}
-	parentParent, parentLeaf := filepath.Split(parent)
-	parentParent = filepath.Clean(parentParent)
-	if parentParent == "." || parentParent == string(filepath.Separator) || parentParent == parent {
-		return filepath.Join(parentLeaf, leaf)
-	}
-	return "…/" + filepath.Join(parentLeaf, leaf)
-}
-
-func formatCount(n int) string {
-	switch n {
-	case 0:
-		return "empty"
-	case 1:
-		return "1 item"
-	}
-	return itoa(n) + " items"
-}
-
-func itoa(n int) string {
-	if n == 0 {
-		return "0"
-	}
-	neg := n < 0
-	if neg {
-		n = -n
-	}
-	var buf [20]byte
-	i := len(buf)
-	for n > 0 {
-		i--
-		buf[i] = byte('0' + n%10)
-		n /= 10
-	}
-	if neg {
-		i--
-		buf[i] = '-'
-	}
-	return string(buf[i:])
+	gtx.Execute(op.InvalidateCmd{At: gtx.Now.Add(80 * time.Millisecond)})
+	return layout.Dimensions{Size: image.Pt(sz, sz)}
 }

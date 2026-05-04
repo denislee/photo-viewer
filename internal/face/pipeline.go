@@ -25,21 +25,21 @@ type OnClusterChange func()
 // index. The pool is started once via Start and fed via Submit; Stop cancels
 // in-flight work and waits for workers to finish.
 type Pipeline struct {
-	idx     *cache.Index
-	jobs    chan Job
-	wg      sync.WaitGroup
-	mu      sync.Mutex
-	cancel  context.CancelFunc
+	idx      *cache.Index
+	jobs     chan Job
+	wg       sync.WaitGroup
+	mu       sync.Mutex
+	cancel   context.CancelFunc
 	onChange OnClusterChange
-	enabled bool
+	enabled  bool
 
 	// clusterMu guards the in-memory cluster cache and serialises the
 	// assignment step across workers. Detection runs in parallel; only the
 	// short cluster-search/update is serialised so two workers can't both
 	// invent a new cluster for the same face.
-	clusterMu       sync.Mutex
-	cachedClusters  []cache.Cluster
-	clusterCacheOK  bool
+	clusterMu      sync.Mutex
+	cachedClusters []cache.Cluster
+	clusterCacheOK bool
 }
 
 // NewPipeline returns a pipeline. If pv-face-detect is missing, the pipeline

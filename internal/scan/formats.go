@@ -62,8 +62,26 @@ var extensions = map[string]MediaType{
 }
 
 func DetectType(path string) MediaType {
-	ext := strings.ToLower(filepath.Ext(path))
-	if t, ok := extensions[ext]; ok {
+	ext := filepath.Ext(path)
+	if ext == "" {
+		return TypeUnknown
+	}
+
+	var lowerExt string
+	hasUpper := false
+	for i := 0; i < len(ext); i++ {
+		if ext[i] >= 'A' && ext[i] <= 'Z' {
+			hasUpper = true
+			break
+		}
+	}
+	if hasUpper {
+		lowerExt = strings.ToLower(ext)
+	} else {
+		lowerExt = ext
+	}
+
+	if t, ok := extensions[lowerExt]; ok {
 		return t
 	}
 	return TypeUnknown

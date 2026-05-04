@@ -83,7 +83,6 @@ func (i *Index) EnsureHashes(ctx context.Context, progress func(done, total int)
 		full  string // already-cached full hash, empty if not computed yet
 	}
 
-	i.mu.Lock()
 	rows, err := i.db.Query(`
 		SELECT path, size, COALESCE(quick_hash, ''), COALESCE(content_hash, '')
 		FROM entries
@@ -92,7 +91,6 @@ func (i *Index) EnsureHashes(ctx context.Context, progress func(done, total int)
 		)
 	`)
 	if err != nil {
-		i.mu.Unlock()
 		return err
 	}
 	var todo []cand
@@ -104,7 +102,6 @@ func (i *Index) EnsureHashes(ctx context.Context, progress func(done, total int)
 		todo = append(todo, c)
 	}
 	rows.Close()
-	i.mu.Unlock()
 
 	if len(todo) == 0 {
 		if progress != nil {
@@ -114,8 +111,8 @@ func (i *Index) EnsureHashes(ctx context.Context, progress func(done, total int)
 	}
 
 	numWorkers := runtime.NumCPU()
-	if numWorkers > 8 {
-		numWorkers = 8
+	if numWorkers < 4 {
+		numWorkers = 4
 	}
 
 	// Phase 1: quick-hash candidates that don't have a cached quick hash.
@@ -179,16 +176,13 @@ func (i *Index) EnsureHashes(ctx context.Context, progress func(done, total int)
 			if len(pending) == 0 {
 				return nil
 			}
-			i.mu.Lock()
 			tx, err := i.db.Begin()
 			if err != nil {
-				i.mu.Unlock()
 				return err
 			}
 			stmt, err := tx.Prepare("UPDATE entries SET quick_hash = ? WHERE path = ?")
 			if err != nil {
 				tx.Rollback()
-				i.mu.Unlock()
 				return err
 			}
 			for _, r := range pending {
@@ -196,7 +190,6 @@ func (i *Index) EnsureHashes(ctx context.Context, progress func(done, total int)
 			}
 			stmt.Close()
 			err = tx.Commit()
-			i.mu.Unlock()
 			pending = pending[:0]
 			return err
 		}
@@ -303,16 +296,13 @@ func (i *Index) EnsureHashes(ctx context.Context, progress func(done, total int)
 		if len(pending) == 0 {
 			return nil
 		}
-		i.mu.Lock()
 		tx, err := i.db.Begin()
 		if err != nil {
-			i.mu.Unlock()
 			return err
 		}
 		stmt, err := tx.Prepare("UPDATE entries SET content_hash = ? WHERE path = ?")
 		if err != nil {
 			tx.Rollback()
-			i.mu.Unlock()
 			return err
 		}
 		for _, r := range pending {
@@ -320,7 +310,6 @@ func (i *Index) EnsureHashes(ctx context.Context, progress func(done, total int)
 		}
 		stmt.Close()
 		err = tx.Commit()
-		i.mu.Unlock()
 		pending = pending[:0]
 		return err
 	}
@@ -349,8 +338,6 @@ func (i *Index) EnsureHashes(ctx context.Context, progress func(done, total int)
 // hash. Within each group, entries are ordered by ModTime ascending (oldest
 // first).
 func (i *Index) FindDuplicates() []DuplicateGroup {
-	i.mu.Lock()
-	defer i.mu.Unlock()
 
 	rows, err := i.db.Query(`
 		SELECT path, type, size, mtime, thumb_id, content_hash
@@ -396,8 +383,6 @@ func (i *Index) FindDuplicates() []DuplicateGroup {
 
 // RemoveEntry deletes a single row from the index by path.
 func (i *Index) RemoveEntry(path string) error {
-	i.mu.Lock()
-	defer i.mu.Unlock()
 	_, err := i.db.Exec("DELETE FROM entries WHERE path = ?", path)
 	return err
 }

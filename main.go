@@ -6,9 +6,8 @@ import (
 	"os"
 	"path/filepath"
 
-	"fyne.io/fyne/v2"
-	"fyne.io/fyne/v2/app"
-	"fyne.io/fyne/v2/dialog"
+	"gioui.org/app"
+	"gioui.org/unit"
 
 	"github.com/dns/photo-viewer/internal/cache"
 	"github.com/dns/photo-viewer/internal/ui"
@@ -33,39 +32,33 @@ func main() {
 		log.Fatalf("library root %q is not a directory: %v", abs, err)
 	}
 
-	a := app.NewWithID("com.github.dns.photoviewer")
-	a.Settings().SetTheme(ui.MinimalTheme())
-	w := a.NewWindow("Photo Viewer")
-	w.Resize(fyne.NewSize(1200, 800))
-
 	cacheDir, err := cache.CacheDir(abs)
 	if err != nil {
-		dialog.ShowError(err, w)
-		w.ShowAndRun()
-		return
+		log.Fatalf("cache dir: %v", err)
 	}
 	dbPath := filepath.Join(abs, ".photo-viewer.db")
 	idx, err := cache.Load(dbPath)
 	if err != nil {
-		log.Printf("load index: %v", err)
-		idx, _ = cache.Load(dbPath)
+		log.Fatalf("load index: %v", err)
 	}
 	store, err := cache.NewThumbStore(cacheDir)
 	if err != nil {
 		log.Fatalf("thumb store: %v", err)
 	}
 
-	ctrl := ui.NewController(w, abs, idx, store, cacheDir)
-	w.SetContent(ctrl.Build())
-
-	// Trigger an initial scan/refresh from the library root.
+	ctrl := ui.NewController(abs, idx, store, cacheDir)
 	go ctrl.SelectDir(abs)
 
-	w.Canvas().SetOnTypedRune(func(r rune) {
-		if r == 'q' {
-			a.Quit()
+	go func() {
+		w := new(app.Window)
+		w.Option(
+			app.Title("Photo Viewer"),
+			app.Size(unit.Dp(1200), unit.Dp(800)),
+		)
+		if err := ui.Run(w, ctrl); err != nil {
+			log.Fatal(err)
 		}
-	})
-
-	w.ShowAndRun()
+		os.Exit(0)
+	}()
+	app.Main()
 }

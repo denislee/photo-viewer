@@ -4,44 +4,90 @@ import (
 	"bytes"
 	"errors"
 	"image"
-	"image/jpeg"
+	_ "image/jpeg"
 	"os"
 	"os/exec"
 )
 
-// RAW extracts the embedded JPEG preview from a camera RAW file using
-// exiftool, then resamples it to a thumbnail. Falls back to JpgFromRaw if
-// PreviewImage is missing. Requires `exiftool` on PATH.
+// RAW extracts an embedded JPEG preview from a camera RAW file and resamples
+// it into a thumbnail. Falls back to ffmpeg if no embedded preview is found.
 func RAW(src, dst string, size int) error {
-	if _, err := exec.LookPath("exiftool"); err != nil {
-		return errors.New("exiftool not installed")
-	}
-	jpgBytes, err := extractEmbedded(src, "-PreviewImage")
-	if err != nil || len(jpgBytes) == 0 {
-		jpgBytes, err = extractEmbedded(src, "-JpgFromRaw")
-	}
+	img, err := LoadRAWImage(src)
 	if err != nil {
 		return err
 	}
-	if len(jpgBytes) == 0 {
-		return errors.New("no embedded preview in RAW file")
-	}
-	img, err := jpeg.Decode(bytes.NewReader(jpgBytes))
-	if err != nil {
-		// Some cameras embed a non-JPEG preview; try the generic decoder.
-		img, _, err = image.Decode(bytes.NewReader(jpgBytes))
-		if err != nil {
-			return err
+	return writeThumb(img, dst, size)
+}
+
+// LoadRAWImage returns a decoded image.Image from a RAW file. It tries
+// embedded previews first (via exiftool) and falls back to decoding the
+// full RAW via ffmpeg.
+func LoadRAWImage(src string) (image.Image, error) {
+	data, err := LoadRAWPreview(src)
+	if err == nil {
+		img, _, err := image.Decode(bytes.NewReader(data))
+		if err == nil {
+			return img, nil
 		}
 	}
-	return writeThumb(img, dst, size)
+
+	// Fallback: ffmpeg can decode many RAW formats (DNG, CR2, etc) directly.
+	if _, err := exec.LookPath("ffmpeg"); err == nil {
+		cmd := exec.Command("ffmpeg", "-i", src, "-frames:v", "1", "-f", "image2pipe", "-vcodec", "mjpeg", "-")
+		var out bytes.Buffer
+		cmd.Stdout = &out
+		if err := cmd.Run(); err == nil {
+			img, _, err := image.Decode(&out)
+			if err == nil {
+				return img, nil
+			}
+		}
+	}
+
+	if err != nil {
+		return nil, err
+	}
+	return nil, errors.New("could not decode RAW file")
+}
+
+// LoadRAWPreview returns the bytes of an embedded JPEG/TIFF preview.
+func LoadRAWPreview(src string) ([]byte, error) {
+	f, err := os.Open(src)
+	if err != nil {
+		return nil, err
+	}
+	var head [4]byte
+	n, _ := f.Read(head[:])
+	f.Close()
+
+	// If it's already a JPEG, return it whole.
+	if n >= 3 && head[0] == 0xff && head[1] == 0xd8 && head[2] == 0xff {
+		return os.ReadFile(src)
+	}
+
+	if _, err := exec.LookPath("exiftool"); err != nil {
+		return nil, errors.New("exiftool not installed")
+	}
+
+	// Try common preview tags in order of descending typical quality/size.
+	tags := []string{"-PreviewImage", "-JpgFromRaw", "-ThumbnailImage", "-PreviewTIFF", "-OtherImage"}
+	for _, tag := range tags {
+		b, err := extractEmbedded(src, tag)
+		if err == nil && len(b) > 0 {
+			// Quick check: is this actually an image?
+			if _, _, err := image.DecodeConfig(bytes.NewReader(b)); err == nil {
+				return b, nil
+			}
+		}
+	}
+
+	return nil, errors.New("no embedded preview found")
 }
 
 func extractEmbedded(src, tag string) ([]byte, error) {
 	cmd := exec.Command("exiftool", "-b", tag, src)
 	var buf bytes.Buffer
 	cmd.Stdout = &buf
-	cmd.Stderr = os.Stderr
 	if err := cmd.Run(); err != nil {
 		return nil, err
 	}

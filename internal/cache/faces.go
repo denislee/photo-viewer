@@ -54,8 +54,6 @@ func DecodeEmbedding(b []byte) []float32 {
 // matching the given thumb mtime. Callers use this to skip re-detection when
 // the thumbnail hasn't changed.
 func (i *Index) HasFreshFaces(path string, thumbMtime int64) bool {
-	i.mu.Lock()
-	defer i.mu.Unlock()
 	var n int
 	err := i.db.QueryRow(
 		"SELECT COUNT(*) FROM faces WHERE path = ? AND thumb_mtime = ?",
@@ -88,8 +86,6 @@ type FaceOpResult struct {
 // Callers (the face pipeline) are expected to have already chosen
 // existing-cluster vs. new-cluster against an in-memory cache.
 func (i *Index) WriteFacesForPath(path string, ops []FaceOp) ([]FaceOpResult, error) {
-	i.mu.Lock()
-	defer i.mu.Unlock()
 	tx, err := i.db.Begin()
 	if err != nil {
 		return nil, err
@@ -149,8 +145,6 @@ func (i *Index) WriteFacesForPath(path string, ops []FaceOp) ([]FaceOpResult, er
 
 // AllClusters returns every cluster with its current face count.
 func (i *Index) AllClusters() []Cluster {
-	i.mu.Lock()
-	defer i.mu.Unlock()
 	rows, err := i.db.Query(`
 		SELECT c.id, c.label, c.centroid, c.sample_face_id,
 			(SELECT COUNT(*) FROM faces f WHERE f.cluster_id = c.id)
@@ -174,16 +168,12 @@ func (i *Index) AllClusters() []Cluster {
 
 // RenameCluster updates the user-visible label for a cluster.
 func (i *Index) RenameCluster(clusterID int64, label string) error {
-	i.mu.Lock()
-	defer i.mu.Unlock()
 	_, err := i.db.Exec("UPDATE face_clusters SET label = ? WHERE id = ?", label, clusterID)
 	return err
 }
 
 // PathsInCluster returns the distinct entry paths whose faces belong to a cluster.
 func (i *Index) PathsInCluster(clusterID int64) []string {
-	i.mu.Lock()
-	defer i.mu.Unlock()
 	rows, err := i.db.Query(
 		"SELECT DISTINCT path FROM faces WHERE cluster_id = ? ORDER BY path",
 		clusterID,
@@ -204,8 +194,6 @@ func (i *Index) PathsInCluster(clusterID int64) []string {
 
 // SampleFace returns the face row used as a cluster's preview thumbnail.
 func (i *Index) SampleFace(faceID int64) (Face, bool) {
-	i.mu.Lock()
-	defer i.mu.Unlock()
 	var f Face
 	var blob []byte
 	err := i.db.QueryRow(
@@ -226,8 +214,6 @@ func (i *Index) MergeClusters(srcID, dstID int64) error {
 	if srcID == dstID {
 		return nil
 	}
-	i.mu.Lock()
-	defer i.mu.Unlock()
 	tx, err := i.db.Begin()
 	if err != nil {
 		return err
@@ -282,8 +268,6 @@ func mergeCentroids(a []float32, na int, b []float32, nb int) []float32 {
 
 // GetEntry returns the index row for path, or (Entry{}, false) if unknown.
 func (i *Index) GetEntry(path string) (Entry, bool) {
-	i.mu.Lock()
-	defer i.mu.Unlock()
 	var e Entry
 	var mtimeUnix int64
 	var fav int
@@ -301,8 +285,6 @@ func (i *Index) GetEntry(path string) (Entry, bool) {
 
 // WipeFaces drops every face row and cluster. Used by the rebuild path.
 func (i *Index) WipeFaces() error {
-	i.mu.Lock()
-	defer i.mu.Unlock()
 	if _, err := i.db.Exec("DELETE FROM faces"); err != nil {
 		return err
 	}

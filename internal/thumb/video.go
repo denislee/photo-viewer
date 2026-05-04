@@ -32,7 +32,6 @@ func Video(src, dst string, size int) error {
 		"-vf", vf,
 		frame,
 	)
-	cmd.Stderr = os.Stderr
 	if err := cmd.Run(); err != nil {
 		// Retry from start in case the file is shorter than 1s.
 		cmd2 := exec.Command("ffmpeg",
@@ -43,7 +42,6 @@ func Video(src, dst string, size int) error {
 			"-vf", vf,
 			frame,
 		)
-		cmd2.Stderr = os.Stderr
 		if err := cmd2.Run(); err != nil {
 			return err
 		}
