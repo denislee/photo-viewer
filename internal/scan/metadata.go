@@ -2,6 +2,7 @@ package scan
 
 import (
 	"fmt"
+	"math/big"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -9,6 +10,7 @@ import (
 	"time"
 
 	"github.com/rwcarlsen/goexif/exif"
+	"github.com/rwcarlsen/goexif/tiff"
 )
 
 // MediaInfo holds extended metadata for a file.
@@ -91,7 +93,7 @@ func GetMediaInfo(path string) MediaInfo {
 				// Basic manual extraction for settings if exiftool missed them.
 				if info.Aperture == "" {
 					if fnum, err := x.Get(exif.FNumber); err == nil {
-						if rat, err := fnum.Rat(0); err == nil {
+						if rat := safeRat(fnum); rat != nil {
 							f, _ := rat.Float64()
 							info.Aperture = fmt.Sprintf("f/%.1f", f)
 						}
@@ -109,7 +111,7 @@ func GetMediaInfo(path string) MediaInfo {
 				}
 				if info.FocalLength == "" {
 					if fl, err := x.Get(exif.FocalLength); err == nil {
-						if rat, err := fl.Rat(0); err == nil {
+						if rat := safeRat(fl); rat != nil {
 							f, _ := rat.Float64()
 							info.FocalLength = fmt.Sprintf("%.1f mm", f)
 						}
@@ -130,6 +132,16 @@ func GetMediaInfo(path string) MediaInfo {
 	}
 
 	return info
+}
+
+func safeRat(tag *tiff.Tag) (rat *big.Rat) {
+	defer func() {
+		recover()
+	}()
+	if r, err := tag.Rat(0); err == nil {
+		return r
+	}
+	return nil
 }
 
 // GetMediaDate returns the best creation date found in the file's metadata.
