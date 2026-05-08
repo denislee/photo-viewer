@@ -120,6 +120,9 @@ func Run(w *app.Window, ctrl *Controller) error {
 			}
 		}()
 	}
+	toolbar.OnWarmUp = func() {
+		ctrl.WarmUp()
+	}
 	toolbar.OnFilter = func(f string) {
 		ctrl.SetFilter(f)
 	}

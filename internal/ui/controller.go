@@ -542,6 +542,60 @@ func (c *Controller) activeDir() string {
 	return c.currentDir
 }
 
+// WarmUp iterates over every entry in the index and ensures its thumbnail
+// is generated. It runs in the background and respects the controller's
+// scan context for cancellation.
+func (c *Controller) WarmUp() {
+	c.mu.Lock()
+	if c.scanCancel != nil {
+		c.scanCancel()
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	c.scanCancel = cancel
+	c.mu.Unlock()
+
+	go func() {
+		c.mu.Lock()
+		c.scanning++
+		c.scanTarget = "Thumbnail Warm-up"
+		c.scanStartedAt = time.Now()
+		c.scanEndedAt = time.Time{}
+		c.scanBatched = 0
+		c.mu.Unlock()
+		if c.invalidate != nil {
+			c.invalidate()
+		}
+		defer func() {
+			c.mu.Lock()
+			c.scanning--
+			c.scanEndedAt = time.Now()
+			c.mu.Unlock()
+			if c.invalidate != nil {
+				c.invalidate()
+			}
+		}()
+
+		all := c.index.All()
+		for i, e := range all {
+			if ctx.Err() != nil {
+				return
+			}
+			_, _ = c.store.Path(e)
+			if i%50 == 0 {
+				c.mu.Lock()
+				c.scanBatched = i + 1
+				c.mu.Unlock()
+				if c.invalidate != nil {
+					c.invalidate()
+				}
+			}
+		}
+		c.mu.Lock()
+		c.scanBatched = len(all)
+		c.mu.Unlock()
+	}()
+}
+
 // listSubdirs returns the immediate child directories of dir, sorted by name,
 // hidden directories filtered out (matching the scan package's behavior).
 func listSubdirs(dir string) []string {

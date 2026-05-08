@@ -31,6 +31,7 @@ type Toolbar struct {
 	settingsBtn   widget.Clickable
 	organizeBtn   widget.Clickable
 	rebuildBtn    widget.Clickable
+	warmUpBtn     widget.Clickable
 	spinnerBtn    widget.Clickable
 
 	OnFilter      func(string)
@@ -41,6 +42,7 @@ type Toolbar struct {
 	OnOrganize    func()
 	OnSettings    func()
 	OnRebuild     func()
+	OnWarmUp      func()
 	OnIndexInfo   func()
 
 	// State mirrored from the controller; the active filter button is
@@ -107,6 +109,9 @@ func (t *Toolbar) Layout(gtx layout.Context, th *Theme, path string, count int) 
 	}
 	if t.rebuildBtn.Clicked(gtx) && t.OnRebuild != nil {
 		t.OnRebuild()
+	}
+	if t.warmUpBtn.Clicked(gtx) && t.OnWarmUp != nil {
+		t.OnWarmUp()
 	}
 	if t.spinnerBtn.Clicked(gtx) && t.OnIndexInfo != nil {
 		t.OnIndexInfo()
@@ -184,6 +189,8 @@ func (t *Toolbar) Layout(gtx layout.Context, th *Theme, path string, count int) 
 			layout.Rigid(material.Button(th.Theme, &t.settingsBtn, "Settings").Layout),
 			layout.Rigid(layout.Spacer{Width: unit.Dp(4)}.Layout),
 			layout.Rigid(material.Button(th.Theme, &t.rebuildBtn, "Rebuild").Layout),
+			layout.Rigid(layout.Spacer{Width: unit.Dp(4)}.Layout),
+			layout.Rigid(material.Button(th.Theme, &t.warmUpBtn, "Warm Up").Layout),
 		)
 	})
 
