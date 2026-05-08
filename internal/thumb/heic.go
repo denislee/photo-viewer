@@ -2,6 +2,7 @@ package thumb
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"os"
@@ -12,33 +13,34 @@ import (
 // HEIC converts a HEIC/HEIF file to JPEG and resamples it. Tries
 // `heif-convert` (libheif) first, falls back to `ffmpeg` if heif-convert is
 // missing or produced no output.
-func HEIC(src, dst string, size int) error {
+func HEIC(ctx context.Context, src, dst string, size int) error {
 	tmpDir, err := os.MkdirTemp("", "photo-viewer-heic-")
 	if err != nil {
 		return err
 	}
 	defer os.RemoveAll(tmpDir)
 
-	jpg, lastErr := decodeHEIC(src, tmpDir)
+	jpg, lastErr := decodeHEIC(ctx, src, tmpDir)
 	if lastErr != nil {
 		return lastErr
 	}
-	return Image(jpg, dst, size)
+	return Image(ctx, jpg, dst, size)
 }
+
 
 // HEICToJPEG decodes a HEIC/HEIF file to a full-resolution JPEG written under
 // tmpDir. Returns the path of the produced JPEG; the caller is responsible for
 // removing tmpDir.
-func HEICToJPEG(src, tmpDir string) (string, error) {
-	return decodeHEIC(src, tmpDir)
+func HEICToJPEG(ctx context.Context, src, tmpDir string) (string, error) {
+	return decodeHEIC(ctx, src, tmpDir)
 }
 
-func decodeHEIC(src, tmpDir string) (string, error) {
+func decodeHEIC(ctx context.Context, src, tmpDir string) (string, error) {
 	var firstErr error
 	if _, err := exec.LookPath("heif-convert"); err == nil {
 		intermediate := filepath.Join(tmpDir, "out.jpg")
 		var stderr bytes.Buffer
-		cmd := exec.Command("heif-convert", "-q", "90", "--quiet", src, intermediate)
+		cmd := exec.CommandContext(ctx, "heif-convert", "-q", "90", "--quiet", src, intermediate)
 		cmd.Stderr = &stderr
 		errRun := cmd.Run()
 		// For multi-image HEIC (Apple live photos, HDR pairs, image stacks)
@@ -66,7 +68,7 @@ func decodeHEIC(src, tmpDir string) (string, error) {
 	if _, err := exec.LookPath("ffmpeg"); err == nil {
 		out := filepath.Join(tmpDir, "ff-out.jpg")
 		var stderr bytes.Buffer
-		cmd := exec.Command("ffmpeg", "-y", "-loglevel", "error",
+		cmd := exec.CommandContext(ctx, "ffmpeg", "-y", "-loglevel", "error",
 			"-i", src, "-frames:v", "1", "-update", "1", out)
 		cmd.Stderr = &stderr
 		if err := cmd.Run(); err == nil {

@@ -147,7 +147,6 @@ func (v *OrganizeView) scanForMismatched(ctx context.Context, idx *cache.Index, 
 
 	var mismatched []MismatchedVideo
 	for res := range results {
-		mismatched = append(mismatched)
 		mismatched = append(mismatched, res)
 	}
 

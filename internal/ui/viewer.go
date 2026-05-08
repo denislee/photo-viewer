@@ -1,6 +1,7 @@
 package ui
 
 import (
+	"context"
 	"fmt"
 	"image"
 	"image/color"
@@ -42,10 +43,11 @@ type Viewer struct {
 
 	entries []cache.Entry
 
-	loadedPath  string
-	loadingPath string
-	loadedOp    paint.ImageOp
-	loadedSz    image.Point
+	loadedPath       string
+	loadingPath      string
+	loadingCtxCancel context.CancelFunc
+	loadedOp         paint.ImageOp
+	loadedSz         image.Point
 
 	// Decoded dimensions are cached per path. Decoding happens off the UI
 	// goroutine so opening the viewer doesn't stutter on big originals.
@@ -86,6 +88,10 @@ func (v *Viewer) Close() {
 	v.Confirming = false
 	v.loadedPath = ""
 	v.loadingPath = ""
+	if v.loadingCtxCancel != nil {
+		v.loadingCtxCancel()
+		v.loadingCtxCancel = nil
+	}
 	v.loadedOp = paint.ImageOp{}
 }
 
@@ -122,14 +128,23 @@ func (v *Viewer) ConfirmDelete(deleter func(path string) error) {
 	if v.Index >= len(v.entries) {
 		v.Index = len(v.entries) - 1
 	}
+	v.cancelLoading()
 	v.loadedPath = ""
 	v.loadingPath = ""
 	v.loadedOp = paint.ImageOp{}
 }
 
+func (v *Viewer) cancelLoading() {
+	if v.loadingCtxCancel != nil {
+		v.loadingCtxCancel()
+		v.loadingCtxCancel = nil
+	}
+}
+
 func (v *Viewer) Next() {
 	if v.Index < len(v.entries)-1 {
 		v.Index++
+		v.cancelLoading()
 		v.loadedPath = ""
 		v.loadingPath = ""
 		v.loadedOp = paint.ImageOp{}
@@ -139,6 +154,7 @@ func (v *Viewer) Next() {
 func (v *Viewer) Prev() {
 	if v.Index > 0 {
 		v.Index--
+		v.cancelLoading()
 		v.loadedPath = ""
 		v.loadingPath = ""
 		v.loadedOp = paint.ImageOp{}
@@ -478,6 +494,10 @@ func (v *Viewer) imageFor(e cache.Entry, tc *thumbCache) (paint.ImageOp, image.P
 // then assigns the result to the viewer's loaded* fields and invalidates so
 // the next frame paints the full-resolution image.
 func (v *Viewer) kickDecode(e cache.Entry) {
+	v.cancelLoading()
+	ctx, cancel := context.WithCancel(context.Background())
+	v.loadingCtxCancel = cancel
+
 	go func() {
 		var img image.Image
 		var err error
@@ -489,7 +509,7 @@ func (v *Viewer) kickDecode(e cache.Entry) {
 				return
 			}
 			defer os.RemoveAll(tmpDir)
-			jpgPath, err2 := thumb.HEICToJPEG(e.Path, tmpDir)
+			jpgPath, err2 := thumb.HEICToJPEG(ctx, e.Path, tmpDir)
 			if err2 != nil {
 				return
 			}
@@ -500,7 +520,7 @@ func (v *Viewer) kickDecode(e cache.Entry) {
 			img, _, err = image.Decode(f)
 			f.Close()
 		case scan.TypeRAW:
-			img, err = thumb.LoadRAWImage(e.Path)
+			img, err = thumb.LoadRAWImage(ctx, e.Path)
 		case scan.TypePhoto:
 			f, err2 := os.Open(e.Path)
 			if err2 == nil {
@@ -510,6 +530,12 @@ func (v *Viewer) kickDecode(e cache.Entry) {
 		}
 
 		if err != nil || img == nil {
+			return
+		}
+
+		// Check if we were cancelled while decoding before doing more work or
+		// updating the UI.
+		if ctx.Err() != nil {
 			return
 		}
 

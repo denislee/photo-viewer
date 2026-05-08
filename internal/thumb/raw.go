@@ -2,6 +2,7 @@ package thumb
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"image"
 	_ "image/jpeg"
@@ -11,8 +12,8 @@ import (
 
 // RAW extracts an embedded JPEG preview from a camera RAW file and resamples
 // it into a thumbnail. Falls back to ffmpeg if no embedded preview is found.
-func RAW(src, dst string, size int) error {
-	img, err := LoadRAWImage(src)
+func RAW(ctx context.Context, src, dst string, size int) error {
+	img, err := LoadRAWImage(ctx, src)
 	if err != nil {
 		return err
 	}
@@ -22,8 +23,8 @@ func RAW(src, dst string, size int) error {
 // LoadRAWImage returns a decoded image.Image from a RAW file. It tries
 // embedded previews first (via exiftool) and falls back to decoding the
 // full RAW via ffmpeg.
-func LoadRAWImage(src string) (image.Image, error) {
-	data, err := LoadRAWPreview(src)
+func LoadRAWImage(ctx context.Context, src string) (image.Image, error) {
+	data, err := LoadRAWPreview(ctx, src)
 	if err == nil {
 		img, _, err := image.Decode(bytes.NewReader(data))
 		if err == nil {
@@ -33,7 +34,7 @@ func LoadRAWImage(src string) (image.Image, error) {
 
 	// Fallback: ffmpeg can decode many RAW formats (DNG, CR2, etc) directly.
 	if _, err := exec.LookPath("ffmpeg"); err == nil {
-		cmd := exec.Command("ffmpeg", "-i", src, "-frames:v", "1", "-f", "image2pipe", "-vcodec", "mjpeg", "-")
+		cmd := exec.CommandContext(ctx, "ffmpeg", "-i", src, "-frames:v", "1", "-f", "image2pipe", "-vcodec", "mjpeg", "-")
 		var out bytes.Buffer
 		cmd.Stdout = &out
 		if err := cmd.Run(); err == nil {
@@ -51,7 +52,7 @@ func LoadRAWImage(src string) (image.Image, error) {
 }
 
 // LoadRAWPreview returns the bytes of an embedded JPEG/TIFF preview.
-func LoadRAWPreview(src string) ([]byte, error) {
+func LoadRAWPreview(ctx context.Context, src string) ([]byte, error) {
 	f, err := os.Open(src)
 	if err != nil {
 		return nil, err
@@ -72,7 +73,7 @@ func LoadRAWPreview(src string) ([]byte, error) {
 	// Try common preview tags in order of descending typical quality/size.
 	tags := []string{"-PreviewImage", "-JpgFromRaw", "-ThumbnailImage", "-PreviewTIFF", "-OtherImage"}
 	for _, tag := range tags {
-		b, err := extractEmbedded(src, tag)
+		b, err := extractEmbedded(ctx, src, tag)
 		if err == nil && len(b) > 0 {
 			// Quick check: is this actually an image?
 			if _, _, err := image.DecodeConfig(bytes.NewReader(b)); err == nil {
@@ -84,8 +85,8 @@ func LoadRAWPreview(src string) ([]byte, error) {
 	return nil, errors.New("no embedded preview found")
 }
 
-func extractEmbedded(src, tag string) ([]byte, error) {
-	cmd := exec.Command("exiftool", "-b", tag, src)
+func extractEmbedded(ctx context.Context, src, tag string) ([]byte, error) {
+	cmd := exec.CommandContext(ctx, "exiftool", "-b", tag, src)
 	var buf bytes.Buffer
 	cmd.Stdout = &buf
 	if err := cmd.Run(); err != nil {

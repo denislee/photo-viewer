@@ -1,6 +1,6 @@
 package thumb
-
 import (
+	"context"
 	"image"
 	_ "image/gif"
 	"image/jpeg"
@@ -15,7 +15,7 @@ import (
 
 // Image decodes src, resamples it to fit within size×size, and writes a JPEG
 // to dst. Aspect ratio is preserved.
-func Image(src, dst string, size int) error {
+func Image(ctx context.Context, src, dst string, size int) error {
 	in, err := os.Open(src)
 	if err != nil {
 		return err
@@ -27,6 +27,7 @@ func Image(src, dst string, size int) error {
 	}
 	return writeThumb(img, dst, size)
 }
+
 
 func writeThumb(src image.Image, dst string, size int) error {
 	b := src.Bounds()

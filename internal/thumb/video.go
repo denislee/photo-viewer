@@ -1,6 +1,7 @@
 package thumb
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"os"
@@ -10,7 +11,7 @@ import (
 
 // Video extracts a frame ~1 second into the file with ffmpeg and resamples it.
 // Requires `ffmpeg` on PATH.
-func Video(src, dst string, size int) error {
+func Video(ctx context.Context, src, dst string, size int) error {
 	if _, err := exec.LookPath("ffmpeg"); err != nil {
 		return errors.New("ffmpeg not installed")
 	}
@@ -23,7 +24,7 @@ func Video(src, dst string, size int) error {
 	// -ss before -i is fast (keyframe seek); -frames:v 1 grabs a single frame.
 	// -vf scale fits longest edge to size while preserving aspect ratio.
 	vf := fmt.Sprintf("scale='if(gt(iw,ih),%d,-2)':'if(gt(iw,ih),-2,%d)'", size, size)
-	cmd := exec.Command("ffmpeg",
+	cmd := exec.CommandContext(ctx, "ffmpeg",
 		"-loglevel", "error",
 		"-y",
 		"-ss", "1",
@@ -34,7 +35,7 @@ func Video(src, dst string, size int) error {
 	)
 	if err := cmd.Run(); err != nil {
 		// Retry from start in case the file is shorter than 1s.
-		cmd2 := exec.Command("ffmpeg",
+		cmd2 := exec.CommandContext(ctx, "ffmpeg",
 			"-loglevel", "error",
 			"-y",
 			"-i", src,

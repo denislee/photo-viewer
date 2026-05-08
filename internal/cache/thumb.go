@@ -1,6 +1,7 @@
 package cache
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -73,7 +74,7 @@ func (s *ThumbStore) Path(e Entry) (string, error) {
 
 	sem := s.semFor(e.Type)
 	sem <- struct{}{}
-	err := s.generate(e, tmp)
+	err := s.generate(context.Background(), e, tmp)
 	<-sem
 
 	if err != nil {
@@ -95,16 +96,16 @@ func (s *ThumbStore) semFor(t scan.MediaType) chan struct{} {
 	}
 }
 
-func (s *ThumbStore) generate(e Entry, dst string) error {
+func (s *ThumbStore) generate(ctx context.Context, e Entry, dst string) error {
 	switch e.Type {
 	case scan.TypePhoto:
-		return thumb.Image(e.Path, dst, ThumbSize)
+		return thumb.Image(ctx, e.Path, dst, ThumbSize)
 	case scan.TypeRAW:
-		return thumb.RAW(e.Path, dst, ThumbSize)
+		return thumb.RAW(ctx, e.Path, dst, ThumbSize)
 	case scan.TypeHEIC:
-		return thumb.HEIC(e.Path, dst, ThumbSize)
+		return thumb.HEIC(ctx, e.Path, dst, ThumbSize)
 	case scan.TypeVideo:
-		return thumb.Video(e.Path, dst, ThumbSize)
+		return thumb.Video(ctx, e.Path, dst, ThumbSize)
 	}
 	return fmt.Errorf("unsupported media type: %s", e.Type)
 }
