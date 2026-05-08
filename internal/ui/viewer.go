@@ -28,13 +28,6 @@ import (
 	"github.com/dns/photo-viewer/internal/thumb"
 )
 
-// fullDecodeOnce guards repeated full-res decode attempts for the same path
-// so the viewer doesn't refire decoding on every frame after a failure.
-var (
-	fullDecodeMu      sync.Mutex
-	fullDecodeStarted = map[string]struct{}{}
-)
-
 // Viewer renders the currently selected entry over the whole window. Open
 // is true when the viewer should claim the screen. ShowInfo toggles the
 // metadata side panel (bound to 'i').
@@ -49,9 +42,10 @@ type Viewer struct {
 
 	entries []cache.Entry
 
-	loadedPath string
-	loadedOp   paint.ImageOp
-	loadedSz   image.Point
+	loadedPath  string
+	loadingPath string
+	loadedOp    paint.ImageOp
+	loadedSz    image.Point
 
 	// Decoded dimensions are cached per path. Decoding happens off the UI
 	// goroutine so opening the viewer doesn't stutter on big originals.
@@ -91,6 +85,7 @@ func (v *Viewer) Close() {
 	v.Open = false
 	v.Confirming = false
 	v.loadedPath = ""
+	v.loadingPath = ""
 	v.loadedOp = paint.ImageOp{}
 }
 
@@ -128,18 +123,25 @@ func (v *Viewer) ConfirmDelete(deleter func(path string) error) {
 		v.Index = len(v.entries) - 1
 	}
 	v.loadedPath = ""
+	v.loadingPath = ""
 	v.loadedOp = paint.ImageOp{}
 }
 
 func (v *Viewer) Next() {
 	if v.Index < len(v.entries)-1 {
 		v.Index++
+		v.loadedPath = ""
+		v.loadingPath = ""
+		v.loadedOp = paint.ImageOp{}
 	}
 }
 
 func (v *Viewer) Prev() {
 	if v.Index > 0 {
 		v.Index--
+		v.loadedPath = ""
+		v.loadingPath = ""
+		v.loadedOp = paint.ImageOp{}
 	}
 }
 
@@ -462,7 +464,10 @@ func (v *Viewer) imageFor(e cache.Entry, tc *thumbCache) (paint.ImageOp, image.P
 		if v.loadedPath == e.Path {
 			return v.loadedOp, v.loadedSz, true
 		}
-		v.kickDecode(e)
+		if v.loadingPath != e.Path {
+			v.loadingPath = e.Path
+			v.kickDecode(e)
+		}
 	}
 	// Fall back to the cached thumbnail (always JPEG).
 	op, sz, ok := tc.Get(e)
@@ -471,17 +476,8 @@ func (v *Viewer) imageFor(e cache.Entry, tc *thumbCache) (paint.ImageOp, image.P
 
 // kickDecode launches a background decode for the given entry,
 // then assigns the result to the viewer's loaded* fields and invalidates so
-// the next frame paints the full-resolution image. At most one decode is
-// queued per path; on failure subsequent visits stay on the thumbnail.
+// the next frame paints the full-resolution image.
 func (v *Viewer) kickDecode(e cache.Entry) {
-	fullDecodeMu.Lock()
-	if _, ok := fullDecodeStarted[e.Path]; ok {
-		fullDecodeMu.Unlock()
-		return
-	}
-	fullDecodeStarted[e.Path] = struct{}{}
-	fullDecodeMu.Unlock()
-
 	go func() {
 		var img image.Image
 		var err error
