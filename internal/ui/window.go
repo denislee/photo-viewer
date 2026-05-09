@@ -346,7 +346,7 @@ func handleKeys(gtx layout.Context, ctrl *Controller, grid *Grid, sidebar *Sideb
 			}
 		}
 		if viewer.Open {
-			handleViewerKey(ke, viewer, ctrl, w)
+			handleViewerKey(ke, viewer, grid, ctrl, w)
 			continue
 		}
 		if *sidebarFocus {
@@ -357,7 +357,7 @@ func handleKeys(gtx layout.Context, ctrl *Controller, grid *Grid, sidebar *Sideb
 	}
 }
 
-func handleViewerKey(ke key.Event, viewer *Viewer, ctrl *Controller, w *app.Window) {
+func handleViewerKey(ke key.Event, viewer *Viewer, grid *Grid, ctrl *Controller, w *app.Window) {
 	// While the delete-confirmation modal is up, only Enter / Esc / Ctrl+[
 	// are meaningful — every other key is a no-op so a stray hjkl can't
 	// silently advance past a confirmation the user hasn't dismissed.
@@ -377,12 +377,29 @@ func handleViewerKey(ke key.Event, viewer *Viewer, ctrl *Controller, w *app.Wind
 		}
 		return
 	}
+
+	syncGrid := func() {
+		if viewer.Index >= 0 && viewer.Index < len(viewer.entries) {
+			e := viewer.entries[viewer.Index]
+			_, _, currentEntries, _ := ctrl.Snapshot()
+			for i, cur := range currentEntries {
+				if cur.Path == e.Path {
+					grid.Selected = i
+					grid.pendingScroll = true
+					break
+				}
+			}
+		}
+	}
+
 	switch ke.Name {
 	case key.NameEscape, "Q":
+		syncGrid()
 		viewer.Close()
 		w.Invalidate()
 	case "[":
 		if ke.Modifiers.Contain(key.ModCtrl) {
+			syncGrid()
 			viewer.Close()
 			w.Invalidate()
 		}
