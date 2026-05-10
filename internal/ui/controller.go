@@ -194,6 +194,16 @@ func (c *Controller) Scanning() bool {
 	return c.scanning > 0
 }
 
+// CancelScan stops any in-flight scan or warm-up.
+func (c *Controller) CancelScan() {
+	c.mu.Lock()
+	if c.scanCancel != nil {
+		c.scanCancel()
+		c.scanCancel = nil
+	}
+	c.mu.Unlock()
+}
+
 // IndexStatus is a snapshot of the indexing pipeline state for the info modal.
 type IndexStatus struct {
 	LibraryRoot string

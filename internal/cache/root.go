@@ -1,7 +1,9 @@
 package cache
 
 import (
+	"crypto/sha1"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"syscall"
@@ -59,6 +61,28 @@ func CacheDir(libraryRoot string) (string, error) {
 		return "", err
 	}
 	return fallback, nil
+}
+
+// IndexPath returns the path to the SQLite database for the given library. It
+// prefers <libraryRoot>/.photo-viewer.db if writable (to keep the index with
+// the media), but falls back to a hashed name inside cacheDir if the library
+// root is read-only.
+func IndexPath(libraryRoot, cacheDir string) string {
+	local := filepath.Join(libraryRoot, ".photo-viewer.db")
+	if _, err := os.Stat(local); err == nil {
+		// Existing database found in library root.
+		return local
+	}
+
+	if info, err := os.Stat(libraryRoot); err == nil && info.IsDir() && writable(libraryRoot) {
+		return local
+	}
+
+	// Library root is read-only or doesn't exist. Use cacheDir with a
+	// deterministic name unique to this library path.
+	sum := sha1.Sum([]byte(libraryRoot))
+	name := fmt.Sprintf("index-%x.db", sum[:8])
+	return filepath.Join(cacheDir, name)
 }
 
 func writable(dir string) bool {

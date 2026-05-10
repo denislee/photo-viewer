@@ -113,6 +113,10 @@ func Run(w *app.Window, ctrl *Controller) error {
 		indexInfo.Show()
 		w.Invalidate()
 	}
+	toolbar.OnCancelScan = func() {
+		ctrl.CancelScan()
+		w.Invalidate()
+	}
 	toolbar.OnRebuild = func() {
 		go func() {
 			if err := ctrl.Rebuild(); err != nil {

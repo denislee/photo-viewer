@@ -36,7 +36,7 @@ func main() {
 	if err != nil {
 		log.Fatalf("cache dir: %v", err)
 	}
-	dbPath := filepath.Join(abs, ".photo-viewer.db")
+	dbPath := cache.IndexPath(abs, cacheDir)
 	idx, err := cache.Load(dbPath)
 	if err != nil {
 		log.Fatalf("load index: %v", err)

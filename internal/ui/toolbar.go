@@ -32,6 +32,7 @@ type Toolbar struct {
 	organizeBtn   widget.Clickable
 	rebuildBtn    widget.Clickable
 	warmUpBtn     widget.Clickable
+	cancelBtn     widget.Clickable
 	spinnerBtn    widget.Clickable
 
 	OnFilter      func(string)
@@ -44,6 +45,7 @@ type Toolbar struct {
 	OnRebuild     func()
 	OnWarmUp      func()
 	OnIndexInfo   func()
+	OnCancelScan  func()
 
 	// State mirrored from the controller; the active filter button is
 	// rendered with HighImportance so it stands out.
@@ -113,6 +115,9 @@ func (t *Toolbar) Layout(gtx layout.Context, th *Theme, path string, count int) 
 	if t.warmUpBtn.Clicked(gtx) && t.OnWarmUp != nil {
 		t.OnWarmUp()
 	}
+	if t.cancelBtn.Clicked(gtx) && t.OnCancelScan != nil {
+		t.OnCancelScan()
+	}
 	if t.spinnerBtn.Clicked(gtx) && t.OnIndexInfo != nil {
 		t.OnIndexInfo()
 	}
@@ -156,9 +161,19 @@ func (t *Toolbar) Layout(gtx layout.Context, th *Theme, path string, count int) 
 					return layout.Dimensions{}
 				}
 				return layout.Inset{Left: unit.Dp(8)}.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
-					return t.spinnerBtn.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
-						return t.layoutSpinner(gtx, th)
-					})
+					return layout.Flex{Axis: layout.Horizontal, Alignment: layout.Middle}.Layout(gtx,
+						layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+							return t.spinnerBtn.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
+								return t.layoutSpinner(gtx, th)
+							})
+						}),
+						layout.Rigid(layout.Spacer{Width: unit.Dp(8)}.Layout),
+						layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+							b := material.Button(th.Theme, &t.cancelBtn, "Cancel")
+							b.Background = th.Destructive
+							return b.Layout(gtx)
+						}),
+					)
 				})
 			}),
 			layout.Rigid(layout.Spacer{Width: unit.Dp(10)}.Layout),
