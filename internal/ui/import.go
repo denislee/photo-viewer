@@ -1087,15 +1087,36 @@ func (v *ImportView) runImport(ctx context.Context, cfg Config, importDirs, zipF
 // outbox under YYYY-MM-DD folders.
 func (v *ImportView) processBatch(ctx context.Context, outboxDir string, entries []string) {
 	baseDates := make(map[string]time.Time)
+	// Files whose mtime predates their declared EXIF/metadata date — rewrite
+	// the metadata to mtime after we've decided the destination so subsequent
+	// scans see consistent dates.
+	type mtimeFix struct {
+		path string
+		when time.Time
+	}
+	var mtimeFixes []mtimeFix
 	for _, src := range entries {
 		if ctx.Err() != nil {
 			return
 		}
-		mediaDate := scan.GetMediaDate(src)
+		oldest, _, mtimeOlder := scan.GetOldestMediaDate(src)
+		if mtimeOlder {
+			mtimeFixes = append(mtimeFixes, mtimeFix{path: src, when: oldest})
+		}
 		baseName := filepath.Base(src)
 		base := strings.TrimSuffix(baseName, filepath.Ext(baseName))
-		if existing, ok := baseDates[base]; !ok || mediaDate.Before(existing) {
-			baseDates[base] = mediaDate
+		if existing, ok := baseDates[base]; !ok || oldest.Before(existing) {
+			baseDates[base] = oldest
+		}
+	}
+	for _, fix := range mtimeFixes {
+		if ctx.Err() != nil {
+			break
+		}
+		if err := scan.SetMediaDate(fix.path, fix.when); err != nil {
+			v.appendLog("[WARN] Could not rewrite creation date on " + filepath.Base(fix.path) + ": " + err.Error())
+		} else {
+			v.appendLog("Rewrote creation date on " + filepath.Base(fix.path) + " to " + fix.when.Format("2006-01-02"))
 		}
 	}
 

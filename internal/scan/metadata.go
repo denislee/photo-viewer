@@ -144,6 +144,93 @@ func safeRat(tag *tiff.Tag) (rat *big.Rat) {
 	return nil
 }
 
+// GetOldestMediaDate returns the oldest of the file's metadata creation date
+// and its filesystem modification time, alongside the metadata date itself.
+// mtimeOlder is true when mtime predates the EXIF/metadata date (in which
+// case the caller may want to rewrite the metadata date back to mtime). When
+// no metadata date is available, the metadata return value is the zero time
+// and mtimeOlder is false.
+func GetOldestMediaDate(path string) (oldest time.Time, metaDate time.Time, mtimeOlder bool) {
+	metaDate, hasMeta := readMetadataDate(path)
+	var mtime time.Time
+	if fi, err := os.Stat(path); err == nil {
+		mtime = fi.ModTime()
+	}
+	switch {
+	case hasMeta && !mtime.IsZero():
+		if mtime.Before(metaDate) {
+			return mtime, metaDate, true
+		}
+		return metaDate, metaDate, false
+	case hasMeta:
+		return metaDate, metaDate, false
+	case !mtime.IsZero():
+		return mtime, time.Time{}, false
+	default:
+		return time.Now(), time.Time{}, false
+	}
+}
+
+// SetMediaDate writes the given time into the file's EXIF/QuickTime
+// creation tags via exiftool. It also updates the filesystem mtime so the
+// two stay in sync. Returns an error if exiftool is missing or the write
+// fails.
+func SetMediaDate(path string, t time.Time) error {
+	if _, err := exec.LookPath("exiftool"); err != nil {
+		return fmt.Errorf("exiftool not available: %w", err)
+	}
+	stamp := t.Format("2006:01:02 15:04:05")
+	cmd := exec.Command("exiftool",
+		"-overwrite_original",
+		"-P",
+		"-DateTimeOriginal="+stamp,
+		"-CreateDate="+stamp,
+		"-ModifyDate="+stamp,
+		"-MediaCreateDate="+stamp,
+		"-MediaModifyDate="+stamp,
+		"-TrackCreateDate="+stamp,
+		"-TrackModifyDate="+stamp,
+		path)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("exiftool: %w: %s", err, strings.TrimSpace(string(out)))
+	}
+	_ = os.Chtimes(path, t, t)
+	return nil
+}
+
+// readMetadataDate is the shared implementation used by GetMediaDate and
+// GetOldestMediaDate. It returns the metadata creation date (if any) and a
+// flag indicating whether one was found.
+func readMetadataDate(path string) (time.Time, bool) {
+	if _, err := exec.LookPath("exiftool"); err == nil {
+		cmd := exec.Command("exiftool", "-s", "-S", "-CreateDate", "-DateTimeOriginal", "-MediaCreateDate", path)
+		out, err := cmd.Output()
+		if err == nil {
+			lines := strings.Split(strings.TrimSpace(string(out)), "\n")
+			for _, line := range lines {
+				line = strings.TrimSpace(line)
+				if line == "" {
+					continue
+				}
+				for _, layout := range []string{"2006:01:02 15:04:05", "2006:01:02 15:04:05-07:00", "2006:01:02 15:04:05Z"} {
+					if t, err := time.Parse(layout, line); err == nil {
+						return t, true
+					}
+				}
+			}
+		}
+	}
+	if f, err := os.Open(path); err == nil {
+		defer f.Close()
+		if x, err := exif.Decode(f); err == nil {
+			if tm, err := x.DateTime(); err == nil {
+				return tm, true
+			}
+		}
+	}
+	return time.Time{}, false
+}
+
 // GetMediaDate returns the best creation date found in the file's metadata.
 // It tries exiftool first (for videos, RAW, and photos), then falls back to
 // manual EXIF decoding (photos), and finally to the file's modification time.
