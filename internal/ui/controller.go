@@ -245,6 +245,12 @@ func (c *Controller) IndexStatus() IndexStatus {
 // and kicks off a full rescan of the library root. Mirrors the Fyne
 // Controller.rebuildIndex behavior.
 func (c *Controller) Rebuild() error {
+	// Read the current FS structure before taking the lock so the sidebar has
+	// fresh subdirs to render in the gap between Rebuild() returning and the
+	// first scan batch landing — otherwise the tree briefly collapses to just
+	// the root row.
+	subs := listSubdirs(c.libraryRoot)
+
 	c.mu.Lock()
 	if c.scanCancel != nil {
 		c.scanCancel()
@@ -252,7 +258,7 @@ func (c *Controller) Rebuild() error {
 	ctx, cancel := context.WithCancel(context.Background())
 	c.scanCancel = cancel
 	c.entries = nil
-	c.subdirs = nil
+	c.subdirs = subs
 	c.treeDir = c.libraryRoot
 	c.currentDir = c.libraryRoot
 	c.mu.Unlock()
