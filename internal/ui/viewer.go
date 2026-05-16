@@ -21,6 +21,7 @@ import (
 	"gioui.org/widget/material"
 
 	_ "golang.org/x/image/bmp"
+	"golang.org/x/image/draw"
 	_ "golang.org/x/image/tiff"
 	_ "golang.org/x/image/webp"
 
@@ -49,6 +50,11 @@ type Viewer struct {
 	loadedOp         paint.ImageOp
 	loadedSz         image.Point
 
+	// recent caches up to viewerRecentCap previously-decoded paint.ImageOps
+	// so navigating back to a recently viewed entry avoids re-decoding the
+	// original. Ordered MRU→LRU; LRU is dropped when the cap is reached.
+	recent []recentImage
+
 	// Decoded dimensions are cached per path. Decoding happens off the UI
 	// goroutine so opening the viewer doesn't stutter on big originals.
 	dimMu    sync.Mutex
@@ -61,6 +67,25 @@ type Viewer struct {
 	infoAsked map[string]bool
 
 	invalidate func()
+}
+
+// viewerRecentCap is the size of the recently-decoded paint.ImageOp LRU. Each
+// entry is one decoded original, capped to viewerMaxPreviewSide on the long
+// side, so the worst case is ~viewerRecentCap × (side² × 4 bytes) of pixel
+// memory — for 3 × 4096px that's roughly 200 MB, acceptable for an image
+// viewer running interactively.
+const viewerRecentCap = 3
+
+// viewerMaxPreviewSide caps the long side of the decoded preview. RAW/HEIC
+// originals can exceed 8000 px on one side; rendering them at full res
+// creates an enormous GPU texture for no visible benefit on a typical
+// display. The slow path is reserved for an explicit zoom mode (TODO).
+const viewerMaxPreviewSide = 4096
+
+type recentImage struct {
+	path string
+	op   paint.ImageOp
+	sz   image.Point
 }
 
 type cachedInfo struct {
@@ -93,6 +118,46 @@ func (v *Viewer) Close() {
 		v.loadingCtxCancel = nil
 	}
 	v.loadedOp = paint.ImageOp{}
+	v.recent = nil
+}
+
+// parkLoaded moves the current loadedOp into the MRU position of the recent
+// cache if there is one. Called whenever loadedPath is about to be cleared
+// (Next/Prev/Delete/Close-ish) so we can rehydrate without re-decoding when
+// the user navigates back.
+func (v *Viewer) parkLoaded() {
+	if v.loadedPath == "" || v.loadedSz == (image.Point{}) {
+		return
+	}
+	v.cachePut(v.loadedPath, v.loadedOp, v.loadedSz)
+}
+
+// cachePut inserts (path, op) at the MRU end of v.recent, evicting the
+// oldest entry past viewerRecentCap.
+func (v *Viewer) cachePut(path string, op paint.ImageOp, sz image.Point) {
+	for i, r := range v.recent {
+		if r.path == path {
+			v.recent = append(v.recent[:i], v.recent[i+1:]...)
+			break
+		}
+	}
+	v.recent = append([]recentImage{{path: path, op: op, sz: sz}}, v.recent...)
+	if len(v.recent) > viewerRecentCap {
+		v.recent = v.recent[:viewerRecentCap]
+	}
+}
+
+// cacheGet returns the cached image op for path and moves the entry to MRU.
+func (v *Viewer) cacheGet(path string) (paint.ImageOp, image.Point, bool) {
+	for i, r := range v.recent {
+		if r.path == path {
+			if i != 0 {
+				v.recent = append([]recentImage{r}, append(v.recent[:i], v.recent[i+1:]...)...)
+			}
+			return r.op, r.sz, true
+		}
+	}
+	return paint.ImageOp{}, image.Point{}, false
 }
 
 // RequestDelete opens the delete-confirmation modal for the current entry.
@@ -128,6 +193,14 @@ func (v *Viewer) ConfirmDelete(deleter func(path string) error) {
 	if v.Index >= len(v.entries) {
 		v.Index = len(v.entries) - 1
 	}
+	// Drop the deleted entry from the recent cache too — the path no
+	// longer exists, and the cache entry would never get evicted otherwise.
+	for i, r := range v.recent {
+		if r.path == e.Path {
+			v.recent = append(v.recent[:i], v.recent[i+1:]...)
+			break
+		}
+	}
 	v.cancelLoading()
 	v.loadedPath = ""
 	v.loadingPath = ""
@@ -144,6 +217,7 @@ func (v *Viewer) cancelLoading() {
 func (v *Viewer) Next() {
 	if v.Index < len(v.entries)-1 {
 		v.Index++
+		v.parkLoaded()
 		v.cancelLoading()
 		v.loadedPath = ""
 		v.loadingPath = ""
@@ -154,6 +228,7 @@ func (v *Viewer) Next() {
 func (v *Viewer) Prev() {
 	if v.Index > 0 {
 		v.Index--
+		v.parkLoaded()
 		v.cancelLoading()
 		v.loadedPath = ""
 		v.loadingPath = ""
@@ -472,13 +547,23 @@ func titleCaseGio(s string) string {
 }
 
 // imageFor decodes the original photo on demand for photo/HEIC/RAW types and
-// caches a single decoded result; for videos and decode failures it falls back
-// to the thumbnail.
+// caches a small LRU of recent decodes; for videos and decode failures it
+// falls back to the thumbnail.
 func (v *Viewer) imageFor(e cache.Entry, tc *thumbCache) (paint.ImageOp, image.Point, bool) {
 	switch e.Type {
 	case scan.TypePhoto, scan.TypeRAW, scan.TypeHEIC:
 		if v.loadedPath == e.Path {
 			return v.loadedOp, v.loadedSz, true
+		}
+		// Rehydrate from the recent LRU so back-and-forth navigation is
+		// instant. Promote into the live slot so the next frame paints
+		// from it without falling back to the thumbnail.
+		if op, sz, ok := v.cacheGet(e.Path); ok {
+			v.loadedPath = e.Path
+			v.loadedOp = op
+			v.loadedSz = sz
+			v.loadingPath = ""
+			return op, sz, true
 		}
 		if v.loadingPath != e.Path {
 			v.loadingPath = e.Path
@@ -539,18 +624,49 @@ func (v *Viewer) kickDecode(e cache.Entry) {
 			return
 		}
 
+		img = downscalePreview(img, viewerMaxPreviewSide)
+
 		op := paint.NewImageOp(img)
 		op.Filter = paint.FilterLinear
+		sz := img.Bounds().Size()
 
 		// Safe to set here because it's only read and written atomically via pointer/structs
 		// by the main UI thread during Layout.
 		v.loadedPath = e.Path
 		v.loadedOp = op
-		v.loadedSz = img.Bounds().Size()
+		v.loadedSz = sz
+		v.cachePut(e.Path, op, sz)
 		if v.invalidate != nil {
 			v.invalidate()
 		}
 	}()
+}
+
+// downscalePreview returns img resized so its long side is at most maxSide.
+// Images already within the cap are returned unchanged so the common case
+// (already-small JPEGs) avoids an extra allocation and resample.
+func downscalePreview(img image.Image, maxSide int) image.Image {
+	b := img.Bounds()
+	w, h := b.Dx(), b.Dy()
+	longSide := w
+	if h > longSide {
+		longSide = h
+	}
+	if longSide <= maxSide {
+		return img
+	}
+	s := float64(maxSide) / float64(longSide)
+	dstW := int(float64(w) * s)
+	dstH := int(float64(h) * s)
+	if dstW < 1 {
+		dstW = 1
+	}
+	if dstH < 1 {
+		dstH = 1
+	}
+	dst := image.NewRGBA(image.Rect(0, 0, dstW, dstH))
+	draw.ApproxBiLinear.Scale(dst, dst.Bounds(), img, b, draw.Over, nil)
+	return dst
 }
 
 // dim is a helper that returns layout.Dimensions of the given size.

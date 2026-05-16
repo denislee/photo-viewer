@@ -103,7 +103,29 @@ func (i *Index) Save() error {
 	return nil
 }
 
-// ReconcileBatch inserts or updates a slice of scan results in a single transaction.
+// reconcileChunkSize is the maximum number of rows per transaction in
+// ReconcileBatch. Large rebuild scans accumulate tens of thousands of files;
+// keeping each transaction bounded lets concurrent readers (the UI sidebar,
+// the grid) make progress between chunks instead of stalling for one giant
+// fsync, at the cost of one extra fsync per chunk.
+const reconcileChunkSize = 5000
+
+const reconcileInsertSQL = `INSERT INTO entries (path, type, size, mtime, thumb_id) VALUES (?, ?, ?, ?, ?)
+	ON CONFLICT(path) DO UPDATE SET
+		type = excluded.type,
+		size = excluded.size,
+		mtime = excluded.mtime,
+		thumb_id = excluded.thumb_id,
+		quick_hash = CASE
+			WHEN entries.size != excluded.size OR entries.mtime != excluded.mtime
+			THEN NULL ELSE entries.quick_hash END,
+		content_hash = CASE
+			WHEN entries.size != excluded.size OR entries.mtime != excluded.mtime
+			THEN NULL ELSE entries.content_hash END`
+
+// ReconcileBatch inserts or updates a slice of scan results, chunking the
+// work into bounded transactions so readers aren't blocked for the whole
+// run on very large scans.
 func (i *Index) ReconcileBatch(results []scan.Result) []Entry {
 
 	out := make([]Entry, 0, len(results))
@@ -111,33 +133,35 @@ func (i *Index) ReconcileBatch(results []scan.Result) []Entry {
 		return out
 	}
 
+	for start := 0; start < len(results); start += reconcileChunkSize {
+		end := start + reconcileChunkSize
+		if end > len(results) {
+			end = len(results)
+		}
+		i.reconcileChunk(results[start:end], &out)
+	}
+	return out
+}
+
+// reconcileChunk writes one bounded transaction's worth of results and
+// appends the corresponding Entries to out.
+func (i *Index) reconcileChunk(chunk []scan.Result, out *[]Entry) {
 	tx, err := i.db.Begin()
 	if err != nil {
-		return out
+		return
 	}
 	defer tx.Rollback()
 
 	// On update, clear quick_hash and content_hash whenever size or mtime
 	// changed so a re-hash kicks in on the next duplicate scan. (SQLite's
 	// `entries.column` inside DO UPDATE refers to the existing row.)
-	stmt, err := tx.Prepare(`INSERT INTO entries (path, type, size, mtime, thumb_id) VALUES (?, ?, ?, ?, ?)
-		ON CONFLICT(path) DO UPDATE SET
-			type = excluded.type,
-			size = excluded.size,
-			mtime = excluded.mtime,
-			thumb_id = excluded.thumb_id,
-			quick_hash = CASE
-				WHEN entries.size != excluded.size OR entries.mtime != excluded.mtime
-				THEN NULL ELSE entries.quick_hash END,
-			content_hash = CASE
-				WHEN entries.size != excluded.size OR entries.mtime != excluded.mtime
-				THEN NULL ELSE entries.content_hash END`)
+	stmt, err := tx.Prepare(reconcileInsertSQL)
 	if err != nil {
-		return out
+		return
 	}
 	defer stmt.Close()
 
-	for _, r := range results {
+	for _, r := range chunk {
 		e := Entry{
 			Path:    r.Path,
 			Type:    r.Type,
@@ -146,11 +170,9 @@ func (i *Index) ReconcileBatch(results []scan.Result) []Entry {
 			ThumbID: ThumbIDFor(r.Path),
 		}
 		_, _ = stmt.Exec(e.Path, e.Type, e.Size, e.ModTime.Unix(), e.ThumbID)
-		out = append(out, e)
+		*out = append(*out, e)
 	}
 	_ = tx.Commit()
-
-	return out
 }
 
 // Prune drops index entries whose path is not in the given set. Returns the
@@ -221,6 +243,15 @@ func (i *Index) ListDir(dir string) []Entry {
 
 	lower, upper := dirRange(dir)
 
+	// Pre-size the result slice with a cheap COUNT(*) so we don't pay
+	// repeated slice regrowth on large directories. Estimate is allowed to
+	// be slightly stale; append grows from there if needed.
+	var estimate int
+	_ = i.db.QueryRow(
+		"SELECT COUNT(*) FROM entries WHERE (path >= ? AND path < ?) OR path = ?",
+		lower, upper, dir,
+	).Scan(&estimate)
+
 	rows, err := i.db.Query(
 		"SELECT path, type, size, mtime, thumb_id, favorite FROM entries WHERE (path >= ? AND path < ?) OR path = ? ORDER BY path",
 		lower, upper, dir,
@@ -230,7 +261,7 @@ func (i *Index) ListDir(dir string) []Entry {
 	}
 	defer rows.Close()
 
-	var out []Entry
+	out := make([]Entry, 0, estimate)
 	for rows.Next() {
 		var e Entry
 		var mtimeUnix int64
@@ -393,13 +424,16 @@ func typeFilterClause(filter string, showRAW bool) (string, []any) {
 // All returns a snapshot of the entire index.
 func (i *Index) All() []Entry {
 
+	var estimate int
+	_ = i.db.QueryRow("SELECT COUNT(*) FROM entries").Scan(&estimate)
+
 	rows, err := i.db.Query("SELECT path, type, size, mtime, thumb_id, favorite FROM entries ORDER BY path")
 	if err != nil {
 		return nil
 	}
 	defer rows.Close()
 
-	var out []Entry
+	out := make([]Entry, 0, estimate)
 	for rows.Next() {
 		var e Entry
 		var mtimeUnix int64
@@ -416,13 +450,16 @@ func (i *Index) All() []Entry {
 // ListFavorites returns all entries flagged as favorites.
 func (i *Index) ListFavorites() []Entry {
 
+	var estimate int
+	_ = i.db.QueryRow("SELECT COUNT(*) FROM entries WHERE favorite = 1").Scan(&estimate)
+
 	rows, err := i.db.Query("SELECT path, type, size, mtime, thumb_id, favorite FROM entries WHERE favorite = 1 ORDER BY path")
 	if err != nil {
 		return nil
 	}
 	defer rows.Close()
 
-	var out []Entry
+	out := make([]Entry, 0, estimate)
 	for rows.Next() {
 		var e Entry
 		var mtimeUnix int64

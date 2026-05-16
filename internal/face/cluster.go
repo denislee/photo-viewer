@@ -26,20 +26,73 @@ func CosineDistance(a, b []float32) float64 {
 	return 1 - dot/(math.Sqrt(na)*math.Sqrt(nb))
 }
 
+// normalize returns v / ||v||. The result has length 1; cosine distance
+// against another unit vector reduces to a dot product, dropping the two
+// sqrts and divisions from the hot inner loop.
+func normalize(v []float32) []float32 {
+	if len(v) == 0 {
+		return nil
+	}
+	var sum float64
+	for _, x := range v {
+		sum += float64(x) * float64(x)
+	}
+	if sum == 0 {
+		return nil
+	}
+	inv := 1 / math.Sqrt(sum)
+	out := make([]float32, len(v))
+	for i, x := range v {
+		out[i] = float32(float64(x) * inv)
+	}
+	return out
+}
+
+// dotUnit returns the dot product of two equal-length vectors. Caller is
+// responsible for normalization; this is the inner loop of nearest-cluster
+// search so it deliberately avoids any branches or sqrt.
+func dotUnit(a, b []float32) float64 {
+	var d float64
+	for i := range a {
+		d += float64(a[i]) * float64(b[i])
+	}
+	return d
+}
+
 // CentroidCandidate is the slice of (id, vector) pairs the cluster step
-// searches against. The caller fills it from the index.
+// searches against. The caller fills it from the index. Norm is the cached
+// unit-length form of Centroid — populated by NearestCluster on first use so
+// repeated searches against the same in-memory cluster cache don't re-pay
+// the normalization cost.
 type CentroidCandidate struct {
 	ID       int64
 	Centroid []float32
 	Count    int // running face count, used to update the centroid mean
+	Norm     []float32
 }
 
 // NearestCluster picks the cluster whose centroid is closest to v. Returns
-// (-1, distance) if no candidates are within MaxClusterDistance.
+// (-1, distance) if no candidates are within MaxClusterDistance. The
+// candidates slice is mutated in place: Norm is filled the first time a
+// candidate is seen and reused on subsequent calls.
 func NearestCluster(v []float32, candidates []CentroidCandidate) (int, float64) {
+	vn := normalize(v)
+	if vn == nil {
+		return -1, 1
+	}
 	bestIdx, bestDist := -1, MaxClusterDistance
-	for i, c := range candidates {
-		d := CosineDistance(v, c.Centroid)
+	for i := range candidates {
+		c := &candidates[i]
+		if c.Norm == nil || len(c.Norm) != len(c.Centroid) {
+			c.Norm = normalize(c.Centroid)
+			if c.Norm == nil {
+				continue
+			}
+		}
+		if len(c.Norm) != len(vn) {
+			continue
+		}
+		d := 1 - dotUnit(vn, c.Norm)
 		if d < bestDist {
 			bestIdx = i
 			bestDist = d

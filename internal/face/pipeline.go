@@ -40,6 +40,13 @@ type Pipeline struct {
 	clusterMu      sync.Mutex
 	cachedClusters []cache.Cluster
 	clusterCacheOK bool
+
+	// freshnessMu guards freshness, an in-memory mirror of the latest
+	// thumb_mtime stored per-path in the faces table. acceptJob consults
+	// it instead of running a COUNT(*) per Submit. Populated lazily on
+	// first need; updated by process() after it successfully writes faces.
+	freshnessMu sync.RWMutex
+	freshness   map[string]int64
 }
 
 // NewPipeline returns a pipeline. If pv-face-detect is missing, the pipeline
@@ -155,7 +162,7 @@ func (p *Pipeline) acceptJob(j Job) (chan Job, bool) {
 	default:
 		return nil, false
 	}
-	if p.idx.HasFreshFaces(j.Entry.Path, j.ThumbMod) {
+	if p.hasFreshCached(j.Entry.Path, j.ThumbMod) {
 		return nil, false
 	}
 	p.mu.Lock()
@@ -165,6 +172,37 @@ func (p *Pipeline) acceptJob(j Job) (chan Job, bool) {
 		return nil, false
 	}
 	return jobs, true
+}
+
+// hasFreshCached answers the freshness question from the in-memory mirror.
+// On first call it lazily bulk-loads from the index — that single query
+// replaces what would otherwise be one COUNT(*) per Submit on every scan.
+func (p *Pipeline) hasFreshCached(path string, thumbMod int64) bool {
+	p.freshnessMu.RLock()
+	m := p.freshness
+	p.freshnessMu.RUnlock()
+	if m == nil {
+		p.freshnessMu.Lock()
+		if p.freshness == nil {
+			p.freshness = p.idx.LoadFaceFreshness()
+		}
+		m = p.freshness
+		p.freshnessMu.Unlock()
+	}
+	p.freshnessMu.RLock()
+	defer p.freshnessMu.RUnlock()
+	return p.freshness[path] == thumbMod
+}
+
+// markFresh records that path now has faces written against thumbMod, so the
+// next Submit/process for the same (path, thumbMod) skips re-detection.
+func (p *Pipeline) markFresh(path string, thumbMod int64) {
+	p.freshnessMu.Lock()
+	if p.freshness == nil {
+		p.freshness = map[string]int64{}
+	}
+	p.freshness[path] = thumbMod
+	p.freshnessMu.Unlock()
 }
 
 func (p *Pipeline) worker(ctx context.Context) {
@@ -192,7 +230,7 @@ func (p *Pipeline) worker(ctx context.Context) {
 func (p *Pipeline) process(ctx context.Context, d *daemon, j Job) {
 	// Re-check inside the worker — another worker may have handled this
 	// path in the interim (e.g. a re-submit from a refresh).
-	if p.idx.HasFreshFaces(j.Entry.Path, j.ThumbMod) {
+	if p.hasFreshCached(j.Entry.Path, j.ThumbMod) {
 		return
 	}
 	dets, err := d.Detect(ctx, j.ThumbPath)
@@ -244,6 +282,9 @@ func (p *Pipeline) process(ctx context.Context, d *daemon, j Job) {
 			p.cachedClusters[idx].Count = c.Count + 1
 			cands[idx].Centroid = newCentroid
 			cands[idx].Count = c.Count + 1
+			// Centroid changed — drop the cached unit form so the next
+			// NearestCluster call recomputes against the fresh vector.
+			cands[idx].Norm = nil
 			cacheSlots = append(cacheSlots, idx)
 		} else {
 			emb := append([]float32(nil), d.Embedding...)
@@ -270,6 +311,7 @@ func (p *Pipeline) process(ctx context.Context, d *daemon, j Job) {
 		p.clusterMu.Unlock()
 		return
 	}
+	p.markFresh(j.Entry.Path, j.ThumbMod)
 
 	changed := false
 	for i, op := range ops {
@@ -293,4 +335,9 @@ func (p *Pipeline) InvalidateClusters() {
 	p.cachedClusters = nil
 	p.clusterCacheOK = false
 	p.clusterMu.Unlock()
+	// Cluster wipes and merges go hand in hand with the face rows being
+	// rewritten, so the freshness mirror is no longer authoritative.
+	p.freshnessMu.Lock()
+	p.freshness = nil
+	p.freshnessMu.Unlock()
 }

@@ -92,7 +92,16 @@ func NewGrid() *Grid {
 
 func (g *Grid) ensureCells(n int) {
 	if cap(g.cells) < n {
-		g.cells = make([]*widget.Clickable, n)
+		// Grow with ~20% slack so repeated viewport stretches and scroll
+		// past the end of large lists don't trigger a realloc on every
+		// frame. The minimum bump keeps the very-small case sane.
+		grown := n + n/5
+		if grown < n+8 {
+			grown = n + 8
+		}
+		next := make([]*widget.Clickable, n, grown)
+		copy(next, g.cells)
+		g.cells = next
 	} else {
 		g.cells = g.cells[:n]
 	}
@@ -216,9 +225,25 @@ func (g *Grid) SelectedIndex(total int) int {
 func (g *Grid) Layout(gtx layout.Context, th *Theme, entries []cache.Entry, ctrl *Controller) layout.Dimensions {
 	g.ensureCells(len(entries))
 
-	// Drain click events.
-	for i, c := range g.cells {
-		if c.Clicked(gtx) {
+	// Drain click events for the cells that were drawn last frame. Cells
+	// outside the visible window can't have received new pointer events
+	// (they weren't laid out), so polling them is wasted work — and on
+	// large grids that's tens of thousands of Clicked() calls per frame.
+	first, count := g.list.Position.First, g.list.Position.Count
+	cols := g.cols
+	if cols < 1 {
+		cols = 1
+	}
+	clickStart := first * cols
+	clickEnd := (first + count + 1) * cols
+	if clickStart < 0 {
+		clickStart = 0
+	}
+	if clickEnd > len(g.cells) {
+		clickEnd = len(g.cells)
+	}
+	for i := clickStart; i < clickEnd; i++ {
+		if g.cells[i].Clicked(gtx) {
 			g.Selected = i
 			if ctrl.SelectionMode {
 				ctrl.ToggleSelection(entries[i].Path)
@@ -231,7 +256,7 @@ func (g *Grid) Layout(gtx layout.Context, th *Theme, entries []cache.Entry, ctrl
 	cellPx := gtx.Dp(g.cellSize)
 	gapPx := gtx.Dp(cellGapDp)
 	width := gtx.Constraints.Max.X
-	cols := (width + gapPx) / (cellPx + gapPx)
+	cols = (width + gapPx) / (cellPx + gapPx)
 	if cols < 1 {
 		cols = 1
 	}
@@ -283,17 +308,25 @@ func (g *Grid) layoutRow(gtx layout.Context, th *Theme, entries []cache.Entry, c
 	if end > len(entries) {
 		end = len(entries)
 	}
+	// Hoist loop-invariants so the inner loop only does per-cell work:
+	// offset and the IsSelected map lookup. cellSize is fixed for the row,
+	// as are the thumb cache, selection mode, and stride.
 	rowH := cellPx + gapPx
+	stride := cellPx + gapPx
+	yOff := gapPx / 2
+	cellSize := image.Pt(cellPx, cellPx)
+	cellGtx := gtx
+	cellGtx.Constraints.Max = cellSize
+	cellGtx.Constraints.Min = cellSize
+	thumbs := ctrl.Thumbs()
+	selectionMode := ctrl.SelectionMode
+	selected := g.Selected
 	for i := start; i < end; i++ {
-		col := i - start
-		x := col * (cellPx + gapPx)
-		stack := op.Offset(image.Pt(x, gapPx/2)).Push(gtx.Ops)
-		// Constrain inner gtx to the cell, so Clickable's hit area matches.
-		cellGtx := gtx
-		cellGtx.Constraints.Max = image.Pt(cellPx, cellPx)
-		cellGtx.Constraints.Min = image.Pt(cellPx, cellPx)
-		isSelected := ctrl.IsSelected(entries[i].Path)
-		drawCell(cellGtx, th, entries[i], ctrl.Thumbs(), g.cells[i], cellPx, i == g.Selected, isSelected, ctrl.SelectionMode)
+		x := (i - start) * stride
+		stack := op.Offset(image.Pt(x, yOff)).Push(gtx.Ops)
+		e := entries[i]
+		isSelected := selectionMode && ctrl.IsSelected(e.Path)
+		drawCell(cellGtx, th, e, thumbs, g.cells[i], cellPx, i == selected, isSelected, selectionMode)
 		stack.Pop()
 	}
 	return layout.Dimensions{Size: image.Pt(gtx.Constraints.Max.X, rowH)}

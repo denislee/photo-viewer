@@ -30,28 +30,43 @@ func hashFile(path string) (string, error) {
 	return hex.EncodeToString(h.Sum(nil)), nil
 }
 
+// quickHashWindow is the read-window size in bytes for quickHash. 64 KiB is
+// chosen so two reads cover the head and tail of a typical media file without
+// pulling in arbitrarily large blocks.
+const quickHashWindow = 64 * 1024
+
+// quickHashBufPool recycles 64 KiB read buffers across quickHash calls so the
+// duplicate scan doesn't burn an allocation per file.
+var quickHashBufPool = sync.Pool{
+	New: func() any {
+		b := make([]byte, quickHashWindow)
+		return &b
+	},
+}
+
 // quickHash hashes the first and last 64 KiB of a file. Two files that share
 // size but produce different quick hashes cannot be byte-identical, so they
 // can skip the full SHA-256 read.
 func quickHash(path string, size int64) (string, error) {
-	const window = 64 * 1024
 	f, err := os.Open(path)
 	if err != nil {
 		return "", err
 	}
 	defer f.Close()
 	h := sha256.New()
-	if size <= int64(window)*2 {
+	if size <= int64(quickHashWindow)*2 {
 		if _, err := io.Copy(h, f); err != nil {
 			return "", err
 		}
 	} else {
-		buf := make([]byte, window)
+		bufp := quickHashBufPool.Get().(*[]byte)
+		defer quickHashBufPool.Put(bufp)
+		buf := *bufp
 		if _, err := io.ReadFull(f, buf); err != nil {
 			return "", err
 		}
 		h.Write(buf)
-		if _, err := f.Seek(size-int64(window), io.SeekStart); err != nil {
+		if _, err := f.Seek(size-int64(quickHashWindow), io.SeekStart); err != nil {
 			return "", err
 		}
 		if _, err := io.ReadFull(f, buf); err != nil {

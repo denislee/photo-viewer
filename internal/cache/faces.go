@@ -62,6 +62,27 @@ func (i *Index) HasFreshFaces(path string, thumbMtime int64) bool {
 	return err == nil && n > 0
 }
 
+// LoadFaceFreshness returns the maximum thumb_mtime stored against each path
+// that has any face rows. The face pipeline pre-loads this on start so its
+// per-job freshness checks can be answered from memory rather than firing a
+// COUNT(*) per submit.
+func (i *Index) LoadFaceFreshness() map[string]int64 {
+	rows, err := i.db.Query("SELECT path, MAX(thumb_mtime) FROM faces GROUP BY path")
+	if err != nil {
+		return map[string]int64{}
+	}
+	defer rows.Close()
+	out := make(map[string]int64, 1024)
+	for rows.Next() {
+		var p string
+		var mt int64
+		if err := rows.Scan(&p, &mt); err == nil {
+			out[p] = mt
+		}
+	}
+	return out
+}
+
 // FaceOp is one face write decided by the caller. Exactly one of
 // ExistingClusterID or NewClusterCentroid is meaningful per op:
 //   - ExistingClusterID > 0 → assign the face to that cluster and replace its

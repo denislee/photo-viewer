@@ -6,6 +6,8 @@ import (
 	"os"
 	"runtime"
 	"sync"
+	"sync/atomic"
+	"time"
 
 	"gioui.org/op/paint"
 
@@ -23,6 +25,11 @@ type thumbCache struct {
 	mu      sync.Mutex
 	entries map[string]*thumbEntry // key: cache.Entry.Path
 	queue   chan cache.Entry
+
+	// Coalescing: workers bump dirty; a single coalescer goroutine fires
+	// invalidate at most once every ~16ms so a burst of decodes doesn't
+	// hammer the Gio frame loop with one redraw per thumbnail.
+	dirty atomic.Bool
 }
 
 type thumbEntry struct {
@@ -46,7 +53,22 @@ func newThumbCache(store *cache.ThumbStore, invalidate func()) *thumbCache {
 	for i := 0; i < workers; i++ {
 		go tc.worker()
 	}
+	go tc.coalescer()
 	return tc
+}
+
+// coalescer wakes the Gio frame loop at most ~60 times per second when one or
+// more decodes have completed since the last wake. This avoids per-thumbnail
+// invalidate storms when the user scrolls quickly and dozens of workers
+// finish decoding at roughly the same instant.
+func (tc *thumbCache) coalescer() {
+	t := time.NewTicker(16 * time.Millisecond)
+	defer t.Stop()
+	for range t.C {
+		if tc.dirty.Swap(false) && tc.invalidate != nil {
+			tc.invalidate()
+		}
+	}
 }
 
 // Get returns the cached image op for entry if available. If not, the entry is
@@ -97,8 +119,8 @@ func (tc *thumbCache) worker() {
 			te.ready = true
 		}
 		tc.mu.Unlock()
-		if ok && tc.invalidate != nil {
-			tc.invalidate()
+		if ok {
+			tc.dirty.Store(true)
 		}
 	}
 }

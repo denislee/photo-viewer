@@ -15,14 +15,15 @@ import (
 
 func main() {
 	var rootFlag string
-	flag.StringVar(&rootFlag, "root", "", "library root (defaults to ~/Pictures)")
+	flag.StringVar(&rootFlag, "root", "", "library root (defaults to the current working directory)")
 	flag.Parse()
 
 	if rootFlag == "" {
-		home, err := os.UserHomeDir()
-		if err == nil {
-			rootFlag = filepath.Join(home, "Pictures")
+		cwd, err := os.Getwd()
+		if err != nil {
+			log.Fatalf("get working directory: %v", err)
 		}
+		rootFlag = cwd
 	}
 	abs, err := filepath.Abs(rootFlag)
 	if err != nil {
