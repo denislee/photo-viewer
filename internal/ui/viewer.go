@@ -82,6 +82,13 @@ type Viewer struct {
 // viewer running interactively.
 const viewerRecentCap = 3
 
+// viewerMetaCap is the soft cap on entries in dimCache/infoCache (and their
+// "already asked" sidecars). The maps are bulk-cleared when they exceed the
+// cap so the viewer's metadata cache can't grow unboundedly as the user
+// pages through a large library. Recomputing is cheap (one ExifTool / image
+// header read) so a periodic clear is preferable to running a full LRU.
+const viewerMetaCap = 1024
+
 // viewerMaxPreviewSide caps the long side of the decoded preview. RAW/HEIC
 // originals can exceed 8000 px on one side; rendering them at full res
 // creates an enormous GPU texture for no visible benefit on a typical
@@ -480,6 +487,10 @@ func (v *Viewer) dimensionsFor(e cache.Entry) string {
 	go func(path string) {
 		dim := decodeDimensions(path)
 		v.dimMu.Lock()
+		if len(v.dimCache) >= viewerMetaCap {
+			v.dimCache = map[string]string{}
+			v.dimAsked = map[string]bool{}
+		}
 		v.dimCache[path] = dim
 		v.dimMu.Unlock()
 		if v.invalidate != nil {
@@ -551,6 +562,10 @@ func (v *Viewer) mediaInfoFor(e cache.Entry) cachedInfo {
 			c.FocalLength = "—"
 		}
 		v.infoMu.Lock()
+		if len(v.infoCache) >= viewerMetaCap {
+			v.infoCache = map[string]cachedInfo{}
+			v.infoAsked = map[string]bool{}
+		}
 		v.infoCache[path] = c
 		v.infoMu.Unlock()
 		if v.invalidate != nil {

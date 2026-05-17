@@ -105,6 +105,11 @@ func NewGrid() *Grid {
 	return g
 }
 
+// gridSelMemCap is the cap on lastSelByDir. Beyond this the oldest-by-insertion
+// entries are dropped so a deep tree of browsed directories doesn't grow the
+// map unboundedly across a long session.
+const gridSelMemCap = 512
+
 // RememberFor stores the current selection index against dir so a later
 // RestoreFor(dir) lands the user back where they left off. No-op when dir
 // is empty.
@@ -114,6 +119,15 @@ func (g *Grid) RememberFor(dir string) {
 	}
 	if g.lastSelByDir == nil {
 		g.lastSelByDir = map[string]int{}
+	}
+	if _, ok := g.lastSelByDir[dir]; !ok && len(g.lastSelByDir) >= gridSelMemCap {
+		// Drop one arbitrary entry. Map iteration order is randomized, so
+		// this is effectively random eviction — cheap and good enough for
+		// what is just a UX nicety. Full LRU isn't worth the bookkeeping.
+		for k := range g.lastSelByDir {
+			delete(g.lastSelByDir, k)
+			break
+		}
 	}
 	g.lastSelByDir[dir] = g.Selected
 }

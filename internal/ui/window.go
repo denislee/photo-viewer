@@ -490,9 +490,7 @@ func handleViewerKey(ke key.Event, viewer *Viewer, grid *Grid, ctrl *Controller,
 		if viewer.Index >= 0 && viewer.Index < len(viewer.entries) {
 			e := viewer.entries[viewer.Index]
 			if e.Type == scan.TypeVideo {
-				go func() {
-					_ = exec.Command("mpv", "--loop", e.Path).Start()
-				}()
+				go runDetached(exec.Command("mpv", "--loop", e.Path))
 			}
 		}
 	case "F":
@@ -625,21 +623,16 @@ func handleGridKey(ke key.Event, grid *Grid, sidebar *Sidebar, sidebarFocus *boo
 				}
 
 				if allVideos {
-					go func() {
-						var args []string
-						if len(paths) > 1 {
-							args = append([]string{"--loop-playlist=inf"}, paths...)
-						} else {
-							args = []string{"--loop", paths[0]}
-						}
-						_ = exec.Command("mpv", args...).Start()
-					}()
+					var args []string
+					if len(paths) > 1 {
+						args = append([]string{"--loop-playlist=inf"}, paths...)
+					} else {
+						args = []string{"--loop", paths[0]}
+					}
+					go runDetached(exec.Command("mpv", args...))
 				} else {
 					for _, p := range paths {
-						path := p
-						go func() {
-							_ = exec.Command("xdg-open", path).Start()
-						}()
+						go runDetached(exec.Command("xdg-open", p))
 					}
 				}
 			}
@@ -733,15 +726,13 @@ func handleGridKey(ke key.Event, grid *Grid, sidebar *Sidebar, sidebarFocus *boo
 				}
 
 				if allVideos {
-					go func() {
-						var args []string
-						if len(paths) > 1 {
-							args = append([]string{"--loop-playlist=inf"}, paths...)
-						} else {
-							args = []string{"--loop", paths[0]}
-						}
-						_ = exec.Command("mpv", args...).Start()
-					}()
+					var args []string
+					if len(paths) > 1 {
+						args = append([]string{"--loop-playlist=inf"}, paths...)
+					} else {
+						args = []string{"--loop", paths[0]}
+					}
+					go runDetached(exec.Command("mpv", args...))
 					if ctrl.SelectionMode {
 						ctrl.ClearSelection()
 						w.Invalidate()
@@ -1120,4 +1111,15 @@ func pxToDp(gtx layout.Context, px int) int {
 		return px
 	}
 	return int(float32(px) / gtx.Metric.PxPerDp)
+}
+
+// runDetached starts cmd and waits for it to finish so the OS can reap the
+// child process. Errors are intentionally discarded — these are fire-and-
+// forget launches of external viewers (mpv, xdg-open). Always call from a
+// goroutine, since Wait blocks until the child exits.
+func runDetached(cmd *exec.Cmd) {
+	if err := cmd.Start(); err != nil {
+		return
+	}
+	_ = cmd.Wait()
 }
