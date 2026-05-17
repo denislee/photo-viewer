@@ -27,7 +27,7 @@ func (k ProcKind) String() string {
 	case ProcOrganize:
 		return "Organize"
 	case ProcScan:
-		return "Refresh"
+		return "Indexing"
 	case ProcWarmUp:
 		return "Thumbnails"
 	}

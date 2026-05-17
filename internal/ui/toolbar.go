@@ -53,6 +53,10 @@ type Toolbar struct {
 	ShowRAW     bool
 	GroupByYear bool
 	Busy        bool
+	// AnyProcess is true while the process bar has at least one in-flight
+	// task. Used to disable buttons (Rebuild) that would conflict with an
+	// already-running job.
+	AnyProcess bool
 
 	spinnerStart time.Time
 }
@@ -109,7 +113,7 @@ func (t *Toolbar) Layout(gtx layout.Context, th *Theme, path string, count int) 
 	if t.settingsBtn.Clicked(gtx) && t.OnSettings != nil {
 		t.OnSettings()
 	}
-	if t.rebuildBtn.Clicked(gtx) && t.OnRebuild != nil {
+	if t.rebuildBtn.Clicked(gtx) && t.OnRebuild != nil && !t.AnyProcess {
 		t.OnRebuild()
 	}
 	if t.warmUpBtn.Clicked(gtx) && t.OnWarmUp != nil {
@@ -203,7 +207,14 @@ func (t *Toolbar) Layout(gtx layout.Context, th *Theme, path string, count int) 
 			layout.Rigid(layout.Spacer{Width: unit.Dp(4)}.Layout),
 			layout.Rigid(material.Button(th.Theme, &t.settingsBtn, "Settings").Layout),
 			layout.Rigid(layout.Spacer{Width: unit.Dp(4)}.Layout),
-			layout.Rigid(material.Button(th.Theme, &t.rebuildBtn, "Rebuild").Layout),
+			layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+				b := material.Button(th.Theme, &t.rebuildBtn, "Rebuild")
+				if t.AnyProcess {
+					b.Background = th.CellBG
+					b.Color = th.Muted
+				}
+				return b.Layout(gtx)
+			}),
 			layout.Rigid(layout.Spacer{Width: unit.Dp(4)}.Layout),
 			layout.Rigid(material.Button(th.Theme, &t.warmUpBtn, "Warm Up").Layout),
 		)

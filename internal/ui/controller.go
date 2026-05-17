@@ -268,15 +268,10 @@ func (c *Controller) IndexStatus() IndexStatus {
 }
 
 // Rebuild wipes the on-disk cache (sqlite db + thumbs), reopens the index,
-// and kicks off a full rescan of the library root. Mirrors the Fyne
-// Controller.rebuildIndex behavior.
+// and kicks off a full rescan of the library root. The active grid view is
+// preserved — the rescan surfaces only as a process-bar entry, and entries
+// are repopulated as scan batches land via the usual refresh path.
 func (c *Controller) Rebuild() error {
-	// Read the current FS structure before taking the lock so the sidebar has
-	// fresh subdirs to render in the gap between Rebuild() returning and the
-	// first scan batch landing — otherwise the tree briefly collapses to just
-	// the root row.
-	subs := listSubdirs(c.libraryRoot)
-
 	c.mu.Lock()
 	if c.scanCancel != nil {
 		c.scanCancel()
@@ -289,10 +284,6 @@ func (c *Controller) Rebuild() error {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	c.scanCancel = cancel
-	c.entries = nil
-	c.subdirs = subs
-	c.treeDir = c.libraryRoot
-	c.currentDir = c.libraryRoot
 	c.mu.Unlock()
 
 	dbPath := filepath.Join(c.libraryRoot, ".photo-viewer.db")
@@ -307,9 +298,6 @@ func (c *Controller) Rebuild() error {
 	c.index = idx
 	c.mu.Unlock()
 	go c.scanInto(ctx, c.libraryRoot)
-	if c.invalidate != nil {
-		c.invalidate()
-	}
 	return nil
 }
 
@@ -513,8 +501,8 @@ func (c *Controller) scanInto(ctx context.Context, dir string) {
 	// scanCancel hook so we don't need a second context.
 	var proc *Process
 	if c.processes != nil {
-		proc = c.processes.Begin(ProcScan, "Refresh", c.CancelScan, true)
-		proc.SetStatus("Scanning " + filepath.Base(dir))
+		proc = c.processes.Begin(ProcScan, "Indexing", c.CancelScan, true)
+		proc.SetStatus("Indexing " + filepath.Base(dir))
 	}
 
 	defer func() {

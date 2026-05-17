@@ -62,6 +62,9 @@ func Run(w *app.Window, ctrl *Controller) error {
 	dups.SetProcessRegistry(processes)
 	imports.SetProcessRegistry(processes)
 	organize.SetProcessRegistry(processes)
+	// Kick off the initial indexing now that the registry is wired so it
+	// shows up in the process bar like every other scan.
+	go ctrl.SelectDir(ctrl.LibraryRoot())
 	processBar := NewProcessBar(processes)
 	processBar.OnOpen = func(kind ProcKind) {
 		switch kind {
@@ -210,6 +213,7 @@ func Run(w *app.Window, ctrl *Controller) error {
 			toolbar.ShowRAW = ctrl.ShowRAW()
 			toolbar.GroupByYear = GetConfig().GroupByYear
 			toolbar.Busy = ctrl.Scanning()
+			toolbar.AnyProcess = processes.Count() > 0
 			drawRoot(gtx, th, ctrl, toolbar, sidebar, grid, viewer, dups, imports, organize, settings, indexInfo, search, sdPrompt, processBar, splitter, sidebarFocus, w)
 			e.Frame(gtx.Ops)
 		}

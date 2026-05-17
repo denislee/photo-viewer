@@ -48,7 +48,6 @@ func main() {
 	}
 
 	ctrl := ui.NewController(abs, idx, store, cacheDir)
-	go ctrl.SelectDir(abs)
 
 	go func() {
 		w := new(app.Window)
