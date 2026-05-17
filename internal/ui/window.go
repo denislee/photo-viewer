@@ -235,6 +235,7 @@ func handleKeys(gtx layout.Context, ctrl *Controller, grid *Grid, sidebar *Sideb
 			key.Filter{Name: "+", Required: key.ModCtrl},
 			key.Filter{Name: "=", Required: key.ModCtrl},
 			key.Filter{Name: "-", Required: key.ModCtrl},
+			key.Filter{Name: ","},
 		)
 	}
 	for {
@@ -339,7 +340,7 @@ func handleKeys(gtx layout.Context, ctrl *Controller, grid *Grid, sidebar *Sideb
 			continue
 		}
 		if settings.Open {
-			if ke.Name == key.NameEscape || ke.Name == "Q" {
+			if ke.Name == key.NameEscape || ke.Name == "Q" || ke.Name == "," {
 				settings.Close()
 				w.Invalidate()
 			}
@@ -357,6 +358,12 @@ func handleKeys(gtx layout.Context, ctrl *Controller, grid *Grid, sidebar *Sideb
 				sdPrompt.Close()
 				w.Invalidate()
 			}
+			continue
+		}
+		// "," toggles the Settings overlay from anywhere outside a modal.
+		if ke.Name == "," {
+			settings.Show()
+			w.Invalidate()
 			continue
 		}
 		// Ctrl+I / Ctrl+D open the modals from anywhere outside themselves.

@@ -19,14 +19,10 @@ func drawBackground(gtx layout.Context, c color.NRGBA) {
 	ca.Pop()
 }
 
-// drawEditorBox renders an editor inside a colored rectangle that fills the
+// drawEditorBox renders an editor inside a tinted rectangle that fills the
 // caller's available width. The editor is laid out into a recorded macro so
 // the background can be sized to the editor's actual height (plus padding)
-// instead of guessing a fixed pixel value — that mismatch produced the
-// "characters on separate rows" illusion.
-//
-// Both Min.X and Max.X are forced to the available width so single-line
-// editors fill the row instead of shrinking to their content.
+// instead of guessing a fixed pixel value.
 func drawEditorBox(gtx layout.Context, bg color.NRGBA, pad layout.Inset, w layout.Widget) layout.Dimensions {
 	w2 := gtx.Constraints.Max.X
 	if w2 == 0 {

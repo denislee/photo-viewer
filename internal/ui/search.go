@@ -1,9 +1,7 @@
 package ui
 
 import (
-	"fmt"
 	"image"
-	"os"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -49,8 +47,6 @@ type FuzzySearchView struct {
 	selected  int
 
 	rowTags []*searchRowTag
-
-	lastDebugText string
 }
 
 type searchCandidate struct {
@@ -356,11 +352,6 @@ func (v *FuzzySearchView) layoutSearchBox(gtx layout.Context, th *Theme) layout.
 		ed.Color = th.Foreground
 		ed.HintColor = th.Muted
 		ed.TextSize = unit.Sp(14)
-		if t := v.editor.Text(); t != v.lastDebugText {
-			v.lastDebugText = t
-			fmt.Fprintf(os.Stderr, "DEBUG ed.text=%q SL=%v Sub=%v MaxLen=%v Filter=%q WrapPolicy=%v gtx.Min=%v gtx.Max=%v\n",
-				t, v.editor.SingleLine, v.editor.Submit, v.editor.MaxLen, v.editor.Filter, v.editor.WrapPolicy, gtx.Constraints.Min, gtx.Constraints.Max)
-		}
 		return ed.Layout(gtx)
 	})
 }

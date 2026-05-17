@@ -57,6 +57,7 @@ func shortcutHints(viewerOpen, sidebarFocus, selectionMode bool) []string {
 			"ctrl f/b: page",
 			"ctrl i: import",
 			"ctrl d: duplicates",
+			",: settings",
 			"q: quit",
 		}
 	}

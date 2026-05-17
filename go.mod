@@ -16,3 +16,9 @@ require (
 	golang.org/x/sys v0.33.0 // indirect
 	golang.org/x/text v0.36.0 // indirect
 )
+
+// Local Gio fork patched to fix the math.MaxInt overflow in
+// widget/text.go's SingleLine handling, which made every single-line
+// editor wrap its glyphs onto a vertical column. See
+// third_party/gioui-singleline-fix/widget/text.go around line 247.
+replace gioui.org => ./third_party/gioui-singleline-fix
