@@ -207,9 +207,13 @@ func (pb *ProcessBar) layoutRow(gtx layout.Context, th *Theme, s ProcessSnapshot
 	paint.PaintOp{}.Add(gtx.Ops)
 	ca.Pop()
 
-	pauseLabel := "Pause"
+	pauseGlyph := "⏸"
 	if s.Paused {
-		pauseLabel = "Resume"
+		pauseGlyph = "▶"
+	}
+	pauseBG := th.CellBG
+	if s.Paused {
+		pauseBG = th.Accent
 	}
 
 	return layout.Inset{Left: unit.Dp(10), Right: unit.Dp(10), Top: unit.Dp(4), Bottom: unit.Dp(4)}.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
@@ -261,31 +265,46 @@ func (pb *ProcessBar) layoutRow(gtx layout.Context, th *Theme, s ProcessSnapshot
 				)
 			}),
 			layout.Rigid(layout.Spacer{Width: unit.Dp(8)}.Layout),
-			// Buttons (right).
+			// Square icon buttons sized to fit the row height.
 			layout.Rigid(func(gtx layout.Context) layout.Dimensions {
-				b := material.Button(th.Theme, &rb.pause, pauseLabel)
-				if s.Paused {
-					b.Background = th.Accent
-				} else {
-					b.Background = th.CellBG
-					b.Color = th.Foreground
-				}
-				return b.Layout(gtx)
+				return layoutIconButton(gtx, th, &rb.pause, pauseGlyph, pauseBG, th.Foreground)
 			}),
 			layout.Rigid(layout.Spacer{Width: unit.Dp(4)}.Layout),
 			layout.Rigid(func(gtx layout.Context) layout.Dimensions {
-				b := material.Button(th.Theme, &rb.cancel, "Cancel")
-				b.Background = th.Destructive
-				return b.Layout(gtx)
+				return layoutIconButton(gtx, th, &rb.cancel, "✕", th.Destructive, th.Foreground)
 			}),
 			layout.Rigid(layout.Spacer{Width: unit.Dp(4)}.Layout),
 			layout.Rigid(func(gtx layout.Context) layout.Dimensions {
-				b := material.Button(th.Theme, &rb.open, "Open")
-				b.Background = th.CellBG
-				b.Color = th.Foreground
-				return b.Layout(gtx)
+				return layoutIconButton(gtx, th, &rb.open, "↗", th.CellBG, th.Foreground)
 			}),
 		)
+	})
+}
+
+// processBarIconSizeDp is the side length of the square icon buttons in the
+// process bar. Chosen to fit inside processBarRowDp minus the row's top and
+// bottom inset (4dp each) so glyphs aren't clipped.
+const processBarIconSizeDp = 26
+
+// layoutIconButton renders a square, fixed-size clickable cell with a centered
+// glyph. Used in the process bar so Pause/Resume/Cancel/Open fit cleanly inside
+// the row without the min-size padding that material.Button enforces.
+func layoutIconButton(gtx layout.Context, th *Theme, click *widget.Clickable, glyph string, bg, fg color.NRGBA) layout.Dimensions {
+	side := gtx.Dp(unit.Dp(processBarIconSizeDp))
+	gtx.Constraints.Min = image.Pt(side, side)
+	gtx.Constraints.Max = image.Pt(side, side)
+	return click.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
+		rect := image.Rectangle{Max: image.Pt(side, side)}
+		rr := clip.UniformRRect(rect, gtx.Dp(unit.Dp(4))).Push(gtx.Ops)
+		paint.ColorOp{Color: bg}.Add(gtx.Ops)
+		paint.PaintOp{}.Add(gtx.Ops)
+		rr.Pop()
+		return layout.Center.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
+			lbl := material.Label(th.Theme, unit.Sp(13), glyph)
+			lbl.Color = fg
+			lbl.MaxLines = 1
+			return lbl.Layout(gtx)
+		})
 	})
 }
 
