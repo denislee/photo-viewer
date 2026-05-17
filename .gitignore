@@ -34,3 +34,9 @@ go.work.sum
 # Project binaries
 photo-viewer
 pv-scan
+
+CLAUDE.md
+GEMINI.md
+pv-face-detect
+pv-organize
+.photo-viewer.*

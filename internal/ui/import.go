@@ -15,6 +15,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"gioui.org/layout"
@@ -1053,6 +1054,18 @@ func (v *ImportView) runImport(ctx context.Context, cfg Config, importDirs, zipF
 				break
 			}
 			files := subdirFiles[sd]
+			// Fast path: when the source subdirectory and the Outbox live on
+			// the same filesystem AND the user wants the source gone, skip
+			// the Inbox copy entirely — processBatch will os.Rename each
+			// source straight into Outbox/YYYY-MM-DD/, which is atomic and
+			// free on the same device.
+			if deleteSrc && sameDevice(sd, cfg.OutboxDir) {
+				v.setStatus(fmt.Sprintf("Filing %d files from %s directly into %s…", len(files), sd, filepath.Base(cfg.OutboxDir)))
+				v.appendLog(fmt.Sprintf("Same-device shortcut: moving %d files from %s straight to Outbox (no Inbox copy).", len(files), sd))
+				v.setProgress(0, int64(len(files)))
+				v.processBatch(ctx, cfg.OutboxDir, files)
+				continue
+			}
 			v.setStatus(fmt.Sprintf("Copying %d files from %s…", len(files), sd))
 			v.appendLog(fmt.Sprintf("Copying %d files from %s to Inbox...", len(files), sd))
 			var batch []string
@@ -1249,6 +1262,20 @@ func uniqueInboxPath(dir, base string) string {
 			return c
 		}
 	}
+}
+
+// sameDevice reports whether two paths live on the same filesystem. Used to
+// decide whether os.Rename can move a file between them atomically. Any stat
+// failure returns false so callers fall back to the safe copy path.
+func sameDevice(a, b string) bool {
+	var sa, sb syscall.Stat_t
+	if err := syscall.Stat(a, &sa); err != nil {
+		return false
+	}
+	if err := syscall.Stat(b, &sb); err != nil {
+		return false
+	}
+	return sa.Dev == sb.Dev
 }
 
 func copyFile(src, dst string) error {
