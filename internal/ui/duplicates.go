@@ -66,10 +66,37 @@ func NewDuplicatesView(idx *cache.Index, store *cache.ThumbStore, thumbs *thumbC
 	return d
 }
 
-// Show resets state and starts a hashing pass in the background.
+// Show opens the overlay. If a hashing pass is already running (because a
+// previous Close just hid the window) the live state is preserved so the
+// user can keep watching its progress; otherwise a fresh pass kicks off.
 func (d *DuplicatesView) Show() {
-	d.Open = true
 	d.mu.Lock()
+	if d.hashing {
+		d.Open = true
+		d.mu.Unlock()
+		return
+	}
+	d.mu.Unlock()
+	d.startHash()
+}
+
+// Rescan cancels any in-flight pass and restarts hashing from scratch. Bound
+// to the Rescan button, which is only useful once the user wants to discard
+// the current results.
+func (d *DuplicatesView) Rescan() {
+	d.mu.Lock()
+	if d.cancel != nil {
+		d.cancel()
+		d.cancel = nil
+	}
+	d.mu.Unlock()
+	d.startHash()
+}
+
+// startHash resets duplicate state and launches a fresh hashAndScan goroutine.
+func (d *DuplicatesView) startHash() {
+	d.mu.Lock()
+	d.Open = true
 	d.groups = nil
 	d.selected = -1
 	d.hashing = true
@@ -78,19 +105,16 @@ func (d *DuplicatesView) Show() {
 	d.confirming = false
 	d.confirmingAll = false
 	d.statusMsg = "Hashing files…"
-	d.mu.Unlock()
-
 	ctx, cancel := context.WithCancel(context.Background())
 	d.cancel = cancel
+	d.mu.Unlock()
 	go d.hashAndScan(ctx)
 }
 
-// Close hides the overlay and cancels any in-flight hashing pass.
+// Close hides the overlay. A hashing pass that is still running is left
+// running in the background so the user can reopen the overlay later to see
+// the result without restarting the work.
 func (d *DuplicatesView) Close() {
-	if d.cancel != nil {
-		d.cancel()
-		d.cancel = nil
-	}
 	d.Open = false
 	if d.OnClose != nil {
 		d.OnClose()
@@ -125,7 +149,7 @@ func (d *DuplicatesView) hashAndScan(ctx context.Context) {
 	if ctx.Err() != nil {
 		return
 	}
-	groups := d.idx.FindDuplicates()
+	groups := d.pruneMissing(d.idx.FindDuplicates())
 	d.mu.Lock()
 	d.hashing = false
 	d.groups = groups
@@ -134,6 +158,40 @@ func (d *DuplicatesView) hashAndScan(ctx context.Context) {
 	if d.invalidate != nil {
 		d.invalidate()
 	}
+}
+
+// pruneMissing stats every entry in groups, drops vanished paths from the
+// index (and forgets their thumbnails), and returns only groups that still
+// have at least two surviving copies. This is what prevents phantom groups
+// composed of stale rows from sticking around after files are deleted or
+// moved outside the app.
+func (d *DuplicatesView) pruneMissing(groups []cache.DuplicateGroup) []cache.DuplicateGroup {
+	out := make([]cache.DuplicateGroup, 0, len(groups))
+	for _, g := range groups {
+		live := make([]cache.Entry, 0, len(g.Entries))
+		for _, e := range g.Entries {
+			_, err := os.Stat(e.Path)
+			if err == nil {
+				live = append(live, e)
+				continue
+			}
+			if os.IsNotExist(err) {
+				_ = d.idx.RemoveEntry(e.Path)
+				if d.store != nil {
+					d.store.Forget(cache.ThumbIDFor(e.Path))
+				}
+				continue
+			}
+			// Permission errors, transient I/O, etc — keep the entry so a
+			// real duplicate isn't hidden behind a flaky filesystem.
+			live = append(live, e)
+		}
+		if len(live) >= 2 {
+			g.Entries = live
+			out = append(out, g)
+		}
+	}
+	return out
 }
 
 // CancelConfirm clears the pending delete confirmation if any. Returns true
@@ -222,7 +280,8 @@ func (d *DuplicatesView) deleteNewer() {
 		return
 	}
 	for _, v := range g.Entries[1:] {
-		if err := os.Remove(v.Path); err != nil {
+		err := os.Remove(v.Path)
+		if err != nil && !os.IsNotExist(err) {
 			continue
 		}
 		_ = d.idx.RemoveEntry(v.Path)
@@ -230,7 +289,7 @@ func (d *DuplicatesView) deleteNewer() {
 			d.store.Forget(cache.ThumbIDFor(v.Path))
 		}
 	}
-	groups := d.idx.FindDuplicates()
+	groups := d.pruneMissing(d.idx.FindDuplicates())
 	d.mu.Lock()
 	d.groups = groups
 	d.statusMsg = fmt.Sprintf("%d duplicate group(s)", len(groups))
@@ -255,7 +314,8 @@ func (d *DuplicatesView) deleteAllNewer() {
 			continue
 		}
 		for _, v := range g.Entries[1:] {
-			if err := os.Remove(v.Path); err != nil {
+			err := os.Remove(v.Path)
+			if err != nil && !os.IsNotExist(err) {
 				continue
 			}
 			_ = d.idx.RemoveEntry(v.Path)
@@ -264,7 +324,7 @@ func (d *DuplicatesView) deleteAllNewer() {
 			}
 		}
 	}
-	newGroups := d.idx.FindDuplicates()
+	newGroups := d.pruneMissing(d.idx.FindDuplicates())
 	d.mu.Lock()
 	d.groups = newGroups
 	d.statusMsg = fmt.Sprintf("%d duplicate group(s)", len(newGroups))
@@ -281,7 +341,7 @@ func (d *DuplicatesView) Layout(gtx layout.Context, th *Theme) layout.Dimensions
 		d.Close()
 	}
 	if d.rescanBtn.Clicked(gtx) {
-		d.Show()
+		d.Rescan()
 	}
 	if d.deleteBtn.Clicked(gtx) {
 		d.mu.Lock()

@@ -114,11 +114,19 @@ func NewImportView(invalidate func()) *ImportView {
 	return v
 }
 
-// Show resets state and opens the overlay. Loads inbox/outbox from config and
-// pre-counts the inbox.
+// Show opens the overlay. If an import is already running (because a
+// previous Close just hid the window) the existing state — log, progress
+// counters, SD mounts — is preserved so the user can keep watching it.
+// Otherwise state is reset and the inbox/outbox status line refreshed from
+// config.
 func (v *ImportView) Show() {
-	v.Open = true
 	v.mu.Lock()
+	if v.running {
+		v.Open = true
+		v.mu.Unlock()
+		return
+	}
+	v.Open = true
 	v.importDirs = nil
 	v.zipFiles = nil
 	v.logVisible = nil
@@ -167,19 +175,21 @@ func (v *ImportView) ShowForDevice(dev removableDevice, deleteSource bool) {
 	go v.handleSDDeviceClick(dev)
 }
 
-// Close hides the overlay and cancels any in-flight import. Devices that the
-// view mounted itself are unmounted in the background so the user can pull
-// the card safely; failures are logged and otherwise ignored.
+// Close hides the overlay. If an import is currently running it keeps going
+// in the background — the user can reopen the overlay via the toolbar to
+// watch progress or cancel — and SD-card unmounts are deferred to the
+// import's natural completion. When the overlay is closed without a running
+// import, any mounts that the view itself created (e.g. the user added an
+// SD card but never hit Start) are unmounted now so cards can be pulled.
 func (v *ImportView) Close() {
 	v.mu.Lock()
-	cancel := v.cancelImport
-	v.cancelImport = nil
-	mounts := v.sdMounts
-	v.sdMounts = nil
-	v.mu.Unlock()
-	if cancel != nil {
-		cancel()
+	running := v.running
+	var mounts []sdMount
+	if !running {
+		mounts = v.sdMounts
+		v.sdMounts = nil
 	}
+	v.mu.Unlock()
 	if len(mounts) > 0 {
 		go v.unmountAll(mounts)
 	}

@@ -42,6 +42,16 @@ type Controller struct {
 	scanCancel  context.CancelFunc
 	scanning    int // active scanInto goroutines
 
+	// warmUpCancel is owned by the thumbnail warm-up pass and lives outside
+	// scanCancel so that picking a new directory (which cancels the current
+	// scan) does not also abort a warm-up running in the background.
+	warmUpCancel  context.CancelFunc
+	warmUpRunning bool
+	// warmUpGen increments each time WarmUp() starts a fresh pass so the
+	// background goroutine can tell whether warmUpCancel still references
+	// its own context when it exits.
+	warmUpGen int
+
 	// Indexing status, exposed via IndexStatus for the info modal.
 	scanTarget    string
 	scanStartedAt time.Time
@@ -194,12 +204,18 @@ func (c *Controller) Scanning() bool {
 	return c.scanning > 0
 }
 
-// CancelScan stops any in-flight scan or warm-up.
+// CancelScan stops any in-flight scan or warm-up. The toolbar's Cancel
+// button is the only place that should cancel a warm-up — directory changes
+// only abort the scan context.
 func (c *Controller) CancelScan() {
 	c.mu.Lock()
 	if c.scanCancel != nil {
 		c.scanCancel()
 		c.scanCancel = nil
+	}
+	if c.warmUpCancel != nil {
+		c.warmUpCancel()
+		c.warmUpCancel = nil
 	}
 	c.mu.Unlock()
 }
@@ -254,6 +270,12 @@ func (c *Controller) Rebuild() error {
 	c.mu.Lock()
 	if c.scanCancel != nil {
 		c.scanCancel()
+	}
+	// Rebuild wipes the thumbs+db that an in-flight warm-up would be writing
+	// to, so cancel the warm-up as well — otherwise it races the Wipe call.
+	if c.warmUpCancel != nil {
+		c.warmUpCancel()
+		c.warmUpCancel = nil
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	c.scanCancel = cancel
@@ -559,32 +581,39 @@ func (c *Controller) activeDir() string {
 }
 
 // WarmUp iterates over every entry in the index and ensures its thumbnail
-// is generated. It runs in the background and respects the controller's
-// scan context for cancellation.
+// is generated. It runs in the background under its own cancel context, so
+// switching directories or running an incremental scan does not abort it —
+// only an explicit Cancel (via CancelScan) or another WarmUp invocation
+// stops it.
 func (c *Controller) WarmUp() {
 	c.mu.Lock()
-	if c.scanCancel != nil {
-		c.scanCancel()
+	if c.warmUpCancel != nil {
+		c.warmUpCancel()
 	}
 	ctx, cancel := context.WithCancel(context.Background())
-	c.scanCancel = cancel
+	c.warmUpCancel = cancel
+	c.warmUpGen++
+	myGen := c.warmUpGen
+	c.warmUpRunning = true
+	c.scanning++
+	c.scanTarget = "Thumbnail Warm-up"
+	c.scanStartedAt = time.Now()
+	c.scanEndedAt = time.Time{}
+	c.scanBatched = 0
 	c.mu.Unlock()
+	if c.invalidate != nil {
+		c.invalidate()
+	}
 
 	go func() {
-		c.mu.Lock()
-		c.scanning++
-		c.scanTarget = "Thumbnail Warm-up"
-		c.scanStartedAt = time.Now()
-		c.scanEndedAt = time.Time{}
-		c.scanBatched = 0
-		c.mu.Unlock()
-		if c.invalidate != nil {
-			c.invalidate()
-		}
 		defer func() {
 			c.mu.Lock()
 			c.scanning--
 			c.scanEndedAt = time.Now()
+			if c.warmUpGen == myGen {
+				c.warmUpRunning = false
+				c.warmUpCancel = nil
+			}
 			c.mu.Unlock()
 			if c.invalidate != nil {
 				c.invalidate()

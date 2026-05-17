@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"io"
 	"os"
 	"runtime"
@@ -178,6 +179,9 @@ func (i *Index) EnsureHashes(ctx context.Context, progress func(done, total int)
 					}
 					q, err := quickHash(t.path, t.size)
 					if err != nil {
+						if errors.Is(err, os.ErrNotExist) {
+							_ = i.RemoveEntry(t.path)
+						}
 						continue
 					}
 					results <- qres{path: t.path, quick: q}
@@ -298,6 +302,9 @@ func (i *Index) EnsureHashes(ctx context.Context, progress func(done, total int)
 				}
 				h, err := hashFile(c.path)
 				if err != nil {
+					if errors.Is(err, os.ErrNotExist) {
+						_ = i.RemoveEntry(c.path)
+					}
 					continue
 				}
 				results2 <- fres{path: c.path, hash: h}
