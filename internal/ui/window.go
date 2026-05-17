@@ -55,6 +55,14 @@ func Run(w *app.Window, ctrl *Controller) error {
 	organize := NewOrganizeView(w.Invalidate)
 	settings := NewSettingsView()
 	settings.SetInvalidate(w.Invalidate)
+	sdPrompt := &SDPromptView{}
+	sdWatcher := NewSDCardWatcher(w.Invalidate)
+	sdWatcher.Start()
+	defer sdWatcher.Stop()
+	sdPrompt.OnImport = func(dev removableDevice, deleteSource bool) {
+		imports.ShowForDevice(dev, deleteSource)
+		w.Invalidate()
+	}
 	indexInfo := NewIndexInfoView(ctrl.IndexStatus)
 	search := NewFuzzySearchView(ctrl.Index())
 	search.OnPick = func(path string, isDir bool) {
@@ -155,7 +163,15 @@ func Run(w *app.Window, ctrl *Controller) error {
 			return e.Err
 		case app.FrameEvent:
 			gtx := app.NewContext(&ops, e)
-			handleKeys(gtx, ctrl, grid, sidebar, viewer, dups, imports, organize, settings, indexInfo, search, &sidebarFocus, &focusSearch, w)
+			// If the watcher has a fresh removable device and we aren't
+			// already showing a modal, surface the prompt. The prompt only
+			// pops up when no other modal is active so it can't get buried.
+			if !sdPrompt.Open && !imports.Open && !dups.Open && !organize.Open && !settings.Open && !indexInfo.Open && !search.Open {
+				if dev, ok := sdWatcher.Consume(); ok {
+					sdPrompt.Show(dev)
+				}
+			}
+			handleKeys(gtx, ctrl, grid, sidebar, viewer, dups, imports, organize, settings, indexInfo, search, sdPrompt, &sidebarFocus, &focusSearch, w)
 			if focusSearch {
 				search.FocusEditor(gtx)
 				focusSearch = false
@@ -165,13 +181,13 @@ func Run(w *app.Window, ctrl *Controller) error {
 			toolbar.ShowRAW = ctrl.ShowRAW()
 			toolbar.GroupByYear = GetConfig().GroupByYear
 			toolbar.Busy = ctrl.Scanning()
-			drawRoot(gtx, th, ctrl, toolbar, sidebar, grid, viewer, dups, imports, organize, settings, indexInfo, search, splitter, sidebarFocus, w)
+			drawRoot(gtx, th, ctrl, toolbar, sidebar, grid, viewer, dups, imports, organize, settings, indexInfo, search, sdPrompt, splitter, sidebarFocus, w)
 			e.Frame(gtx.Ops)
 		}
 	}
 }
 
-func handleKeys(gtx layout.Context, ctrl *Controller, grid *Grid, sidebar *Sidebar, viewer *Viewer, dups *DuplicatesView, imports *ImportView, organize *OrganizeView, settings *SettingsView, indexInfo *IndexInfoView, search *FuzzySearchView, sidebarFocus *bool, focusSearch *bool, w *app.Window) {
+func handleKeys(gtx layout.Context, ctrl *Controller, grid *Grid, sidebar *Sidebar, viewer *Viewer, dups *DuplicatesView, imports *ImportView, organize *OrganizeView, settings *SettingsView, indexInfo *IndexInfoView, search *FuzzySearchView, sdPrompt *SDPromptView, sidebarFocus *bool, focusSearch *bool, w *app.Window) {
 	_, _, entries, _ := ctrl.Snapshot()
 	total := len(entries)
 
@@ -332,6 +348,13 @@ func handleKeys(gtx layout.Context, ctrl *Controller, grid *Grid, sidebar *Sideb
 		if indexInfo.Open {
 			if ke.Name == key.NameEscape || ke.Name == "Q" {
 				indexInfo.Close()
+				w.Invalidate()
+			}
+			continue
+		}
+		if sdPrompt.Open {
+			if ke.Name == key.NameEscape || ke.Name == "Q" {
+				sdPrompt.Close()
 				w.Invalidate()
 			}
 			continue
@@ -786,7 +809,7 @@ func handleSidebarKey(ke key.Event, sidebar *Sidebar, sidebarFocus *bool, w *app
 	}
 }
 
-func drawRoot(gtx layout.Context, th *Theme, ctrl *Controller, tb *Toolbar, sb *Sidebar, g *Grid, v *Viewer, dups *DuplicatesView, imports *ImportView, organize *OrganizeView, settings *SettingsView, indexInfo *IndexInfoView, search *FuzzySearchView, splitter *sidebarSplitter, sidebarFocus bool, w *app.Window) {
+func drawRoot(gtx layout.Context, th *Theme, ctrl *Controller, tb *Toolbar, sb *Sidebar, g *Grid, v *Viewer, dups *DuplicatesView, imports *ImportView, organize *OrganizeView, settings *SettingsView, indexInfo *IndexInfoView, search *FuzzySearchView, sdPrompt *SDPromptView, splitter *sidebarSplitter, sidebarFocus bool, w *app.Window) {
 	rect := image.Rectangle{Max: gtx.Constraints.Max}
 	defer clip.Rect(rect).Push(gtx.Ops).Pop()
 	paint.ColorOp{Color: th.Background}.Add(gtx.Ops)
@@ -855,6 +878,14 @@ func drawRoot(gtx layout.Context, th *Theme, ctrl *Controller, tb *Toolbar, sb *
 		gtx2.Constraints.Max = image.Pt(totalW, totalH-sbH)
 		gtx2.Constraints.Min = image.Pt(totalW, totalH-sbH)
 		indexInfo.Layout(gtx2, th)
+		drawShortcut()
+		return
+	}
+	if sdPrompt.Open {
+		gtx2 := gtx
+		gtx2.Constraints.Max = image.Pt(totalW, totalH-sbH)
+		gtx2.Constraints.Min = image.Pt(totalW, totalH-sbH)
+		sdPrompt.Layout(gtx2, th)
 		drawShortcut()
 		return
 	}

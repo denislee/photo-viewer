@@ -13,6 +13,9 @@ type Config struct {
 	InboxDir           string `json:"inbox_dir"`
 	OutboxDir          string `json:"outbox_dir"`
 	ImportDeleteSource bool   `json:"import_delete_source"`
+	// SDCardAutoDetect enables a background watcher that polls for newly-
+	// attached removable devices and prompts the user to import from them.
+	SDCardAutoDetect bool `json:"sd_card_auto_detect"`
 	// GroupByYear toggles the sidebar treatment of YYYY-MM-DD subfolders:
 	// when true they are bucketed under collapsible YYYY headers.
 	GroupByYear bool `json:"group_by_year"`

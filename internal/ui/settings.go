@@ -22,6 +22,7 @@ type SettingsView struct {
 	outboxBrowseBtn widget.Clickable
 	saveBtn         widget.Clickable
 	closeBtn        widget.Clickable
+	sdAutoDetect    widget.Bool
 
 	mu        sync.Mutex
 	statusMsg string
@@ -46,6 +47,7 @@ func (v *SettingsView) Show() {
 	c := GetConfig()
 	v.inboxEditor.SetText(c.InboxDir)
 	v.outboxEditor.SetText(c.OutboxDir)
+	v.sdAutoDetect.Value = c.SDCardAutoDetect
 	v.statusMsg = "Config file: " + configPath()
 	v.Open = true
 }
@@ -73,11 +75,19 @@ func (v *SettingsView) Layout(gtx layout.Context, th *Theme) layout.Dimensions {
 		c := GetConfig()
 		c.InboxDir = v.inboxEditor.Text()
 		c.OutboxDir = v.outboxEditor.Text()
+		c.SDCardAutoDetect = v.sdAutoDetect.Value
 		if err := SaveConfig(c); err != nil {
 			v.statusMsg = "Save failed: " + err.Error()
 		} else {
 			v.statusMsg = "Saved to " + configPath()
 		}
+	}
+	// Persist the toggle immediately so the watcher reacts even if the user
+	// flips it and then closes without clicking Save.
+	if v.sdAutoDetect.Update(gtx) {
+		c := GetConfig()
+		c.SDCardAutoDetect = v.sdAutoDetect.Value
+		_ = SaveConfig(c)
 	}
 
 	drawBackground(gtx, th.Background)
@@ -100,6 +110,13 @@ func (v *SettingsView) Layout(gtx layout.Context, th *Theme) layout.Dimensions {
 			layout.Rigid(v.editorRow(th, "Inbox directory", &v.inboxEditor, "/path/to/inbox", &v.inboxBrowseBtn)),
 			layout.Rigid(layout.Spacer{Height: unit.Dp(10)}.Layout),
 			layout.Rigid(v.editorRow(th, "Outbox directory", &v.outboxEditor, "/path/to/outbox", &v.outboxBrowseBtn)),
+			layout.Rigid(layout.Spacer{Height: unit.Dp(16)}.Layout),
+			layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+				cb := material.CheckBox(th.Theme, &v.sdAutoDetect,
+					"Suggest import when a USB drive or SD card is connected")
+				cb.Color = th.Foreground
+				return cb.Layout(gtx)
+			}),
 			layout.Rigid(layout.Spacer{Height: unit.Dp(16)}.Layout),
 			layout.Rigid(func(gtx layout.Context) layout.Dimensions {
 				return layout.Flex{Axis: layout.Horizontal}.Layout(gtx,

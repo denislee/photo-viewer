@@ -148,6 +148,24 @@ func (v *ImportView) Show() {
 	v.mu.Unlock()
 }
 
+// ShowForDevice opens the overlay and queues the given removable device as
+// the sole import source, optionally toggling "delete source after import"
+// to the requested value. Used by the SD-card prompt to skip the manual
+// "click SD Card → click device" dance.
+func (v *ImportView) ShowForDevice(dev removableDevice, deleteSource bool) {
+	v.Show()
+	v.mu.Lock()
+	v.deleteCheck.Value = deleteSource
+	v.deleteSource = deleteSource
+	v.mu.Unlock()
+	cfg := GetConfig()
+	if cfg.ImportDeleteSource != deleteSource {
+		cfg.ImportDeleteSource = deleteSource
+		_ = SaveConfig(cfg)
+	}
+	go v.handleSDDeviceClick(dev)
+}
+
 // Close hides the overlay and cancels any in-flight import. Devices that the
 // view mounted itself are unmounted in the background so the user can pull
 // the card safely; failures are logged and otherwise ignored.
