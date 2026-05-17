@@ -22,6 +22,9 @@ type Config struct {
 	// SidebarWidthDp is the persisted sidebar (directory panel) width in dp.
 	// Zero means "use the default proportional width" (22% of window).
 	SidebarWidthDp int `json:"sidebar_width_dp"`
+	// GridCellDp is the persisted thumbnail cell size in dp. Zero means
+	// "use defaultCellDp". Clamped to [minCellDp, maxCellDp] on load.
+	GridCellDp int `json:"grid_cell_dp"`
 }
 
 var (

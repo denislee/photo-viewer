@@ -53,7 +53,13 @@ type Viewer struct {
 	// recent caches up to viewerRecentCap previously-decoded paint.ImageOps
 	// so navigating back to a recently viewed entry avoids re-decoding the
 	// original. Ordered MRU→LRU; LRU is dropped when the cap is reached.
-	recent []recentImage
+	//
+	// Touched both from the layout goroutine and from background decode
+	// goroutines (main load + neighbour prefetch), so all access goes
+	// through recentMu.
+	recentMu    sync.Mutex
+	recent      []recentImage
+	prefetching map[string]bool
 
 	// Decoded dimensions are cached per path. Decoding happens off the UI
 	// goroutine so opening the viewer doesn't stutter on big originals.
@@ -106,6 +112,8 @@ func (v *Viewer) Show(entries []cache.Entry, idx int) {
 	v.entries = entries
 	v.Index = idx
 	v.Open = true
+	v.prefetchAt(idx + 1)
+	v.prefetchAt(idx - 1)
 }
 
 func (v *Viewer) Close() {
@@ -118,7 +126,10 @@ func (v *Viewer) Close() {
 		v.loadingCtxCancel = nil
 	}
 	v.loadedOp = paint.ImageOp{}
+	v.recentMu.Lock()
 	v.recent = nil
+	v.prefetching = nil
+	v.recentMu.Unlock()
 }
 
 // parkLoaded moves the current loadedOp into the MRU position of the recent
@@ -135,6 +146,8 @@ func (v *Viewer) parkLoaded() {
 // cachePut inserts (path, op) at the MRU end of v.recent, evicting the
 // oldest entry past viewerRecentCap.
 func (v *Viewer) cachePut(path string, op paint.ImageOp, sz image.Point) {
+	v.recentMu.Lock()
+	defer v.recentMu.Unlock()
 	for i, r := range v.recent {
 		if r.path == path {
 			v.recent = append(v.recent[:i], v.recent[i+1:]...)
@@ -149,6 +162,8 @@ func (v *Viewer) cachePut(path string, op paint.ImageOp, sz image.Point) {
 
 // cacheGet returns the cached image op for path and moves the entry to MRU.
 func (v *Viewer) cacheGet(path string) (paint.ImageOp, image.Point, bool) {
+	v.recentMu.Lock()
+	defer v.recentMu.Unlock()
 	for i, r := range v.recent {
 		if r.path == path {
 			if i != 0 {
@@ -158,6 +173,18 @@ func (v *Viewer) cacheGet(path string) (paint.ImageOp, image.Point, bool) {
 		}
 	}
 	return paint.ImageOp{}, image.Point{}, false
+}
+
+// cacheHas reports whether path is in the recent cache without promoting it.
+func (v *Viewer) cacheHas(path string) bool {
+	v.recentMu.Lock()
+	defer v.recentMu.Unlock()
+	for _, r := range v.recent {
+		if r.path == path {
+			return true
+		}
+	}
+	return false
 }
 
 // RequestDelete opens the delete-confirmation modal for the current entry.
@@ -195,12 +222,14 @@ func (v *Viewer) ConfirmDelete(deleter func(path string) error) {
 	}
 	// Drop the deleted entry from the recent cache too — the path no
 	// longer exists, and the cache entry would never get evicted otherwise.
+	v.recentMu.Lock()
 	for i, r := range v.recent {
 		if r.path == e.Path {
 			v.recent = append(v.recent[:i], v.recent[i+1:]...)
 			break
 		}
 	}
+	v.recentMu.Unlock()
 	v.cancelLoading()
 	v.loadedPath = ""
 	v.loadingPath = ""
@@ -222,6 +251,7 @@ func (v *Viewer) Next() {
 		v.loadedPath = ""
 		v.loadingPath = ""
 		v.loadedOp = paint.ImageOp{}
+		v.prefetchAt(v.Index + 1)
 	}
 }
 
@@ -233,6 +263,7 @@ func (v *Viewer) Prev() {
 		v.loadedPath = ""
 		v.loadingPath = ""
 		v.loadedOp = paint.ImageOp{}
+		v.prefetchAt(v.Index - 1)
 	}
 }
 
@@ -584,52 +615,10 @@ func (v *Viewer) kickDecode(e cache.Entry) {
 	v.loadingCtxCancel = cancel
 
 	go func() {
-		var img image.Image
-		var err error
-
-		switch e.Type {
-		case scan.TypeHEIC:
-			tmpDir, err2 := os.MkdirTemp("", "photo-viewer-heicview-")
-			if err2 != nil {
-				return
-			}
-			defer os.RemoveAll(tmpDir)
-			jpgPath, err2 := thumb.HEICToJPEG(ctx, e.Path, tmpDir)
-			if err2 != nil {
-				return
-			}
-			f, err2 := os.Open(jpgPath)
-			if err2 != nil {
-				return
-			}
-			img, _, err = image.Decode(f)
-			f.Close()
-		case scan.TypeRAW:
-			img, err = thumb.LoadRAWImage(ctx, e.Path)
-		case scan.TypePhoto:
-			f, err2 := os.Open(e.Path)
-			if err2 == nil {
-				img, _, err = image.Decode(f)
-				f.Close()
-			}
-		}
-
-		if err != nil || img == nil {
+		op, sz, ok := decodeOriginal(ctx, e)
+		if !ok || ctx.Err() != nil {
 			return
 		}
-
-		// Check if we were cancelled while decoding before doing more work or
-		// updating the UI.
-		if ctx.Err() != nil {
-			return
-		}
-
-		img = downscalePreview(img, viewerMaxPreviewSide)
-
-		op := paint.NewImageOp(img)
-		op.Filter = paint.FilterLinear
-		sz := img.Bounds().Size()
-
 		// Safe to set here because it's only read and written atomically via pointer/structs
 		// by the main UI thread during Layout.
 		v.loadedPath = e.Path
@@ -640,6 +629,96 @@ func (v *Viewer) kickDecode(e cache.Entry) {
 			v.invalidate()
 		}
 	}()
+}
+
+// prefetchAt decodes the entry at idx in the background and parks the result
+// in the recent cache so a subsequent Next/Prev to it is instant. It does
+// not touch loadedPath/Op/Sz — only the LRU. No-op if idx is out of range,
+// the entry is already cached, currently loading, or already being
+// prefetched.
+func (v *Viewer) prefetchAt(idx int) {
+	if idx < 0 || idx >= len(v.entries) {
+		return
+	}
+	e := v.entries[idx]
+	switch e.Type {
+	case scan.TypePhoto, scan.TypeRAW, scan.TypeHEIC:
+	default:
+		return
+	}
+	if v.loadingPath == e.Path || v.loadedPath == e.Path {
+		return
+	}
+	if v.cacheHas(e.Path) {
+		return
+	}
+	v.recentMu.Lock()
+	if v.prefetching == nil {
+		v.prefetching = map[string]bool{}
+	}
+	if v.prefetching[e.Path] {
+		v.recentMu.Unlock()
+		return
+	}
+	v.prefetching[e.Path] = true
+	v.recentMu.Unlock()
+
+	go func(e cache.Entry) {
+		defer func() {
+			v.recentMu.Lock()
+			delete(v.prefetching, e.Path)
+			v.recentMu.Unlock()
+		}()
+		op, sz, ok := decodeOriginal(context.Background(), e)
+		if !ok {
+			return
+		}
+		v.cachePut(e.Path, op, sz)
+	}(e)
+}
+
+// decodeOriginal decodes an entry's full-resolution image into a paint.ImageOp,
+// downscaled to viewerMaxPreviewSide. Returns (op, size, true) on success or
+// the zero value with false on any error / cancellation.
+func decodeOriginal(ctx context.Context, e cache.Entry) (paint.ImageOp, image.Point, bool) {
+	var img image.Image
+	var err error
+	switch e.Type {
+	case scan.TypeHEIC:
+		tmpDir, err2 := os.MkdirTemp("", "photo-viewer-heicview-")
+		if err2 != nil {
+			return paint.ImageOp{}, image.Point{}, false
+		}
+		defer os.RemoveAll(tmpDir)
+		jpgPath, err2 := thumb.HEICToJPEG(ctx, e.Path, tmpDir)
+		if err2 != nil {
+			return paint.ImageOp{}, image.Point{}, false
+		}
+		f, err2 := os.Open(jpgPath)
+		if err2 != nil {
+			return paint.ImageOp{}, image.Point{}, false
+		}
+		img, _, err = image.Decode(f)
+		f.Close()
+	case scan.TypeRAW:
+		img, err = thumb.LoadRAWImage(ctx, e.Path)
+	case scan.TypePhoto:
+		f, err2 := os.Open(e.Path)
+		if err2 == nil {
+			img, _, err = image.Decode(f)
+			f.Close()
+		}
+	}
+	if err != nil || img == nil {
+		return paint.ImageOp{}, image.Point{}, false
+	}
+	if ctx.Err() != nil {
+		return paint.ImageOp{}, image.Point{}, false
+	}
+	img = downscalePreview(img, viewerMaxPreviewSide)
+	op := paint.NewImageOp(img)
+	op.Filter = paint.FilterLinear
+	return op, img.Bounds().Size(), true
 }
 
 // downscalePreview returns img resized so its long side is at most maxSide.

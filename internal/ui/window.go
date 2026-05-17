@@ -87,12 +87,14 @@ func Run(w *app.Window, ctrl *Controller) error {
 	indexInfo := NewIndexInfoView(ctrl.IndexStatus)
 	search := NewFuzzySearchView(ctrl.Index())
 	search.OnPick = func(path string, isDir bool) {
-		grid.Selected = 0
-		if isDir {
-			ctrl.SelectDir(path)
-		} else {
-			ctrl.SelectDir(filepath.Dir(path))
+		_, prev, _, _ := ctrl.Snapshot()
+		grid.RememberFor(prev)
+		target := path
+		if !isDir {
+			target = filepath.Dir(path)
 		}
+		grid.RestoreFor(target)
+		ctrl.SelectDir(target)
 		search.Close()
 		w.Invalidate()
 	}
@@ -106,15 +108,21 @@ func Run(w *app.Window, ctrl *Controller) error {
 	sidebarFocus := false
 
 	sidebar.OnPick = func(p string) {
-		grid.Selected = 0
+		_, prev, _, _ := ctrl.Snapshot()
+		grid.RememberFor(prev)
+		grid.RestoreFor(p)
 		ctrl.SelectDir(p)
 	}
 	sidebar.OnPreview = func(p string) {
-		grid.Selected = 0
+		_, prev, _, _ := ctrl.Snapshot()
+		grid.RememberFor(prev)
+		grid.RestoreFor(p)
 		ctrl.PreviewDir(p)
 	}
 	sidebar.OnPreviewYear = func(year string, dirs []string) {
-		grid.Selected = 0
+		_, prev, _, _ := ctrl.Snapshot()
+		grid.RememberFor(prev)
+		grid.RestoreFor(YearViewPrefix + year)
 		ctrl.PreviewYear(year, dirs)
 	}
 	grid.OnOpen = func(idx int) {

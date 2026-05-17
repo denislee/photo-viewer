@@ -54,6 +54,11 @@ type Grid struct {
 	// so it remains stable across refreshes that may reorder entries.
 	Confirming  bool
 	ConfirmPath string
+
+	// lastSelByDir remembers the selected index for each directory the user
+	// has visited so revisiting restores their place. In-memory only — not
+	// persisted across launches.
+	lastSelByDir map[string]int
 }
 
 // RequestDelete opens the delete-confirmation modal for the entry at idx.
@@ -85,9 +90,45 @@ func (g *Grid) ConfirmDelete(deleter func(path string) error) {
 }
 
 func NewGrid() *Grid {
-	g := &Grid{cellSize: defaultCellDp}
+	size := unit.Dp(defaultCellDp)
+	if v := GetConfig().GridCellDp; v > 0 {
+		size = unit.Dp(v)
+		if size < minCellDp {
+			size = minCellDp
+		}
+		if size > maxCellDp {
+			size = maxCellDp
+		}
+	}
+	g := &Grid{cellSize: size, lastSelByDir: map[string]int{}}
 	g.list.Axis = layout.Vertical
 	return g
+}
+
+// RememberFor stores the current selection index against dir so a later
+// RestoreFor(dir) lands the user back where they left off. No-op when dir
+// is empty.
+func (g *Grid) RememberFor(dir string) {
+	if dir == "" {
+		return
+	}
+	if g.lastSelByDir == nil {
+		g.lastSelByDir = map[string]int{}
+	}
+	g.lastSelByDir[dir] = g.Selected
+}
+
+// RestoreFor sets Selected to the previously remembered index for dir, or 0
+// if none. A pending scroll is queued so the next Layout brings it into view.
+func (g *Grid) RestoreFor(dir string) {
+	idx := 0
+	if g.lastSelByDir != nil {
+		if v, ok := g.lastSelByDir[dir]; ok {
+			idx = v
+		}
+	}
+	g.Selected = idx
+	g.pendingScroll = true
 }
 
 func (g *Grid) ensureCells(n int) {
@@ -166,7 +207,13 @@ func (g *Grid) Zoom(dir int) bool {
 	if g.cellSize > maxCellDp {
 		g.cellSize = maxCellDp
 	}
-	return g.cellSize != old
+	if g.cellSize != old {
+		c := GetConfig()
+		c.GridCellDp = int(g.cellSize)
+		_ = SaveConfig(c)
+		return true
+	}
+	return false
 }
 
 // PageMove jumps the selection by one viewport-worth of rows. dir>0 moves
