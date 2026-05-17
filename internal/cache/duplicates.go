@@ -3,6 +3,7 @@ package cache
 import (
 	"context"
 	"crypto/sha256"
+	"encoding/binary"
 	"encoding/hex"
 	"errors"
 	"io"
@@ -45,9 +46,11 @@ var quickHashBufPool = sync.Pool{
 	},
 }
 
-// quickHash hashes the first and last 64 KiB of a file. Two files that share
-// size but produce different quick hashes cannot be byte-identical, so they
-// can skip the full SHA-256 read.
+// quickHash hashes the file size plus the first and last 64 KiB of its
+// contents. Two files that share size but produce different quick hashes
+// cannot be byte-identical, so they can skip the full SHA-256 read. Mixing
+// size in means a quick-hash collision implies same size, so callers can
+// group by quick alone instead of (size, quick).
 func quickHash(path string, size int64) (string, error) {
 	f, err := os.Open(path)
 	if err != nil {
@@ -55,6 +58,7 @@ func quickHash(path string, size int64) (string, error) {
 	}
 	defer f.Close()
 	h := sha256.New()
+	_ = binary.Write(h, binary.LittleEndian, size)
 	if size <= int64(quickHashWindow)*2 {
 		if _, err := io.Copy(h, f); err != nil {
 			return "", err
@@ -131,9 +135,17 @@ func (i *Index) EnsureHashes(ctx context.Context, progress func(done, total int)
 		return ctx.Err()
 	}
 
-	numWorkers := runtime.NumCPU()
-	if numWorkers < 4 {
-		numWorkers = 4
+	// Quick hash reads two 64 KiB windows per file — overwhelmingly I/O-bound,
+	// so oversubscribe (NumCPU * 3) to keep the disk queue saturated on SSD.
+	// Full SHA-256 reads every byte and the digest itself burns CPU, so cap
+	// at NumCPU. Matches the cpu/ext split that ThumbStore uses.
+	cpuWorkers := runtime.NumCPU()
+	if cpuWorkers < 4 {
+		cpuWorkers = 4
+	}
+	ioWorkers := cpuWorkers * 3
+	if ioWorkers < 6 {
+		ioWorkers = 6
 	}
 
 	// Phase 1: quick-hash candidates that don't have a cached quick hash.
@@ -161,7 +173,7 @@ func (i *Index) EnsureHashes(ctx context.Context, progress func(done, total int)
 			path  string
 			quick string
 		}
-		jobs := make(chan cand, numWorkers*2)
+		jobs := make(chan cand, ioWorkers*2)
 		go func() {
 			defer close(jobs)
 			for _, t := range phase1 {
@@ -172,9 +184,9 @@ func (i *Index) EnsureHashes(ctx context.Context, progress func(done, total int)
 				}
 			}
 		}()
-		results := make(chan qres, numWorkers*2)
+		results := make(chan qres, ioWorkers*2)
 		var wg sync.WaitGroup
-		for w := 0; w < numWorkers; w++ {
+		for w := 0; w < ioWorkers; w++ {
 			wg.Add(1)
 			go func() {
 				defer wg.Done()
@@ -243,12 +255,10 @@ func (i *Index) EnsureHashes(ctx context.Context, progress func(done, total int)
 		}
 	}
 
-	// Build (size, quick) groups using all cached + computed quick hashes.
-	type key struct {
-		size  int64
-		quick string
-	}
-	groups := map[key][]cand{}
+	// Group by quick hash alone. Size is mixed into the digest by quickHash,
+	// so a quick-hash collision already implies same size — no need for a
+	// composite (size, quick) key.
+	groups := map[string][]cand{}
 	for _, c := range todo {
 		q := c.quick
 		if q == "" {
@@ -257,11 +267,10 @@ func (i *Index) EnsureHashes(ctx context.Context, progress func(done, total int)
 		if q == "" {
 			continue // quick hash failed earlier
 		}
-		groups[key{size: c.size, quick: q}] = append(groups[key{size: c.size, quick: q}],
-			cand{path: c.path, size: c.size, quick: q, full: c.full})
+		groups[q] = append(groups[q], cand{path: c.path, size: c.size, quick: q, full: c.full})
 	}
 
-	// Phase 2: full-hash files whose (size, quick) collides with another and
+	// Phase 2: full-hash files whose quick hash collides with another and
 	// don't already have a cached content hash.
 	var toFull []cand
 	for _, gs := range groups {
@@ -287,7 +296,7 @@ func (i *Index) EnsureHashes(ctx context.Context, progress func(done, total int)
 		path string
 		hash string
 	}
-	jobs2 := make(chan cand, numWorkers*2)
+	jobs2 := make(chan cand, cpuWorkers*2)
 	go func() {
 		defer close(jobs2)
 		for _, c := range toFull {
@@ -298,9 +307,9 @@ func (i *Index) EnsureHashes(ctx context.Context, progress func(done, total int)
 			}
 		}
 	}()
-	results2 := make(chan fres, numWorkers*2)
+	results2 := make(chan fres, cpuWorkers*2)
 	var wg2 sync.WaitGroup
-	for w := 0; w < numWorkers; w++ {
+	for w := 0; w < cpuWorkers; w++ {
 		wg2.Add(1)
 		go func() {
 			defer wg2.Done()

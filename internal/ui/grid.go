@@ -160,11 +160,17 @@ func (g *Grid) ensureCells(n int) {
 	} else {
 		g.cells = g.cells[:n]
 	}
-	for i := 0; i < n; i++ {
-		if g.cells[i] == nil {
-			g.cells[i] = &widget.Clickable{}
-		}
+	// Clickables are lazily allocated by cellAt — off-screen cells (the
+	// 99% case on a 100k-entry library) stay nil.
+}
+
+// cellAt returns the Clickable for index i, allocating on first access. Safe
+// to call only from the layout goroutine (Grid has no internal locking).
+func (g *Grid) cellAt(i int) *widget.Clickable {
+	if g.cells[i] == nil {
+		g.cells[i] = &widget.Clickable{}
 	}
+	return g.cells[i]
 }
 
 // Cols returns the most recently computed column count. Used by hjkl handlers
@@ -304,6 +310,9 @@ func (g *Grid) Layout(gtx layout.Context, th *Theme, entries []cache.Entry, ctrl
 		clickEnd = len(g.cells)
 	}
 	for i := clickStart; i < clickEnd; i++ {
+		if g.cells[i] == nil {
+			continue
+		}
 		if g.cells[i].Clicked(gtx) {
 			g.Selected = i
 			if ctrl.SelectionMode {
@@ -387,7 +396,7 @@ func (g *Grid) layoutRow(gtx layout.Context, th *Theme, entries []cache.Entry, c
 		stack := op.Offset(image.Pt(x, yOff)).Push(gtx.Ops)
 		e := entries[i]
 		isSelected := selectionMode && ctrl.IsSelected(e.Path)
-		drawCell(cellGtx, th, e, thumbs, g.cells[i], cellPx, i == selected, isSelected, selectionMode)
+		drawCell(cellGtx, th, e, thumbs, g.cellAt(i), cellPx, i == selected, isSelected, selectionMode)
 		stack.Pop()
 	}
 	return layout.Dimensions{Size: image.Pt(gtx.Constraints.Max.X, rowH)}

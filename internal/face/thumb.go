@@ -63,7 +63,7 @@ func EnsureThumb(cacheDir, srcThumb string, faceID int64, bbox [4]int) (string, 
 
 	tw, th := fitWithin(rect.Dx(), rect.Dy(), FaceThumbSize)
 	scaled := image.NewRGBA(image.Rect(0, 0, tw, th))
-	draw.ApproxBiLinear.Scale(scaled, scaled.Bounds(), cropped, cropped.Bounds(), draw.Over, nil)
+	draw.ApproxBiLinear.Scale(scaled, scaled.Bounds(), cropped, cropped.Bounds(), draw.Src, nil)
 
 	tmp := dst + ".tmp"
 	out, err := os.Create(tmp)

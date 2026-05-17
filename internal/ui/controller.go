@@ -645,33 +645,38 @@ func (c *Controller) WarmUp() {
 			}
 		}()
 
-		all := c.index.All()
+		total := c.index.Count()
 		if proc != nil {
-			proc.SetTotal(int64(len(all)))
+			proc.SetTotal(int64(total))
 		}
-		for i, e := range all {
+		// Throttle the redraw notifications so a burst of fast thumb decodes
+		// doesn't pile dozens of frame requests onto Gio's loop. The progress
+		// bar still ticks at full granularity via proc.SetDone.
+		var lastInv time.Time
+		var i int
+		c.index.ForEachEntry(func(e cache.Entry) bool {
 			if proc != nil {
 				proc.Wait()
 			}
 			if ctx.Err() != nil {
-				return
+				return false
 			}
 			_, _ = c.store.Path(e)
+			i++
 			if proc != nil {
-				proc.SetDone(int64(i + 1))
+				proc.SetDone(int64(i))
 			}
-			if i%50 == 0 {
+			if i%50 == 0 || i == total {
 				c.mu.Lock()
-				c.scanBatched = i + 1
+				c.scanBatched = i
 				c.mu.Unlock()
-				if c.invalidate != nil {
-					c.invalidate()
-				}
 			}
-		}
-		c.mu.Lock()
-		c.scanBatched = len(all)
-		c.mu.Unlock()
+			if c.invalidate != nil && time.Since(lastInv) >= 33*time.Millisecond {
+				c.invalidate()
+				lastInv = time.Now()
+			}
+			return true
+		})
 	}()
 }
 

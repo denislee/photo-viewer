@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"sync"
 
 	"github.com/dns/photo-viewer/internal/scan"
 	"github.com/dns/photo-viewer/internal/thumb"
@@ -26,6 +27,12 @@ type ThumbStore struct {
 	dir    string // <cache>/thumbs
 	cpuSem chan struct{}
 	extSem chan struct{}
+
+	// Singleflight: concurrent Path() calls for the same thumb id share one
+	// generation. The first caller stores a channel here; followers wait on
+	// it and re-stat the result. Keyed by thumb id.
+	flightMu sync.Mutex
+	inflight map[string]chan struct{}
 }
 
 func NewThumbStore(cacheDir string) (*ThumbStore, error) {
@@ -42,9 +49,10 @@ func NewThumbStore(cacheDir string) (*ThumbStore, error) {
 		ext = 6
 	}
 	return &ThumbStore{
-		dir:    d,
-		cpuSem: make(chan struct{}, cpu),
-		extSem: make(chan struct{}, ext),
+		dir:      d,
+		cpuSem:   make(chan struct{}, cpu),
+		extSem:   make(chan struct{}, ext),
+		inflight: make(map[string]chan struct{}),
 	}, nil
 }
 
@@ -67,6 +75,28 @@ func (s *ThumbStore) Path(e Entry) (string, error) {
 		// Stale: source changed since the thumb was written. Regenerate.
 		os.Remove(dst)
 	}
+
+	// Singleflight: dedupe concurrent calls for the same thumb id.
+	s.flightMu.Lock()
+	if ch, ok := s.inflight[e.ThumbID]; ok {
+		s.flightMu.Unlock()
+		<-ch
+		if info, err := os.Stat(dst); err == nil &&
+			(info.ModTime().After(e.ModTime) || info.ModTime().Equal(e.ModTime)) {
+			return dst, nil
+		}
+		return "", fmt.Errorf("thumb generation failed for %s", e.Path)
+	}
+	ch := make(chan struct{})
+	s.inflight[e.ThumbID] = ch
+	s.flightMu.Unlock()
+	defer func() {
+		s.flightMu.Lock()
+		delete(s.inflight, e.ThumbID)
+		s.flightMu.Unlock()
+		close(ch)
+	}()
+
 	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
 		return "", err
 	}

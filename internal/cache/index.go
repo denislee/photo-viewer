@@ -6,7 +6,6 @@ import (
 	"encoding/hex"
 	"os"
 	"path/filepath"
-	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -69,6 +68,30 @@ func Load(dbPath string) (*Index, error) {
 		return nil, err
 	}
 	_, _ = db.Exec("ALTER TABLE entries ADD COLUMN quick_hash TEXT")
+	_, _ = db.Exec("ALTER TABLE entries ADD COLUMN year INTEGER")
+	if _, err := db.Exec("CREATE INDEX IF NOT EXISTS idx_entries_year ON entries(year)"); err != nil {
+		return nil, err
+	}
+
+	// Schema versioning for value-format migrations. Bump when a persisted
+	// hash/value format changes so stale rows are invalidated.
+	const schemaVersion = 2
+	var userVersion int
+	_ = db.QueryRow("PRAGMA user_version").Scan(&userVersion)
+	if userVersion < 1 {
+		// v1: quick_hash now mixes the file size into the digest, so any
+		// values stored under the old format must be re-hashed.
+		_, _ = db.Exec("UPDATE entries SET quick_hash = NULL")
+	}
+	if userVersion < 2 {
+		// v2: year column populated from the YYYY-MM-DD parent dir. Backfill
+		// existing rows so the sidebar's Years/ListByYear queries can group
+		// in SQL instead of streaming every row to Go.
+		backfillYear(db)
+	}
+	if userVersion < schemaVersion {
+		_, _ = db.Exec("PRAGMA user_version = " + strconv.Itoa(schemaVersion))
+	}
 
 	_, err = db.Exec(`
 		CREATE TABLE IF NOT EXISTS face_clusters (
@@ -110,12 +133,13 @@ func (i *Index) Save() error {
 // fsync, at the cost of one extra fsync per chunk.
 const reconcileChunkSize = 5000
 
-const reconcileInsertSQL = `INSERT INTO entries (path, type, size, mtime, thumb_id) VALUES (?, ?, ?, ?, ?)
+const reconcileInsertSQL = `INSERT INTO entries (path, type, size, mtime, thumb_id, year) VALUES (?, ?, ?, ?, ?, ?)
 	ON CONFLICT(path) DO UPDATE SET
 		type = excluded.type,
 		size = excluded.size,
 		mtime = excluded.mtime,
 		thumb_id = excluded.thumb_id,
+		year = excluded.year,
 		quick_hash = CASE
 			WHEN entries.size != excluded.size OR entries.mtime != excluded.mtime
 			THEN NULL ELSE entries.quick_hash END,
@@ -169,7 +193,11 @@ func (i *Index) reconcileChunk(chunk []scan.Result, out *[]Entry) {
 			ModTime: r.ModTime,
 			ThumbID: ThumbIDFor(r.Path),
 		}
-		_, _ = stmt.Exec(e.Path, e.Type, e.Size, e.ModTime.Unix(), e.ThumbID)
+		var yearArg any
+		if y := pathYear(r.Path); y != 0 {
+			yearArg = y
+		}
+		_, _ = stmt.Exec(e.Path, e.Type, e.Size, e.ModTime.Unix(), e.ThumbID, yearArg)
 		*out = append(*out, e)
 	}
 	_ = tx.Commit()
@@ -313,26 +341,43 @@ func pathYear(path string) int {
 	if len(dir) != 10 || dir[4] != '-' || dir[7] != '-' {
 		return 0
 	}
-	y, err := strconv.Atoi(dir[:4])
-	if err != nil || y < 1900 || y > 9999 {
+	d := func(i int) (int, bool) {
+		c := dir[i]
+		if c < '0' || c > '9' {
+			return 0, false
+		}
+		return int(c - '0'), true
+	}
+	y3, ok3 := d(0)
+	y2, ok2 := d(1)
+	y1, ok1 := d(2)
+	y0, ok0 := d(3)
+	if !(ok3 && ok2 && ok1 && ok0) {
 		return 0
 	}
-	if _, err := strconv.Atoi(dir[5:7]); err != nil {
+	y := y3*1000 + y2*100 + y1*10 + y0
+	if y < 1900 || y > 9999 {
 		return 0
 	}
-	if _, err := strconv.Atoi(dir[8:10]); err != nil {
+	if _, ok := d(5); !ok {
+		return 0
+	}
+	if _, ok := d(6); !ok {
+		return 0
+	}
+	if _, ok := d(8); !ok {
+		return 0
+	}
+	if _, ok := d(9); !ok {
 		return 0
 	}
 	return y
 }
 
-// entryYear returns pathYear(path) when non-zero, else the year of mtime in UTC.
-func entryYear(path string, mtime int64) int {
-	if y := pathYear(path); y != 0 {
-		return y
-	}
-	return time.Unix(mtime, 0).UTC().Year()
-}
+// yearExpr is the SQL expression for the per-entry year: prefer the stored
+// `year` column (populated from a YYYY-MM-DD parent dir on ingest); fall back
+// to the year of mtime in UTC.
+const yearExpr = "COALESCE(year, CAST(strftime('%Y', mtime, 'unixepoch') AS INTEGER))"
 
 // Years returns the distinct years (descending) present in the index, with
 // per-year counts that respect the current filter and showRAW toggle. Year
@@ -340,7 +385,7 @@ func entryYear(path string, mtime int64) int {
 func (i *Index) Years(filter string, showRAW bool) []YearStat {
 
 	where, args := typeFilterClause(filter, showRAW)
-	q := "SELECT path, mtime FROM entries WHERE 1=1" + where
+	q := "SELECT " + yearExpr + " AS y, COUNT(*) FROM entries WHERE 1=1" + where + " GROUP BY y ORDER BY y DESC"
 
 	rows, err := i.db.Query(q, args...)
 	if err != nil {
@@ -348,20 +393,13 @@ func (i *Index) Years(filter string, showRAW bool) []YearStat {
 	}
 	defer rows.Close()
 
-	counts := make(map[int]int)
+	var out []YearStat
 	for rows.Next() {
-		var path string
-		var mtimeUnix int64
-		if err := rows.Scan(&path, &mtimeUnix); err == nil {
-			counts[entryYear(path, mtimeUnix)]++
+		var y, c int
+		if err := rows.Scan(&y, &c); err == nil {
+			out = append(out, YearStat{Year: y, Count: c})
 		}
 	}
-
-	out := make([]YearStat, 0, len(counts))
-	for y, c := range counts {
-		out = append(out, YearStat{Year: y, Count: c})
-	}
-	sort.Slice(out, func(a, b int) bool { return out[a].Year > out[b].Year })
 	return out
 }
 
@@ -370,9 +408,10 @@ func (i *Index) Years(filter string, showRAW bool) []YearStat {
 func (i *Index) ListByYear(year int, filter string, showRAW bool) []Entry {
 
 	where, args := typeFilterClause(filter, showRAW)
-	q := "SELECT path, type, size, mtime, thumb_id, favorite FROM entries WHERE 1=1" + where + " ORDER BY path"
+	q := "SELECT path, type, size, mtime, thumb_id, favorite FROM entries WHERE " + yearExpr + " = ?" + where + " ORDER BY path"
+	queryArgs := append([]any{year}, args...)
 
-	rows, err := i.db.Query(q, args...)
+	rows, err := i.db.Query(q, queryArgs...)
 	if err != nil {
 		return nil
 	}
@@ -386,14 +425,54 @@ func (i *Index) ListByYear(year int, filter string, showRAW bool) []Entry {
 		if err := rows.Scan(&e.Path, &e.Type, &e.Size, &mtimeUnix, &e.ThumbID, &fav); err != nil {
 			continue
 		}
-		if entryYear(e.Path, mtimeUnix) != year {
-			continue
-		}
 		e.ModTime = time.Unix(mtimeUnix, 0)
 		e.Favorite = fav != 0
 		out = append(out, e)
 	}
 	return out
+}
+
+// backfillYear populates the `year` column for legacy rows where it's still
+// NULL but the path's parent directory is a YYYY-MM-DD bucket. Runs once on
+// schema migration; rows whose parent isn't a date stay NULL and the SQL
+// expression falls back to mtime year.
+func backfillYear(db *sql.DB) {
+	rows, err := db.Query("SELECT path FROM entries WHERE year IS NULL")
+	if err != nil {
+		return
+	}
+	type upd struct {
+		path string
+		year int
+	}
+	var pending []upd
+	for rows.Next() {
+		var p string
+		if err := rows.Scan(&p); err != nil {
+			continue
+		}
+		if y := pathYear(p); y != 0 {
+			pending = append(pending, upd{path: p, year: y})
+		}
+	}
+	rows.Close()
+	if len(pending) == 0 {
+		return
+	}
+	tx, err := db.Begin()
+	if err != nil {
+		return
+	}
+	stmt, err := tx.Prepare("UPDATE entries SET year = ? WHERE path = ?")
+	if err != nil {
+		tx.Rollback()
+		return
+	}
+	for _, u := range pending {
+		_, _ = stmt.Exec(u.year, u.path)
+	}
+	stmt.Close()
+	_ = tx.Commit()
 }
 
 // typeFilterClause builds an SQL fragment ("" or " AND ...") and the
@@ -445,6 +524,52 @@ func (i *Index) All() []Entry {
 		}
 	}
 	return out
+}
+
+// Count returns the number of entries in the index.
+func (i *Index) Count() int {
+	var n int
+	_ = i.db.QueryRow("SELECT COUNT(*) FROM entries").Scan(&n)
+	return n
+}
+
+// ForEachEntry calls visit for every entry in path order. Iteration is
+// internally paged so it doesn't pin one long-running SQL read transaction
+// (which would block WAL checkpointing during a multi-minute warm-up).
+// Returning false from visit stops iteration early.
+func (i *Index) ForEachEntry(visit func(Entry) bool) {
+	const pageSize = 1000
+	lastPath := ""
+	for {
+		rows, err := i.db.Query(
+			"SELECT path, type, size, mtime, thumb_id, favorite FROM entries WHERE path > ? ORDER BY path LIMIT ?",
+			lastPath, pageSize)
+		if err != nil {
+			return
+		}
+		seen := 0
+		stop := false
+		for rows.Next() {
+			var e Entry
+			var mtimeUnix int64
+			var fav int
+			if err := rows.Scan(&e.Path, &e.Type, &e.Size, &mtimeUnix, &e.ThumbID, &fav); err != nil {
+				continue
+			}
+			e.ModTime = time.Unix(mtimeUnix, 0)
+			e.Favorite = fav != 0
+			lastPath = e.Path
+			seen++
+			if !visit(e) {
+				stop = true
+				break
+			}
+		}
+		rows.Close()
+		if stop || seen == 0 {
+			return
+		}
+	}
 }
 
 // ListFavorites returns all entries flagged as favorites.

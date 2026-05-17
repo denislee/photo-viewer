@@ -1,6 +1,7 @@
 package ui
 
 import (
+	"container/list"
 	"image"
 	_ "image/jpeg"
 	"os"
@@ -14,16 +15,25 @@ import (
 	"github.com/dns/photo-viewer/internal/cache"
 )
 
+// thumbCacheCapacity caps the number of decoded thumbnails kept in memory.
+// Each entry holds an RGBA pixel buffer (~256 KB at the default thumb size),
+// so 1024 entries ≈ 256 MB peak. Far larger than any visible window, so live
+// cells are never evicted; old entries are dropped once a long browse session
+// has touched many directories.
+const thumbCacheCapacity = 1024
+
 // thumbCache lazily resolves thumbnail JPEGs into paint.ImageOp values and
-// caches them. Multiple frames may request the same thumb concurrently;
-// only one decode is queued per entry. When a decode completes, invalidate
-// is fired so the next frame can paint the result.
+// caches them with an LRU policy. Multiple frames may request the same thumb
+// concurrently; only one decode is queued per entry. When a decode completes,
+// invalidate is fired so the next frame can paint the result.
 type thumbCache struct {
 	store      *cache.ThumbStore
 	invalidate func()
+	capacity   int
 
 	mu      sync.Mutex
-	entries map[string]*thumbEntry // key: cache.Entry.Path
+	entries map[string]*list.Element // value: *thumbEntry, list ordered MRU→LRU
+	lru     *list.List
 	queue   chan cache.Entry
 
 	// Coalescing: workers bump dirty; a single coalescer goroutine fires
@@ -33,6 +43,7 @@ type thumbCache struct {
 }
 
 type thumbEntry struct {
+	path   string
 	ready  bool
 	op     paint.ImageOp
 	size   image.Point
@@ -43,7 +54,9 @@ func newThumbCache(store *cache.ThumbStore, invalidate func()) *thumbCache {
 	tc := &thumbCache{
 		store:      store,
 		invalidate: invalidate,
-		entries:    make(map[string]*thumbEntry),
+		capacity:   thumbCacheCapacity,
+		entries:    make(map[string]*list.Element),
+		lru:        list.New(),
 		queue:      make(chan cache.Entry, 256),
 	}
 	workers := runtime.NumCPU()
@@ -76,11 +89,7 @@ func (tc *thumbCache) coalescer() {
 // invalidate fires will see the populated op.
 func (tc *thumbCache) Get(e cache.Entry) (paint.ImageOp, image.Point, bool) {
 	tc.mu.Lock()
-	te, ok := tc.entries[e.Path]
-	if !ok {
-		te = &thumbEntry{}
-		tc.entries[e.Path] = te
-	}
+	te := tc.touchOrCreate(e.Path)
 	if te.ready {
 		op, sz := te.op, te.size
 		tc.mu.Unlock()
@@ -103,14 +112,70 @@ func (tc *thumbCache) Get(e cache.Entry) (paint.ImageOp, image.Point, bool) {
 	return paint.ImageOp{}, image.Point{}, false
 }
 
+// touchOrCreate returns the entry for path, promoting it to the MRU end of
+// the LRU list (creating it if missing). Caller must hold tc.mu. Eviction of
+// the oldest entries happens here when the cache exceeds its capacity, but
+// only ready entries with no in-flight decode are eligible — a queued entry
+// is needed by the next frame.
+func (tc *thumbCache) touchOrCreate(path string) *thumbEntry {
+	if el, ok := tc.entries[path]; ok {
+		tc.lru.MoveToFront(el)
+		return el.Value.(*thumbEntry)
+	}
+	te := &thumbEntry{path: path}
+	el := tc.lru.PushFront(te)
+	tc.entries[path] = el
+	tc.evictIfNeeded()
+	return te
+}
+
+// evictIfNeeded drops the least-recently-used ready entries until the cache
+// is within capacity. Caller must hold tc.mu.
+func (tc *thumbCache) evictIfNeeded() {
+	for tc.lru.Len() > tc.capacity {
+		oldest := tc.lru.Back()
+		if oldest == nil {
+			return
+		}
+		te := oldest.Value.(*thumbEntry)
+		if te.queued && !te.ready {
+			// Don't evict an entry whose decode hasn't landed yet — when it
+			// does, the worker will store into a stale *thumbEntry. Walk
+			// back from the oldest to find an evictable candidate instead.
+			prev := oldest.Prev()
+			for prev != nil {
+				cand := prev.Value.(*thumbEntry)
+				if !cand.queued || cand.ready {
+					tc.lru.Remove(prev)
+					delete(tc.entries, cand.path)
+					break
+				}
+				prev = prev.Prev()
+			}
+			if prev == nil {
+				return // nothing evictable
+			}
+			continue
+		}
+		tc.lru.Remove(oldest)
+		delete(tc.entries, te.path)
+	}
+}
+
 func (tc *thumbCache) worker() {
 	for e := range tc.queue {
 		op, sz, ok := tc.decode(e)
 		tc.mu.Lock()
-		te := tc.entries[e.Path]
-		if te == nil {
-			te = &thumbEntry{}
-			tc.entries[e.Path] = te
+		el := tc.entries[e.Path]
+		var te *thumbEntry
+		if el == nil {
+			// Evicted while in-flight; reinsert at MRU.
+			te = &thumbEntry{path: e.Path}
+			el = tc.lru.PushFront(te)
+			tc.entries[e.Path] = el
+			tc.evictIfNeeded()
+		} else {
+			te = el.Value.(*thumbEntry)
 		}
 		te.queued = false
 		if ok {
