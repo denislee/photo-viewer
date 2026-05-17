@@ -49,6 +49,9 @@ type OrganizeView struct {
 	logList     widget.List
 
 	invalidate func()
+
+	processes *ProcessRegistry
+	proc      *Process
 }
 
 func NewOrganizeView(invalidate func()) *OrganizeView {
@@ -57,6 +60,10 @@ func NewOrganizeView(invalidate func()) *OrganizeView {
 	v.logList.ScrollToEnd = true
 	return v
 }
+
+// SetProcessRegistry wires the organize view to the main-screen process
+// bar so the scan + move passes show up with pause / cancel controls.
+func (v *OrganizeView) SetProcessRegistry(r *ProcessRegistry) { v.processes = r }
 
 func (v *OrganizeView) Show(idx *cache.Index, root string) {
 	v.Open = true
@@ -89,6 +96,28 @@ func (v *OrganizeView) Close() {
 }
 
 func (v *OrganizeView) scanForMismatched(ctx context.Context, idx *cache.Index, root string) {
+	var proc *Process
+	if v.processes != nil {
+		proc = v.processes.Begin(ProcOrganize, "Organize: scan", func() {
+			v.mu.Lock()
+			c := v.cancelFn
+			v.mu.Unlock()
+			if c != nil {
+				c()
+			}
+		}, true)
+		proc.SetStatus("Scanning videos…")
+		v.mu.Lock()
+		v.proc = proc
+		v.mu.Unlock()
+		defer func() {
+			v.mu.Lock()
+			v.proc = nil
+			v.mu.Unlock()
+			proc.End()
+		}()
+	}
+
 	allEntries := idx.All()
 	var videos []cache.Entry
 	for _, e := range allEntries {
@@ -100,7 +129,10 @@ func (v *OrganizeView) scanForMismatched(ctx context.Context, idx *cache.Index, 
 	total := len(videos)
 	atomic.StoreInt64(&v.progressMax, int64(total))
 	atomic.StoreInt64(&v.progressDone, 0)
-	
+	if proc != nil {
+		proc.SetTotal(int64(total))
+	}
+
 	v.setStatus(fmt.Sprintf("Scanning %d videos for mismatched dates...", total))
 
 	// Use a worker pool to speed up metadata extraction (exiftool is slow)
@@ -118,6 +150,9 @@ func (v *OrganizeView) scanForMismatched(ctx context.Context, idx *cache.Index, 
 		go func() {
 			defer wg.Done()
 			for e := range jobs {
+				if proc != nil {
+					proc.Wait()
+				}
 				if ctx.Err() != nil {
 					return
 				}
@@ -126,6 +161,9 @@ func (v *OrganizeView) scanForMismatched(ctx context.Context, idx *cache.Index, 
 					results <- MismatchedVideo{Entry: e, ExpectedDate: date}
 				}
 				atomic.AddInt64(&v.progressDone, 1)
+				if proc != nil {
+					proc.AddDone(1)
+				}
 				if atomic.LoadInt64(&v.progressDone)%10 == 0 {
 					if v.invalidate != nil {
 						v.invalidate()
@@ -170,7 +208,11 @@ func (v *OrganizeView) scanForMismatched(ctx context.Context, idx *cache.Index, 
 func (v *OrganizeView) setStatus(msg string) {
 	v.mu.Lock()
 	v.statusMsg = msg
+	proc := v.proc
 	v.mu.Unlock()
+	if proc != nil {
+		proc.SetStatus(msg)
+	}
 	if v.invalidate != nil {
 		v.invalidate()
 	}
@@ -192,17 +234,40 @@ func (v *OrganizeView) startOrganize(root string) {
 	atomic.StoreInt64(&v.progressMax, int64(len(mismatched)))
 
 	go func() {
+		var proc *Process
+		if v.processes != nil {
+			proc = v.processes.Begin(ProcOrganize, "Organize: move", func() {
+				v.mu.Lock()
+				c := v.cancelFn
+				v.mu.Unlock()
+				if c != nil {
+					c()
+				}
+			}, true)
+			proc.SetStatus(fmt.Sprintf("Moving %d videos…", len(mismatched)))
+			proc.SetTotal(int64(len(mismatched)))
+			v.mu.Lock()
+			v.proc = proc
+			v.mu.Unlock()
+		}
 		defer func() {
 			v.mu.Lock()
 			v.running = false
 			v.cancelFn = nil
+			v.proc = nil
 			v.mu.Unlock()
+			if proc != nil {
+				proc.End()
+			}
 			if v.invalidate != nil {
 				v.invalidate()
 			}
 		}()
 
 		for _, m := range mismatched {
+			if proc != nil {
+				proc.Wait()
+			}
 			if ctx.Err() != nil {
 				v.appendLog("Organization cancelled.")
 				v.setStatus("Cancelled.")
@@ -253,6 +318,12 @@ func (v *OrganizeView) appendLog(msg string) {
 
 func (v *OrganizeView) bumpProgress() {
 	atomic.AddInt64(&v.progressDone, 1)
+	v.mu.Lock()
+	proc := v.proc
+	v.mu.Unlock()
+	if proc != nil {
+		proc.AddDone(1)
+	}
 	if v.invalidate != nil {
 		v.invalidate()
 	}

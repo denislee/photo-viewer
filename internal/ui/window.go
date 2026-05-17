@@ -53,6 +53,27 @@ func Run(w *app.Window, ctrl *Controller) error {
 	dups := NewDuplicatesView(ctrl.Index(), ctrl.Store(), ctrl.Thumbs(), w.Invalidate)
 	imports := NewImportView(w.Invalidate)
 	organize := NewOrganizeView(w.Invalidate)
+
+	// Process registry surfaces background work (scan, warm-up, import,
+	// duplicate hash, organize) in the main-screen process bar so the user
+	// can pause / resume / cancel without keeping the modal open.
+	processes := NewProcessRegistry(w.Invalidate)
+	ctrl.SetProcessRegistry(processes)
+	dups.SetProcessRegistry(processes)
+	imports.SetProcessRegistry(processes)
+	organize.SetProcessRegistry(processes)
+	processBar := NewProcessBar(processes)
+	processBar.OnOpen = func(kind ProcKind) {
+		switch kind {
+		case ProcImport:
+			imports.Show()
+		case ProcDuplicates:
+			dups.Show()
+		case ProcOrganize:
+			organize.Show(ctrl.Index(), ctrl.LibraryRoot())
+		}
+		w.Invalidate()
+	}
 	settings := NewSettingsView()
 	settings.SetInvalidate(w.Invalidate)
 	sdPrompt := &SDPromptView{}
@@ -181,7 +202,7 @@ func Run(w *app.Window, ctrl *Controller) error {
 			toolbar.ShowRAW = ctrl.ShowRAW()
 			toolbar.GroupByYear = GetConfig().GroupByYear
 			toolbar.Busy = ctrl.Scanning()
-			drawRoot(gtx, th, ctrl, toolbar, sidebar, grid, viewer, dups, imports, organize, settings, indexInfo, search, sdPrompt, splitter, sidebarFocus, w)
+			drawRoot(gtx, th, ctrl, toolbar, sidebar, grid, viewer, dups, imports, organize, settings, indexInfo, search, sdPrompt, processBar, splitter, sidebarFocus, w)
 			e.Frame(gtx.Ops)
 		}
 	}
@@ -816,7 +837,7 @@ func handleSidebarKey(ke key.Event, sidebar *Sidebar, sidebarFocus *bool, w *app
 	}
 }
 
-func drawRoot(gtx layout.Context, th *Theme, ctrl *Controller, tb *Toolbar, sb *Sidebar, g *Grid, v *Viewer, dups *DuplicatesView, imports *ImportView, organize *OrganizeView, settings *SettingsView, indexInfo *IndexInfoView, search *FuzzySearchView, sdPrompt *SDPromptView, splitter *sidebarSplitter, sidebarFocus bool, w *app.Window) {
+func drawRoot(gtx layout.Context, th *Theme, ctrl *Controller, tb *Toolbar, sb *Sidebar, g *Grid, v *Viewer, dups *DuplicatesView, imports *ImportView, organize *OrganizeView, settings *SettingsView, indexInfo *IndexInfoView, search *FuzzySearchView, sdPrompt *SDPromptView, processBar *ProcessBar, splitter *sidebarSplitter, sidebarFocus bool, w *app.Window) {
 	rect := image.Rectangle{Max: gtx.Constraints.Max}
 	defer clip.Rect(rect).Push(gtx.Ops).Pop()
 	paint.ColorOp{Color: th.Background}.Add(gtx.Ops)
@@ -828,6 +849,11 @@ func drawRoot(gtx layout.Context, th *Theme, ctrl *Controller, tb *Toolbar, sb *
 	totalH := gtx.Constraints.Max.Y
 	sbH := gtx.Dp(unit.Dp(shortcutBarHeightDp))
 
+	// Process bar — sits just above the shortcut bar and only consumes
+	// space when at least one background process is running.
+	procSnap := ctrl.processes.Snapshot()
+	pbH := gtx.Dp(unit.Dp(processBar.HeightDp(procSnap)))
+
 	// Bottom shortcut bar — always drawn, including over the viewer.
 	drawShortcut := func() {
 		gtx2 := gtx
@@ -835,6 +861,17 @@ func drawRoot(gtx layout.Context, th *Theme, ctrl *Controller, tb *Toolbar, sb *
 		gtx2.Constraints.Min = image.Pt(totalW, sbH)
 		stack := op.Offset(image.Pt(0, totalH-sbH)).Push(gtx.Ops)
 		drawShortcutBar(gtx2, th, v.Open, sidebarFocus, ctrl.SelectionMode)
+		stack.Pop()
+	}
+	drawProcBar := func() {
+		if pbH == 0 {
+			return
+		}
+		gtx2 := gtx
+		gtx2.Constraints.Max = image.Pt(totalW, pbH)
+		gtx2.Constraints.Min = image.Pt(totalW, pbH)
+		stack := op.Offset(image.Pt(0, totalH-sbH-pbH)).Push(gtx.Ops)
+		processBar.Layout(gtx2, th, procSnap)
 		stack.Pop()
 	}
 
@@ -926,9 +963,10 @@ func drawRoot(gtx layout.Context, th *Theme, ctrl *Controller, tb *Toolbar, sb *
 		tb.Layout(gtx2, th, dispDir, len(entries))
 	}
 
-	// Body region below the toolbar and above the shortcut bar.
+	// Body region below the toolbar and above the (optional) process
+	// bar + shortcut bar.
 	bodyY := tbH
-	bodyH := totalH - tbH - sbH
+	bodyH := totalH - tbH - sbH - pbH
 	minW := gtx.Dp(unit.Dp(sidebarMinDp))
 	maxW := gtx.Dp(unit.Dp(sidebarMaxDp))
 	if maxW > totalW-minW {
@@ -983,6 +1021,7 @@ func drawRoot(gtx layout.Context, th *Theme, ctrl *Controller, tb *Toolbar, sb *
 		drawDeleteConfirm(gtx2, th, filepath.Base(g.ConfirmPath), image.Rectangle{Max: gtx2.Constraints.Max})
 	}
 
+	drawProcBar()
 	drawShortcut()
 }
 

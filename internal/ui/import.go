@@ -88,6 +88,12 @@ type ImportView struct {
 	logList       widget.List
 
 	invalidate func()
+
+	// processes lets the import publish progress to the main-screen
+	// process bar so the user can pause / resume / cancel without
+	// opening the modal.
+	processes *ProcessRegistry
+	proc      *Process
 }
 
 const (
@@ -101,6 +107,11 @@ type sdMount struct {
 	DevicePath string
 	MountPath  string
 }
+
+// SetProcessRegistry wires the import view to the main-screen process
+// bar so each Start Import publishes progress, pause, and cancel
+// controls outside the modal.
+func (v *ImportView) SetProcessRegistry(r *ProcessRegistry) { v.processes = r }
 
 // NewImportView wires the import overlay.
 func NewImportView(invalidate func()) *ImportView {
@@ -313,9 +324,25 @@ func (v *ImportView) handleSDDeviceClick(dev removableDevice) {
 func (v *ImportView) setStatus(msg string) {
 	v.mu.Lock()
 	v.statusMsg = msg
+	proc := v.proc
 	v.mu.Unlock()
+	if proc != nil {
+		proc.SetStatus(msg)
+	}
 	if v.invalidate != nil {
 		v.invalidate()
+	}
+}
+
+// waitIfPaused blocks while the import is paused via the process bar.
+// Workers call this at loop boundaries; if no process is registered
+// (e.g. tests) it's a no-op.
+func (v *ImportView) waitIfPaused() {
+	v.mu.Lock()
+	proc := v.proc
+	v.mu.Unlock()
+	if proc != nil {
+		proc.Wait()
 	}
 }
 
@@ -937,6 +964,19 @@ func (v *ImportView) startImport() {
 	atomic.StoreInt64(&v.progressDone, 0)
 	atomic.StoreInt64(&v.progressMax, 0)
 
+	// Register with the process bar so the user can pause / cancel
+	// the import even when the modal is closed.
+	if v.processes != nil {
+		v.proc = v.processes.Begin(ProcImport, "Import", func() {
+			v.mu.Lock()
+			c := v.cancelImport
+			v.mu.Unlock()
+			if c != nil {
+				c()
+			}
+		}, true)
+	}
+
 	go func() {
 		defer func() {
 			v.mu.Lock()
@@ -947,7 +987,12 @@ func (v *ImportView) startImport() {
 			// reading from them. The user can then safely pull the card.
 			mounts := v.sdMounts
 			v.sdMounts = nil
+			proc := v.proc
+			v.proc = nil
 			v.mu.Unlock()
+			if proc != nil {
+				proc.End()
+			}
 			if len(mounts) > 0 {
 				v.unmountAll(mounts)
 			}
@@ -1080,6 +1125,7 @@ func (v *ImportView) runImport(ctx context.Context, cfg Config, importDirs, zipF
 			v.appendLog(fmt.Sprintf("Copying %d files from %s to Inbox...", len(files), sd))
 			var batch []string
 			for _, srcFile := range files {
+				v.waitIfPaused()
 				if ctx.Err() != nil {
 					break
 				}
@@ -1137,6 +1183,7 @@ func (v *ImportView) processBatch(ctx context.Context, outboxDir string, entries
 	}
 	var mtimeFixes []mtimeFix
 	for _, src := range entries {
+		v.waitIfPaused()
 		if ctx.Err() != nil {
 			return
 		}
@@ -1162,6 +1209,7 @@ func (v *ImportView) processBatch(ctx context.Context, outboxDir string, entries
 	}
 
 	for _, src := range entries {
+		v.waitIfPaused()
 		if ctx.Err() != nil {
 			return
 		}
@@ -1245,6 +1293,13 @@ func (v *ImportView) extractZipToInbox(zipPath, inboxDir string) []string {
 func (v *ImportView) setProgress(done, max int64) {
 	atomic.StoreInt64(&v.progressDone, done)
 	atomic.StoreInt64(&v.progressMax, max)
+	v.mu.Lock()
+	proc := v.proc
+	v.mu.Unlock()
+	if proc != nil {
+		proc.SetDone(done)
+		proc.SetTotal(max)
+	}
 	if v.invalidate != nil {
 		v.invalidate()
 	}
@@ -1252,6 +1307,12 @@ func (v *ImportView) setProgress(done, max int64) {
 
 func (v *ImportView) bumpProgress() {
 	atomic.AddInt64(&v.progressDone, 1)
+	v.mu.Lock()
+	proc := v.proc
+	v.mu.Unlock()
+	if proc != nil {
+		proc.AddDone(1)
+	}
 	if v.invalidate != nil {
 		v.invalidate()
 	}

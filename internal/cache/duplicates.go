@@ -91,7 +91,12 @@ const hashBatchSize = 500
 // commits happen in batches throughout the run — so cancelling part way
 // through preserves progress and the next run only processes whatever is
 // still missing.
-func (i *Index) EnsureHashes(ctx context.Context, progress func(done, total int)) error {
+//
+// waitIfPaused, if non-nil, is called by each worker before starting a
+// new hashing job so the caller can implement pause/resume on top of
+// the hashing pass without restarting it. It must be cheap and safe to
+// call from any goroutine.
+func (i *Index) EnsureHashes(ctx context.Context, progress func(done, total int), waitIfPaused func()) error {
 	type cand struct {
 		path  string
 		size  int64
@@ -174,6 +179,9 @@ func (i *Index) EnsureHashes(ctx context.Context, progress func(done, total int)
 			go func() {
 				defer wg.Done()
 				for t := range jobs {
+					if waitIfPaused != nil {
+						waitIfPaused()
+					}
 					if ctx.Err() != nil {
 						continue
 					}
@@ -297,6 +305,9 @@ func (i *Index) EnsureHashes(ctx context.Context, progress func(done, total int)
 		go func() {
 			defer wg2.Done()
 			for c := range jobs2 {
+				if waitIfPaused != nil {
+					waitIfPaused()
+				}
 				if ctx.Err() != nil {
 					continue
 				}

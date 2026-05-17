@@ -86,6 +86,11 @@ type Controller struct {
 	SelectedPaths map[string]bool
 
 	invalidate func()
+
+	// processes tracks long-running background work surfaced in the
+	// main-screen process bar. Optional — when nil, scan/warm-up just
+	// skip the registration calls.
+	processes *ProcessRegistry
 }
 
 func NewController(root string, idx *cache.Index, store *cache.ThumbStore, cacheDir string) *Controller {
@@ -111,6 +116,11 @@ func NewController(root string, idx *cache.Index, store *cache.ThumbStore, cache
 // SetInvalidate registers a callback used to wake the Gio frame loop after
 // background work mutates state.
 func (c *Controller) SetInvalidate(f func()) { c.invalidate = f }
+
+// SetProcessRegistry wires the long-running-task registry so that
+// background scans and the thumbnail warm-up appear in the main-screen
+// process bar with pause / resume / cancel controls.
+func (c *Controller) SetProcessRegistry(r *ProcessRegistry) { c.processes = r }
 
 // Snapshot returns a stable view of the current directory's entries and the
 // sidebar's tree anchor + its child directories. The slices must not be
@@ -497,11 +507,24 @@ func (c *Controller) scanInto(ctx context.Context, dir string) {
 	if c.invalidate != nil {
 		c.invalidate()
 	}
+
+	// Register with the process bar so the user can pause / resume /
+	// cancel from the main screen. Cancellation reuses the existing
+	// scanCancel hook so we don't need a second context.
+	var proc *Process
+	if c.processes != nil {
+		proc = c.processes.Begin(ProcScan, "Refresh", c.CancelScan, true)
+		proc.SetStatus("Scanning " + filepath.Base(dir))
+	}
+
 	defer func() {
 		c.mu.Lock()
 		c.scanning--
 		c.scanEndedAt = time.Now()
 		c.mu.Unlock()
+		if proc != nil {
+			proc.End()
+		}
 		if c.invalidate != nil {
 			c.invalidate()
 		}
@@ -521,9 +544,15 @@ func (c *Controller) scanInto(ctx context.Context, dir string) {
 		c.mu.Lock()
 		c.scanBatched += n
 		c.mu.Unlock()
+		if proc != nil {
+			proc.AddDone(int64(n))
+		}
 		c.scheduleRefresh(c.activeDir())
 	}
 	for r := range results {
+		if proc != nil {
+			proc.Wait()
+		}
 		if ctx.Err() != nil {
 			return
 		}
@@ -606,6 +635,11 @@ func (c *Controller) WarmUp() {
 	}
 
 	go func() {
+		var proc *Process
+		if c.processes != nil {
+			proc = c.processes.Begin(ProcWarmUp, "Thumbnails", cancel, true)
+			proc.SetStatus("Generating thumbnails…")
+		}
 		defer func() {
 			c.mu.Lock()
 			c.scanning--
@@ -615,17 +649,29 @@ func (c *Controller) WarmUp() {
 				c.warmUpCancel = nil
 			}
 			c.mu.Unlock()
+			if proc != nil {
+				proc.End()
+			}
 			if c.invalidate != nil {
 				c.invalidate()
 			}
 		}()
 
 		all := c.index.All()
+		if proc != nil {
+			proc.SetTotal(int64(len(all)))
+		}
 		for i, e := range all {
+			if proc != nil {
+				proc.Wait()
+			}
 			if ctx.Err() != nil {
 				return
 			}
 			_, _ = c.store.Path(e)
+			if proc != nil {
+				proc.SetDone(int64(i + 1))
+			}
 			if i%50 == 0 {
 				c.mu.Lock()
 				c.scanBatched = i + 1

@@ -54,6 +54,9 @@ type DuplicatesView struct {
 	groupClicks   []*widget.Clickable
 
 	invalidate func()
+
+	processes *ProcessRegistry
+	proc      *Process
 }
 
 // NewDuplicatesView wires the view to the index/store/thumb cache and an
@@ -65,6 +68,11 @@ func NewDuplicatesView(idx *cache.Index, store *cache.ThumbStore, thumbs *thumbC
 	d.detailList.Axis = layout.Vertical
 	return d
 }
+
+// SetProcessRegistry wires the hashing pass into the main-screen
+// process bar so the user can pause / resume / cancel without keeping
+// the modal open.
+func (d *DuplicatesView) SetProcessRegistry(r *ProcessRegistry) { d.processes = r }
 
 // Show opens the overlay. If a hashing pass is already running (because a
 // previous Close just hid the window) the live state is preserved so the
@@ -122,6 +130,30 @@ func (d *DuplicatesView) Close() {
 }
 
 func (d *DuplicatesView) hashAndScan(ctx context.Context) {
+	// Publish to the main-screen process bar so the user can pause /
+	// resume / cancel without keeping the modal open.
+	var proc *Process
+	if d.processes != nil {
+		proc = d.processes.Begin(ProcDuplicates, "Duplicates", func() {
+			d.mu.Lock()
+			c := d.cancel
+			d.mu.Unlock()
+			if c != nil {
+				c()
+			}
+		}, true)
+		proc.SetStatus("Hashing files…")
+		d.mu.Lock()
+		d.proc = proc
+		d.mu.Unlock()
+		defer func() {
+			d.mu.Lock()
+			d.proc = nil
+			d.mu.Unlock()
+			proc.End()
+		}()
+	}
+
 	err := d.idx.EnsureHashes(ctx, func(done, total int) {
 		d.mu.Lock()
 		d.done = done
@@ -132,8 +164,16 @@ func (d *DuplicatesView) hashAndScan(ctx context.Context) {
 			d.statusMsg = "Nothing to hash"
 		}
 		d.mu.Unlock()
+		if proc != nil {
+			proc.SetTotal(int64(total))
+			proc.SetDone(int64(done))
+		}
 		if d.invalidate != nil {
 			d.invalidate()
+		}
+	}, func() {
+		if proc != nil {
+			proc.Wait()
 		}
 	})
 	if err != nil {
