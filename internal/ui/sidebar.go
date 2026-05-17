@@ -98,6 +98,10 @@ type sidebarRow struct {
 	// indent is the visual indent in 12dp units; used so date subdirs nested
 	// under a year header are clearly children.
 	indent int
+	// favorite is true for the synthetic Favorites row so the renderer can
+	// draw a star icon (the unicode glyph rendered as an empty box on some
+	// systems).
+	favorite bool
 	// expanded is meaningful for rowYear — used to render the chevron.
 	expanded bool
 	// hasCount/count is precomputed so the renderer doesn't need the counts
@@ -170,7 +174,7 @@ func (s *Sidebar) Layout(gtx layout.Context, th *Theme, root, treeDir, highlight
 		focused := s.KeyboardFocus && i == s.Selected
 		r := rows[i]
 		active := r.kind == rowPath && r.path == highlight
-		return drawSidebarRow(gtx, th, r.label, r.count, r.hasCount, active, focused, r.indent, s.tags[i])
+		return drawSidebarRow(gtx, th, r.label, r.count, r.hasCount, active, focused, r.indent, r.favorite, s.tags[i])
 	})
 }
 
@@ -186,7 +190,7 @@ func (s *Sidebar) Layout(gtx layout.Context, th *Theme, root, treeDir, highlight
 // When grouping is off the original "every subdir as-is" layout is restored.
 func (s *Sidebar) buildRows(root, treeDir string, subdirs []string, counts map[string]int, groupByYear bool) []sidebarRow {
 	rows := []sidebarRow{
-		{label: "★ Favorites", path: FavoritesView, kind: rowPath},
+		{label: "Favorites", path: FavoritesView, kind: rowPath, favorite: true},
 		{label: filepath.Base(root), path: root, kind: rowPath},
 	}
 	if treeDir != root {
@@ -403,7 +407,7 @@ func (s *Sidebar) Activate() bool {
 	}
 }
 
-func drawSidebarRow(gtx layout.Context, th *Theme, label string, count int, hasCount, active, focused bool, indent int, tag *sidebarTag) layout.Dimensions {
+func drawSidebarRow(gtx layout.Context, th *Theme, label string, count int, hasCount, active, focused bool, indent int, favorite bool, tag *sidebarTag) layout.Dimensions {
 	leftDp := 10 + indent*14
 	pad := layout.Inset{Top: unit.Dp(6), Bottom: unit.Dp(6), Left: unit.Dp(float32(leftDp)), Right: unit.Dp(10)}
 
@@ -419,6 +423,17 @@ func drawSidebarRow(gtx layout.Context, th *Theme, label string, count int, hasC
 	macro := op.Record(gtx.Ops)
 	dims := pad.Layout(contentGtx, func(gtx layout.Context) layout.Dimensions {
 		return layout.Flex{Axis: layout.Horizontal, Alignment: layout.Middle}.Layout(gtx,
+			layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+				if !favorite || th.Icons == nil || th.Icons.Star == nil {
+					return layout.Dimensions{}
+				}
+				side := gtx.Dp(unit.Dp(16))
+				gtx.Constraints.Min = image.Pt(side, side)
+				gtx.Constraints.Max = image.Pt(side, side)
+				return layout.Inset{Right: unit.Dp(6)}.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
+					return th.Icons.Star.Layout(gtx, favoriteGold)
+				})
+			}),
 			layout.Flexed(1, func(gtx layout.Context) layout.Dimensions {
 				lbl := material.Label(th.Theme, unit.Sp(13), label)
 				lbl.Color = th.Foreground

@@ -149,14 +149,6 @@ func Run(w *app.Window, ctrl *Controller) error {
 		settings.Show()
 		w.Invalidate()
 	}
-	toolbar.OnIndexInfo = func() {
-		indexInfo.Show()
-		w.Invalidate()
-	}
-	toolbar.OnCancelScan = func() {
-		ctrl.CancelScan()
-		w.Invalidate()
-	}
 	toolbar.OnRebuild = func() {
 		go func() {
 			if err := ctrl.Rebuild(); err != nil {
@@ -212,7 +204,6 @@ func Run(w *app.Window, ctrl *Controller) error {
 			toolbar.Filter = ctrl.Filter()
 			toolbar.ShowRAW = ctrl.ShowRAW()
 			toolbar.GroupByYear = GetConfig().GroupByYear
-			toolbar.Busy = ctrl.Scanning()
 			toolbar.AnyProcess = processes.Count() > 0
 			drawRoot(gtx, th, ctrl, toolbar, sidebar, grid, viewer, dups, imports, organize, settings, indexInfo, search, sdPrompt, processBar, splitter, sidebarFocus, w)
 			e.Frame(gtx.Ops)
@@ -850,15 +841,23 @@ func drawRoot(gtx layout.Context, th *Theme, ctrl *Controller, tb *Toolbar, sb *
 
 	totalW := gtx.Constraints.Max.X
 	totalH := gtx.Constraints.Max.Y
-	sbH := gtx.Dp(unit.Dp(shortcutBarHeightDp))
+	showShortcuts := GetConfig().ShowShortcutHints
+	sbH := 0
+	if showShortcuts {
+		sbH = gtx.Dp(unit.Dp(shortcutBarHeightDp))
+	}
 
 	// Process bar — sits just above the shortcut bar and only consumes
 	// space when at least one background process is running.
 	procSnap := ctrl.processes.Snapshot()
 	pbH := gtx.Dp(unit.Dp(processBar.HeightDp(procSnap)))
 
-	// Bottom shortcut bar — always drawn, including over the viewer.
+	// Bottom shortcut bar — drawn over the viewer and all modals when the
+	// user has opted in via Settings. Hidden by default.
 	drawShortcut := func() {
+		if !showShortcuts {
+			return
+		}
 		gtx2 := gtx
 		gtx2.Constraints.Max = image.Pt(totalW, sbH)
 		gtx2.Constraints.Min = image.Pt(totalW, sbH)
@@ -1026,6 +1025,18 @@ func drawRoot(gtx layout.Context, th *Theme, ctrl *Controller, tb *Toolbar, sb *
 
 	drawProcBar()
 	drawShortcut()
+
+	// Tooltip overlay for the toolbar — drawn last so it floats above the
+	// sidebar/grid/process-bar content. Anchored to the right edge, just
+	// below the toolbar.
+	if tb.HoveredLabel() != "" {
+		gtx2 := gtx
+		gtx2.Constraints.Max = image.Pt(totalW, totalH-tbH)
+		gtx2.Constraints.Min = image.Point{}
+		stack := op.Offset(image.Pt(0, tbH)).Push(gtx.Ops)
+		tb.DrawTooltipOverlay(gtx2, th, totalW-gtx.Dp(unit.Dp(12)))
+		stack.Pop()
+	}
 }
 
 // layoutSplitter draws the divider strip and processes pointer drag events

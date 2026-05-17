@@ -25,6 +25,9 @@ type Config struct {
 	// GridCellDp is the persisted thumbnail cell size in dp. Zero means
 	// "use defaultCellDp". Clamped to [minCellDp, maxCellDp] on load.
 	GridCellDp int `json:"grid_cell_dp"`
+	// ShowShortcutHints toggles the bottom keyboard-shortcut helper strip.
+	// Defaults to false (hidden) — power users can opt in from Settings.
+	ShowShortcutHints bool `json:"show_shortcut_hints"`
 }
 
 var (

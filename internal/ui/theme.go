@@ -24,6 +24,9 @@ type Theme struct {
 	SelectionBG color.NRGBA
 	Accent      color.NRGBA
 	Destructive color.NRGBA
+
+	// Icons holds the vector glyphs used by the toolbar and sidebar.
+	Icons *IconSet
 }
 
 func NewTheme() *Theme {
@@ -38,6 +41,7 @@ func NewTheme() *Theme {
 		SelectionBG: color.NRGBA{R: 0x3a, G: 0x55, B: 0x88, A: 0xff},
 		Accent:      color.NRGBA{R: 0x5e, G: 0x9c, B: 0xea, A: 0xff},
 		Destructive: color.NRGBA{R: 0xbd, G: 0x39, B: 0x39, A: 0xff},
+		Icons:       newIconSet(),
 	}
 }
 

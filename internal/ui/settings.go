@@ -23,6 +23,7 @@ type SettingsView struct {
 	saveBtn         widget.Clickable
 	closeBtn        widget.Clickable
 	sdAutoDetect    widget.Bool
+	showShortcuts   widget.Bool
 
 	mu        sync.Mutex
 	statusMsg string
@@ -48,6 +49,7 @@ func (v *SettingsView) Show() {
 	v.inboxEditor.SetText(c.InboxDir)
 	v.outboxEditor.SetText(c.OutboxDir)
 	v.sdAutoDetect.Value = c.SDCardAutoDetect
+	v.showShortcuts.Value = c.ShowShortcutHints
 	v.statusMsg = "Config file: " + configPath()
 	v.Open = true
 }
@@ -76,6 +78,7 @@ func (v *SettingsView) Layout(gtx layout.Context, th *Theme) layout.Dimensions {
 		c.InboxDir = v.inboxEditor.Text()
 		c.OutboxDir = v.outboxEditor.Text()
 		c.SDCardAutoDetect = v.sdAutoDetect.Value
+		c.ShowShortcutHints = v.showShortcuts.Value
 		if err := SaveConfig(c); err != nil {
 			v.statusMsg = "Save failed: " + err.Error()
 		} else {
@@ -87,6 +90,11 @@ func (v *SettingsView) Layout(gtx layout.Context, th *Theme) layout.Dimensions {
 	if v.sdAutoDetect.Update(gtx) {
 		c := GetConfig()
 		c.SDCardAutoDetect = v.sdAutoDetect.Value
+		_ = SaveConfig(c)
+	}
+	if v.showShortcuts.Update(gtx) {
+		c := GetConfig()
+		c.ShowShortcutHints = v.showShortcuts.Value
 		_ = SaveConfig(c)
 	}
 
@@ -114,6 +122,13 @@ func (v *SettingsView) Layout(gtx layout.Context, th *Theme) layout.Dimensions {
 			layout.Rigid(func(gtx layout.Context) layout.Dimensions {
 				cb := material.CheckBox(th.Theme, &v.sdAutoDetect,
 					"Suggest import when a USB drive or SD card is connected")
+				cb.Color = th.Foreground
+				return cb.Layout(gtx)
+			}),
+			layout.Rigid(layout.Spacer{Height: unit.Dp(8)}.Layout),
+			layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+				cb := material.CheckBox(th.Theme, &v.showShortcuts,
+					"Show keyboard-shortcut hints at the bottom of the window")
 				cb.Color = th.Foreground
 				return cb.Layout(gtx)
 			}),
