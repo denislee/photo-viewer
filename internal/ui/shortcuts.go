@@ -22,6 +22,9 @@ func shortcutHints(viewerOpen, sidebarFocus, selectionMode bool) []string {
 			"j/k ↓/↑: prev/next",
 			"f: favorite",
 			"d: delete",
+			"space: play/pause",
+			"[/]: seek 5s",
+			"m: mute",
 			"o: open mpv",
 			"esc/q/ctrl+[: close",
 		}

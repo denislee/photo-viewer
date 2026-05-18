@@ -261,10 +261,13 @@ func handleKeys(gtx layout.Context, ctrl *Controller, grid *Grid, sidebar *Sideb
 			key.Filter{Name: "J"},
 			key.Filter{Name: "K"},
 			key.Filter{Name: "L"},
+			key.Filter{Name: "M"},
 			key.Filter{Name: "O"},
 			key.Filter{Name: "o"},
 			key.Filter{Name: "Q"},
 			key.Filter{Name: "V"},
+			key.Filter{Name: "["},
+			key.Filter{Name: "]"},
 			key.Filter{Name: "F", Required: key.ModCtrl},
 			key.Filter{Name: "B", Required: key.ModCtrl},
 			key.Filter{Name: "I", Required: key.ModCtrl},
@@ -473,6 +476,11 @@ func handleViewerKey(ke key.Event, viewer *Viewer, grid *Grid, ctrl *Controller,
 			syncGrid()
 			viewer.Close()
 			w.Invalidate()
+		} else if isViewerVideo(viewer) {
+			if p := viewer.Player(); p != nil {
+				p.SeekRelative(-5)
+				w.Invalidate()
+			}
 		}
 	case key.NameLeftArrow, "H":
 		viewer.Prev()
@@ -507,7 +515,41 @@ func handleViewerKey(ke key.Event, viewer *Viewer, grid *Grid, ctrl *Controller,
 			e.Favorite = ctrl.ToggleFavorite(e.Path)
 			w.Invalidate()
 		}
+	case key.NameSpace:
+		// Pause/resume the embedded player when on a video. Space on
+		// anything else is a no-op so it doesn't accidentally pause a
+		// player that isn't loaded.
+		if isViewerVideo(viewer) {
+			if p := viewer.Player(); p != nil {
+				p.TogglePause()
+				w.Invalidate()
+			}
+		}
+	case "M":
+		if isViewerVideo(viewer) {
+			if p := viewer.Player(); p != nil {
+				p.ToggleMute()
+				w.Invalidate()
+			}
+		}
+	case "]":
+		if isViewerVideo(viewer) {
+			if p := viewer.Player(); p != nil {
+				p.SeekRelative(5)
+				w.Invalidate()
+			}
+		}
 	}
+}
+
+// isViewerVideo reports whether the viewer's current entry is a video.
+// Hoisted so the video-control key cases don't have to repeat the index /
+// type checks.
+func isViewerVideo(viewer *Viewer) bool {
+	if viewer.Index < 0 || viewer.Index >= len(viewer.entries) {
+		return false
+	}
+	return viewer.entries[viewer.Index].Type == scan.TypeVideo
 }
 
 func handleGridKey(ke key.Event, grid *Grid, sidebar *Sidebar, sidebarFocus *bool, viewer *Viewer, total int, ctrl *Controller, w *app.Window) {

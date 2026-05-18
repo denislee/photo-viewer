@@ -28,6 +28,7 @@ import (
 	"github.com/dns/photo-viewer/internal/cache"
 	"github.com/dns/photo-viewer/internal/scan"
 	"github.com/dns/photo-viewer/internal/thumb"
+	"github.com/dns/photo-viewer/internal/video"
 )
 
 // Viewer renders the currently selected entry over the whole window. Open
@@ -71,6 +72,14 @@ type Viewer struct {
 	infoMu    sync.Mutex
 	infoCache map[string]cachedInfo
 	infoAsked map[string]bool
+
+	// player is lazily created the first time the viewer lands on a video.
+	// It's kept alive between videos so navigation between clips doesn't
+	// pay the libmpv-init cost each time; the player itself is also a
+	// no-op when libmpv failed to load on this machine.
+	playerOnce sync.Once
+	playerErr  error
+	player     *video.Player
 
 	invalidate func()
 }
@@ -137,6 +146,21 @@ func (v *Viewer) Close() {
 	v.recent = nil
 	v.prefetching = nil
 	v.recentMu.Unlock()
+	if v.player != nil {
+		v.player.Stop()
+	}
+}
+
+// stopVideoIfRunning halts mpv playback whenever the current entry isn't a
+// video. Called from Next/Prev so paging away from a clip releases its
+// decoder; the player itself stays warm for the next video.
+func (v *Viewer) stopVideoIfRunning() {
+	if v.player == nil {
+		return
+	}
+	if v.Index < 0 || v.Index >= len(v.entries) || v.entries[v.Index].Type != scan.TypeVideo {
+		v.player.Stop()
+	}
 }
 
 // parkLoaded moves the current loadedOp into the MRU position of the recent
@@ -258,6 +282,7 @@ func (v *Viewer) Next() {
 		v.loadedPath = ""
 		v.loadingPath = ""
 		v.loadedOp = paint.ImageOp{}
+		v.stopVideoIfRunning()
 		v.prefetchAt(v.Index + 1)
 	}
 }
@@ -270,8 +295,43 @@ func (v *Viewer) Prev() {
 		v.loadedPath = ""
 		v.loadingPath = ""
 		v.loadedOp = paint.ImageOp{}
+		v.stopVideoIfRunning()
 		v.prefetchAt(v.Index - 1)
 	}
+}
+
+// Player returns the lazily-initialised libmpv player, or nil if libmpv
+// failed to load. The first call initialises the player; subsequent calls
+// return the cached instance.
+func (v *Viewer) Player() *video.Player {
+	v.playerOnce.Do(func() {
+		v.player, v.playerErr = video.New(v.invalidate)
+	})
+	return v.player
+}
+
+// playVideo loads the current entry into mpv if it isn't already, renders
+// the current frame at the requested size, and returns it wrapped as a
+// paint.ImageOp. The mpv-side renderer letterboxes within (w, h) so the
+// caller can paint the result at imgArea without further fitting. Returns
+// (false) when libmpv is unavailable or no frame is ready yet.
+func (v *Viewer) playVideo(e cache.Entry, w, h int) (paint.ImageOp, bool) {
+	p := v.Player()
+	if p == nil {
+		return paint.ImageOp{}, false
+	}
+	if p.Current() != e.Path {
+		if err := p.Load(e.Path); err != nil {
+			return paint.ImageOp{}, false
+		}
+	}
+	frame, ok := p.Render(w, h)
+	if !ok {
+		return paint.ImageOp{}, false
+	}
+	op := paint.NewImageOp(frame)
+	op.Filter = paint.FilterLinear
+	return op, true
 }
 
 // Layout fills gtx.Constraints with a black background and the active
@@ -301,9 +361,24 @@ func (v *Viewer) Layout(gtx layout.Context, th *Theme, tc *thumbCache) layout.Di
 		imgArea = image.Rectangle{Max: image.Pt(size.X-infoW, size.Y)}
 	}
 
-	imgOp, imgSz, ok := v.imageFor(e, tc)
-	if ok {
-		drawFitted(gtx, imgOp, imgSz, imgArea)
+	if e.Type == scan.TypeVideo {
+		if op, ok := v.playVideo(e, imgArea.Dx(), imgArea.Dy()); ok {
+			// mpv already letterboxed to (Dx, Dy), so we paint at
+			// imgArea.Min with the rect's native size.
+			off := opOffset(gtx, imgArea.Min)
+			op.Add(gtx.Ops)
+			paint.PaintOp{}.Add(gtx.Ops)
+			off.Pop()
+		} else if imgOp, imgSz, fb := tc.Get(e); fb {
+			// While mpv is still warming up or libmpv is unavailable,
+			// show the cached thumbnail so the screen isn't blank.
+			drawFitted(gtx, imgOp, imgSz, imgArea)
+		}
+	} else {
+		imgOp, imgSz, ok := v.imageFor(e, tc)
+		if ok {
+			drawFitted(gtx, imgOp, imgSz, imgArea)
+		}
 	}
 
 	if v.ShowInfo {
