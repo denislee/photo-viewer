@@ -71,7 +71,6 @@ func imageViaFfmpeg(ctx context.Context, src, dst string, size int) error {
 	return nil
 }
 
-
 // rgbaPool recycles the destination RGBA used by writeThumb. The thumbnail
 // size is fixed at the package level (cache.ThumbSize) so essentially every
 // buffer is reusable as-is; the slice length is reset before scaling and

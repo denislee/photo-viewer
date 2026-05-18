@@ -673,6 +673,7 @@ func (c *Controller) WarmUp() {
 	}
 
 	go func() {
+		defer cancel()
 		var proc *Process
 		if c.processes != nil {
 			proc = c.processes.Begin(ProcWarmUp, "Thumbnails", cancel, true)

@@ -38,23 +38,23 @@ type Toolbar struct {
 	rebuildBtn    widget.Clickable
 	warmUpBtn     widget.Clickable
 
-	OnFilter        func(string)
-	OnShowRAW       func(bool)
-	OnGroupByYear   func(bool)
-	OnSortByLength  func(bool)
-	OnImport      func()
-	OnDuplicates  func()
-	OnOrganize    func()
-	OnSettings    func()
-	OnRebuild     func()
-	OnWarmUp      func()
+	OnFilter       func(string)
+	OnShowRAW      func(bool)
+	OnGroupByYear  func(bool)
+	OnSortByLength func(bool)
+	OnImport       func()
+	OnDuplicates   func()
+	OnOrganize     func()
+	OnSettings     func()
+	OnRebuild      func()
+	OnWarmUp       func()
 
 	// State mirrored from the controller; the active filter button is
 	// rendered with the accent background so it stands out.
-	Filter        string
-	ShowRAW       bool
-	GroupByYear   bool
-	SortByLength  bool
+	Filter       string
+	ShowRAW      bool
+	GroupByYear  bool
+	SortByLength bool
 	// AnyProcess is true while the process bar has at least one in-flight
 	// task. Used to disable buttons (Rebuild) that would conflict with an
 	// already-running job.

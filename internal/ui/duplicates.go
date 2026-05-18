@@ -116,7 +116,10 @@ func (d *DuplicatesView) startHash() {
 	ctx, cancel := context.WithCancel(context.Background())
 	d.cancel = cancel
 	d.mu.Unlock()
-	go d.hashAndScan(ctx)
+	go func() {
+		defer cancel()
+		d.hashAndScan(ctx)
+	}()
 }
 
 // Close hides the overlay. A hashing pass that is still running is left

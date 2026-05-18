@@ -42,7 +42,7 @@ func TestIndexPath(t *testing.T) {
 
 	t.Run("ReadOnlyRoot", func(t *testing.T) {
 		libRoot := filepath.Join(tmpDir, "lib-readonly")
-		os.MkdirAll(libRoot, 0555) // Read-only
+		os.MkdirAll(libRoot, 0555)    // Read-only
 		defer os.Chmod(libRoot, 0755) // So RemoveAll can clean it up
 
 		path := IndexPath(libRoot, cacheDir)

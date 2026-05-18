@@ -978,6 +978,7 @@ func (v *ImportView) startImport() {
 	}
 
 	go func() {
+		defer cancel()
 		defer func() {
 			v.mu.Lock()
 			v.running = false

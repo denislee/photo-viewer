@@ -52,7 +52,6 @@ func HEIC(ctx context.Context, src, dst string, size int) error {
 	return writeThumb(img, dst, size)
 }
 
-
 // HEICToJPEG decodes a HEIC/HEIF file to a full-resolution JPEG written under
 // tmpDir. Returns the path of the produced JPEG; the caller is responsible for
 // removing tmpDir.

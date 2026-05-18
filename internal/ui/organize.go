@@ -74,11 +74,11 @@ func (v *OrganizeView) Show(idx *cache.Index, root string) {
 	v.statusMsg = "Preparing library scan..."
 	v.logVisible = nil
 	v.logBuf = nil
-	
+
 	ctx, cancel := context.WithCancel(context.Background())
 	v.cancelFn = cancel
 	v.mu.Unlock()
-	
+
 	go v.scanForMismatched(ctx, idx, root)
 }
 
@@ -234,6 +234,7 @@ func (v *OrganizeView) startOrganize(root string) {
 	atomic.StoreInt64(&v.progressMax, int64(len(mismatched)))
 
 	go func() {
+		defer cancel()
 		var proc *Process
 		if v.processes != nil {
 			proc = v.processes.Begin(ProcOrganize, "Organize: move", func() {
@@ -275,7 +276,7 @@ func (v *OrganizeView) startOrganize(root string) {
 			}
 			dateFolder := m.ExpectedDate.Format("2006-01-02")
 			destDir := filepath.Join(root, dateFolder)
-			
+
 			if err := os.MkdirAll(destDir, 0755); err != nil {
 				v.appendLog(fmt.Sprintf("[ERROR] mkdir %s: %v", destDir, err))
 				v.bumpProgress()
@@ -284,7 +285,7 @@ func (v *OrganizeView) startOrganize(root string) {
 
 			baseName := filepath.Base(m.Entry.Path)
 			dest := filepath.Join(destDir, baseName)
-			
+
 			// Handle collisions
 			if _, err := os.Stat(dest); err == nil {
 				ext := filepath.Ext(baseName)

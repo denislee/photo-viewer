@@ -39,8 +39,8 @@ const thumbCacheShards = 16
 // list. The decode queue and the coalescer remain singletons since they're
 // inherently global.
 type thumbCache struct {
-	store      *cache.ThumbStore
-	invalidate func()
+	store       *cache.ThumbStore
+	invalidate  func()
 	capPerShard int
 
 	shards [thumbCacheShards]thumbCacheShard

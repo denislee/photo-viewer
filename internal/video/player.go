@@ -108,11 +108,16 @@ type Player struct {
 
 	invalidate func()
 
-	mu      sync.Mutex
-	buf     *image.RGBA // reused across frames; reallocated on size change
-	closed  atomic.Bool
-	loaded  atomic.Bool
-	current string
+	mu       sync.Mutex
+	buf      *image.RGBA // reused across frames; reallocated on size change
+	closed   atomic.Bool
+	loaded   atomic.Bool
+	drainDone chan struct{} // closed when drainEvents returns
+	// current holds the path of the file currently loaded. Read by the UI
+	// goroutine (Current) and written by Load/Stop on whichever goroutine
+	// called them; published via atomic.Pointer to avoid torn reads of
+	// the string header.
+	current atomic.Pointer[string]
 
 	// updatePending is set by the render update callback and cleared on
 	// the next successful render. It exists so callers can poll cheaply
@@ -146,6 +151,9 @@ func New(invalidate func()) (*Player, error) {
 	}
 	for _, kv := range [][2]string{
 		{"vo", "libmpv"},
+		// auto-safe prefers *-copy hwdec backends, which decode in HW
+		// then copy frames back to system memory — exactly what we need
+		// for the SW render path.
 		{"hwdec", "auto-safe"},
 		{"loop-file", "inf"},
 		{"keep-open", "always"},
@@ -154,6 +162,23 @@ func New(invalidate func()) (*Player, error) {
 		{"input-default-bindings", "no"},
 		{"input-vo-keyboard", "no"},
 		{"terminal", "no"},
+		// Speed up first-frame display on large videos:
+		// - profile=fast bundles vd-lavc-fast=yes,
+		//   vd-lavc-skiploopfilter=nonkey, and scaling shortcuts.
+		// - cache=yes + demuxer-* gives the demuxer a generous read-ahead
+		//   so big MP4/MOV files don't bounce the disk seeking through
+		//   the MOOV atom when seeking around.
+		// - vd-lavc-threads=0 lets libavcodec autodetect cores; matters
+		//   a lot for 4K HEVC.
+		// - hr-seek-framedrop=yes drops frames during seeks so the first
+		//   frame after a seek lands faster.
+		{"profile", "fast"},
+		{"cache", "yes"},
+		{"demuxer-max-bytes", "256MiB"},
+		{"demuxer-max-back-bytes", "64MiB"},
+		{"demuxer-readahead-secs", "20"},
+		{"vd-lavc-threads", "0"},
+		{"hr-seek-framedrop", "yes"},
 	} {
 		if err := setOpt(kv[0], kv[1]); err != nil {
 			C.mpv_terminate_destroy(h)
@@ -166,7 +191,7 @@ func New(invalidate func()) (*Player, error) {
 		return nil, fmt.Errorf("mpv_initialize: %s", C.GoString(C.mpv_error_string(rc)))
 	}
 
-	p := &Player{h: h, invalidate: invalidate}
+	p := &Player{h: h, invalidate: invalidate, drainDone: make(chan struct{})}
 	p.handle = cgo.NewHandle(p)
 	user := C.uintptr_t(p.handle)
 
@@ -197,7 +222,8 @@ func (p *Player) Load(path string) error {
 	if rc := C.loadfile(p.h, cp); rc < 0 {
 		return fmt.Errorf("mpv loadfile: %s", C.GoString(C.mpv_error_string(rc)))
 	}
-	p.current = path
+	pathCopy := path
+	p.current.Store(&pathCopy)
 	p.loaded.Store(true)
 	p.updatePending.Store(true)
 	return nil
@@ -213,7 +239,7 @@ func (p *Player) Stop() {
 	defer C.free(unsafe.Pointer(cs))
 	C.command_str(p.h, cs)
 	p.loaded.Store(false)
-	p.current = ""
+	p.current.Store(nil)
 }
 
 // TogglePause toggles the pause property.
@@ -254,7 +280,10 @@ func (p *Player) Current() string {
 	if p == nil {
 		return ""
 	}
-	return p.current
+	if s := p.current.Load(); s != nil {
+		return *s
+	}
+	return ""
 }
 
 // Render asks mpv to blit the current frame into an internal w×h RGBA
@@ -318,7 +347,14 @@ func (p *Player) Close() {
 		p.ctx = nil
 	}
 	if p.h != nil {
+		// mpv_terminate_destroy posts MPV_EVENT_SHUTDOWN to the event
+		// queue, which makes drainEvents fall out of mpv_wait_event.
+		// Wait for that to happen before zeroing p.h so the goroutine
+		// can't be observed passing a nil handle to mpv.
 		C.mpv_terminate_destroy(p.h)
+		if p.drainDone != nil {
+			<-p.drainDone
+		}
 		p.h = nil
 	}
 	p.handle.Delete()
@@ -328,6 +364,7 @@ func (p *Player) Close() {
 // host to consume events. The loop exits when mpv signals shutdown (which
 // happens during Close via mpv_terminate_destroy).
 func (p *Player) drainEvents() {
+	defer close(p.drainDone)
 	for {
 		ev := C.mpv_wait_event(p.h, -1)
 		if ev == nil {

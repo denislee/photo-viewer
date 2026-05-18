@@ -8,6 +8,7 @@ import (
 	_ "image/gif"
 	_ "image/jpeg"
 	_ "image/png"
+	"io"
 	"os"
 	"path/filepath"
 	"sync"
@@ -128,6 +129,7 @@ func (v *Viewer) Show(entries []cache.Entry, idx int) {
 	v.entries = entries
 	v.Index = idx
 	v.Open = true
+	v.preloadVideoIfNeeded()
 	v.prefetchAt(idx + 1)
 	v.prefetchAt(idx - 1)
 }
@@ -161,6 +163,31 @@ func (v *Viewer) stopVideoIfRunning() {
 	if v.Index < 0 || v.Index >= len(v.entries) || v.entries[v.Index].Type != scan.TypeVideo {
 		v.player.Stop()
 	}
+}
+
+// preloadVideoIfNeeded kicks an mpv loadfile for the current entry if it's a
+// video, in a goroutine so the UI thread doesn't pay the initial libmpv
+// initialisation cost on first call. Subsequent calls are cheap. By the time
+// Layout runs and calls playVideo, mpv is already demuxing — first-frame
+// latency drops by however long Layout would otherwise have spent waiting.
+func (v *Viewer) preloadVideoIfNeeded() {
+	if v.Index < 0 || v.Index >= len(v.entries) {
+		return
+	}
+	e := v.entries[v.Index]
+	if e.Type != scan.TypeVideo {
+		return
+	}
+	go func(path string) {
+		p := v.Player()
+		if p == nil {
+			return
+		}
+		if p.Current() == path {
+			return
+		}
+		_ = p.Load(path)
+	}(e.Path)
 }
 
 // parkLoaded moves the current loadedOp into the MRU position of the recent
@@ -283,6 +310,7 @@ func (v *Viewer) Next() {
 		v.loadingPath = ""
 		v.loadedOp = paint.ImageOp{}
 		v.stopVideoIfRunning()
+		v.preloadVideoIfNeeded()
 		v.prefetchAt(v.Index + 1)
 	}
 }
@@ -296,6 +324,7 @@ func (v *Viewer) Prev() {
 		v.loadingPath = ""
 		v.loadedOp = paint.ImageOp{}
 		v.stopVideoIfRunning()
+		v.preloadVideoIfNeeded()
 		v.prefetchAt(v.Index - 1)
 	}
 }
@@ -705,15 +734,17 @@ func (v *Viewer) kickDecode(e cache.Entry) {
 	v.loadingCtxCancel = cancel
 
 	go func() {
+		defer cancel()
 		op, sz, ok := decodeOriginal(ctx, e)
 		if !ok || ctx.Err() != nil {
 			return
 		}
-		// Safe to set here because it's only read and written atomically via pointer/structs
-		// by the main UI thread during Layout.
-		v.loadedPath = e.Path
-		v.loadedOp = op
-		v.loadedSz = sz
+		// Don't mutate v.loadedPath/Op/Sz from here — those fields are
+		// read by the UI goroutine in Layout and writing them off-thread
+		// is a data race (string headers and paint.ImageOp aren't atomic
+		// to copy). cachePut is mutex-guarded; the next Layout will see
+		// the result via imageFor's cacheGet path, which promotes into
+		// the live slot on the UI goroutine.
 		v.cachePut(e.Path, op, sz)
 		if v.invalidate != nil {
 			v.invalidate()
@@ -726,6 +757,11 @@ func (v *Viewer) kickDecode(e cache.Entry) {
 // not touch loadedPath/Op/Sz — only the LRU. No-op if idx is out of range,
 // the entry is already cached, currently loading, or already being
 // prefetched.
+//
+// For video entries we don't decode anything — mpv owns playback — but we
+// do warm the OS page cache by streaming the first few MB so that when the
+// user navigates to the clip, mpv's demuxer doesn't have to wait on a cold
+// disk read for the MOOV atom + first GOP.
 func (v *Viewer) prefetchAt(idx int) {
 	if idx < 0 || idx >= len(v.entries) {
 		return
@@ -733,6 +769,9 @@ func (v *Viewer) prefetchAt(idx int) {
 	e := v.entries[idx]
 	switch e.Type {
 	case scan.TypePhoto, scan.TypeRAW, scan.TypeHEIC:
+	case scan.TypeVideo:
+		v.prefetchVideo(e)
+		return
 	default:
 		return
 	}
@@ -765,6 +804,43 @@ func (v *Viewer) prefetchAt(idx int) {
 		}
 		v.cachePut(e.Path, op, sz)
 	}(e)
+}
+
+// videoPrefetchBytes is the head-of-file window we read into the OS page
+// cache for neighbour videos. Picked so that the MOOV atom of a typical
+// MP4/MOV (a few MB) and the first GOP land in cache, without churning RAM
+// for files we may never open.
+const videoPrefetchBytes = 16 << 20
+
+// prefetchVideo warms the OS page cache for an adjacent video by reading
+// its first videoPrefetchBytes. Doesn't touch the player — mpv only loads
+// one file at a time — but on a cold cache this is the difference between
+// mpv blocking on disk seeks and the first frame appearing instantly.
+func (v *Viewer) prefetchVideo(e cache.Entry) {
+	v.recentMu.Lock()
+	if v.prefetching == nil {
+		v.prefetching = map[string]bool{}
+	}
+	if v.prefetching[e.Path] {
+		v.recentMu.Unlock()
+		return
+	}
+	v.prefetching[e.Path] = true
+	v.recentMu.Unlock()
+
+	go func(path string) {
+		defer func() {
+			v.recentMu.Lock()
+			delete(v.prefetching, path)
+			v.recentMu.Unlock()
+		}()
+		f, err := os.Open(path)
+		if err != nil {
+			return
+		}
+		defer f.Close()
+		_, _ = io.CopyN(io.Discard, f, videoPrefetchBytes)
+	}(e.Path)
 }
 
 // decodeOriginal decodes an entry's full-resolution image into a paint.ImageOp,
