@@ -52,6 +52,7 @@ func Run(w *app.Window, ctrl *Controller) error {
 	viewer.SetInvalidate(w.Invalidate)
 	dups := NewDuplicatesView(ctrl.Index(), ctrl.Store(), ctrl.Thumbs(), w.Invalidate)
 	dups.SetDeleter(ctrl.DeletePath)
+	dups.SetBatchDeleter(ctrl.DeletePaths)
 	imports := NewImportView(w.Invalidate)
 	organize := NewOrganizeView(w.Invalidate)
 

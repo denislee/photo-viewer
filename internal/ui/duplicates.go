@@ -34,6 +34,12 @@ type DuplicatesView struct {
 	// from window.go). Nil falls back to plain os.Remove for tests and
 	// stand-alone use of the view.
 	deleter func(path string) error
+	// batchDeleter is the bulk variant — used by "Delete all newer"
+	// confirmations so 100 duplicates pay for one in-memory patch + one
+	// index transaction instead of N. Nil falls back to repeated calls
+	// to deleter (or removeOne) so tests can exercise the view without
+	// a Controller.
+	batchDeleter func(paths []string) error
 
 	mu        sync.Mutex
 	hashing   bool
@@ -83,6 +89,12 @@ func (d *DuplicatesView) SetProcessRegistry(r *ProcessRegistry) { d.processes = 
 // through the same trash flow as keyboard delete (rename → trash dir,
 // instant UI update). Without it, deletions fall back to a direct unlink.
 func (d *DuplicatesView) SetDeleter(f func(path string) error) { d.deleter = f }
+
+// SetBatchDeleter wires the bulk soft-delete callback. The bulk variant
+// matters for the "delete all newer" flow where dozens of duplicates need
+// removing — without it, each path goes through removeOne and pays for a
+// separate index DELETE and UI patch.
+func (d *DuplicatesView) SetBatchDeleter(f func(paths []string) error) { d.batchDeleter = f }
 
 // removeOne soft-deletes path through the controller (if wired) or falls
 // back to a direct unlink, then drops the index row and forgets the thumb.
@@ -354,9 +366,11 @@ func (d *DuplicatesView) deleteNewer() {
 	if len(g.Entries) < 2 {
 		return
 	}
+	paths := make([]string, 0, len(g.Entries)-1)
 	for _, v := range g.Entries[1:] {
-		d.removeOne(v.Path)
+		paths = append(paths, v.Path)
 	}
+	d.removeBatch(paths)
 	groups := d.pruneMissing(d.idx.FindDuplicates())
 	d.mu.Lock()
 	d.groups = groups
@@ -377,14 +391,16 @@ func (d *DuplicatesView) deleteAllNewer() {
 	d.confirmingAll = false
 	d.mu.Unlock()
 
+	var paths []string
 	for _, g := range groups {
 		if len(g.Entries) < 2 {
 			continue
 		}
 		for _, v := range g.Entries[1:] {
-			d.removeOne(v.Path)
+			paths = append(paths, v.Path)
 		}
 	}
+	d.removeBatch(paths)
 	newGroups := d.pruneMissing(d.idx.FindDuplicates())
 	d.mu.Lock()
 	d.groups = newGroups
@@ -393,6 +409,22 @@ func (d *DuplicatesView) deleteAllNewer() {
 	d.mu.Unlock()
 	if d.invalidate != nil {
 		d.invalidate()
+	}
+}
+
+// removeBatch routes through batchDeleter when wired so the Controller can
+// do one in-memory patch + one index transaction; falls back to per-item
+// removeOne otherwise (tests and standalone use of the view).
+func (d *DuplicatesView) removeBatch(paths []string) {
+	if len(paths) == 0 {
+		return
+	}
+	if d.batchDeleter != nil {
+		_ = d.batchDeleter(paths)
+		return
+	}
+	for _, p := range paths {
+		d.removeOne(p)
 	}
 }
 

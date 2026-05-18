@@ -428,3 +428,27 @@ func (i *Index) RemoveEntry(path string) error {
 	_, err := i.db.Exec("DELETE FROM entries WHERE path = ?", path)
 	return err
 }
+
+// RemoveEntries deletes multiple rows from the index in a single transaction.
+// Used by bulk-delete flows so the UI doesn't pay for one DB round-trip per
+// path. Errors on individual rows are swallowed — the transaction commits
+// whichever deletes did succeed.
+func (i *Index) RemoveEntries(paths []string) error {
+	if len(paths) == 0 {
+		return nil
+	}
+	tx, err := i.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	stmt, err := tx.Prepare("DELETE FROM entries WHERE path = ?")
+	if err != nil {
+		return err
+	}
+	defer stmt.Close()
+	for _, p := range paths {
+		_, _ = stmt.Exec(p)
+	}
+	return tx.Commit()
+}
