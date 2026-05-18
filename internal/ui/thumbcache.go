@@ -15,31 +15,47 @@ import (
 	"github.com/dns/photo-viewer/internal/cache"
 )
 
-// thumbCacheCapacity caps the number of decoded thumbnails kept in memory.
-// Each entry holds an RGBA pixel buffer (~256 KB at the default thumb size),
-// so 1024 entries ≈ 256 MB peak. Far larger than any visible window, so live
-// cells are never evicted; old entries are dropped once a long browse session
-// has touched many directories.
+// thumbCacheCapacity caps the number of decoded thumbnails kept in memory
+// across all shards. Each entry holds an RGBA pixel buffer (~256 KB at the
+// default thumb size), so 1024 entries ≈ 256 MB peak. Far larger than any
+// visible window, so live cells are never evicted; old entries are dropped
+// once a long browse session has touched many directories.
 const thumbCacheCapacity = 1024
+
+// thumbCacheShards is the number of independent shards. Sharding lets the
+// Gio render goroutine call Get() for every visible cell while decode
+// workers store their results in parallel, without all of them serializing
+// on a single mutex. 16 is comfortably larger than typical CPU counts so
+// shard contention is rare even under bursty scrolling.
+const thumbCacheShards = 16
 
 // thumbCache lazily resolves thumbnail JPEGs into paint.ImageOp values and
 // caches them with an LRU policy. Multiple frames may request the same thumb
 // concurrently; only one decode is queued per entry. When a decode completes,
 // invalidate is fired so the next frame can paint the result.
+//
+// State is split across thumbCacheShards independent shards keyed by a
+// hash of the thumbnail path; each shard has its own mutex, map, and LRU
+// list. The decode queue and the coalescer remain singletons since they're
+// inherently global.
 type thumbCache struct {
 	store      *cache.ThumbStore
 	invalidate func()
-	capacity   int
+	capPerShard int
 
-	mu      sync.Mutex
-	entries map[string]*list.Element // value: *thumbEntry, list ordered MRU→LRU
-	lru     *list.List
-	queue   chan cache.Entry
+	shards [thumbCacheShards]thumbCacheShard
+	queue  chan cache.Entry
 
 	// Coalescing: workers bump dirty; a single coalescer goroutine fires
 	// invalidate at most once every ~16ms so a burst of decodes doesn't
 	// hammer the Gio frame loop with one redraw per thumbnail.
 	dirty atomic.Bool
+}
+
+type thumbCacheShard struct {
+	mu      sync.Mutex
+	entries map[string]*list.Element // value: *thumbEntry, list ordered MRU→LRU
+	lru     *list.List
 }
 
 type thumbEntry struct {
@@ -52,12 +68,14 @@ type thumbEntry struct {
 
 func newThumbCache(store *cache.ThumbStore, invalidate func()) *thumbCache {
 	tc := &thumbCache{
-		store:      store,
-		invalidate: invalidate,
-		capacity:   thumbCacheCapacity,
-		entries:    make(map[string]*list.Element),
-		lru:        list.New(),
-		queue:      make(chan cache.Entry, 256),
+		store:       store,
+		invalidate:  invalidate,
+		capPerShard: (thumbCacheCapacity + thumbCacheShards - 1) / thumbCacheShards,
+		queue:       make(chan cache.Entry, 256),
+	}
+	for i := range tc.shards {
+		tc.shards[i].entries = make(map[string]*list.Element)
+		tc.shards[i].lru = list.New()
 	}
 	workers := runtime.NumCPU()
 	if workers < 4 {
@@ -68,6 +86,18 @@ func newThumbCache(store *cache.ThumbStore, invalidate func()) *thumbCache {
 	}
 	go tc.coalescer()
 	return tc
+}
+
+// shardFor returns the shard responsible for path. FNV-1a is cheap and
+// produces good distribution for filesystem-path strings, which share long
+// directory prefixes that a naive hash would bunch into one shard.
+func (tc *thumbCache) shardFor(path string) *thumbCacheShard {
+	var h uint32 = 2166136261
+	for i := 0; i < len(path); i++ {
+		h ^= uint32(path[i])
+		h *= 16777619
+	}
+	return &tc.shards[h%thumbCacheShards]
 }
 
 // coalescer wakes the Gio frame loop at most ~60 times per second when one or
@@ -88,52 +118,54 @@ func (tc *thumbCache) coalescer() {
 // queued for background decode and the bool is false. Subsequent frames after
 // invalidate fires will see the populated op.
 func (tc *thumbCache) Get(e cache.Entry) (paint.ImageOp, image.Point, bool) {
-	tc.mu.Lock()
-	te := tc.touchOrCreate(e.Path)
+	sh := tc.shardFor(e.Path)
+	sh.mu.Lock()
+	te := tc.touchOrCreate(sh, e.Path)
 	if te.ready {
 		op, sz := te.op, te.size
-		tc.mu.Unlock()
+		sh.mu.Unlock()
 		return op, sz, true
 	}
 	if !te.queued {
 		te.queued = true
-		tc.mu.Unlock()
+		sh.mu.Unlock()
 		select {
 		case tc.queue <- e:
 		default:
 			// queue full; drop and let a later frame retry by clearing queued.
-			tc.mu.Lock()
+			sh.mu.Lock()
 			te.queued = false
-			tc.mu.Unlock()
+			sh.mu.Unlock()
 		}
 		return paint.ImageOp{}, image.Point{}, false
 	}
-	tc.mu.Unlock()
+	sh.mu.Unlock()
 	return paint.ImageOp{}, image.Point{}, false
 }
 
-// touchOrCreate returns the entry for path, promoting it to the MRU end of
-// the LRU list (creating it if missing). Caller must hold tc.mu. Eviction of
-// the oldest entries happens here when the cache exceeds its capacity, but
-// only ready entries with no in-flight decode are eligible — a queued entry
-// is needed by the next frame.
-func (tc *thumbCache) touchOrCreate(path string) *thumbEntry {
-	if el, ok := tc.entries[path]; ok {
-		tc.lru.MoveToFront(el)
+// touchOrCreate returns the entry for path within sh, promoting it to MRU
+// (creating it if missing). Caller must hold sh.mu. When the entry is
+// already at the front the MoveToFront call is skipped — common on the
+// hot path where the same cell is re-fetched every frame.
+func (tc *thumbCache) touchOrCreate(sh *thumbCacheShard, path string) *thumbEntry {
+	if el, ok := sh.entries[path]; ok {
+		if sh.lru.Front() != el {
+			sh.lru.MoveToFront(el)
+		}
 		return el.Value.(*thumbEntry)
 	}
 	te := &thumbEntry{path: path}
-	el := tc.lru.PushFront(te)
-	tc.entries[path] = el
-	tc.evictIfNeeded()
+	el := sh.lru.PushFront(te)
+	sh.entries[path] = el
+	tc.evictIfNeeded(sh)
 	return te
 }
 
-// evictIfNeeded drops the least-recently-used ready entries until the cache
-// is within capacity. Caller must hold tc.mu.
-func (tc *thumbCache) evictIfNeeded() {
-	for tc.lru.Len() > tc.capacity {
-		oldest := tc.lru.Back()
+// evictIfNeeded drops the least-recently-used ready entries from sh until
+// it's within capacity. Caller must hold sh.mu.
+func (tc *thumbCache) evictIfNeeded(sh *thumbCacheShard) {
+	for sh.lru.Len() > tc.capPerShard {
+		oldest := sh.lru.Back()
 		if oldest == nil {
 			return
 		}
@@ -146,8 +178,8 @@ func (tc *thumbCache) evictIfNeeded() {
 			for prev != nil {
 				cand := prev.Value.(*thumbEntry)
 				if !cand.queued || cand.ready {
-					tc.lru.Remove(prev)
-					delete(tc.entries, cand.path)
+					sh.lru.Remove(prev)
+					delete(sh.entries, cand.path)
 					break
 				}
 				prev = prev.Prev()
@@ -157,23 +189,27 @@ func (tc *thumbCache) evictIfNeeded() {
 			}
 			continue
 		}
-		tc.lru.Remove(oldest)
-		delete(tc.entries, te.path)
+		sh.lru.Remove(oldest)
+		delete(sh.entries, te.path)
 	}
 }
 
 func (tc *thumbCache) worker() {
 	for e := range tc.queue {
+		// Decode happens entirely outside the lock — paint.NewImageOp can
+		// be expensive (image snapshot) and must not block other Get
+		// callers on this shard.
 		op, sz, ok := tc.decode(e)
-		tc.mu.Lock()
-		el := tc.entries[e.Path]
+		sh := tc.shardFor(e.Path)
+		sh.mu.Lock()
+		el := sh.entries[e.Path]
 		var te *thumbEntry
 		if el == nil {
 			// Evicted while in-flight; reinsert at MRU.
 			te = &thumbEntry{path: e.Path}
-			el = tc.lru.PushFront(te)
-			tc.entries[e.Path] = el
-			tc.evictIfNeeded()
+			el = sh.lru.PushFront(te)
+			sh.entries[e.Path] = el
+			tc.evictIfNeeded(sh)
 		} else {
 			te = el.Value.(*thumbEntry)
 		}
@@ -183,7 +219,7 @@ func (tc *thumbCache) worker() {
 			te.size = sz
 			te.ready = true
 		}
-		tc.mu.Unlock()
+		sh.mu.Unlock()
 		if ok {
 			tc.dirty.Store(true)
 		}

@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/dns/photo-viewer/internal/scan"
@@ -30,6 +31,17 @@ type Entry struct {
 // Index is the SQLite database representation of the media cache.
 type Index struct {
 	db *sql.DB
+
+	// Long-lived prepared statements. SQLite reprepares are not free in
+	// Go's database/sql layer — caching the statements for the lifetime of
+	// the *Index keeps hot writers (scan reconcile, face writes) from
+	// burning a Prepare per call.
+	stmtMu             sync.Mutex
+	reconcileStmt      *sql.Stmt
+	faceInsStmt        *sql.Stmt
+	faceUpdClusterStmt *sql.Stmt
+	faceNewClusterStmt *sql.Stmt
+	faceSetClusterStmt *sql.Stmt
 }
 
 // Load opens the SQLite database index.
@@ -54,7 +66,6 @@ func Load(dbPath string) (*Index, error) {
 			thumb_id TEXT,
 			content_hash TEXT
 		);
-		CREATE INDEX IF NOT EXISTS idx_entries_path ON entries(path);
 		CREATE INDEX IF NOT EXISTS idx_entries_size ON entries(size);
 	`)
 	if err != nil {
@@ -82,7 +93,7 @@ func Load(dbPath string) (*Index, error) {
 
 	// Schema versioning for value-format migrations. Bump when a persisted
 	// hash/value format changes so stale rows are invalidated.
-	const schemaVersion = 2
+	const schemaVersion = 3
 	var userVersion int
 	_ = db.QueryRow("PRAGMA user_version").Scan(&userVersion)
 	if userVersion < 1 {
@@ -95,6 +106,11 @@ func Load(dbPath string) (*Index, error) {
 		// existing rows so the sidebar's Years/ListByYear queries can group
 		// in SQL instead of streaming every row to Go.
 		backfillYear(db)
+	}
+	if userVersion < 3 {
+		// v3: drop idx_entries_path — it duplicated the primary key on path
+		// and only added write overhead.
+		_, _ = db.Exec("DROP INDEX IF EXISTS idx_entries_path")
 	}
 	if userVersion < schemaVersion {
 		_, _ = db.Exec("PRAGMA user_version = " + strconv.Itoa(schemaVersion))
@@ -177,9 +193,30 @@ func (i *Index) ReconcileBatch(results []scan.Result) []Entry {
 	return out
 }
 
+// reconcileStatement lazily prepares the long-lived reconcile upsert. The
+// statement survives across batches — over a full library scan that's tens
+// of thousands of avoided Prepare calls.
+func (i *Index) reconcileStatement() (*sql.Stmt, error) {
+	i.stmtMu.Lock()
+	defer i.stmtMu.Unlock()
+	if i.reconcileStmt != nil {
+		return i.reconcileStmt, nil
+	}
+	s, err := i.db.Prepare(reconcileInsertSQL)
+	if err != nil {
+		return nil, err
+	}
+	i.reconcileStmt = s
+	return s, nil
+}
+
 // reconcileChunk writes one bounded transaction's worth of results and
 // appends the corresponding Entries to out.
 func (i *Index) reconcileChunk(chunk []scan.Result, out *[]Entry) {
+	stmt, err := i.reconcileStatement()
+	if err != nil {
+		return
+	}
 	tx, err := i.db.Begin()
 	if err != nil {
 		return
@@ -189,11 +226,8 @@ func (i *Index) reconcileChunk(chunk []scan.Result, out *[]Entry) {
 	// On update, clear quick_hash and content_hash whenever size or mtime
 	// changed so a re-hash kicks in on the next duplicate scan. (SQLite's
 	// `entries.column` inside DO UPDATE refers to the existing row.)
-	stmt, err := tx.Prepare(reconcileInsertSQL)
-	if err != nil {
-		return
-	}
-	defer stmt.Close()
+	txStmt := tx.Stmt(stmt)
+	defer txStmt.Close()
 
 	for _, r := range chunk {
 		e := Entry{
@@ -208,7 +242,7 @@ func (i *Index) reconcileChunk(chunk []scan.Result, out *[]Entry) {
 		if y := pathYear(r.Path); y != 0 {
 			yearArg = y
 		}
-		_, _ = stmt.Exec(e.Path, e.Type, e.Size, e.ModTime.Unix(), e.ThumbID, yearArg, e.DurationMs)
+		_, _ = txStmt.Exec(e.Path, e.Type, e.Size, e.ModTime.Unix(), e.ThumbID, yearArg, e.DurationMs)
 		*out = append(*out, e)
 	}
 	_ = tx.Commit()
@@ -654,8 +688,66 @@ func ThumbIDFor(path string) string {
 
 // Close explicitly closes the database connection.
 func (i *Index) Close() error {
+	i.stmtMu.Lock()
+	for _, s := range []**sql.Stmt{
+		&i.reconcileStmt,
+		&i.faceInsStmt,
+		&i.faceUpdClusterStmt,
+		&i.faceNewClusterStmt,
+		&i.faceSetClusterStmt,
+	} {
+		if *s != nil {
+			_ = (*s).Close()
+			*s = nil
+		}
+	}
+	i.stmtMu.Unlock()
 	if i.db != nil {
 		return i.db.Close()
 	}
 	return nil
+}
+
+// CountChildDirsFiltered returns, for each immediate child directory of
+// parent, the recursive count of entries that pass the given filter. The
+// whole result set is produced by a single grouped scan over the parent's
+// path range — far cheaper than firing one COUNT(*) per child, which is
+// what the sidebar refresh used to do per scan flush.
+//
+// Keys in the returned map are absolute paths matching what
+// listSubdirs returns.
+func (i *Index) CountChildDirsFiltered(parent, filter string, showRAW bool) map[string]int {
+	lower, upper := dirRange(parent)
+	// SQLite uses 1-based positions for substr/instr. lower has a trailing
+	// separator, so the child segment starts at column len(lower)+1 and
+	// runs up to the next '/' (which marks the boundary into the child's
+	// own subtree). Paths directly under parent (no further '/') are not
+	// counted; those represent files in parent and aren't subdirs.
+	startCol := len(lower) + 1
+	where, args := typeFilterClause(filter, showRAW)
+	q := `
+		SELECT
+			substr(path, ?, instr(substr(path, ?), '/') - 1) AS child,
+			COUNT(*)
+		FROM entries
+		WHERE path >= ? AND path < ?
+		  AND instr(substr(path, ?), '/') > 0` + where + `
+		GROUP BY child`
+	queryArgs := []any{startCol, startCol, lower, upper, startCol}
+	queryArgs = append(queryArgs, args...)
+
+	rows, err := i.db.Query(q, queryArgs...)
+	if err != nil {
+		return nil
+	}
+	defer rows.Close()
+	out := make(map[string]int, 16)
+	for rows.Next() {
+		var name string
+		var n int
+		if err := rows.Scan(&name, &n); err == nil && name != "" {
+			out[filepath.Join(parent, name)] = n
+		}
+	}
+	return out
 }

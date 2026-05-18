@@ -9,6 +9,7 @@ import (
 	_ "image/png"
 	"os"
 	"os/exec"
+	"sync"
 
 	_ "golang.org/x/image/bmp"
 	"golang.org/x/image/draw"
@@ -71,12 +72,33 @@ func imageViaFfmpeg(ctx context.Context, src, dst string, size int) error {
 }
 
 
+// rgbaPool recycles the destination RGBA used by writeThumb. The thumbnail
+// size is fixed at the package level (cache.ThumbSize) so essentially every
+// buffer is reusable as-is; the slice length is reset before scaling and
+// the original capacity preserved when returning to the pool.
+var rgbaPool = sync.Pool{
+	New: func() any { return &image.RGBA{} },
+}
+
 func writeThumb(src image.Image, dst string, size int) error {
 	b := src.Bounds()
 	w, h := b.Dx(), b.Dy()
 	tw, th := fitWithin(w, h, size)
-	thumb := image.NewRGBA(image.Rect(0, 0, tw, th))
-	draw.ApproxBiLinear.Scale(thumb, thumb.Bounds(), src, b, draw.Src, nil)
+	thumb := rgbaPool.Get().(*image.RGBA)
+	defer rgbaPool.Put(thumb)
+
+	needed := 4 * tw * th
+	if cap(thumb.Pix) < needed {
+		thumb.Pix = make([]uint8, needed)
+	} else {
+		thumb.Pix = thumb.Pix[:needed]
+	}
+	thumb.Stride = 4 * tw
+	thumb.Rect = image.Rect(0, 0, tw, th)
+	// draw.Src overwrites every destination pixel, so reusing the buffer
+	// without zeroing is safe.
+	draw.ApproxBiLinear.Scale(thumb, thumb.Rect, src, b, draw.Src, nil)
+
 	out, err := os.Create(dst)
 	if err != nil {
 		return err

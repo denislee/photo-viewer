@@ -58,12 +58,12 @@ func EnsureThumb(cacheDir, srcThumb string, faceID int64, bbox [4]int) (string, 
 		return "", errors.New("face: bbox does not intersect source image")
 	}
 
-	cropped := image.NewRGBA(image.Rect(0, 0, rect.Dx(), rect.Dy()))
-	draw.Draw(cropped, cropped.Bounds(), src, rect.Min, draw.Src)
-
+	// Scale straight from the sub-rect of src into the final RGBA — the
+	// scaler accepts a source rectangle, so the intermediate "cropped"
+	// RGBA the older code allocated and copied into was unnecessary.
 	tw, th := fitWithin(rect.Dx(), rect.Dy(), FaceThumbSize)
 	scaled := image.NewRGBA(image.Rect(0, 0, tw, th))
-	draw.ApproxBiLinear.Scale(scaled, scaled.Bounds(), cropped, cropped.Bounds(), draw.Src, nil)
+	draw.ApproxBiLinear.Scale(scaled, scaled.Bounds(), src, rect, draw.Src, nil)
 
 	tmp := dst + ".tmp"
 	out, err := os.Create(tmp)

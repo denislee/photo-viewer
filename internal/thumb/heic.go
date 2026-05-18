@@ -5,26 +5,51 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"image"
+	_ "image/jpeg"
 	"os"
 	"os/exec"
 	"path/filepath"
 )
 
-// HEIC converts a HEIC/HEIF file to JPEG and resamples it. Tries
-// `heif-convert` (libheif) first, falls back to `ffmpeg` if heif-convert is
-// missing or produced no output.
+// HEIC converts a HEIC/HEIF file to JPEG and resamples it.
+//
+// Strategy: prefer ffmpeg with `-vf scale` (one subprocess does the HEIC
+// decode + downscale + JPEG encode in a single pass — same trick the video
+// thumbnailer uses). Fall back to `heif-convert` + an in-process scale when
+// ffmpeg can't open the file (HEIC support depends on how ffmpeg was built).
+// The previous implementation always wrote a full-resolution JPEG then
+// re-decoded + re-scaled + re-encoded it, paying for two JPEG codec passes.
 func HEIC(ctx context.Context, src, dst string, size int) error {
+	if _, err := exec.LookPath("ffmpeg"); err == nil {
+		if err := imageViaFfmpeg(ctx, src, dst, size); err == nil {
+			return nil
+		}
+		// fall through — ffmpeg either lacks HEIC or refused this file.
+	}
+
 	tmpDir, err := os.MkdirTemp("", "photo-viewer-heic-")
 	if err != nil {
 		return err
 	}
 	defer os.RemoveAll(tmpDir)
-
 	jpg, lastErr := decodeHEIC(ctx, src, tmpDir)
 	if lastErr != nil {
 		return lastErr
 	}
-	return Image(ctx, jpg, dst, size)
+	// jpg is a freshly written JPEG of unknown size. Skip the os.Stat /
+	// ffmpeg-threshold branch inside Image() (we know exactly where the
+	// file came from) and just decode + writeThumb directly.
+	in, err := os.Open(jpg)
+	if err != nil {
+		return err
+	}
+	defer in.Close()
+	img, _, err := image.Decode(in)
+	if err != nil {
+		return err
+	}
+	return writeThumb(img, dst, size)
 }
 
 

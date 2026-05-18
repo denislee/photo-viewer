@@ -29,15 +29,16 @@ func GetMediaInfo(path string) MediaInfo {
 	var info MediaInfo
 	dateFound := false
 
-	// Try exiftool first for everything.
+	// Try exiftool first for everything. The reader goes through a shared
+	// -stay_open daemon (see exiftool.go) so bulk reads avoid one fork per
+	// file; first-failure falls back to per-call exec under the hood.
 	if _, err := exec.LookPath("exiftool"); err == nil {
 		// Target tags for settings.
-		cmd := exec.Command("exiftool", "-s", "-S",
+		out, err := runExiftool("-s", "-S",
 			"-Model", "-LensModel",
 			"-CreateDate", "-DateTimeOriginal", "-MediaCreateDate",
 			"-FNumber", "-ExposureTime", "-ISO", "-FocalLength",
 			path)
-		out, err := cmd.Output()
 		if err == nil {
 			lines := strings.Split(strings.TrimSpace(string(out)), "\n")
 			for _, line := range lines {
@@ -203,8 +204,7 @@ func SetMediaDate(path string, t time.Time) error {
 // flag indicating whether one was found.
 func readMetadataDate(path string) (time.Time, bool) {
 	if _, err := exec.LookPath("exiftool"); err == nil {
-		cmd := exec.Command("exiftool", "-s", "-S", "-CreateDate", "-DateTimeOriginal", "-MediaCreateDate", path)
-		out, err := cmd.Output()
+		out, err := runExiftool("-s", "-S", "-CreateDate", "-DateTimeOriginal", "-MediaCreateDate", path)
 		if err == nil {
 			lines := strings.Split(strings.TrimSpace(string(out)), "\n")
 			for _, line := range lines {
@@ -238,8 +238,7 @@ func GetMediaDate(path string) time.Time {
 	// First try exiftool for any media type (it handles photos, RAW, and videos).
 	if _, err := exec.LookPath("exiftool"); err == nil {
 		// Use -s -S for short tag names and no spaces/headers.
-		cmd := exec.Command("exiftool", "-s", "-S", "-CreateDate", "-DateTimeOriginal", "-MediaCreateDate", path)
-		out, err := cmd.Output()
+		out, err := runExiftool("-s", "-S", "-CreateDate", "-DateTimeOriginal", "-MediaCreateDate", path)
 		if err == nil {
 			lines := strings.Split(strings.TrimSpace(string(out)), "\n")
 			for _, line := range lines {

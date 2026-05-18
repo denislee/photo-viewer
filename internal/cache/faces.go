@@ -102,11 +102,53 @@ type FaceOpResult struct {
 	ClusterID int64
 }
 
+// faceStatements lazily prepares the long-lived statements used by
+// WriteFacesForPath. The four statements are reused for the life of the
+// *Index; each face-detection scan would otherwise reprepare them per call.
+func (i *Index) faceStatements() (ins, updCluster, newCluster, setCluster *sql.Stmt, err error) {
+	i.stmtMu.Lock()
+	defer i.stmtMu.Unlock()
+	if i.faceInsStmt == nil {
+		if i.faceInsStmt, err = i.db.Prepare(
+			`INSERT INTO faces (path, thumb_mtime, bbox_x, bbox_y, bbox_w, bbox_h, embedding) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+		); err != nil {
+			return
+		}
+	}
+	if i.faceUpdClusterStmt == nil {
+		if i.faceUpdClusterStmt, err = i.db.Prepare(
+			"UPDATE face_clusters SET centroid = ? WHERE id = ?",
+		); err != nil {
+			return
+		}
+	}
+	if i.faceNewClusterStmt == nil {
+		if i.faceNewClusterStmt, err = i.db.Prepare(
+			"INSERT INTO face_clusters (centroid, sample_face_id) VALUES (?, ?)",
+		); err != nil {
+			return
+		}
+	}
+	if i.faceSetClusterStmt == nil {
+		if i.faceSetClusterStmt, err = i.db.Prepare(
+			"UPDATE faces SET cluster_id = ? WHERE id = ?",
+		); err != nil {
+			return
+		}
+	}
+	return i.faceInsStmt, i.faceUpdClusterStmt, i.faceNewClusterStmt, i.faceSetClusterStmt, nil
+}
+
 // WriteFacesForPath wipes existing face rows for path and writes the given
 // ops in a single transaction (1 fsync per image instead of ~3 per face).
 // Callers (the face pipeline) are expected to have already chosen
 // existing-cluster vs. new-cluster against an in-memory cache.
 func (i *Index) WriteFacesForPath(path string, ops []FaceOp) ([]FaceOpResult, error) {
+	insStmt, updClusterStmt, newClusterStmt, setClusterStmt, err := i.faceStatements()
+	if err != nil {
+		return nil, err
+	}
+
 	tx, err := i.db.Begin()
 	if err != nil {
 		return nil, err
@@ -117,11 +159,19 @@ func (i *Index) WriteFacesForPath(path string, ops []FaceOp) ([]FaceOpResult, er
 		return nil, err
 	}
 
+	ins := tx.Stmt(insStmt)
+	defer ins.Close()
+	updCluster := tx.Stmt(updClusterStmt)
+	defer updCluster.Close()
+	newCluster := tx.Stmt(newClusterStmt)
+	defer newCluster.Close()
+	setCluster := tx.Stmt(setClusterStmt)
+	defer setCluster.Close()
+
 	results := make([]FaceOpResult, len(ops))
 	for k, op := range ops {
 		f := op.Face
-		res, err := tx.Exec(
-			`INSERT INTO faces (path, thumb_mtime, bbox_x, bbox_y, bbox_w, bbox_h, embedding) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+		res, err := ins.Exec(
 			f.Path, f.ThumbMtime, f.BBox[0], f.BBox[1], f.BBox[2], f.BBox[3], EncodeEmbedding(f.Embedding),
 		)
 		if err != nil {
@@ -135,15 +185,11 @@ func (i *Index) WriteFacesForPath(path string, ops []FaceOp) ([]FaceOpResult, er
 
 		clusterID := op.ExistingClusterID
 		if clusterID > 0 {
-			if _, err := tx.Exec("UPDATE face_clusters SET centroid = ? WHERE id = ?",
-				EncodeEmbedding(op.UpdatedCentroid), clusterID); err != nil {
+			if _, err := updCluster.Exec(EncodeEmbedding(op.UpdatedCentroid), clusterID); err != nil {
 				return nil, err
 			}
 		} else {
-			cres, err := tx.Exec(
-				"INSERT INTO face_clusters (centroid, sample_face_id) VALUES (?, ?)",
-				EncodeEmbedding(op.NewClusterCentroid), faceID,
-			)
+			cres, err := newCluster.Exec(EncodeEmbedding(op.NewClusterCentroid), faceID)
 			if err != nil {
 				return nil, err
 			}
@@ -152,7 +198,7 @@ func (i *Index) WriteFacesForPath(path string, ops []FaceOp) ([]FaceOpResult, er
 				return nil, err
 			}
 		}
-		if _, err := tx.Exec("UPDATE faces SET cluster_id = ? WHERE id = ?", clusterID, faceID); err != nil {
+		if _, err := setCluster.Exec(clusterID, faceID); err != nil {
 			return nil, err
 		}
 		results[k].ClusterID = clusterID
@@ -165,12 +211,22 @@ func (i *Index) WriteFacesForPath(path string, ops []FaceOp) ([]FaceOpResult, er
 }
 
 // AllClusters returns every cluster with its current face count.
+//
+// The face count comes from one GROUP BY scan over faces joined onto the
+// clusters table rather than a correlated subquery per row, so the cost
+// stays O(faces) instead of O(clusters × faces).
 func (i *Index) AllClusters() []Cluster {
 	rows, err := i.db.Query(`
 		SELECT c.id, c.label, c.centroid, c.sample_face_id,
-			(SELECT COUNT(*) FROM faces f WHERE f.cluster_id = c.id)
+			COALESCE(f.cnt, 0) AS cnt
 		FROM face_clusters c
-		ORDER BY 5 DESC, c.id ASC`)
+		LEFT JOIN (
+			SELECT cluster_id, COUNT(*) AS cnt
+			FROM faces
+			WHERE cluster_id IS NOT NULL
+			GROUP BY cluster_id
+		) f ON f.cluster_id = c.id
+		ORDER BY cnt DESC, c.id ASC`)
 	if err != nil {
 		return nil
 	}

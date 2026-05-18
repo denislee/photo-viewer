@@ -274,6 +274,14 @@ func (p *Player) Render(w, h int) (*image.RGBA, bool) {
 
 	if p.buf == nil || p.buf.Rect.Dx() != w || p.buf.Rect.Dy() != h {
 		p.buf = image.NewRGBA(image.Rect(0, 0, w, h))
+		// mpv's rgb0 SW format writes R, G, B at byte offsets 0, 1, 2 and
+		// leaves the 4th byte untouched. Pre-fill the alpha column to 0xff
+		// once at allocation time so the per-frame loop that used to scan
+		// every pixel (~480 MB/s of writes at 1080p60) goes away entirely.
+		pix := p.buf.Pix
+		for i := 3; i < len(pix); i += 4 {
+			pix[i] = 0xff
+		}
 	}
 
 	stride := C.size_t(p.buf.Stride)
@@ -281,13 +289,6 @@ func (p *Player) Render(w, h int) (*image.RGBA, bool) {
 		stride, unsafe.Pointer(&p.buf.Pix[0]))
 	if rc < 0 {
 		return nil, false
-	}
-	// mpv wrote R, G, B at byte offsets 0, 1, 2; the 4th byte is garbage.
-	// Force alpha to 0xff so the buffer is a valid premultiplied RGBA
-	// image regardless of what background the caller paints over.
-	pix := p.buf.Pix
-	for i := 3; i < len(pix); i += 4 {
-		pix[i] = 0xff
 	}
 	p.updatePending.Store(false)
 	return p.buf, true

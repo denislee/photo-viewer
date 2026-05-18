@@ -490,14 +490,21 @@ func (c *Controller) refreshFromIndex(dir string) {
 	// treeDir's parent (if the tree isn't anchored at root), and each subdir.
 	// Recomputed on every refresh so they stay in sync with filter/showRAW
 	// changes and with newly-batched scan results.
+	//
+	// The per-subdir counts come from one grouped scan over treeDir's path
+	// range (CountChildDirsFiltered) instead of N round-trips, so a deep
+	// directory with dozens of children is one query instead of N+3.
 	counts := make(map[string]int, len(subs)+3)
 	counts[root] = c.index.CountDirFiltered(root, filter, showRAW)
 	if treeDir != root {
 		parent := filepath.Dir(treeDir)
 		counts[parent] = c.index.CountDirFiltered(parent, filter, showRAW)
 	}
-	for _, s := range subs {
-		counts[s] = c.index.CountDirFiltered(s, filter, showRAW)
+	if len(subs) > 0 {
+		childCounts := c.index.CountChildDirsFiltered(treeDir, filter, showRAW)
+		for _, s := range subs {
+			counts[s] = childCounts[s]
+		}
 	}
 	counts[FavoritesView] = c.index.CountFavorites(filter, showRAW)
 
@@ -552,7 +559,16 @@ func (c *Controller) scanInto(ctx context.Context, dir string) {
 		}
 	}()
 
-	results := scan.Walk(ctx, dir)
+	// Pass an index-backed duration lookup so videos that already have a
+	// stored duration_ms skip the ffprobe fork on incremental rescans.
+	results := scan.WalkWith(ctx, dir, scan.WalkOptions{
+		KnownDurationMs: func(path string) int64 {
+			if e, ok := c.index.GetEntry(path); ok {
+				return e.DurationMs
+			}
+			return 0
+		},
+	})
 	var batch []scan.Result
 	flushAt := time.Now().Add(time.Second)
 	flush := func() {
