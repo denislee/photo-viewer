@@ -171,9 +171,21 @@ func Run(w *app.Window, ctrl *Controller) error {
 		_ = SaveConfig(c)
 		w.Invalidate()
 	}
+	toolbar.OnSortByLength = func(v bool) {
+		c := GetConfig()
+		if v {
+			c.SortMode = SortByDuration
+		} else {
+			c.SortMode = SortByName
+		}
+		_ = SaveConfig(c)
+		ctrl.SetSort(c.SortMode)
+		w.Invalidate()
+	}
 	toolbar.Filter = ctrl.Filter()
 	toolbar.ShowRAW = ctrl.ShowRAW()
 	toolbar.GroupByYear = GetConfig().GroupByYear
+	toolbar.SortByLength = ctrl.Sort() == SortByDuration
 
 	splitter := &sidebarSplitter{}
 
@@ -204,6 +216,7 @@ func Run(w *app.Window, ctrl *Controller) error {
 			toolbar.Filter = ctrl.Filter()
 			toolbar.ShowRAW = ctrl.ShowRAW()
 			toolbar.GroupByYear = GetConfig().GroupByYear
+			toolbar.SortByLength = ctrl.Sort() == SortByDuration
 			toolbar.AnyProcess = processes.Count() > 0
 			drawRoot(gtx, th, ctrl, toolbar, sidebar, grid, viewer, dups, imports, organize, settings, indexInfo, search, sdPrompt, processBar, splitter, sidebarFocus, w)
 			e.Frame(gtx.Ops)

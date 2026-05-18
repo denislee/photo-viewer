@@ -21,6 +21,21 @@ import (
 // directory) when the controller's currentDir equals this value.
 const FavoritesView = "\x00favorites"
 
+// Sort modes accepted in Config.SortMode and Controller.sortMode.
+const (
+	SortByName     = "name"
+	SortByDuration = "duration"
+)
+
+// normalizeSort returns a known sort mode, defaulting to SortByName for any
+// unrecognized or empty value.
+func normalizeSort(s string) string {
+	if s == SortByDuration {
+		return SortByDuration
+	}
+	return SortByName
+}
+
 // YearViewPrefix marks synthetic currentDir values produced by PreviewYear.
 // The suffix is the YYYY year string. The grid shows the union of entries
 // under each date subdir bucketed beneath that year header.
@@ -39,6 +54,7 @@ type Controller struct {
 	subdirs     []string
 	mediaFilter string
 	showRAW     bool
+	sortMode    string // "name" or "duration"
 	scanCancel  context.CancelFunc
 	scanning    int // active scanInto goroutines
 
@@ -103,6 +119,7 @@ func NewController(root string, idx *cache.Index, store *cache.ThumbStore, cache
 		currentDir:    root,
 		mediaFilter:   "All",
 		showRAW:       true,
+		sortMode:      normalizeSort(GetConfig().SortMode),
 		SelectedPaths: make(map[string]bool),
 	}
 	c.thumbs = newThumbCache(store, func() {
@@ -205,6 +222,22 @@ func (c *Controller) SetShowRAW(v bool) {
 // the active state without a separate state mirror.
 func (c *Controller) Filter() string { c.mu.Lock(); defer c.mu.Unlock(); return c.mediaFilter }
 func (c *Controller) ShowRAW() bool  { c.mu.Lock(); defer c.mu.Unlock(); return c.showRAW }
+func (c *Controller) Sort() string   { c.mu.Lock(); defer c.mu.Unlock(); return c.sortMode }
+
+// SetSort switches the grid sort mode and refreshes the active view so the
+// new order is visible immediately.
+func (c *Controller) SetSort(mode string) {
+	mode = normalizeSort(mode)
+	c.mu.Lock()
+	if c.sortMode == mode {
+		c.mu.Unlock()
+		return
+	}
+	c.sortMode = mode
+	dir := c.currentDir
+	c.mu.Unlock()
+	c.scheduleRefresh(dir)
+}
 
 // Scanning reports whether at least one scanInto goroutine is currently
 // walking the filesystem and reconciling entries into the index.
@@ -419,6 +452,7 @@ func (c *Controller) refreshFromIndex(dir string) {
 	c.mu.Lock()
 	filter := c.mediaFilter
 	showRAW := c.showRAW
+	sortMode := c.sortMode
 	treeDir := c.treeDir
 	root := c.libraryRoot
 	prevSubdirs := c.subdirs
@@ -441,7 +475,7 @@ func (c *Controller) refreshFromIndex(dir string) {
 		}
 		filtered = append(filtered, e)
 	}
-	sort.Slice(filtered, func(i, j int) bool { return filtered[i].Path < filtered[j].Path })
+	sortEntries(filtered, sortMode)
 
 	// Avoid running listSubdirs (filesystem I/O) under the mutex.
 	wantSubdirs := treeDir == dir && dir != FavoritesView
@@ -678,6 +712,32 @@ func (c *Controller) WarmUp() {
 			return true
 		})
 	}()
+}
+
+// sortEntries orders the slice in place according to mode. SortByDuration
+// puts the longest videos first; entries without a duration (photos, RAW,
+// HEIC, or videos whose duration couldn't be probed) fall to the end ordered
+// by path so the listing stays stable.
+func sortEntries(entries []cache.Entry, mode string) {
+	switch normalizeSort(mode) {
+	case SortByDuration:
+		sort.SliceStable(entries, func(i, j int) bool {
+			di, dj := entries[i].DurationMs, entries[j].DurationMs
+			if di != dj {
+				// Non-video / unknown duration → end of list.
+				if di == 0 {
+					return false
+				}
+				if dj == 0 {
+					return true
+				}
+				return di > dj
+			}
+			return entries[i].Path < entries[j].Path
+		})
+	default:
+		sort.Slice(entries, func(i, j int) bool { return entries[i].Path < entries[j].Path })
+	}
 }
 
 // listSubdirs returns the immediate child directories of dir, sorted by name,

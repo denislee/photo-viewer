@@ -16,12 +16,15 @@ import (
 
 // Entry is one media file recorded in the index.
 type Entry struct {
-	Path     string         `json:"path"`
-	Type     scan.MediaType `json:"type"`
-	Size     int64          `json:"size"`
-	ModTime  time.Time      `json:"mtime"`
-	ThumbID  string         `json:"thumb_id"`
-	Favorite bool           `json:"favorite"`
+	Path    string         `json:"path"`
+	Type    scan.MediaType `json:"type"`
+	Size    int64          `json:"size"`
+	ModTime time.Time      `json:"mtime"`
+	ThumbID string         `json:"thumb_id"`
+	// DurationMs is the playback length of a video in milliseconds. 0 for
+	// non-videos and for videos whose duration could not be probed.
+	DurationMs int64 `json:"duration_ms"`
+	Favorite   bool  `json:"favorite"`
 }
 
 // Index is the SQLite database representation of the media cache.
@@ -70,6 +73,10 @@ func Load(dbPath string) (*Index, error) {
 	_, _ = db.Exec("ALTER TABLE entries ADD COLUMN quick_hash TEXT")
 	_, _ = db.Exec("ALTER TABLE entries ADD COLUMN year INTEGER")
 	if _, err := db.Exec("CREATE INDEX IF NOT EXISTS idx_entries_year ON entries(year)"); err != nil {
+		return nil, err
+	}
+	_, _ = db.Exec("ALTER TABLE entries ADD COLUMN duration_ms INTEGER NOT NULL DEFAULT 0")
+	if _, err := db.Exec("CREATE INDEX IF NOT EXISTS idx_entries_duration ON entries(duration_ms)"); err != nil {
 		return nil, err
 	}
 
@@ -133,13 +140,16 @@ func (i *Index) Save() error {
 // fsync, at the cost of one extra fsync per chunk.
 const reconcileChunkSize = 5000
 
-const reconcileInsertSQL = `INSERT INTO entries (path, type, size, mtime, thumb_id, year) VALUES (?, ?, ?, ?, ?, ?)
+const reconcileInsertSQL = `INSERT INTO entries (path, type, size, mtime, thumb_id, year, duration_ms) VALUES (?, ?, ?, ?, ?, ?, ?)
 	ON CONFLICT(path) DO UPDATE SET
 		type = excluded.type,
 		size = excluded.size,
 		mtime = excluded.mtime,
 		thumb_id = excluded.thumb_id,
 		year = excluded.year,
+		duration_ms = CASE
+			WHEN excluded.duration_ms > 0 THEN excluded.duration_ms
+			ELSE entries.duration_ms END,
 		quick_hash = CASE
 			WHEN entries.size != excluded.size OR entries.mtime != excluded.mtime
 			THEN NULL ELSE entries.quick_hash END,
@@ -187,17 +197,18 @@ func (i *Index) reconcileChunk(chunk []scan.Result, out *[]Entry) {
 
 	for _, r := range chunk {
 		e := Entry{
-			Path:    r.Path,
-			Type:    r.Type,
-			Size:    r.Size,
-			ModTime: r.ModTime,
-			ThumbID: ThumbIDFor(r.Path),
+			Path:       r.Path,
+			Type:       r.Type,
+			Size:       r.Size,
+			ModTime:    r.ModTime,
+			ThumbID:    ThumbIDFor(r.Path),
+			DurationMs: r.DurationMs,
 		}
 		var yearArg any
 		if y := pathYear(r.Path); y != 0 {
 			yearArg = y
 		}
-		_, _ = stmt.Exec(e.Path, e.Type, e.Size, e.ModTime.Unix(), e.ThumbID, yearArg)
+		_, _ = stmt.Exec(e.Path, e.Type, e.Size, e.ModTime.Unix(), e.ThumbID, yearArg, e.DurationMs)
 		*out = append(*out, e)
 	}
 	_ = tx.Commit()
@@ -281,7 +292,7 @@ func (i *Index) ListDir(dir string) []Entry {
 	).Scan(&estimate)
 
 	rows, err := i.db.Query(
-		"SELECT path, type, size, mtime, thumb_id, favorite FROM entries WHERE (path >= ? AND path < ?) OR path = ? ORDER BY path",
+		"SELECT path, type, size, mtime, thumb_id, favorite, duration_ms FROM entries WHERE (path >= ? AND path < ?) OR path = ? ORDER BY path",
 		lower, upper, dir,
 	)
 	if err != nil {
@@ -294,7 +305,7 @@ func (i *Index) ListDir(dir string) []Entry {
 		var e Entry
 		var mtimeUnix int64
 		var fav int
-		if err := rows.Scan(&e.Path, &e.Type, &e.Size, &mtimeUnix, &e.ThumbID, &fav); err == nil {
+		if err := rows.Scan(&e.Path, &e.Type, &e.Size, &mtimeUnix, &e.ThumbID, &fav, &e.DurationMs); err == nil {
 			e.ModTime = time.Unix(mtimeUnix, 0)
 			e.Favorite = fav != 0
 			out = append(out, e)
@@ -408,7 +419,7 @@ func (i *Index) Years(filter string, showRAW bool) []YearStat {
 func (i *Index) ListByYear(year int, filter string, showRAW bool) []Entry {
 
 	where, args := typeFilterClause(filter, showRAW)
-	q := "SELECT path, type, size, mtime, thumb_id, favorite FROM entries WHERE " + yearExpr + " = ?" + where + " ORDER BY path"
+	q := "SELECT path, type, size, mtime, thumb_id, favorite, duration_ms FROM entries WHERE " + yearExpr + " = ?" + where + " ORDER BY path"
 	queryArgs := append([]any{year}, args...)
 
 	rows, err := i.db.Query(q, queryArgs...)
@@ -422,7 +433,7 @@ func (i *Index) ListByYear(year int, filter string, showRAW bool) []Entry {
 		var e Entry
 		var mtimeUnix int64
 		var fav int
-		if err := rows.Scan(&e.Path, &e.Type, &e.Size, &mtimeUnix, &e.ThumbID, &fav); err != nil {
+		if err := rows.Scan(&e.Path, &e.Type, &e.Size, &mtimeUnix, &e.ThumbID, &fav, &e.DurationMs); err != nil {
 			continue
 		}
 		e.ModTime = time.Unix(mtimeUnix, 0)
@@ -506,7 +517,7 @@ func (i *Index) All() []Entry {
 	var estimate int
 	_ = i.db.QueryRow("SELECT COUNT(*) FROM entries").Scan(&estimate)
 
-	rows, err := i.db.Query("SELECT path, type, size, mtime, thumb_id, favorite FROM entries ORDER BY path")
+	rows, err := i.db.Query("SELECT path, type, size, mtime, thumb_id, favorite, duration_ms FROM entries ORDER BY path")
 	if err != nil {
 		return nil
 	}
@@ -517,7 +528,7 @@ func (i *Index) All() []Entry {
 		var e Entry
 		var mtimeUnix int64
 		var fav int
-		if err := rows.Scan(&e.Path, &e.Type, &e.Size, &mtimeUnix, &e.ThumbID, &fav); err == nil {
+		if err := rows.Scan(&e.Path, &e.Type, &e.Size, &mtimeUnix, &e.ThumbID, &fav, &e.DurationMs); err == nil {
 			e.ModTime = time.Unix(mtimeUnix, 0)
 			e.Favorite = fav != 0
 			out = append(out, e)
@@ -542,7 +553,7 @@ func (i *Index) ForEachEntry(visit func(Entry) bool) {
 	lastPath := ""
 	for {
 		rows, err := i.db.Query(
-			"SELECT path, type, size, mtime, thumb_id, favorite FROM entries WHERE path > ? ORDER BY path LIMIT ?",
+			"SELECT path, type, size, mtime, thumb_id, favorite, duration_ms FROM entries WHERE path > ? ORDER BY path LIMIT ?",
 			lastPath, pageSize)
 		if err != nil {
 			return
@@ -553,7 +564,7 @@ func (i *Index) ForEachEntry(visit func(Entry) bool) {
 			var e Entry
 			var mtimeUnix int64
 			var fav int
-			if err := rows.Scan(&e.Path, &e.Type, &e.Size, &mtimeUnix, &e.ThumbID, &fav); err != nil {
+			if err := rows.Scan(&e.Path, &e.Type, &e.Size, &mtimeUnix, &e.ThumbID, &fav, &e.DurationMs); err != nil {
 				continue
 			}
 			e.ModTime = time.Unix(mtimeUnix, 0)
@@ -578,7 +589,7 @@ func (i *Index) ListFavorites() []Entry {
 	var estimate int
 	_ = i.db.QueryRow("SELECT COUNT(*) FROM entries WHERE favorite = 1").Scan(&estimate)
 
-	rows, err := i.db.Query("SELECT path, type, size, mtime, thumb_id, favorite FROM entries WHERE favorite = 1 ORDER BY path")
+	rows, err := i.db.Query("SELECT path, type, size, mtime, thumb_id, favorite, duration_ms FROM entries WHERE favorite = 1 ORDER BY path")
 	if err != nil {
 		return nil
 	}
@@ -589,7 +600,7 @@ func (i *Index) ListFavorites() []Entry {
 		var e Entry
 		var mtimeUnix int64
 		var fav int
-		if err := rows.Scan(&e.Path, &e.Type, &e.Size, &mtimeUnix, &e.ThumbID, &fav); err == nil {
+		if err := rows.Scan(&e.Path, &e.Type, &e.Size, &mtimeUnix, &e.ThumbID, &fav, &e.DurationMs); err == nil {
 			e.ModTime = time.Unix(mtimeUnix, 0)
 			e.Favorite = fav != 0
 			out = append(out, e)

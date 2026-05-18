@@ -293,9 +293,9 @@ func (i *Index) GetEntry(path string) (Entry, bool) {
 	var mtimeUnix int64
 	var fav int
 	err := i.db.QueryRow(
-		"SELECT path, type, size, mtime, thumb_id, favorite FROM entries WHERE path = ?",
+		"SELECT path, type, size, mtime, thumb_id, favorite, duration_ms FROM entries WHERE path = ?",
 		path,
-	).Scan(&e.Path, &e.Type, &e.Size, &mtimeUnix, &e.ThumbID, &fav)
+	).Scan(&e.Path, &e.Type, &e.Size, &mtimeUnix, &e.ThumbID, &fav, &e.DurationMs)
 	if err != nil {
 		return Entry{}, false
 	}

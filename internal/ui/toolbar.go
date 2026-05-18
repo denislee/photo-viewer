@@ -30,6 +30,7 @@ type Toolbar struct {
 	videosBtn     widget.Clickable
 	rawBtn        widget.Clickable
 	yearsBtn      widget.Clickable
+	sortDurBtn    widget.Clickable
 	importBtn     widget.Clickable
 	duplicatesBtn widget.Clickable
 	settingsBtn   widget.Clickable
@@ -37,9 +38,10 @@ type Toolbar struct {
 	rebuildBtn    widget.Clickable
 	warmUpBtn     widget.Clickable
 
-	OnFilter      func(string)
-	OnShowRAW     func(bool)
-	OnGroupByYear func(bool)
+	OnFilter        func(string)
+	OnShowRAW       func(bool)
+	OnGroupByYear   func(bool)
+	OnSortByLength  func(bool)
 	OnImport      func()
 	OnDuplicates  func()
 	OnOrganize    func()
@@ -49,9 +51,10 @@ type Toolbar struct {
 
 	// State mirrored from the controller; the active filter button is
 	// rendered with the accent background so it stands out.
-	Filter      string
-	ShowRAW     bool
-	GroupByYear bool
+	Filter        string
+	ShowRAW       bool
+	GroupByYear   bool
+	SortByLength  bool
 	// AnyProcess is true while the process bar has at least one in-flight
 	// task. Used to disable buttons (Rebuild) that would conflict with an
 	// already-running job.
@@ -101,6 +104,12 @@ func (t *Toolbar) Layout(gtx layout.Context, th *Theme, path string, count int) 
 		t.GroupByYear = !t.GroupByYear
 		if t.OnGroupByYear != nil {
 			t.OnGroupByYear(t.GroupByYear)
+		}
+	}
+	if t.sortDurBtn.Clicked(gtx) {
+		t.SortByLength = !t.SortByLength
+		if t.OnSortByLength != nil {
+			t.OnSortByLength(t.SortByLength)
 		}
 	}
 	if t.importBtn.Clicked(gtx) && t.OnImport != nil {
@@ -181,6 +190,8 @@ func (t *Toolbar) Layout(gtx layout.Context, th *Theme, path string, count int) 
 			icon(&t.rawBtn, th.Icons.RAW, rawTooltip(t.ShowRAW), t.ShowRAW, false),
 			layout.Rigid(layout.Spacer{Width: unit.Dp(2)}.Layout),
 			icon(&t.yearsBtn, th.Icons.Years, yearsTooltip(t.GroupByYear), t.GroupByYear, false),
+			layout.Rigid(layout.Spacer{Width: unit.Dp(2)}.Layout),
+			icon(&t.sortDurBtn, th.Icons.SortDur, sortDurTooltip(t.SortByLength), t.SortByLength, false),
 
 			groupSep(th),
 
@@ -331,4 +342,11 @@ func yearsTooltip(on bool) string {
 		return "Year grouping on — click to disable"
 	}
 	return "Group date folders by year"
+}
+
+func sortDurTooltip(on bool) string {
+	if on {
+		return "Sorted by video length — click to sort by name"
+	}
+	return "Sort by video length (longest first)"
 }

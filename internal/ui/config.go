@@ -28,6 +28,10 @@ type Config struct {
 	// ShowShortcutHints toggles the bottom keyboard-shortcut helper strip.
 	// Defaults to false (hidden) — power users can opt in from Settings.
 	ShowShortcutHints bool `json:"show_shortcut_hints"`
+	// SortMode controls the grid ordering. Values: "name" (default — path
+	// ascending) or "duration" (video length descending, with non-videos
+	// pushed to the end ordered by path).
+	SortMode string `json:"sort_mode"`
 }
 
 var (

@@ -21,6 +21,7 @@ type IconSet struct {
 	WarmUp     *widget.Icon
 	Settings   *widget.Icon
 	Star       *widget.Icon
+	SortDur    *widget.Icon
 }
 
 func newIconSet() *IconSet {
@@ -41,5 +42,6 @@ func newIconSet() *IconSet {
 		WarmUp:     mk(icons.ActionTrendingUp),
 		Settings:   mk(icons.ActionSettings),
 		Star:       mk(icons.ToggleStar),
+		SortDur:    mk(icons.AVAVTimer),
 	}
 }

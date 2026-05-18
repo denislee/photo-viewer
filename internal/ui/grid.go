@@ -435,7 +435,7 @@ func drawCell(gtx layout.Context, th *Theme, e cache.Entry, tc *thumbCache, clic
 			drawSelectionBadge(gtx, th, rect)
 		}
 		if e.Type == scan.TypeVideo {
-			drawVideoBadge(gtx, th, rect)
+			drawVideoBadge(gtx, th, rect, e.DurationMs)
 		}
 
 		return layout.Dimensions{Size: rect.Max}
@@ -509,7 +509,7 @@ func drawSelectionBadge(gtx layout.Context, th *Theme, cell image.Rectangle) {
 	stack.Pop()
 }
 
-func drawVideoBadge(gtx layout.Context, th *Theme, cell image.Rectangle) {
+func drawVideoBadge(gtx layout.Context, th *Theme, cell image.Rectangle, durationMs int64) {
 	pad := gtx.Dp(favoriteBadgeInset)
 	size := gtx.Dp(favoriteBadgeSize)
 	x1 := cell.Max.X - pad
@@ -533,6 +533,108 @@ func drawVideoBadge(gtx layout.Context, th *Theme, cell image.Rectangle) {
 		return lbl.Layout(gtx)
 	})
 	stack.Pop()
+
+	if durationMs > 0 {
+		drawDurationBadge(gtx, th, cell, x0, y1, formatDuration(durationMs))
+	}
+}
+
+// drawDurationBadge renders a small "MM:SS" pill in the bottom-left of the
+// cell, immediately to the left of the ▶ play badge. badgeLeftX is the left
+// edge of the play badge so the duration pill butts up against it with a
+// small gap. bottomY is the bottom edge shared with the play badge.
+func drawDurationBadge(gtx layout.Context, th *Theme, cell image.Rectangle, badgeLeftX, bottomY int, text string) {
+	pad := gtx.Dp(favoriteBadgeInset)
+	size := gtx.Dp(favoriteBadgeSize)
+	hGap := gtx.Dp(unit.Dp(4))
+
+	// Measure label first so the pill hugs the text width.
+	macro := op.Record(gtx.Ops)
+	mgtx := gtx
+	mgtx.Constraints.Min = image.Point{}
+	mgtx.Constraints.Max.X = cell.Dx()
+	lbl := material.Label(th.Theme, unit.Sp(11), text)
+	lbl.Color = th.Foreground
+	lbl.MaxLines = 1
+	lblDims := lbl.Layout(mgtx)
+	labelCall := macro.Stop()
+
+	padX := gtx.Dp(unit.Dp(6))
+	pillH := size
+	pillW := lblDims.Size.X + padX*2
+
+	x1 := badgeLeftX - hGap
+	x0 := x1 - pillW
+	if x0 < cell.Min.X+pad {
+		// Not enough room in the cell — fall back to drawing inside the play
+		// badge column. Shrink rather than overlap.
+		x0 = cell.Min.X + pad
+		if x1 <= x0 {
+			x1 = x0 + pillW
+		}
+	}
+	y1 := bottomY
+	y0 := y1 - pillH
+	rect := image.Rect(x0, y0, x1, y1)
+
+	ca := clip.UniformRRect(rect, gtx.Dp(unit.Dp(4))).Push(gtx.Ops)
+	paint.ColorOp{Color: favoriteShadow}.Add(gtx.Ops)
+	paint.PaintOp{}.Add(gtx.Ops)
+	ca.Pop()
+
+	textY := y0 + (pillH-lblDims.Size.Y)/2
+	if textY < y0 {
+		textY = y0
+	}
+	stack := op.Offset(image.Pt(x0+padX, textY)).Push(gtx.Ops)
+	labelCall.Add(gtx.Ops)
+	stack.Pop()
+}
+
+// formatDuration renders milliseconds as M:SS, MM:SS, or H:MM:SS.
+func formatDuration(ms int64) string {
+	if ms <= 0 {
+		return ""
+	}
+	total := ms / 1000
+	if ms%1000 >= 500 {
+		total++
+	}
+	h := total / 3600
+	m := (total % 3600) / 60
+	s := total % 60
+	if h > 0 {
+		return fmtDur3(h, m, s)
+	}
+	return fmtDur2(m, s)
+}
+
+func fmtDur2(m, s int64) string {
+	buf := [5]byte{'0', '0', ':', '0', '0'}
+	buf[0] = byte('0' + m/10)
+	buf[1] = byte('0' + m%10)
+	buf[3] = byte('0' + s/10)
+	buf[4] = byte('0' + s%10)
+	if m < 10 {
+		return string(buf[1:])
+	}
+	return string(buf[:])
+}
+
+func fmtDur3(h, m, s int64) string {
+	// H:MM:SS — hours can be multi-digit for very long files.
+	hs := []byte{}
+	if h == 0 {
+		hs = append(hs, '0')
+	} else {
+		for h > 0 {
+			hs = append([]byte{byte('0' + h%10)}, hs...)
+			h /= 10
+		}
+	}
+	out := append(hs, ':')
+	out = append(out, byte('0'+m/10), byte('0'+m%10), ':', byte('0'+s/10), byte('0'+s%10))
+	return string(out)
 }
 
 // drawBorder strokes a rectangular border `width` px thick on the inside of

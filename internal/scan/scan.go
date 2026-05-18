@@ -16,6 +16,10 @@ type Result struct {
 	Type    MediaType
 	Size    int64
 	ModTime time.Time
+	// DurationMs is the playback length in milliseconds for videos. 0 when
+	// the file is not a video, or when probing failed (e.g. ffprobe missing
+	// or corrupt file). Probed lazily in the scan workers.
+	DurationMs int64
 }
 
 // Walk emits a Result for each media file under root and all its subdirectories.
@@ -50,6 +54,9 @@ func Walk(ctx context.Context, root string) <-chan Result {
 						Type:    w.t,
 						Size:    info.Size(),
 						ModTime: info.ModTime(),
+					}
+					if w.t == TypeVideo {
+						r.DurationMs = probeVideoDurationMs(ctx, w.path)
 					}
 					select {
 					case out <- r:
