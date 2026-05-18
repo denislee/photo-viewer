@@ -21,6 +21,11 @@ import (
 // directory) when the controller's currentDir equals this value.
 const FavoritesView = "\x00favorites"
 
+// TrashView is the sentinel currentDir used to render the soft-deleted items
+// living in the trash directory. The sidebar shows a synthetic "Trash" row
+// that selects it.
+const TrashView = "\x00trash"
+
 // Sort modes accepted in Config.SortMode and Controller.sortMode.
 const (
 	SortByName     = "name"
@@ -44,6 +49,7 @@ const YearViewPrefix = "\x00year:"
 type Controller struct {
 	libraryRoot string
 	cacheDir    string
+	trashDir    string
 	index       *cache.Index
 	store       *cache.ThumbStore
 
@@ -110,9 +116,11 @@ type Controller struct {
 }
 
 func NewController(root string, idx *cache.Index, store *cache.ThumbStore, cacheDir string) *Controller {
+	trashDir, _ := cache.TrashDir(root, cacheDir)
 	c := &Controller{
 		libraryRoot:   root,
 		cacheDir:      cacheDir,
+		trashDir:      trashDir,
 		index:         idx,
 		store:         store,
 		treeDir:       root,
@@ -173,15 +181,15 @@ func (c *Controller) DirCounts() map[string]int {
 // scan. Both the grid and the sidebar tree re-anchor on path. Safe to call
 // from any goroutine.
 func (c *Controller) SelectDir(path string) {
-	if path == FavoritesView {
+	if path == FavoritesView || path == TrashView {
 		c.mu.Lock()
 		if c.scanCancel != nil {
 			c.scanCancel()
 			c.scanCancel = nil
 		}
-		c.currentDir = FavoritesView
+		c.currentDir = path
 		c.mu.Unlock()
-		c.scheduleRefresh(FavoritesView)
+		c.scheduleRefresh(path)
 		return
 	}
 	c.mu.Lock()
@@ -371,21 +379,139 @@ func (c *Controller) PreviewYear(year string, dirs []string) {
 	c.scheduleRefresh(key)
 }
 
-// DeletePath removes path from disk, drops its row from the index, and
-// forgets its thumbnail. The active view is refreshed so the deletion is
-// visible immediately. Returns any error encountered while removing the
-// file from disk; index/thumb cleanup happens regardless.
+// DeletePath soft-deletes path: it atomically renames the file into the
+// trash dir (which lives on the same filesystem as the library, so the move
+// is O(1) regardless of file size), drops its row from the index, and
+// transfers its thumbnail to the new path's id so the Trash view can show
+// it without regenerating. The active view is refreshed so the deletion is
+// visible immediately. If the rename fails for any reason — including the
+// trash dir living on a different filesystem — we fall back to an
+// asynchronous os.Remove so the UI still updates instantly. Use EmptyTrash
+// to actually free the disk space later.
+//
+// When path is itself already inside the trash dir, DeletePath performs an
+// actual unlink (and forgets the thumbnail) — i.e. the user is permanently
+// removing one item from the trash. Useful for clearing individual items
+// without emptying the whole trash.
+//
+// Returns any error encountered while moving/removing the file; index/thumb
+// cleanup and the refresh happen regardless.
 func (c *Controller) DeletePath(path string) error {
 	if path == "" {
 		return nil
 	}
-	err := os.Remove(path)
+
+	if c.isInTrash(path) {
+		// Inside the Trash view, the "delete" gesture is repurposed as
+		// "restore" — the only way to permanently delete is Empty Trash.
+		// This matches the convention every desktop file manager uses.
+		restored, err := cache.RestoreFromTrash(path, c.store)
+		if err != nil {
+			log.Printf("trash: restore failed for %s: %v", path, err)
+			c.scheduleRefresh(c.activeDir())
+			return err
+		}
+		// Put the restored entry back in the index so it shows up in its
+		// original directory without waiting for a rescan. Stat-based —
+		// duration/etc. will get backfilled on the next scan if needed.
+		if info, sErr := os.Stat(restored); sErr == nil {
+			c.index.ReconcileBatch([]scan.Result{{
+				Path:    restored,
+				Type:    scan.DetectType(restored),
+				Size:    info.Size(),
+				ModTime: info.ModTime(),
+			}})
+		}
+		c.scheduleRefresh(c.activeDir())
+		return nil
+	}
+
 	_ = c.index.RemoveEntry(path)
+	c.scheduleRefresh(c.activeDir())
+
+	if c.trashDir != "" {
+		dst, err := cache.MoveToTrash(path, c.trashDir)
+		if err == nil {
+			// Carry the thumbnail over to the new path's id so the Trash
+			// view doesn't regenerate it. Best-effort — generation will
+			// just rerun on demand if rename fails.
+			if c.store != nil {
+				_ = c.store.Rename(cache.ThumbIDFor(path), cache.ThumbIDFor(dst))
+			}
+			return nil
+		}
+		log.Printf("trash: rename failed for %s (%v); falling back to async remove", path, err)
+	}
 	if c.store != nil {
 		c.store.Forget(cache.ThumbIDFor(path))
 	}
-	c.scheduleRefresh(c.activeDir())
-	return err
+	var rerr error
+	go func() {
+		if rmErr := os.Remove(path); rmErr != nil && !os.IsNotExist(rmErr) {
+			log.Printf("trash: async remove failed for %s: %v", path, rmErr)
+		}
+	}()
+	return rerr
+}
+
+// isInTrash reports whether path lives under the trash dir. Used so a
+// "delete" gesture inside the Trash view permanently removes the item
+// instead of trying to soft-delete it (which would be a no-op rename onto
+// itself).
+func (c *Controller) isInTrash(path string) bool {
+	if c.trashDir == "" {
+		return false
+	}
+	abs, err := filepath.Abs(path)
+	if err != nil {
+		abs = path
+	}
+	prefix := c.trashDir + string(filepath.Separator)
+	return strings.HasPrefix(abs, prefix)
+}
+
+// TrashDir returns the directory where soft-deleted files live, or "" if no
+// writable location was found at startup.
+func (c *Controller) TrashDir() string { return c.trashDir }
+
+// TrashStats reports the number of items and total bytes currently in the
+// trash. Safe to call from the UI goroutine — it's a cheap stat walk.
+func (c *Controller) TrashStats() (count int, bytes int64) {
+	return cache.TrashStats(c.trashDir)
+}
+
+// EmptyTrash permanently removes every item in the trash dir along with
+// each item's cached thumbnail. Runs on a background goroutine so the UI
+// isn't blocked by large files; done is invoked on that goroutine once the
+// wipe finishes (nil if no callback is wanted).
+func (c *Controller) EmptyTrash(done func(count int, bytes int64, err error)) {
+	dir := c.trashDir
+	if dir == "" {
+		if done != nil {
+			done(0, 0, nil)
+		}
+		return
+	}
+	go func() {
+		// Forget thumbnails first so we don't leak them when the source
+		// files are gone. List before wiping; the entries' ThumbIDs are
+		// derived from the trash paths themselves.
+		if c.store != nil {
+			for _, e := range cache.ListTrash(dir) {
+				c.store.Forget(e.ThumbID)
+			}
+		}
+		count, bytes, err := cache.EmptyTrash(dir)
+		// The trash view (if currently shown) needs a refresh so the now-
+		// empty list reflects on screen.
+		c.scheduleRefresh(c.activeDir())
+		if done != nil {
+			done(count, bytes, err)
+		}
+		if c.invalidate != nil {
+			c.invalidate()
+		}
+	}()
 }
 
 // ToggleFavorite flips the favorite flag for path and refreshes the active
@@ -438,6 +564,8 @@ func (c *Controller) refreshFromIndex(dir string) {
 	switch {
 	case dir == FavoritesView:
 		entries = c.index.ListFavorites()
+	case dir == TrashView:
+		entries = cache.ListTrash(c.trashDir)
 	case strings.HasPrefix(dir, YearViewPrefix):
 		c.mu.Lock()
 		yearDirs := append([]string(nil), c.yearPreviewDirs...)
@@ -478,7 +606,7 @@ func (c *Controller) refreshFromIndex(dir string) {
 	sortEntries(filtered, sortMode)
 
 	// Avoid running listSubdirs (filesystem I/O) under the mutex.
-	wantSubdirs := treeDir == dir && dir != FavoritesView
+	wantSubdirs := treeDir == dir && dir != FavoritesView && dir != TrashView
 	var subs []string
 	if wantSubdirs {
 		subs = listSubdirs(dir)
@@ -507,6 +635,10 @@ func (c *Controller) refreshFromIndex(dir string) {
 		}
 	}
 	counts[FavoritesView] = c.index.CountFavorites(filter, showRAW)
+	if c.trashDir != "" {
+		trashCount, _ := cache.TrashStats(c.trashDir)
+		counts[TrashView] = trashCount
+	}
 
 	c.mu.Lock()
 	if c.currentDir == dir {

@@ -30,6 +30,11 @@ type DuplicatesView struct {
 	store  *cache.ThumbStore
 	thumbs *thumbCache
 
+	// deleter is the soft-delete function (Controller.DeletePath when wired
+	// from window.go). Nil falls back to plain os.Remove for tests and
+	// stand-alone use of the view.
+	deleter func(path string) error
+
 	mu        sync.Mutex
 	hashing   bool
 	done      int
@@ -73,6 +78,33 @@ func NewDuplicatesView(idx *cache.Index, store *cache.ThumbStore, thumbs *thumbC
 // process bar so the user can pause / resume / cancel without keeping
 // the modal open.
 func (d *DuplicatesView) SetProcessRegistry(r *ProcessRegistry) { d.processes = r }
+
+// SetDeleter wires the soft-delete callback so duplicate-removal goes
+// through the same trash flow as keyboard delete (rename → trash dir,
+// instant UI update). Without it, deletions fall back to a direct unlink.
+func (d *DuplicatesView) SetDeleter(f func(path string) error) { d.deleter = f }
+
+// removeOne soft-deletes path through the controller (if wired) or falls
+// back to a direct unlink, then drops the index row and forgets the thumb.
+// Returns true when the on-disk operation succeeded (or the file was
+// already gone) so the caller can keep the entry out of pruneMissing's
+// "live" list.
+func (d *DuplicatesView) removeOne(path string) bool {
+	var err error
+	if d.deleter != nil {
+		err = d.deleter(path)
+	} else {
+		err = os.Remove(path)
+		_ = d.idx.RemoveEntry(path)
+		if d.store != nil {
+			d.store.Forget(cache.ThumbIDFor(path))
+		}
+	}
+	if err != nil && !os.IsNotExist(err) {
+		return false
+	}
+	return true
+}
 
 // Show opens the overlay. If a hashing pass is already running (because a
 // previous Close just hid the window) the live state is preserved so the
@@ -323,14 +355,7 @@ func (d *DuplicatesView) deleteNewer() {
 		return
 	}
 	for _, v := range g.Entries[1:] {
-		err := os.Remove(v.Path)
-		if err != nil && !os.IsNotExist(err) {
-			continue
-		}
-		_ = d.idx.RemoveEntry(v.Path)
-		if d.store != nil {
-			d.store.Forget(cache.ThumbIDFor(v.Path))
-		}
+		d.removeOne(v.Path)
 	}
 	groups := d.pruneMissing(d.idx.FindDuplicates())
 	d.mu.Lock()
@@ -357,14 +382,7 @@ func (d *DuplicatesView) deleteAllNewer() {
 			continue
 		}
 		for _, v := range g.Entries[1:] {
-			err := os.Remove(v.Path)
-			if err != nil && !os.IsNotExist(err) {
-				continue
-			}
-			_ = d.idx.RemoveEntry(v.Path)
-			if d.store != nil {
-				d.store.Forget(cache.ThumbIDFor(v.Path))
-			}
+			d.removeOne(v.Path)
 		}
 	}
 	newGroups := d.pruneMissing(d.idx.FindDuplicates())

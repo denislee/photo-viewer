@@ -22,6 +22,7 @@ type IconSet struct {
 	Settings   *widget.Icon
 	Star       *widget.Icon
 	SortDur    *widget.Icon
+	Trash      *widget.Icon
 }
 
 func newIconSet() *IconSet {
@@ -43,5 +44,6 @@ func newIconSet() *IconSet {
 		Settings:   mk(icons.ActionSettings),
 		Star:       mk(icons.ToggleStar),
 		SortDur:    mk(icons.AVAVTimer),
+		Trash:      mk(icons.ActionDelete),
 	}
 }

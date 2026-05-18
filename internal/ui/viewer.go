@@ -44,6 +44,12 @@ type Viewer struct {
 	// true, Enter triggers the deletion and Esc/Ctrl+[ dismiss.
 	Confirming bool
 
+	// InTrash is set by the window each frame to mirror whether the active
+	// view is the Trash sentinel. When true, the confirm modal copy flips
+	// to "Restore this file from trash?" since DeletePath repurposes the
+	// keybind as Restore for trash items.
+	InTrash bool
+
 	entries []cache.Entry
 
 	loadedPath       string
@@ -418,16 +424,18 @@ func (v *Viewer) Layout(gtx layout.Context, th *Theme, tc *thumbCache) layout.Di
 	}
 
 	if v.Confirming {
-		drawDeleteConfirm(gtx, th, filepath.Base(e.Path), rect)
+		drawDeleteConfirm(gtx, th, filepath.Base(e.Path), rect, v.InTrash)
 	}
 
 	clipArea.Pop()
 	return layout.Dimensions{Size: size}
 }
 
-// drawDeleteConfirm dims rect and centers a delete-confirmation box showing
+// drawDeleteConfirm dims rect and centers a confirmation box showing
 // filename and the available shortcuts. Shared between the viewer and grid.
-func drawDeleteConfirm(gtx layout.Context, th *Theme, filename string, rect image.Rectangle) {
+// When restore is true the prompt asks about restoring an item out of the
+// trash instead of deleting it, since the same key binding handles both.
+func drawDeleteConfirm(gtx layout.Context, th *Theme, filename string, rect image.Rectangle, restore bool) {
 	dimStack := clip.Rect(rect).Push(gtx.Ops)
 	paint.ColorOp{Color: color.NRGBA{A: 0xb0}}.Add(gtx.Ops)
 	paint.PaintOp{}.Add(gtx.Ops)
@@ -445,7 +453,11 @@ func drawDeleteConfirm(gtx layout.Context, th *Theme, filename string, rect imag
 	innerGtx.Constraints.Min = image.Pt(boxW-pad*2, 0)
 	contentDims := layout.Flex{Axis: layout.Vertical, Spacing: layout.SpaceEnd}.Layout(innerGtx,
 		layout.Rigid(func(gtx layout.Context) layout.Dimensions {
-			lbl := material.Label(th.Theme, unit.Sp(15), "Delete this file?")
+			title := "Delete this file?"
+			if restore {
+				title = "Restore this file from trash?"
+			}
+			lbl := material.Label(th.Theme, unit.Sp(15), title)
 			lbl.Color = th.Foreground
 			lbl.Font.Weight = 700
 			return lbl.Layout(gtx)
@@ -459,7 +471,11 @@ func drawDeleteConfirm(gtx layout.Context, th *Theme, filename string, rect imag
 		}),
 		layout.Rigid(layout.Spacer{Height: unit.Dp(14)}.Layout),
 		layout.Rigid(func(gtx layout.Context) layout.Dimensions {
-			lbl := material.Label(th.Theme, unit.Sp(12), "Enter to delete    Esc / Ctrl+[ to cancel")
+			hint := "Enter to delete    Esc / Ctrl+[ to cancel"
+			if restore {
+				hint = "Enter to restore    Esc / Ctrl+[ to cancel"
+			}
+			lbl := material.Label(th.Theme, unit.Sp(12), hint)
 			lbl.Color = th.Muted
 			return lbl.Layout(gtx)
 		}),

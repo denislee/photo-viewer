@@ -51,6 +51,7 @@ func Run(w *app.Window, ctrl *Controller) error {
 	viewer := &Viewer{ShowInfo: true}
 	viewer.SetInvalidate(w.Invalidate)
 	dups := NewDuplicatesView(ctrl.Index(), ctrl.Store(), ctrl.Thumbs(), w.Invalidate)
+	dups.SetDeleter(ctrl.DeletePath)
 	imports := NewImportView(w.Invalidate)
 	organize := NewOrganizeView(w.Invalidate)
 
@@ -79,6 +80,7 @@ func Run(w *app.Window, ctrl *Controller) error {
 	}
 	settings := NewSettingsView()
 	settings.SetInvalidate(w.Invalidate)
+	settings.SetController(ctrl)
 	sdPrompt := &SDPromptView{}
 	sdWatcher := NewSDCardWatcher(w.Invalidate)
 	sdWatcher.Start()
@@ -998,6 +1000,7 @@ func drawRoot(gtx layout.Context, th *Theme, ctrl *Controller, tb *Toolbar, sb *
 		gtx2 := gtx
 		gtx2.Constraints.Max = image.Pt(totalW, totalH-sbH)
 		gtx2.Constraints.Min = image.Pt(totalW, totalH-sbH)
+		v.InTrash = currentDir == TrashView
 		v.Layout(gtx2, th, ctrl.Thumbs())
 		drawShortcut()
 		return
@@ -1014,6 +1017,8 @@ func drawRoot(gtx layout.Context, th *Theme, ctrl *Controller, tb *Toolbar, sb *
 		switch {
 		case dispDir == FavoritesView:
 			dispDir = "Favorites"
+		case dispDir == TrashView:
+			dispDir = "Trash"
 		case strings.HasPrefix(dispDir, YearViewPrefix):
 			dispDir = "Year " + strings.TrimPrefix(dispDir, YearViewPrefix)
 		}
@@ -1075,7 +1080,7 @@ func drawRoot(gtx layout.Context, th *Theme, ctrl *Controller, tb *Toolbar, sb *
 		gtx2 := gtx
 		gtx2.Constraints.Max = image.Pt(totalW, totalH-sbH)
 		gtx2.Constraints.Min = image.Pt(totalW, totalH-sbH)
-		drawDeleteConfirm(gtx2, th, filepath.Base(g.ConfirmPath), image.Rectangle{Max: gtx2.Constraints.Max})
+		drawDeleteConfirm(gtx2, th, filepath.Base(g.ConfirmPath), image.Rectangle{Max: gtx2.Constraints.Max}, currentDir == TrashView)
 	}
 
 	drawProcBar()

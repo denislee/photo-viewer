@@ -1,6 +1,7 @@
 package ui
 
 import (
+	"fmt"
 	"sync"
 
 	"gioui.org/layout"
@@ -22,14 +23,25 @@ type SettingsView struct {
 	outboxBrowseBtn widget.Clickable
 	saveBtn         widget.Clickable
 	closeBtn        widget.Clickable
+	emptyTrashBtn   widget.Clickable
 	sdAutoDetect    widget.Bool
 	showShortcuts   widget.Bool
 
+	// ctrl is wired by window.go so the Empty Trash button can read trash
+	// stats and trigger the wipe. Optional — when nil, the trash row is
+	// hidden.
+	ctrl *Controller
+
 	mu        sync.Mutex
 	statusMsg string
+	trashMsg  string
 
 	invalidate func()
 }
+
+// SetController gives the settings view a handle to the controller for
+// trash management. Call once at startup.
+func (v *SettingsView) SetController(c *Controller) { v.ctrl = c }
 
 // SetInvalidate registers the redraw callback so background folder-picker
 // goroutines can refresh the editors after the user picks a path.
@@ -51,7 +63,34 @@ func (v *SettingsView) Show() {
 	v.sdAutoDetect.Value = c.SDCardAutoDetect
 	v.showShortcuts.Value = c.ShowShortcutHints
 	v.statusMsg = "Config file: " + configPath()
+	v.trashMsg = v.trashStatus()
 	v.Open = true
+}
+
+// trashStatus formats the current trash usage for display next to the Empty
+// Trash button. Returns "" when no controller is wired.
+func (v *SettingsView) trashStatus() string {
+	if v.ctrl == nil {
+		return ""
+	}
+	count, bytes := v.ctrl.TrashStats()
+	if count == 0 {
+		return "Trash is empty"
+	}
+	return fmt.Sprintf("Trash: %d item(s), %s", count, humanBytes(bytes))
+}
+
+func humanBytes(n int64) string {
+	const unit = 1024
+	if n < unit {
+		return fmt.Sprintf("%d B", n)
+	}
+	div, exp := int64(unit), 0
+	for x := n / unit; x >= unit; x /= unit {
+		div *= unit
+		exp++
+	}
+	return fmt.Sprintf("%.1f %ciB", float64(n)/float64(div), "KMGTPE"[exp])
 }
 
 // Close hides the modal.
@@ -97,6 +136,25 @@ func (v *SettingsView) Layout(gtx layout.Context, th *Theme) layout.Dimensions {
 		c.ShowShortcutHints = v.showShortcuts.Value
 		_ = SaveConfig(c)
 	}
+	if v.emptyTrashBtn.Clicked(gtx) && v.ctrl != nil {
+		v.mu.Lock()
+		v.trashMsg = "Emptying trash..."
+		v.mu.Unlock()
+		v.ctrl.EmptyTrash(func(count int, bytes int64, err error) {
+			v.mu.Lock()
+			if err != nil {
+				v.trashMsg = fmt.Sprintf("Empty trash failed: %v", err)
+			} else if count == 0 {
+				v.trashMsg = "Trash is empty"
+			} else {
+				v.trashMsg = fmt.Sprintf("Wiped %d item(s), freed %s", count, humanBytes(bytes))
+			}
+			v.mu.Unlock()
+			if v.invalidate != nil {
+				v.invalidate()
+			}
+		})
+	}
 
 	drawBackground(gtx, th.Background)
 
@@ -133,6 +191,8 @@ func (v *SettingsView) Layout(gtx layout.Context, th *Theme) layout.Dimensions {
 				return cb.Layout(gtx)
 			}),
 			layout.Rigid(layout.Spacer{Height: unit.Dp(16)}.Layout),
+			layout.Rigid(v.trashRow(th)),
+			layout.Rigid(layout.Spacer{Height: unit.Dp(16)}.Layout),
 			layout.Rigid(func(gtx layout.Context) layout.Dimensions {
 				return layout.Flex{Axis: layout.Horizontal}.Layout(gtx,
 					layout.Rigid(material.Button(th.Theme, &v.saveBtn, "Save").Layout),
@@ -142,6 +202,42 @@ func (v *SettingsView) Layout(gtx layout.Context, th *Theme) layout.Dimensions {
 			}),
 		)
 	})
+}
+
+// trashRow draws the trash status label next to an Empty Trash button.
+// Hidden when no controller is wired.
+func (v *SettingsView) trashRow(th *Theme) layout.Widget {
+	return func(gtx layout.Context) layout.Dimensions {
+		if v.ctrl == nil {
+			return layout.Dimensions{}
+		}
+		v.mu.Lock()
+		msg := v.trashMsg
+		v.mu.Unlock()
+		if msg == "" {
+			msg = v.trashStatus()
+		}
+		return layout.Flex{Axis: layout.Vertical}.Layout(gtx,
+			layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+				lbl := material.Label(th.Theme, unit.Sp(12), "Deleted files (trash)")
+				lbl.Color = th.Foreground
+				lbl.Font.Weight = 700
+				return lbl.Layout(gtx)
+			}),
+			layout.Rigid(layout.Spacer{Height: unit.Dp(4)}.Layout),
+			layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+				return layout.Flex{Axis: layout.Horizontal, Alignment: layout.Middle}.Layout(gtx,
+					layout.Flexed(1, func(gtx layout.Context) layout.Dimensions {
+						lbl := material.Label(th.Theme, unit.Sp(12), msg)
+						lbl.Color = th.Foreground
+						return lbl.Layout(gtx)
+					}),
+					layout.Rigid(layout.Spacer{Width: unit.Dp(6)}.Layout),
+					layout.Rigid(material.Button(th.Theme, &v.emptyTrashBtn, "Empty Trash").Layout),
+				)
+			}),
+		)
+	}
 }
 
 func (v *SettingsView) editorRow(th *Theme, label string, ed *widget.Editor, hint string, browse *widget.Clickable) layout.Widget {

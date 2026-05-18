@@ -144,3 +144,22 @@ func (s *ThumbStore) generate(ctx context.Context, e Entry, dst string) error {
 func (s *ThumbStore) Forget(id string) {
 	os.Remove(s.thumbPath(id))
 }
+
+// Rename moves the thumbnail file from oldID to newID, creating the
+// destination shard directory if needed. Used by the soft-delete flow so
+// trashed files keep their existing thumbnail without regeneration.
+// Missing source files are silently treated as success.
+func (s *ThumbStore) Rename(oldID, newID string) error {
+	if oldID == newID {
+		return nil
+	}
+	src := s.thumbPath(oldID)
+	if _, err := os.Stat(src); os.IsNotExist(err) {
+		return nil
+	}
+	dst := s.thumbPath(newID)
+	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
+		return err
+	}
+	return os.Rename(src, dst)
+}
