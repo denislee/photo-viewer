@@ -91,6 +91,7 @@ func Run(w *app.Window, ctrl *Controller) error {
 		w.Invalidate()
 	}
 	indexInfo := NewIndexInfoView(ctrl.IndexStatus)
+	webView := NewWebServerView(ctrl.WebServer())
 	search := NewFuzzySearchView(ctrl.Index())
 	search.OnPick = func(path string, isDir bool) {
 		_, prev, _, _ := ctrl.Snapshot()
@@ -162,6 +163,10 @@ func Run(w *app.Window, ctrl *Controller) error {
 	toolbar.OnWarmUp = func() {
 		ctrl.WarmUp()
 	}
+	toolbar.OnWebServer = func() {
+		webView.Show()
+		w.Invalidate()
+	}
 	toolbar.OnFilter = func(f string) {
 		ctrl.SetFilter(f)
 	}
@@ -205,12 +210,12 @@ func Run(w *app.Window, ctrl *Controller) error {
 			// If the watcher has a fresh removable device and we aren't
 			// already showing a modal, surface the prompt. The prompt only
 			// pops up when no other modal is active so it can't get buried.
-			if !sdPrompt.Open && !imports.Open && !dups.Open && !organize.Open && !settings.Open && !indexInfo.Open && !search.Open {
+			if !sdPrompt.Open && !imports.Open && !dups.Open && !organize.Open && !settings.Open && !indexInfo.Open && !search.Open && !webView.Open {
 				if dev, ok := sdWatcher.Consume(); ok {
 					sdPrompt.Show(dev)
 				}
 			}
-			handleKeys(gtx, ctrl, grid, sidebar, viewer, dups, imports, organize, settings, indexInfo, search, sdPrompt, &sidebarFocus, &focusSearch, w)
+			handleKeys(gtx, ctrl, grid, sidebar, viewer, dups, imports, organize, settings, indexInfo, search, sdPrompt, webView, &sidebarFocus, &focusSearch, w)
 			if focusSearch {
 				search.FocusEditor(gtx)
 				focusSearch = false
@@ -221,13 +226,14 @@ func Run(w *app.Window, ctrl *Controller) error {
 			toolbar.GroupByYear = GetConfig().GroupByYear
 			toolbar.SortByLength = ctrl.Sort() == SortByDuration
 			toolbar.AnyProcess = processes.Count() > 0
-			drawRoot(gtx, th, ctrl, toolbar, sidebar, grid, viewer, dups, imports, organize, settings, indexInfo, search, sdPrompt, processBar, splitter, sidebarFocus, w)
+			toolbar.WebServerRunning = webView.Running()
+			drawRoot(gtx, th, ctrl, toolbar, sidebar, grid, viewer, dups, imports, organize, settings, indexInfo, search, sdPrompt, webView, processBar, splitter, sidebarFocus, w)
 			e.Frame(gtx.Ops)
 		}
 	}
 }
 
-func handleKeys(gtx layout.Context, ctrl *Controller, grid *Grid, sidebar *Sidebar, viewer *Viewer, dups *DuplicatesView, imports *ImportView, organize *OrganizeView, settings *SettingsView, indexInfo *IndexInfoView, search *FuzzySearchView, sdPrompt *SDPromptView, sidebarFocus *bool, focusSearch *bool, w *app.Window) {
+func handleKeys(gtx layout.Context, ctrl *Controller, grid *Grid, sidebar *Sidebar, viewer *Viewer, dups *DuplicatesView, imports *ImportView, organize *OrganizeView, settings *SettingsView, indexInfo *IndexInfoView, search *FuzzySearchView, sdPrompt *SDPromptView, webView *WebServerView, sidebarFocus *bool, focusSearch *bool, w *app.Window) {
 	_, _, entries, _ := ctrl.Snapshot()
 	total := len(entries)
 
@@ -399,6 +405,19 @@ func handleKeys(gtx layout.Context, ctrl *Controller, grid *Grid, sidebar *Sideb
 		if sdPrompt.Open {
 			if ke.Name == key.NameEscape || ke.Name == "Q" {
 				sdPrompt.Close()
+				w.Invalidate()
+			}
+			continue
+		}
+		if webView.Open {
+			// Q would collide with the password editor, so only Esc /
+			// Ctrl+[ close the modal. Everything else falls through to the
+			// focused editor.
+			if ke.Name == key.NameEscape {
+				webView.Close()
+				w.Invalidate()
+			} else if ke.Name == "[" && ke.Modifiers.Contain(key.ModCtrl) {
+				webView.Close()
 				w.Invalidate()
 			}
 			continue
@@ -889,7 +908,7 @@ func handleSidebarKey(ke key.Event, sidebar *Sidebar, sidebarFocus *bool, w *app
 	}
 }
 
-func drawRoot(gtx layout.Context, th *Theme, ctrl *Controller, tb *Toolbar, sb *Sidebar, g *Grid, v *Viewer, dups *DuplicatesView, imports *ImportView, organize *OrganizeView, settings *SettingsView, indexInfo *IndexInfoView, search *FuzzySearchView, sdPrompt *SDPromptView, processBar *ProcessBar, splitter *sidebarSplitter, sidebarFocus bool, w *app.Window) {
+func drawRoot(gtx layout.Context, th *Theme, ctrl *Controller, tb *Toolbar, sb *Sidebar, g *Grid, v *Viewer, dups *DuplicatesView, imports *ImportView, organize *OrganizeView, settings *SettingsView, indexInfo *IndexInfoView, search *FuzzySearchView, sdPrompt *SDPromptView, webView *WebServerView, processBar *ProcessBar, splitter *sidebarSplitter, sidebarFocus bool, w *app.Window) {
 	rect := image.Rectangle{Max: gtx.Constraints.Max}
 	defer clip.Rect(rect).Push(gtx.Ops).Pop()
 	paint.ColorOp{Color: th.Background}.Add(gtx.Ops)
@@ -990,6 +1009,14 @@ func drawRoot(gtx layout.Context, th *Theme, ctrl *Controller, tb *Toolbar, sb *
 		gtx2.Constraints.Max = image.Pt(totalW, totalH-sbH)
 		gtx2.Constraints.Min = image.Pt(totalW, totalH-sbH)
 		sdPrompt.Layout(gtx2, th)
+		drawShortcut()
+		return
+	}
+	if webView.Open {
+		gtx2 := gtx
+		gtx2.Constraints.Max = image.Pt(totalW, totalH-sbH)
+		gtx2.Constraints.Min = image.Pt(totalW, totalH-sbH)
+		webView.Layout(gtx2, th)
 		drawShortcut()
 		return
 	}

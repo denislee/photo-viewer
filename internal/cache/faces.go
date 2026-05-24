@@ -360,6 +360,25 @@ func (i *Index) GetEntry(path string) (Entry, bool) {
 	return e, true
 }
 
+// GetEntryByThumbID returns the index row whose thumb_id matches id.
+// Used by the webserver to look up media by an opaque ID without exposing
+// filesystem paths to clients.
+func (i *Index) GetEntryByThumbID(id string) (Entry, bool) {
+	var e Entry
+	var mtimeUnix int64
+	var fav int
+	err := i.db.QueryRow(
+		"SELECT path, type, size, mtime, thumb_id, favorite, duration_ms FROM entries WHERE thumb_id = ? LIMIT 1",
+		id,
+	).Scan(&e.Path, &e.Type, &e.Size, &mtimeUnix, &e.ThumbID, &fav, &e.DurationMs)
+	if err != nil {
+		return Entry{}, false
+	}
+	e.ModTime = time.Unix(mtimeUnix, 0)
+	e.Favorite = fav != 0
+	return e, true
+}
+
 // WipeFaces drops every face row and cluster. Used by the rebuild path.
 func (i *Index) WipeFaces() error {
 	if _, err := i.db.Exec("DELETE FROM faces"); err != nil {

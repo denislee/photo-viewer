@@ -37,6 +37,7 @@ type Toolbar struct {
 	organizeBtn   widget.Clickable
 	rebuildBtn    widget.Clickable
 	warmUpBtn     widget.Clickable
+	webBtn        widget.Clickable
 
 	OnFilter       func(string)
 	OnShowRAW      func(bool)
@@ -48,6 +49,11 @@ type Toolbar struct {
 	OnSettings     func()
 	OnRebuild      func()
 	OnWarmUp       func()
+	OnWebServer    func()
+
+	// WebServerRunning, when true, renders the webserver button in the
+	// "active" accent so users can see at a glance that the server is up.
+	WebServerRunning bool
 
 	// State mirrored from the controller; the active filter button is
 	// rendered with the accent background so it stands out.
@@ -130,6 +136,9 @@ func (t *Toolbar) Layout(gtx layout.Context, th *Theme, path string, count int) 
 	if t.warmUpBtn.Clicked(gtx) && t.OnWarmUp != nil {
 		t.OnWarmUp()
 	}
+	if t.webBtn.Clicked(gtx) && t.OnWebServer != nil {
+		t.OnWebServer()
+	}
 
 	h := gtx.Dp(unit.Dp(toolbarHeightDp))
 	w := gtx.Constraints.Max.X
@@ -208,6 +217,8 @@ func (t *Toolbar) Layout(gtx layout.Context, th *Theme, path string, count int) 
 			icon(&t.rebuildBtn, th.Icons.Rebuild, "Rebuild index", false, t.AnyProcess),
 			layout.Rigid(layout.Spacer{Width: unit.Dp(2)}.Layout),
 			icon(&t.warmUpBtn, th.Icons.WarmUp, "Warm up thumbnails", false, false),
+			layout.Rigid(layout.Spacer{Width: unit.Dp(2)}.Layout),
+			icon(&t.webBtn, th.Icons.WebServer, webServerTooltip(t.WebServerRunning), t.WebServerRunning, false),
 
 			groupSep(th),
 
@@ -342,6 +353,13 @@ func yearsTooltip(on bool) string {
 		return "Year grouping on — click to disable"
 	}
 	return "Group date folders by year"
+}
+
+func webServerTooltip(on bool) string {
+	if on {
+		return "Web server running — click to manage"
+	}
+	return "Share library over the web"
 }
 
 func sortDurTooltip(on bool) string {

@@ -32,6 +32,16 @@ type Config struct {
 	// ascending) or "duration" (video length descending, with non-videos
 	// pushed to the end ordered by path).
 	SortMode string `json:"sort_mode"`
+
+	// WebServerPort is the TCP port used by the optional HTTP server that
+	// serves the indexed library to a browser. Zero means "use the default"
+	// (8080). The password is intentionally not persisted to disk to avoid
+	// stashing credentials in a plaintext config file.
+	WebServerPort int `json:"web_server_port"`
+	// WebServerBindAll, when true, binds the HTTP server to 0.0.0.0 so other
+	// hosts on the network can reach it. The default (false) binds to
+	// 127.0.0.1 only.
+	WebServerBindAll bool `json:"web_server_bind_all"`
 }
 
 var (

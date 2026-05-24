@@ -14,6 +14,7 @@ import (
 
 	"github.com/dns/photo-viewer/internal/cache"
 	"github.com/dns/photo-viewer/internal/scan"
+	"github.com/dns/photo-viewer/internal/webserver"
 )
 
 // FavoritesView is the sentinel "path" used by the sidebar's synthetic
@@ -121,6 +122,11 @@ type Controller struct {
 	// main-screen process bar. Optional — when nil, scan/warm-up just
 	// skip the registration calls.
 	processes *ProcessRegistry
+
+	// webserver is the optional HTTP server that serves the index to a
+	// browser. Lazily constructed when the user first opens the webserver
+	// modal so headless / unused sessions don't allocate it.
+	webserver *webserver.Server
 }
 
 func NewController(root string, idx *cache.Index, store *cache.ThumbStore, cacheDir string) *Controller {
@@ -154,6 +160,18 @@ func (c *Controller) SetInvalidate(f func()) { c.invalidate = f }
 // background scans and the thumbnail warm-up appear in the main-screen
 // process bar with pause / resume / cancel controls.
 func (c *Controller) SetProcessRegistry(r *ProcessRegistry) { c.processes = r }
+
+// WebServer lazily constructs and returns the controller's HTTP server.
+// The instance is reused across Start/Stop cycles so its state survives
+// the modal closing.
+func (c *Controller) WebServer() *webserver.Server {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.webserver == nil {
+		c.webserver = webserver.New(c.index, c.store, c.libraryRoot)
+	}
+	return c.webserver
+}
 
 // Snapshot returns a stable view of the current directory's entries and the
 // sidebar's tree anchor + its child directories. The slices must not be
