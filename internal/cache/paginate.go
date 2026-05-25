@@ -13,28 +13,32 @@ type View struct {
 	Kind    string // "all" | "favorites" | "year" | "dir"
 	Dir     string // absolute path; only for Kind == "dir"
 	Year    int    // only for Kind == "year"
-	Filter  string // "All" | "Photos" | "Videos" (year view only today)
-	ShowRAW bool   // year view only
+	Filter  string // "All" | "Photos" | "Videos"
+	ShowRAW bool   // when false, RAW entries are excluded
 }
 
 // whereClause renders the SQL WHERE fragment (without the leading "WHERE")
-// and the bound args for v.
+// and the bound args for v. The media-type filter (Filter + ShowRAW) is
+// applied to every kind so the web UI's toolbar toggles take effect in any
+// view.
 func (v View) whereClause() (string, []any) {
+	typeWhere, typeArgs := typeFilterClause(v.Filter, v.ShowRAW)
 	switch v.Kind {
 	case "favorites":
-		return "favorite = 1", nil
+		return "favorite = 1" + typeWhere, typeArgs
 	case "year":
-		typeWhere, typeArgs := typeFilterClause(v.Filter, v.ShowRAW)
 		args := []any{v.Year}
 		args = append(args, typeArgs...)
-		// typeFilterClause returns "" or " AND ...", so we strip its leading
-		// " AND " for the standalone clause and re-add it manually.
 		return yearExpr + " = ?" + typeWhere, args
 	case "dir":
 		lower, upper := dirRange(v.Dir)
-		return "((path >= ? AND path < ?) OR path = ?)", []any{lower, upper, v.Dir}
+		args := []any{lower, upper, v.Dir}
+		args = append(args, typeArgs...)
+		return "((path >= ? AND path < ?) OR path = ?)" + typeWhere, args
 	default: // "all"
-		return "1=1", nil
+		// typeFilterClause returns "" or " AND ...", so anchor with 1=1 so
+		// the filter slots in cleanly when set.
+		return "1=1" + typeWhere, typeArgs
 	}
 }
 
@@ -133,4 +137,3 @@ func scanEntries(rows *sql.Rows) []Entry {
 	}
 	return out
 }
-

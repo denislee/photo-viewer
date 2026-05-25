@@ -2,6 +2,7 @@ package webserver
 
 import (
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -90,9 +91,11 @@ func TestIndexPageIsBounded(t *testing.T) {
 	if resp.StatusCode != 200 {
 		t.Fatalf("status = %d", resp.StatusCode)
 	}
-	buf := make([]byte, 200000)
-	n, _ := resp.Body.Read(buf)
-	body := string(buf[:n])
+	raw, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body := string(raw)
 
 	// Expect at most pageSize cells in the initial render, even though
 	// the index holds 500 entries.
