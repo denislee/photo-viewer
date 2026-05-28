@@ -60,6 +60,7 @@ func shortcutHints(viewerOpen, sidebarFocus, selectionMode bool) []string {
 			"ctrl f/b: page",
 			"ctrl i: import",
 			"ctrl d: duplicates",
+			"ctrl e: export favorites",
 			",: settings",
 			"q: quit",
 		}

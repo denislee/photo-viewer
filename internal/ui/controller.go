@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/dns/photo-viewer/internal/cache"
+	"github.com/dns/photo-viewer/internal/export"
 	"github.com/dns/photo-viewer/internal/scan"
 	"github.com/dns/photo-viewer/internal/webserver"
 )
@@ -692,6 +693,66 @@ func (c *Controller) resetTrashCount() {
 		c.dirCounts[TrashView] = 0
 	}
 	c.mu.Unlock()
+}
+
+// ExportFavoritesOptions carries the user-tunable knobs for ExportFavorites.
+// Defaults (zero values) mean: copy, preserve subfolders, no recompression.
+type ExportFavoritesOptions struct {
+	Dst         string
+	Move        bool
+	Flatten     bool
+	MaxLongEdge int // > 0 enables image/video recompression
+}
+
+// ExportFavorites copies (or moves) every entry currently flagged as a
+// favorite into opts.Dst. When opts.MaxLongEdge > 0, images and videos
+// are recompressed to fit that pixel limit. Runs on a goroutine; appears
+// in the process bar with Cancel support, and done is invoked once the
+// work finishes (nil if no callback is wanted).
+func (c *Controller) ExportFavorites(opts ExportFavoritesOptions, done func(res export.Result, err error)) {
+	if opts.Dst == "" {
+		if done != nil {
+			done(export.Result{}, nil)
+		}
+		return
+	}
+	go func() {
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		var proc *Process
+		if c.processes != nil {
+			title := "Export favorites: copy"
+			switch {
+			case opts.Move:
+				title = "Export favorites: move"
+			case opts.MaxLongEdge > 0:
+				title = "Export favorites: recompress"
+			}
+			proc = c.processes.Begin(ProcExportFavorites, title, cancel, false)
+			proc.SetStatus("Starting…")
+			defer proc.End()
+		}
+		progress := func(step, total int, action, msg string) {
+			if proc != nil {
+				proc.SetTotal(int64(total))
+				proc.SetDone(int64(step))
+				proc.SetStatus(action + " " + msg)
+			}
+		}
+		res, err := export.Favorites(ctx, c.index, export.Options{
+			Root:        c.libraryRoot,
+			Dst:         opts.Dst,
+			Flatten:     opts.Flatten,
+			Move:        opts.Move,
+			MaxLongEdge: opts.MaxLongEdge,
+		}, progress)
+		if done != nil {
+			done(res, err)
+		}
+		if c.invalidate != nil {
+			c.invalidate()
+		}
+	}()
 }
 
 // EmptyTrash permanently removes every item in the trash dir along with

@@ -2,12 +2,16 @@ package ui
 
 import (
 	"fmt"
+	"strconv"
+	"strings"
 	"sync"
 
 	"gioui.org/layout"
 	"gioui.org/unit"
 	"gioui.org/widget"
 	"gioui.org/widget/material"
+
+	"github.com/dns/photo-viewer/internal/export"
 )
 
 // SettingsView is a minimal settings overlay for the Gio build. It exposes
@@ -23,18 +27,24 @@ type SettingsView struct {
 	outboxBrowseBtn widget.Clickable
 	saveBtn         widget.Clickable
 	closeBtn        widget.Clickable
-	emptyTrashBtn   widget.Clickable
-	sdAutoDetect    widget.Bool
-	showShortcuts   widget.Bool
+	emptyTrashBtn      widget.Clickable
+	exportFavBtn       widget.Clickable
+	exportFavFlat      widget.Bool
+	exportFavMove      widget.Bool
+	exportFavRecompres widget.Bool
+	exportFavMaxEdge   widget.Editor
+	sdAutoDetect       widget.Bool
+	showShortcuts      widget.Bool
 
 	// ctrl is wired by window.go so the Empty Trash button can read trash
 	// stats and trigger the wipe. Optional — when nil, the trash row is
 	// hidden.
 	ctrl *Controller
 
-	mu        sync.Mutex
-	statusMsg string
-	trashMsg  string
+	mu          sync.Mutex
+	statusMsg   string
+	trashMsg    string
+	exportFavMsg string
 
 	invalidate func()
 }
@@ -64,7 +74,24 @@ func (v *SettingsView) Show() {
 	v.showShortcuts.Value = c.ShowShortcutHints
 	v.statusMsg = "Config file: " + configPath()
 	v.trashMsg = v.trashStatus()
+	v.exportFavMsg = v.favoritesStatus()
 	v.Open = true
+}
+
+// favoritesStatus reports the number of favorites currently in the index,
+// shown next to the Export button so the user knows what would be exported.
+func (v *SettingsView) favoritesStatus() string {
+	if v.ctrl == nil || v.ctrl.Index() == nil {
+		return ""
+	}
+	n := len(v.ctrl.Index().ListFavorites())
+	if n == 0 {
+		return "No favorites to export"
+	}
+	if n == 1 {
+		return "1 favorite ready to export"
+	}
+	return fmt.Sprintf("%d favorites ready to export", n)
 }
 
 // trashStatus formats the current trash usage for display next to the Empty
@@ -136,6 +163,16 @@ func (v *SettingsView) Layout(gtx layout.Context, th *Theme) layout.Dimensions {
 		c.ShowShortcutHints = v.showShortcuts.Value
 		_ = SaveConfig(c)
 	}
+	if v.exportFavBtn.Clicked(gtx) && v.ctrl != nil {
+		opts := ExportFavoritesOptions{
+			Flatten: v.exportFavFlat.Value,
+			Move:    v.exportFavMove.Value,
+		}
+		if v.exportFavRecompres.Value {
+			opts.MaxLongEdge = parseMaxEdge(v.exportFavMaxEdge.Text())
+		}
+		go v.pickExportDestAndRun(opts)
+	}
 	if v.emptyTrashBtn.Clicked(gtx) && v.ctrl != nil {
 		v.mu.Lock()
 		v.trashMsg = "Emptying trash..."
@@ -193,6 +230,8 @@ func (v *SettingsView) Layout(gtx layout.Context, th *Theme) layout.Dimensions {
 			layout.Rigid(layout.Spacer{Height: unit.Dp(16)}.Layout),
 			layout.Rigid(v.trashRow(th)),
 			layout.Rigid(layout.Spacer{Height: unit.Dp(16)}.Layout),
+			layout.Rigid(v.exportFavoritesRow(th)),
+			layout.Rigid(layout.Spacer{Height: unit.Dp(16)}.Layout),
 			layout.Rigid(func(gtx layout.Context) layout.Dimensions {
 				return layout.Flex{Axis: layout.Horizontal}.Layout(gtx,
 					layout.Rigid(material.Button(th.Theme, &v.saveBtn, "Save").Layout),
@@ -237,6 +276,144 @@ func (v *SettingsView) trashRow(th *Theme) layout.Widget {
 				)
 			}),
 		)
+	}
+}
+
+// exportFavoritesRow renders the "Export favorites" section: copy/move and
+// flatten toggles plus a button that prompts for a destination directory
+// and starts the export. The status line below reflects either the current
+// favorite count or the last run's result.
+func (v *SettingsView) exportFavoritesRow(th *Theme) layout.Widget {
+	return func(gtx layout.Context) layout.Dimensions {
+		if v.ctrl == nil {
+			return layout.Dimensions{}
+		}
+		v.mu.Lock()
+		msg := v.exportFavMsg
+		v.mu.Unlock()
+		if msg == "" {
+			msg = v.favoritesStatus()
+		}
+		return layout.Flex{Axis: layout.Vertical}.Layout(gtx,
+			layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+				lbl := material.Label(th.Theme, unit.Sp(12), "Export favorites")
+				lbl.Color = th.Foreground
+				lbl.Font.Weight = 700
+				return lbl.Layout(gtx)
+			}),
+			layout.Rigid(layout.Spacer{Height: unit.Dp(4)}.Layout),
+			layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+				cb := material.CheckBox(th.Theme, &v.exportFavFlat,
+					"Flatten into target directory (default: preserve subfolders)")
+				cb.Color = th.Foreground
+				return cb.Layout(gtx)
+			}),
+			layout.Rigid(layout.Spacer{Height: unit.Dp(4)}.Layout),
+			layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+				cb := material.CheckBox(th.Theme, &v.exportFavMove,
+					"Move instead of copy (removes the favorite from the library)")
+				cb.Color = th.Foreground
+				return cb.Layout(gtx)
+			}),
+			layout.Rigid(layout.Spacer{Height: unit.Dp(4)}.Layout),
+			layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+				return layout.Flex{Axis: layout.Horizontal, Alignment: layout.Middle}.Layout(gtx,
+					layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+						cb := material.CheckBox(th.Theme, &v.exportFavRecompres,
+							"Recompress for smaller files — max long edge:")
+						cb.Color = th.Foreground
+						return cb.Layout(gtx)
+					}),
+					layout.Rigid(layout.Spacer{Width: unit.Dp(6)}.Layout),
+					layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+						v.exportFavMaxEdge.SingleLine = true
+						ed := material.Editor(th.Theme, &v.exportFavMaxEdge, "1920")
+						ed.Color = th.Foreground
+						ed.HintColor = th.Muted
+						gtx.Constraints.Min.X = gtx.Dp(unit.Dp(72))
+						gtx.Constraints.Max.X = gtx.Dp(unit.Dp(96))
+						return drawEditorBox(gtx, th.CellBG, layout.UniformInset(unit.Dp(6)), ed.Layout)
+					}),
+					layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+						lbl := material.Label(th.Theme, unit.Sp(12), " px (RAW always copied as-is)")
+						lbl.Color = th.Muted
+						return lbl.Layout(gtx)
+					}),
+				)
+			}),
+			layout.Rigid(layout.Spacer{Height: unit.Dp(6)}.Layout),
+			layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+				return layout.Flex{Axis: layout.Horizontal, Alignment: layout.Middle}.Layout(gtx,
+					layout.Flexed(1, func(gtx layout.Context) layout.Dimensions {
+						lbl := material.Label(th.Theme, unit.Sp(12), msg)
+						lbl.Color = th.Foreground
+						return lbl.Layout(gtx)
+					}),
+					layout.Rigid(layout.Spacer{Width: unit.Dp(6)}.Layout),
+					layout.Rigid(material.Button(th.Theme, &v.exportFavBtn, "Choose target & export").Layout),
+				)
+			}),
+		)
+	}
+}
+
+// pickExportDestAndRun pops a zenity directory picker and, if the user
+// confirms, asks the controller to run the export. Status updates are
+// surfaced both inline (exportFavMsg) and in the main process bar.
+func (v *SettingsView) pickExportDestAndRun(opts ExportFavoritesOptions) {
+	dst, err := runZenity("--file-selection", "--directory", "--title=Choose export destination")
+	if err != nil {
+		v.setExportMsg("Picker failed: " + err.Error())
+		return
+	}
+	if dst == "" {
+		return
+	}
+	opts.Dst = dst
+	verb := "Copying"
+	switch {
+	case opts.Move:
+		verb = "Moving"
+	case opts.MaxLongEdge > 0:
+		verb = fmt.Sprintf("Recompressing (≤%dpx)", opts.MaxLongEdge)
+	}
+	v.setExportMsg(verb + " favorites to " + dst + "…")
+	v.ctrl.ExportFavorites(opts, func(res export.Result, err error) {
+		switch {
+		case err != nil:
+			v.setExportMsg(fmt.Sprintf("Export failed: %v (done %d, skipped %d, failed %d)",
+				err, res.Done, res.Skipped, res.Failed))
+		case res.Failed > 0:
+			v.setExportMsg(fmt.Sprintf("Finished: exported %d, skipped %d, failed %d → %s",
+				res.Done, res.Skipped, res.Failed, dst))
+		default:
+			v.setExportMsg(fmt.Sprintf("Exported %d favorite(s) to %s (skipped %d)",
+				res.Done, dst, res.Skipped))
+		}
+	})
+}
+
+// parseMaxEdge interprets the user's "max long edge" text. Empty / invalid
+// / non-positive inputs default to 1920 so the recompress checkbox is safe
+// even when the editor is blank.
+func parseMaxEdge(s string) int {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return 1920
+	}
+	n, err := strconv.Atoi(s)
+	if err != nil || n <= 0 {
+		return 1920
+	}
+	return n
+}
+
+func (v *SettingsView) setExportMsg(s string) {
+	v.mu.Lock()
+	v.exportFavMsg = s
+	v.mu.Unlock()
+	if v.invalidate != nil {
+		v.invalidate()
 	}
 }
 

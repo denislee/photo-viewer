@@ -281,6 +281,7 @@ func handleKeys(gtx layout.Context, ctrl *Controller, grid *Grid, sidebar *Sideb
 			key.Filter{Name: "B", Required: key.ModCtrl},
 			key.Filter{Name: "I", Required: key.ModCtrl},
 			key.Filter{Name: "D", Required: key.ModCtrl},
+			key.Filter{Name: "E", Required: key.ModCtrl},
 			key.Filter{Name: "+", Required: key.ModCtrl},
 			key.Filter{Name: "=", Required: key.ModCtrl},
 			key.Filter{Name: "-", Required: key.ModCtrl},
@@ -718,6 +719,10 @@ func handleGridKey(ke key.Event, grid *Grid, sidebar *Sidebar, sidebarFocus *boo
 			w.Invalidate()
 		}
 	case "E":
+		if ke.Modifiers.Contain(key.ModCtrl) {
+			go exportFavoritesViaPicker(ctrl, w.Invalidate)
+			return
+		}
 		if ctrl.SelectionMode {
 			_, _, entries, _ := ctrl.Snapshot()
 			var selected []string
@@ -1214,6 +1219,21 @@ func pxToDp(gtx layout.Context, px int) int {
 		return px
 	}
 	return int(float32(px) / gtx.Metric.PxPerDp)
+}
+
+// exportFavoritesViaPicker pops a zenity directory picker and, on confirm,
+// asks the controller to copy every favorite into the chosen target while
+// preserving subfolders. Always call from a goroutine — zenity blocks.
+// Status surfaces in the bottom process bar; no callback is needed here.
+func exportFavoritesViaPicker(ctrl *Controller, invalidate func()) {
+	dst, err := runZenity("--file-selection", "--directory", "--title=Export favorites to…")
+	if err != nil || dst == "" {
+		return
+	}
+	ctrl.ExportFavorites(ExportFavoritesOptions{Dst: dst}, nil)
+	if invalidate != nil {
+		invalidate()
+	}
 }
 
 // runDetached starts cmd and waits for it to finish so the OS can reap the
