@@ -83,6 +83,14 @@ static int loadfile(mpv_handle *h, const char *path) {
     cmd[2] = NULL;
     return mpv_command(h, cmd);
 }
+
+// request_log asks mpv to deliver log messages at min_level and above as
+// MPV_EVENT_LOG_MESSAGE events on the normal event queue, where drainEvents
+// picks them up. Used purely for crash diagnostics: an internal libmpv
+// assertion is usually preceded by an error-level log line.
+static int request_log(mpv_handle *h, const char *min_level) {
+    return mpv_request_log_messages(h, min_level);
+}
 */
 import "C"
 
@@ -90,7 +98,9 @@ import (
 	"errors"
 	"fmt"
 	"image"
+	"log"
 	"runtime/cgo"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"unsafe"
@@ -108,6 +118,12 @@ type Player struct {
 
 	invalidate func()
 
+	// mu serialises every entry into libmpv from Go: Load, Stop, the
+	// command helpers, and Render all hold it, so no two of them issue mpv
+	// calls (or mutate buf / current / loaded) concurrently. The one thing
+	// that must NOT take mu is the render-update / wakeup callbacks: mpv can
+	// fire them synchronously from inside a command we're issuing under the
+	// lock, so they stay lock-free (they only touch atomics + invalidate).
 	mu       sync.Mutex
 	buf      *image.RGBA // reused across frames; reallocated on size change
 	closed   atomic.Bool
@@ -191,6 +207,15 @@ func New(invalidate func()) (*Player, error) {
 		return nil, fmt.Errorf("mpv_initialize: %s", C.GoString(C.mpv_error_string(rc)))
 	}
 
+	// Surface mpv's own warnings/errors to stderr (see drainEvents). When an
+	// internal libmpv/ffmpeg/hwdec assertion aborts the process, the message
+	// it logs first lands in the log immediately above the Go crash dump,
+	// which is the only breadcrumb a C-side abort() leaves behind.
+	if lvl := C.CString("warn"); lvl != nil {
+		C.request_log(h, lvl)
+		C.free(unsafe.Pointer(lvl))
+	}
+
 	p := &Player{h: h, invalidate: invalidate, drainDone: make(chan struct{})}
 	p.handle = cgo.NewHandle(p)
 	user := C.uintptr_t(p.handle)
@@ -214,8 +239,21 @@ func New(invalidate func()) (*Player, error) {
 // Load starts playback of path. Any previously-playing file is replaced.
 // Safe to call repeatedly as the user navigates between videos.
 func (p *Player) Load(path string) error {
-	if p == nil || p.closed.Load() {
+	if p == nil {
 		return errors.New("player closed")
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.closed.Load() {
+		return errors.New("player closed")
+	}
+	// Idempotent: the UI goroutine (playVideo) and the background preload
+	// goroutine both call Load for the same entry, so without this guard a
+	// race between their Current() checks would issue two loadfile commands
+	// and double-write current/loaded. Holding mu makes the check-and-load
+	// atomic and collapses the duplicate into a no-op.
+	if cur := p.current.Load(); cur != nil && *cur == path {
+		return nil
 	}
 	cp := C.CString(path)
 	defer C.free(unsafe.Pointer(cp))
@@ -232,7 +270,12 @@ func (p *Player) Load(path string) error {
 // Stop halts playback and clears the active file. Used when the viewer
 // moves off a video so we don't keep decoding in the background.
 func (p *Player) Stop() {
-	if p == nil || p.closed.Load() || !p.loaded.Load() {
+	if p == nil {
+		return
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.closed.Load() || !p.loaded.Load() {
 		return
 	}
 	cs := C.CString("stop")
@@ -244,7 +287,12 @@ func (p *Player) Stop() {
 
 // TogglePause toggles the pause property.
 func (p *Player) TogglePause() {
-	if p == nil || p.closed.Load() {
+	if p == nil {
+		return
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.closed.Load() {
 		return
 	}
 	cs := C.CString("cycle pause")
@@ -254,7 +302,12 @@ func (p *Player) TogglePause() {
 
 // ToggleMute toggles the mute property.
 func (p *Player) ToggleMute() {
-	if p == nil || p.closed.Load() {
+	if p == nil {
+		return
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.closed.Load() {
 		return
 	}
 	cs := C.CString("cycle mute")
@@ -265,7 +318,12 @@ func (p *Player) ToggleMute() {
 // SeekRelative seeks by delta seconds relative to the current position.
 // Negative values seek backwards.
 func (p *Player) SeekRelative(delta float64) {
-	if p == nil || p.closed.Load() {
+	if p == nil {
+		return
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.closed.Load() {
 		return
 	}
 	cmd := fmt.Sprintf("seek %f relative+exact", delta)
@@ -373,10 +431,28 @@ func (p *Player) drainEvents() {
 		if ev.event_id == C.MPV_EVENT_SHUTDOWN {
 			return
 		}
+		if ev.event_id == C.MPV_EVENT_LOG_MESSAGE {
+			logMpvMessage((*C.mpv_event_log_message)(ev.data))
+		}
 		if p.closed.Load() {
 			return
 		}
 	}
+}
+
+// logMpvMessage relays one mpv log line to stderr. The text mpv hands us
+// already carries a trailing newline; we trim it so Go's log package adds
+// exactly one. These lines are the breadcrumb that survives a C-side abort()
+// — they print immediately before the crash dump.
+func logMpvMessage(msg *C.mpv_event_log_message) {
+	if msg == nil {
+		return
+	}
+	text := strings.TrimRight(C.GoString(msg.text), "\n")
+	if text == "" {
+		return
+	}
+	log.Printf("[mpv %s] %s: %s", C.GoString(msg.level), C.GoString(msg.prefix), text)
 }
 
 //export goMpvRenderUpdate
