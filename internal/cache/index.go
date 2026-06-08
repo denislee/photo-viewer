@@ -316,15 +316,6 @@ func (i *Index) ListDir(dir string) []Entry {
 
 	lower, upper := dirRange(dir)
 
-	// Pre-size the result slice with a cheap COUNT(*) so we don't pay
-	// repeated slice regrowth on large directories. Estimate is allowed to
-	// be slightly stale; append grows from there if needed.
-	var estimate int
-	_ = i.db.QueryRow(
-		"SELECT COUNT(*) FROM entries WHERE (path >= ? AND path < ?) OR path = ?",
-		lower, upper, dir,
-	).Scan(&estimate)
-
 	rows, err := i.db.Query(
 		"SELECT path, type, size, mtime, thumb_id, favorite, duration_ms FROM entries WHERE (path >= ? AND path < ?) OR path = ? ORDER BY path",
 		lower, upper, dir,
@@ -334,7 +325,10 @@ func (i *Index) ListDir(dir string) []Entry {
 	}
 	defer rows.Close()
 
-	out := make([]Entry, 0, estimate)
+	// Grown via append rather than pre-sized: a COUNT(*) pre-pass would walk
+	// the same b-tree range a second time, which costs more than the slice
+	// regrowth it would save.
+	var out []Entry
 	for rows.Next() {
 		var e Entry
 		var mtimeUnix int64
@@ -548,16 +542,16 @@ func typeFilterClause(filter string, showRAW bool) (string, []any) {
 // All returns a snapshot of the entire index.
 func (i *Index) All() []Entry {
 
-	var estimate int
-	_ = i.db.QueryRow("SELECT COUNT(*) FROM entries").Scan(&estimate)
-
 	rows, err := i.db.Query("SELECT path, type, size, mtime, thumb_id, favorite, duration_ms FROM entries ORDER BY path")
 	if err != nil {
 		return nil
 	}
 	defer rows.Close()
 
-	out := make([]Entry, 0, estimate)
+	// Grown via append rather than pre-sized: a COUNT(*) pre-pass would walk
+	// the full table a second time, which costs more than the slice regrowth
+	// it would save.
+	var out []Entry
 	for rows.Next() {
 		var e Entry
 		var mtimeUnix int64
@@ -620,16 +614,16 @@ func (i *Index) ForEachEntry(visit func(Entry) bool) {
 // ListFavorites returns all entries flagged as favorites.
 func (i *Index) ListFavorites() []Entry {
 
-	var estimate int
-	_ = i.db.QueryRow("SELECT COUNT(*) FROM entries WHERE favorite = 1").Scan(&estimate)
-
 	rows, err := i.db.Query("SELECT path, type, size, mtime, thumb_id, favorite, duration_ms FROM entries WHERE favorite = 1 ORDER BY path")
 	if err != nil {
 		return nil
 	}
 	defer rows.Close()
 
-	out := make([]Entry, 0, estimate)
+	// Grown via append rather than pre-sized: a COUNT(*) pre-pass would scan
+	// the favorites a second time, which costs more than the slice regrowth
+	// it would save.
+	var out []Entry
 	for rows.Next() {
 		var e Entry
 		var mtimeUnix int64

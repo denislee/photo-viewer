@@ -1040,7 +1040,8 @@ func listSubdirs(dir string) []string {
 		}
 		out = append(out, filepath.Join(dir, name))
 	}
-	sort.Strings(out)
+	// os.ReadDir already returns entries sorted by filename; joining each with
+	// the common `dir` prefix preserves that order, so no explicit sort needed.
 	return out
 }
 

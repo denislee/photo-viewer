@@ -526,22 +526,27 @@ func (c *Controller) patchLocalDeletion(paths []string, intoTrash bool) {
 		c.entries = kept
 	}
 	if c.dirCounts != nil {
-		sep := string(filepath.Separator)
-		for k := range c.dirCounts {
-			if k == FavoritesView || k == TrashView || k == "" {
-				continue
-			}
-			n := 0
-			for p := range deleted {
-				if p == k || strings.HasPrefix(p, k+sep) {
-					n++
+		// Walk each deleted path up its ancestor chain and decrement the
+		// matching dirCounts keys. This is O(deleted × depth) map lookups
+		// rather than O(dirCounts × deleted) prefix comparisons — the old
+		// approach rescanned every sidebar dir for every deleted file, which
+		// stalled the UI on large deletions in deep trees.
+		for p := range deleted {
+			for cur := p; ; {
+				if cur == "" || cur == FavoritesView || cur == TrashView {
+					break
 				}
-			}
-			if n > 0 {
-				c.dirCounts[k] -= n
-				if c.dirCounts[k] < 0 {
-					c.dirCounts[k] = 0
+				if _, ok := c.dirCounts[cur]; ok {
+					c.dirCounts[cur]--
+					if c.dirCounts[cur] < 0 {
+						c.dirCounts[cur] = 0
+					}
 				}
+				parent := filepath.Dir(cur)
+				if parent == cur {
+					break
+				}
+				cur = parent
 			}
 		}
 		if favCount > 0 {
@@ -1147,7 +1152,10 @@ func (c *Controller) WarmUp() {
 func sortEntries(entries []cache.Entry, mode string) {
 	switch normalizeSort(mode) {
 	case SortByDuration:
-		sort.SliceStable(entries, func(i, j int) bool {
+		// Path is a unique tie-breaker (it's the index primary key), so the
+		// comparator is a total order and stability is irrelevant — sort.Slice
+		// is faster and allocation-free.
+		sort.Slice(entries, func(i, j int) bool {
 			di, dj := entries[i].DurationMs, entries[j].DurationMs
 			if di != dj {
 				// Non-video / unknown duration → end of list.
@@ -1184,6 +1192,7 @@ func listSubdirs(dir string) []string {
 		}
 		out = append(out, filepath.Join(dir, name))
 	}
-	sort.Strings(out)
+	// os.ReadDir already returns entries sorted by filename; joining each with
+	// the common `dir` prefix preserves that order, so no explicit sort needed.
 	return out
 }
