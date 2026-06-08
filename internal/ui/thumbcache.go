@@ -15,11 +15,13 @@ import (
 	"github.com/dns/photo-viewer/internal/cache"
 )
 
-// thumbCacheCapacity caps the number of decoded thumbnails kept in memory
-// across all shards. Each entry holds an RGBA pixel buffer (~256 KB at the
-// default thumb size), so 1024 entries ≈ 256 MB peak. Far larger than any
-// visible window, so live cells are never evicted; old entries are dropped
-// once a long browse session has touched many directories.
+// thumbCacheCapacity is the floor on the number of decoded thumbnails kept in
+// memory across all shards. Each entry holds an RGBA pixel buffer (~256 KB at
+// the default thumb size), so 1024 entries ≈ 256 MB peak. This covers any
+// normal viewport, but a large display (e.g. 4K) zoomed all the way out
+// (minCellDp = 64) can put more than 1024 cells on screen at once. When that
+// happens the cap is raised to the working set via EnsureCapacity so live
+// cells aren't evicted mid-frame and re-decoded every frame (cache thrashing).
 const thumbCacheCapacity = 1024
 
 // thumbCacheShards is the number of independent shards. Sharding lets the
@@ -39,9 +41,12 @@ const thumbCacheShards = 16
 // list. The decode queue and the coalescer remain singletons since they're
 // inherently global.
 type thumbCache struct {
-	store       *cache.ThumbStore
-	invalidate  func()
-	capPerShard int
+	store      *cache.ThumbStore
+	invalidate func()
+	// capPerShard is the per-shard LRU ceiling. Read under each shard's mutex
+	// during eviction but written from the Gio layout goroutine via
+	// EnsureCapacity, so it's atomic to avoid a data race. Grow-only.
+	capPerShard atomic.Int64
 
 	shards [thumbCacheShards]thumbCacheShard
 	queue  chan cache.Entry
@@ -68,11 +73,11 @@ type thumbEntry struct {
 
 func newThumbCache(store *cache.ThumbStore, invalidate func()) *thumbCache {
 	tc := &thumbCache{
-		store:       store,
-		invalidate:  invalidate,
-		capPerShard: (thumbCacheCapacity + thumbCacheShards - 1) / thumbCacheShards,
-		queue:       make(chan cache.Entry, 256),
+		store:      store,
+		invalidate: invalidate,
+		queue:      make(chan cache.Entry, 256),
 	}
+	tc.capPerShard.Store((thumbCacheCapacity + thumbCacheShards - 1) / thumbCacheShards)
 	for i := range tc.shards {
 		tc.shards[i].entries = make(map[string]*list.Element)
 		tc.shards[i].lru = list.New()
@@ -86,6 +91,26 @@ func newThumbCache(store *cache.ThumbStore, invalidate func()) *thumbCache {
 	}
 	go tc.coalescer()
 	return tc
+}
+
+// EnsureCapacity raises the total LRU ceiling so it can hold at least
+// `working` decoded thumbnails — the count the grid currently needs resident
+// (visible cells plus a scroll buffer). Called once per layout frame. It only
+// ever grows the cap (never below thumbCacheCapacity) so zooming out on a big
+// display stops the cache from evicting cells it's about to repaint, while
+// zooming back in doesn't churn the cap up and down.
+func (tc *thumbCache) EnsureCapacity(working int) {
+	working = max(working, thumbCacheCapacity)
+	per := int64((working + thumbCacheShards - 1) / thumbCacheShards)
+	for {
+		cur := tc.capPerShard.Load()
+		if per <= cur {
+			return
+		}
+		if tc.capPerShard.CompareAndSwap(cur, per) {
+			return
+		}
+	}
 }
 
 // shardFor returns the shard responsible for path. FNV-1a is cheap and
@@ -164,7 +189,8 @@ func (tc *thumbCache) touchOrCreate(sh *thumbCacheShard, path string) *thumbEntr
 // evictIfNeeded drops the least-recently-used ready entries from sh until
 // it's within capacity. Caller must hold sh.mu.
 func (tc *thumbCache) evictIfNeeded(sh *thumbCacheShard) {
-	for sh.lru.Len() > tc.capPerShard {
+	cap := int(tc.capPerShard.Load())
+	for sh.lru.Len() > cap {
 		oldest := sh.lru.Back()
 		if oldest == nil {
 			return

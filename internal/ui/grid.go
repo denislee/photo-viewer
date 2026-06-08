@@ -335,6 +335,11 @@ func (g *Grid) Layout(gtx layout.Context, th *Theme, entries []cache.Entry, ctrl
 	if rowH > 0 {
 		g.viewportRows = gtx.Constraints.Max.Y / rowH
 	}
+	// Keep the thumbnail cache large enough to hold everything on screen plus a
+	// couple of scroll buffer rows. On a big display zoomed all the way out the
+	// visible cell count can exceed the default cap; without this the cache
+	// would evict and re-decode cells every frame.
+	ctrl.Thumbs().EnsureCapacity(cols * (g.viewportRows + 4))
 	rowCount := (len(entries) + cols - 1) / cols
 	g.SelectedIndex(len(entries))
 
