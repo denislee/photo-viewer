@@ -99,6 +99,7 @@ import (
 	"fmt"
 	"image"
 	"log"
+	"os"
 	"runtime/cgo"
 	"strings"
 	"sync"
@@ -141,6 +142,17 @@ type Player struct {
 	updatePending atomic.Bool
 }
 
+// hwdecMode returns the value for mpv's hwdec option. It defaults to "no"
+// (software decode) because hardware decoding is unavailable on the target
+// machines and its failed probes destabilise the SW render path; PV_HWDEC
+// overrides it for hosts with a working GPU stack (e.g. PV_HWDEC=auto-safe).
+func hwdecMode() string {
+	if v := strings.TrimSpace(os.Getenv("PV_HWDEC")); v != "" {
+		return v
+	}
+	return "no"
+}
+
 // New constructs and initialises a libmpv handle with the SW render API
 // attached. invalidate is called from mpv's worker threads whenever a new
 // frame is available or an internal state change occurs; the caller should
@@ -167,10 +179,18 @@ func New(invalidate func()) (*Player, error) {
 	}
 	for _, kv := range [][2]string{
 		{"vo", "libmpv"},
-		// auto-safe prefers *-copy hwdec backends, which decode in HW
-		// then copy frames back to system memory — exactly what we need
-		// for the SW render path.
-		{"hwdec", "auto-safe"},
+		// Software decode only. On the target machines every hardware
+		// backend is unavailable (no libcuda, vaapi setup fails, vulkan
+		// lacks VK_KHR_video_decode_queue, the vdpau nvidia driver is
+		// missing), so hwdec=auto-safe just churns through failing
+		// "Failed setup … no frame!" probes on every load. Besides the log
+		// spam, a half-initialised hwdec frame can be handed to the SW
+		// renderer with dimensions that disagree with the params it computed
+		// its source crop from — which trips libmpv's mp_image_crop assertion
+		// (`x1 <= img->w`) and aborts the whole process. Forcing pure SW
+		// decode removes that class of frame entirely. Set PV_HWDEC to
+		// override (e.g. "auto-safe") on a box with a working GPU stack.
+		{"hwdec", hwdecMode()},
 		{"loop-file", "inf"},
 		{"keep-open", "always"},
 		{"audio-display", "no"},
