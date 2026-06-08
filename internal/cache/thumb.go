@@ -56,6 +56,15 @@ func NewThumbStore(cacheDir string) (*ThumbStore, error) {
 	}, nil
 }
 
+// CacheDir returns the base cache directory the store lives under (the
+// parent of <cache>/thumbs). Other on-disk caches that want to sit
+// alongside the thumbnails — e.g. the HLS segment cache — derive their
+// location from here so they share the same writable root the store
+// already resolved.
+func (s *ThumbStore) CacheDir() string {
+	return filepath.Dir(s.dir)
+}
+
 func (s *ThumbStore) thumbPath(id string) string {
 	if len(id) < 2 {
 		return filepath.Join(s.dir, id+".jpg")

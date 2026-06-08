@@ -77,6 +77,14 @@ type Server struct {
 	addr     string // resolved listen address (host:port) once running
 	password string
 	running  bool
+
+	// HLS on-the-fly transcode state (see hls.go). Lazily initialised by
+	// hlsInit so New stays a plain literal. hlsSem bounds concurrent ffmpeg
+	// transcodes; hlsInflight is a per-segment singleflight.
+	hlsOnce     sync.Once
+	hlsSem      chan struct{}
+	hlsFlightMu sync.Mutex
+	hlsInflight map[string]chan struct{}
 }
 
 // New constructs an idle server. libraryRoot is used to enumerate the
@@ -131,6 +139,7 @@ func (s *Server) Start(host string, port int, password string) error {
 	mux.HandleFunc("/view/", s.handleView)
 	mux.HandleFunc("/thumb/", s.handleThumb)
 	mux.HandleFunc("/media/", s.handleMedia)
+	mux.HandleFunc("/hls/", s.handleHLS)
 	mux.HandleFunc("/api/page", s.handleAPIPage)
 	mux.HandleFunc("/api/favorite", s.handleAPIFavorite)
 	mux.HandleFunc("/api/info", s.handleAPIInfo)
@@ -1187,7 +1196,19 @@ func (s *Server) renderViewer(w http.ResponseWriter,
 	fmt.Fprint(w, `<div class="vstage" id="vstage">`)
 	mediaURL := "/media/" + cur.ThumbID
 	if cur.Type == scan.TypeVideo {
-		fmt.Fprintf(w, `<video class="vmedia" id="vmedia" controls preload="metadata" playsinline src="%s"></video>`, mediaURL)
+		// iOS Safari (and desktop Safari) play HLS natively in a <video>
+		// tag, but cannot decode the containers/codecs the GUI handles via
+		// mpv (mkv, avi, webm, mts…). For those we serve an on-the-fly HLS
+		// transcode; for already-Safari-friendly containers (mp4/mov) we
+		// serve the original directly so we don't burn CPU transcoding a
+		// file the device can already play. The src is picked client-side
+		// because only the browser knows whether it has native HLS support.
+		hlsURL := "/hls/" + cur.ThumbID + "/index.m3u8"
+		fmt.Fprint(w, `<video class="vmedia" id="vmedia" controls preload="metadata" playsinline></video>`)
+		fmt.Fprintf(w, `<script>(function(){var v=document.getElementById('vmedia');`+
+			`var canHls=!!v.canPlayType('application/vnd.apple.mpegurl');`+
+			`var needsHls=%t;v.src=(canHls&&needsHls)?%q:%q;})();</script>`,
+			needsHLS(cur.Path), hlsURL, mediaURL)
 	} else {
 		fmt.Fprintf(w, `<img class="vmedia" src="%s" alt="%s">`,
 			mediaURL, html.EscapeString(filepath.Base(cur.Path)))
@@ -1282,6 +1303,21 @@ func validID(id string) bool {
 		}
 	}
 	return true
+}
+
+// needsHLS reports whether a video's container should be served via the
+// on-the-fly HLS transcode rather than streamed directly. mp4/m4v/mov are
+// the containers Safari/iOS decode natively, so they go direct; everything
+// else the scanner recognises as video (mkv, webm, avi, mts, m2ts) is
+// undecodable in a <video> tag and must be transcoded. HEVC inside an mp4
+// is the one case this misses — if that surfaces, add a codec probe here.
+func needsHLS(path string) bool {
+	switch strings.ToLower(filepath.Ext(path)) {
+	case ".mp4", ".m4v", ".mov":
+		return false
+	default:
+		return true
+	}
 }
 
 // mimeFor returns a content type for common extensions. The Go stdlib's
