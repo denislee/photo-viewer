@@ -4,12 +4,14 @@ package ui
 
 import (
 	"context"
+	"fmt"
 	"log"
 	"os"
 	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/dns/photo-viewer/internal/cache"
@@ -1114,34 +1116,84 @@ func (c *Controller) WarmUp() {
 		if proc != nil {
 			proc.SetTotal(int64(total))
 		}
+
+		// Fan out across a worker pool. store.Path is internally bounded by
+		// the CPU/external decode semaphores, but driving it from a single
+		// goroutine only ever keeps one decode in flight, so the semaphores
+		// sit mostly idle. Running WarmUpConcurrency workers lets both pools
+		// saturate; the channel back-pressures the producer so we never hold
+		// more than a small window of entries in memory.
+		workers := c.store.WarmUpConcurrency()
+		if workers < 1 {
+			workers = 1
+		}
+		jobs := make(chan cache.Entry, workers*2)
+
 		// Throttle the redraw notifications so a burst of fast thumb decodes
 		// doesn't pile dozens of frame requests onto Gio's loop. The progress
 		// bar still ticks at full granularity via proc.SetDone.
+		var done, generated int64
+		var invMu sync.Mutex
 		var lastInv time.Time
-		var i int
-		c.index.ForEachEntry(func(e cache.Entry) bool {
+		notify := func(n int64) {
 			if proc != nil {
-				proc.Wait()
+				proc.SetDone(n)
 			}
+			if n%50 == 0 || n == int64(total) {
+				c.mu.Lock()
+				c.scanBatched = int(n)
+				c.mu.Unlock()
+			}
+			if c.invalidate != nil {
+				invMu.Lock()
+				if time.Since(lastInv) >= 33*time.Millisecond {
+					lastInv = time.Now()
+					invMu.Unlock()
+					c.invalidate()
+				} else {
+					invMu.Unlock()
+				}
+			}
+		}
+
+		var wg sync.WaitGroup
+		for w := 0; w < workers; w++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				for e := range jobs {
+					if proc != nil {
+						proc.Wait()
+					}
+					// Skip thumbnails that already exist and are fresh: a
+					// single stat, no decode and no singleflight. On a warm
+					// cache this is almost every entry, so it is what makes a
+					// re-run of the warm-up cheap.
+					if ctx.Err() == nil && !c.store.Has(e) {
+						if _, err := c.store.Path(e); err == nil {
+							atomic.AddInt64(&generated, 1)
+						}
+					}
+					notify(atomic.AddInt64(&done, 1))
+				}
+			}()
+		}
+
+		c.index.ForEachEntry(func(e cache.Entry) bool {
 			if ctx.Err() != nil {
 				return false
 			}
-			_, _ = c.store.Path(e)
-			i++
-			if proc != nil {
-				proc.SetDone(int64(i))
-			}
-			if i%50 == 0 || i == total {
-				c.mu.Lock()
-				c.scanBatched = i
-				c.mu.Unlock()
-			}
-			if c.invalidate != nil && time.Since(lastInv) >= 33*time.Millisecond {
-				c.invalidate()
-				lastInv = time.Now()
-			}
+			jobs <- e
 			return true
 		})
+		close(jobs)
+		wg.Wait()
+
+		if proc != nil {
+			n := atomic.LoadInt64(&generated)
+			proc.SetStatus(fmt.Sprintf("Generated %d new thumbnail(s), skipped %d existing",
+				n, atomic.LoadInt64(&done)-n))
+		}
 	}()
 }
 

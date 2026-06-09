@@ -65,6 +65,28 @@ func (s *ThumbStore) CacheDir() string {
 	return filepath.Dir(s.dir)
 }
 
+// Has reports whether a fresh thumbnail for e already exists on disk — i.e.
+// one that is not older than the source file. It is a single stat with no
+// generation, singleflight, or directory creation, so a bulk warm-up can use
+// it to cheaply skip the (usually large) set of already-cached thumbnails
+// before paying the cost of entering Path's generation machinery.
+func (s *ThumbStore) Has(e Entry) bool {
+	info, err := os.Stat(s.thumbPath(e.ThumbID))
+	if err != nil {
+		return false
+	}
+	return !info.ModTime().Before(e.ModTime)
+}
+
+// WarmUpConcurrency is the number of worker goroutines a bulk warm-up should
+// run so both decode semaphores stay saturated. Path() is internally bounded
+// by cpuSem/extSem, but a single caller only ever keeps one decode in flight;
+// fanning out to this many callers lets the CPU-bound and external-tool pools
+// run at full width at once.
+func (s *ThumbStore) WarmUpConcurrency() int {
+	return cap(s.cpuSem) + cap(s.extSem)
+}
+
 func (s *ThumbStore) thumbPath(id string) string {
 	if len(id) < 2 {
 		return filepath.Join(s.dir, id+".jpg")
