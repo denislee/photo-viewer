@@ -15,6 +15,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -103,8 +104,50 @@ func Probe() Status {
 	return s
 }
 
-// Available is a thin wrapper used by hot paths that just need a yes/no.
-func Available() bool { return Probe().Working }
+// probe caching. Probe() forks a 1–15s Python --check every call (dlib import),
+// so hot-path callers (Available, NewPipeline) must not re-run it. cachedProbe
+// memoises the first result; refreshProbe re-runs it and updates the cache
+// (used by Pipeline.Recheck when the helper may have been installed/removed).
+var (
+	probeMu     sync.Mutex
+	probeCached *Status
+)
+
+// cachedProbe returns the memoised helper status, running the (potentially
+// multi-second) probe only on the first call.
+func cachedProbe() Status {
+	probeMu.Lock()
+	defer probeMu.Unlock()
+	if probeCached == nil {
+		s := Probe()
+		probeCached = &s
+	}
+	return *probeCached
+}
+
+// refreshProbe re-runs the probe unconditionally and stores the fresh result,
+// so a helper installed or removed after startup is picked up.
+func refreshProbe() Status {
+	s := Probe()
+	probeMu.Lock()
+	probeCached = &s
+	probeMu.Unlock()
+	return s
+}
+
+// Available is a thin wrapper for hot paths that just need a yes/no. It reads
+// the cached probe result, so only the first call pays the Python fork cost.
+func Available() bool { return cachedProbe().Working }
+
+// perImageError is returned by Detect when the daemon replied with an explicit
+// {"error": ...} for one image but is otherwise healthy — the caller skips the
+// image and keeps reusing the daemon. Every other error from Detect (pipe
+// write/read, unmarshal, context timeout) means the child is dead or the stream
+// is out of sync and the daemon must be respawned. The pipeline distinguishes
+// the two with errors.As.
+type perImageError struct{ msg string }
+
+func (e *perImageError) Error() string { return e.msg }
 
 // daemon is a long-running pv-face-detect --server child. Each pipeline
 // worker owns one daemon for its lifetime so the dlib import (~1–3s per
@@ -127,6 +170,11 @@ func spawnDaemon() (*daemon, error) {
 	}
 	cmd := exec.Command(bin, "--server")
 	cmd.Stderr = os.Stderr
+	// Pin the child to a single OpenMP thread. dlib/numpy otherwise spin up one
+	// OMP thread per core in *every* daemon, so N daemons × NumCPU threads
+	// thrash the scheduler for no throughput gain (each detection is already a
+	// separate process). One thread per daemon is both cheaper and faster here.
+	cmd.Env = append(os.Environ(), "OMP_NUM_THREADS=1")
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
 		return nil, err
@@ -187,10 +235,12 @@ func (d *daemon) Detect(ctx context.Context, imagePath string) ([]Detection, err
 			Error      string      `json:"error"`
 		}
 		if err := json.Unmarshal(r.line, &resp); err != nil {
+			// A malformed line corrupts stream framing — treat as transport.
 			return nil, err
 		}
 		if resp.Error != "" {
-			return nil, errors.New(resp.Error)
+			// Daemon is healthy; it just couldn't handle this one image.
+			return nil, &perImageError{msg: resp.Error}
 		}
 		return resp.Detections, nil
 	}

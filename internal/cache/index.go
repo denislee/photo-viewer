@@ -91,8 +91,10 @@ func Load(dbPath string) (*Index, error) {
 	}
 
 	// Schema versioning for value-format migrations. Bump when a persisted
-	// hash/value format changes so stale rows are invalidated.
-	const schemaVersion = 3
+	// hash/value format changes so stale rows are invalidated. user_version is
+	// written once, after every migration below has run, so a crash mid-upgrade
+	// re-runs the migrations rather than skipping them.
+	const schemaVersion = 4
 	var userVersion int
 	_ = db.QueryRow("PRAGMA user_version").Scan(&userVersion)
 	if userVersion < 1 {
@@ -110,9 +112,6 @@ func Load(dbPath string) (*Index, error) {
 		// v3: drop idx_entries_path — it duplicated the primary key on path
 		// and only added write overhead.
 		_, _ = db.Exec("DROP INDEX IF EXISTS idx_entries_path")
-	}
-	if userVersion < schemaVersion {
-		_, _ = db.Exec("PRAGMA user_version = " + strconv.Itoa(schemaVersion))
 	}
 
 	_, err = db.Exec(`
@@ -138,6 +137,27 @@ func Load(dbPath string) (*Index, error) {
 	`)
 	if err != nil {
 		return nil, err
+	}
+
+	if userVersion < 4 {
+		// v4: the incremental face clusterer switched from cosine distance to
+		// squared-Euclidean — the metric dlib's canonical 0.6 threshold was
+		// actually calibrated for (see internal/face/cluster.go). Clusters
+		// built under the wrong cosine metric chained different people together,
+		// so every pre-v4 cluster is polluted and can't be trusted. Wipe the
+		// face + cluster rows so the next scan re-detects and re-clusters with
+		// the correct metric. A plain wipe (rather than an in-place recluster
+		// from the stored embeddings) is the simple, provably-correct reset:
+		// Load has no clustering logic to reuse here and cache can't import the
+		// face package, and re-detection is already gated by thumb_mtime so only
+		// the wiped rows pay for it. On a fresh database these tables are empty,
+		// so the deletes are harmless no-ops.
+		_, _ = db.Exec("DELETE FROM faces")
+		_, _ = db.Exec("DELETE FROM face_clusters")
+	}
+
+	if userVersion < schemaVersion {
+		_, _ = db.Exec("PRAGMA user_version = " + strconv.Itoa(schemaVersion))
 	}
 
 	return &Index{db: db}, nil

@@ -2,13 +2,35 @@ package face
 
 import (
 	"context"
+	"errors"
 	"log"
 	"runtime"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/dns/photo-viewer/internal/cache"
 	"github.com/dns/photo-viewer/internal/scan"
+)
+
+// Tunables for the worker pool. See Start (maxWorkers), process (detectTimeout)
+// and worker (maxDaemonRespawns) for how each is used.
+const (
+	// maxWorkers caps the number of concurrent daemons. Each pv-face-detect
+	// --server child loads dlib + numpy (~300–500 MB RSS), so on a 16-core box
+	// one-per-CPU would burn 5–8 GB and thrash OpenMP threads. Detection is
+	// coarse-grained (a separate process per call) so 4 in flight already keeps
+	// the disk/CPU busy without the memory blow-up.
+	maxWorkers = 4
+	// detectTimeout bounds a single Detect call. A HOG detect on a thumbnail is
+	// tens of milliseconds; 60s is a generous ceiling that still guarantees a
+	// wedged helper unblocks shutdown on its own even before the parent ctx is
+	// cancelled — this is what breaks the old Stop deadlock.
+	detectTimeout = 60 * time.Second
+	// maxDaemonRespawns caps how many times a worker will restart a crashing
+	// helper before giving up, so a permanently-broken install (e.g. a dlib
+	// segfault on every thumb) degrades loudly instead of spin-restarting.
+	maxDaemonRespawns = 3
 )
 
 // Job is one unit of face work.
@@ -28,6 +50,7 @@ type OnClusterChange func()
 type Pipeline struct {
 	idx      *cache.Index
 	jobs     chan Job
+	quit     chan struct{}
 	wg       sync.WaitGroup
 	mu       sync.Mutex
 	cancel   context.CancelFunc
@@ -35,6 +58,12 @@ type Pipeline struct {
 	// enabled is read lock-free by acceptJob on every Submit while Recheck can
 	// flip it from another goroutine, so it's atomic rather than mu-guarded.
 	enabled atomic.Bool
+	// liveWorkers counts workers currently able to consume jobs. Start seeds it
+	// with the worker count; each worker decrements it on exit (daemon spawn
+	// failure, repeated crashes, or Stop). acceptJob refuses new work once it
+	// hits zero so SubmitBlocking can't park forever on a channel that nothing
+	// will ever read — the failure mode when every worker's spawnDaemon failed.
+	liveWorkers atomic.Int32
 
 	// clusterMu guards the in-memory cluster cache and serialises the
 	// assignment step across workers. Detection runs in parallel; only the
@@ -74,7 +103,10 @@ func (p *Pipeline) Enabled() bool {
 // flipped from off → on; this function never starts or stops workers on
 // its own, to avoid surprising the caller.
 func (p *Pipeline) Recheck() Status {
-	s := Probe()
+	// refreshProbe (not cachedProbe) so a newly-installed or newly-broken helper
+	// is actually re-probed and the memoised result is refreshed for the next
+	// Available()/NewPipeline hot-path caller.
+	s := refreshProbe()
 	p.enabled.Store(s.Working)
 	return s
 }
@@ -88,34 +120,50 @@ func (p *Pipeline) Start(parent context.Context) {
 	}
 	ctx, cancel := context.WithCancel(parent)
 	p.cancel = cancel
-	// One worker per CPU is a fine ceiling: detection is CPU-bound (HOG,
-	// dlib feature extraction) and a separate Python process per call,
-	// so saturating beyond NumCPU just causes context-switch overhead.
-	n := max(runtime.NumCPU(), 2)
-	p.jobs = make(chan Job, n*4)
+	// Detection is CPU-bound (HOG + dlib feature extraction) with a separate
+	// process per call, so one-per-CPU is the natural ceiling; maxWorkers then
+	// caps the daemon count so we don't spawn a dlib child per core on big
+	// machines. Floor of 2 so even a single-core box overlaps I/O and compute.
+	n := min(max(runtime.NumCPU(), 2), maxWorkers)
+	jobs := make(chan Job, n*4)
+	quit := make(chan struct{})
+	p.jobs = jobs
+	p.quit = quit
+	p.liveWorkers.Store(int32(n))
+	// Pass the channels in rather than reading the fields: Stop nils the fields
+	// to stop accepting new work, but a worker must keep draining the exact
+	// channel it started on.
 	for range n {
 		p.wg.Add(1)
-		go p.worker(ctx)
+		go p.worker(ctx, jobs, quit)
 	}
 }
 
-// Stop closes the input queue and waits for already-queued jobs to finish.
-// Use this for graceful drain at end of run (e.g. pv-scan completion).
+// Stop asks the workers to drain what's already queued and exit, then waits for
+// them. Use this for graceful drain at end of run (e.g. pv-scan completion).
 // Safe to call multiple times.
+//
+// Shutdown is signalled by closing the private quit channel, NOT the jobs
+// channel. Closing jobs would race any in-flight Submit/SubmitBlocking that has
+// already passed acceptJob but not yet sent, panicking the whole process; the
+// jobs channel is therefore never closed. Workers observe quit, best-effort
+// drain the buffer, and return; the parent ctx is cancelled only afterwards so
+// the drain itself isn't interrupted.
 func (p *Pipeline) Stop() {
 	p.mu.Lock()
-	jobs := p.jobs
-	p.jobs = nil
+	quit := p.quit
+	p.quit = nil
+	p.jobs = nil // reject new submissions (acceptJob sees nil)
 	cancel := p.cancel
 	p.cancel = nil
 	p.mu.Unlock()
-	if jobs != nil {
-		close(jobs)
+	if quit == nil {
+		return // never started, or already stopped
 	}
+	close(quit)
 	p.wg.Wait()
-	// Cancel only after workers have drained — we don't want to interrupt
-	// the last subprocess. The cancel still releases the parent ctx so
-	// callers can re-Start.
+	// Release the parent ctx after workers have drained so callers can re-Start
+	// and any leftover subprocess is reaped.
 	if cancel != nil {
 		cancel()
 	}
@@ -144,11 +192,25 @@ func (p *Pipeline) SubmitBlocking(ctx context.Context, j Job) bool {
 	if !ok {
 		return false
 	}
-	select {
-	case <-ctx.Done():
-		return false
-	case jobs <- j:
-		return true
+	// Re-poll liveWorkers while parked. acceptJob's check can go stale in a
+	// narrow window: every worker can exit (all daemons crash past the respawn
+	// cap) after we're already blocked on a full buffer, and the caller's ctx
+	// may never cancel. The ticker guarantees we notice a drained pool and bail
+	// instead of blocking forever. In the common case the send wins immediately
+	// and the ticker never fires.
+	ticker := time.NewTicker(50 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return false
+		case jobs <- j:
+			return true
+		case <-ticker.C:
+			if p.liveWorkers.Load() <= 0 {
+				return false
+			}
+		}
 	}
 }
 
@@ -169,6 +231,12 @@ func (p *Pipeline) acceptJob(j Job) (chan Job, bool) {
 	jobs := p.jobs
 	p.mu.Unlock()
 	if jobs == nil {
+		return nil, false
+	}
+	// No live workers means nothing will ever drain the channel; refuse so a
+	// blocking SubmitBlocking returns instead of parking forever (the failure
+	// mode when every worker's spawnDaemon failed).
+	if p.liveWorkers.Load() <= 0 {
 		return nil, false
 	}
 	return jobs, true
@@ -205,40 +273,108 @@ func (p *Pipeline) markFresh(path string, thumbMod int64) {
 	p.freshnessMu.Unlock()
 }
 
-func (p *Pipeline) worker(ctx context.Context) {
+func (p *Pipeline) worker(ctx context.Context, jobs <-chan Job, quit <-chan struct{}) {
 	defer p.wg.Done()
+	defer p.liveWorkers.Add(-1)
+
 	d, err := spawnDaemon()
 	if err != nil {
 		log.Printf("face: spawn helper: %v", err)
 		return
 	}
-	defer d.Close()
+	// d is reassigned on respawn; the deferred close nils it out on the paths
+	// that already closed it so we never double-close (double Wait errors).
+	defer func() {
+		if d != nil {
+			d.Close()
+		}
+	}()
 
+	respawns := 0
 	for {
 		select {
 		case <-ctx.Done():
 			return
-		case j, ok := <-p.jobs:
+		case <-quit:
+			// Graceful stop: process whatever is already buffered, then exit.
+			p.drain(ctx, d, jobs)
+			return
+		case j, ok := <-jobs:
 			if !ok {
+				return // defensive: jobs is never closed
+			}
+			if p.process(ctx, d, j) {
+				continue
+			}
+			// Transport error: the helper died mid-request (a dlib segfault on
+			// a corrupt thumb is the classic trigger). Reap it and spawn a
+			// fresh one so this worker doesn't become a black-hole consumer
+			// that silently eats every subsequent job. Cap respawns so a
+			// permanently-broken helper degrades loudly instead of spinning.
+			d.Close()
+			d = nil
+			if ctx.Err() != nil {
 				return
 			}
-			p.process(ctx, d, j)
+			respawns++
+			if respawns > maxDaemonRespawns {
+				log.Printf("face: helper crashed %d times; stopping this worker", respawns)
+				return
+			}
+			nd, err := spawnDaemon()
+			if err != nil {
+				log.Printf("face: respawn helper: %v", err)
+				return
+			}
+			d = nd
 		}
 	}
 }
 
-func (p *Pipeline) process(ctx context.Context, d *daemon, j Job) {
+// drain best-effort processes jobs already sitting in the buffer at Stop time
+// so a graceful Stop doesn't discard queued work. It never waits for new
+// submissions (the default case returns the instant the buffer is empty) and
+// bails if the helper dies mid-drain — completeness here is best-effort since
+// the next scan re-detects anything skipped.
+func (p *Pipeline) drain(ctx context.Context, d *daemon, jobs <-chan Job) {
+	for {
+		select {
+		case j, ok := <-jobs:
+			if !ok || !p.process(ctx, d, j) {
+				return
+			}
+		default:
+			return
+		}
+	}
+}
+
+// process handles one job: detect faces on the thumbnail, then cluster and
+// persist them. It returns false only when the daemon died mid-request (a
+// transport error), signalling the worker to respawn it; a per-image skip, a
+// successful write, or an already-fresh path all return true (daemon healthy).
+func (p *Pipeline) process(ctx context.Context, d *daemon, j Job) (daemonOK bool) {
 	// Re-check inside the worker — another worker may have handled this
 	// path in the interim (e.g. a re-submit from a refresh).
 	if p.hasFreshCached(j.Entry.Path, j.ThumbMod) {
-		return
+		return true
 	}
-	dets, err := d.Detect(ctx, j.ThumbPath)
+	// Bound each detection so a wedged helper can't block Stop indefinitely.
+	// On timeout Detect kills the child, so the daemon is dead and we fall
+	// through to the transport-error path (respawn).
+	detectCtx, cancel := context.WithTimeout(ctx, detectTimeout)
+	dets, err := d.Detect(detectCtx, j.ThumbPath)
+	cancel()
 	if err != nil {
 		if ctx.Err() == nil {
 			log.Printf("face: detect %s: %v", j.Entry.Path, err)
 		}
-		return
+		// A per-image error means the daemon is healthy and just couldn't
+		// handle this one file — skip it and keep the daemon. Anything else
+		// (pipe write/read, timeout-kill, malformed line) means the child is
+		// dead or the stream is out of sync, so the daemon must be respawned.
+		var pie *perImageError
+		return errors.As(err, &pie)
 	}
 
 	p.clusterMu.Lock()
@@ -280,11 +416,10 @@ func (p *Pipeline) process(ctx context.Context, d *daemon, j Job) {
 			})
 			p.cachedClusters[idx].Centroid = newCentroid
 			p.cachedClusters[idx].Count = c.Count + 1
+			// Keep the candidate centroid in lockstep so a later face in the
+			// same image compares against the just-updated cluster.
 			cands[idx].Centroid = newCentroid
 			cands[idx].Count = c.Count + 1
-			// Centroid changed — drop the cached unit form so the next
-			// NearestCluster call recomputes against the fresh vector.
-			cands[idx].Norm = nil
 			cacheSlots = append(cacheSlots, idx)
 		} else {
 			emb := append([]float32(nil), d.Embedding...)
@@ -305,11 +440,12 @@ func (p *Pipeline) process(ctx context.Context, d *daemon, j Job) {
 	if err != nil {
 		log.Printf("face: write %s: %v", j.Entry.Path, err)
 		// Cache may be inconsistent with DB now; drop it so the next
-		// assignment reloads from authoritative state.
+		// assignment reloads from authoritative state. This is a DB error,
+		// not a helper transport error, so the daemon stays healthy.
 		p.cachedClusters = nil
 		p.clusterCacheOK = false
 		p.clusterMu.Unlock()
-		return
+		return true
 	}
 	p.markFresh(j.Entry.Path, j.ThumbMod)
 
@@ -325,6 +461,7 @@ func (p *Pipeline) process(ctx context.Context, d *daemon, j Job) {
 	if changed && p.onChange != nil {
 		p.onChange()
 	}
+	return true
 }
 
 // InvalidateClusters drops the in-memory cluster cache. UI paths that mutate
