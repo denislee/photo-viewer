@@ -17,6 +17,7 @@ import (
 	_ "golang.org/x/image/tiff"
 	_ "golang.org/x/image/webp"
 
+	"github.com/dns/photo-viewer/internal/imgorient"
 	"github.com/dns/photo-viewer/internal/scan"
 )
 
@@ -76,6 +77,14 @@ func recompressImage(src, dst string, maxEdge, quality int) error {
 	if err != nil {
 		return err
 	}
+	// Go's image decoders ignore the EXIF Orientation tag and jpeg.Encode
+	// writes no EXIF, so a portrait camera JPEG (Orientation != 1) would
+	// otherwise export with sideways pixels AND no tag left to correct it —
+	// permanently rotated. Bake the orientation into the pixels here, after
+	// decode and before scaling, so the output JPEG is upright with no
+	// orientation tag needed. (The plain non-recompress copy path keeps the
+	// original bytes incl. the EXIF tag, so it doesn't need this.)
+	img = imgorient.Apply(img, imgorient.ReadOrientation(src))
 	b := img.Bounds()
 	tw, th := fitWithin(b.Dx(), b.Dy(), maxEdge)
 	dstImg := image.NewRGBA(image.Rect(0, 0, tw, th))
@@ -87,6 +96,14 @@ func recompressImage(src, dst string, maxEdge, quality int) error {
 		return err
 	}
 	if err := jpeg.Encode(out, dstImg, &jpeg.Options{Quality: quality}); err != nil {
+		out.Close()
+		os.Remove(tmp)
+		return err
+	}
+	// fsync before the rename so the encoded JPEG is on stable storage, not just
+	// in the page cache, before it becomes visible at dst. A failed Sync is the
+	// "not yet durable" case, so treat it as an encode failure and drop the temp.
+	if err := out.Sync(); err != nil {
 		out.Close()
 		os.Remove(tmp)
 		return err

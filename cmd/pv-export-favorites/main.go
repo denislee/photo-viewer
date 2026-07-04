@@ -34,6 +34,17 @@ func main() {
 		os.Exit(1)
 	}
 
+	// -move and -max-long-edge are mutually exclusive: -move relocates the
+	// original file, while -max-long-edge re-encodes it into a brand-new file
+	// (leaving the original in place — which isn't a move at all). Previously
+	// the two flags were wired independently and -move simply won, silently
+	// skipping the requested recompression. Reject the combination up front so
+	// the user never believes their export was down-scaled when it wasn't.
+	if *move && *maxEdge > 0 {
+		fmt.Fprintln(os.Stderr, "Error: -move and -max-long-edge cannot be combined (-move relocates the original file; -max-long-edge re-encodes it into a new file). Choose one.")
+		os.Exit(1)
+	}
+
 	absRoot, err := filepath.Abs(*root)
 	if err != nil {
 		log.Fatalf("resolve root: %v", err)
