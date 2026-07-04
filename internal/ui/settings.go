@@ -46,8 +46,22 @@ type SettingsView struct {
 	trashMsg    string
 	exportFavMsg string
 
+	// pendingInbox / pendingOutbox hold a directory the background zenity
+	// picker (pickDir) chose. The picker can't call editor.SetText itself —
+	// that mutates a widget.Editor the frame goroutine is laying out — so it
+	// stashes the path here (guarded by mu) and Layout applies it on the UI
+	// thread. nil means "nothing pending".
+	pendingInbox  *string
+	pendingOutbox *string
+
 	invalidate func()
 }
+
+// pickDir targets — which editor a background directory pick applies to.
+const (
+	pickInbox = iota
+	pickOutbox
+)
 
 // SetController gives the settings view a handle to the controller for
 // trash management. Call once at startup.
@@ -72,9 +86,14 @@ func (v *SettingsView) Show() {
 	v.outboxEditor.SetText(c.OutboxDir)
 	v.sdAutoDetect.Value = c.SDCardAutoDetect
 	v.showShortcuts.Value = c.ShowShortcutHints
+	// statusMsg/trashMsg/exportFavMsg are also written from background
+	// goroutines (pickDir, EmptyTrash, setExportMsg), so every access goes
+	// through mu.
+	v.mu.Lock()
 	v.statusMsg = "Config file: " + configPath()
 	v.trashMsg = v.trashStatus()
 	v.exportFavMsg = v.favoritesStatus()
+	v.mu.Unlock()
 	v.Open = true
 }
 
@@ -130,14 +149,27 @@ func (v *SettingsView) Close() {
 
 // Layout draws the overlay over the supplied constraints.
 func (v *SettingsView) Layout(gtx layout.Context, th *Theme) layout.Dimensions {
+	// Apply any directory the background picker stashed. SetText must run on
+	// the UI goroutine — doing it inside pickDir would mutate the editor while
+	// this Layout reads it.
+	v.mu.Lock()
+	pInbox, pOutbox := v.pendingInbox, v.pendingOutbox
+	v.pendingInbox, v.pendingOutbox = nil, nil
+	v.mu.Unlock()
+	if pInbox != nil {
+		v.inboxEditor.SetText(*pInbox)
+	}
+	if pOutbox != nil {
+		v.outboxEditor.SetText(*pOutbox)
+	}
 	if v.closeBtn.Clicked(gtx) {
 		v.Close()
 	}
 	if v.inboxBrowseBtn.Clicked(gtx) {
-		go v.pickDir(&v.inboxEditor, "Select inbox directory")
+		go v.pickDir(pickInbox, "Select inbox directory")
 	}
 	if v.outboxBrowseBtn.Clicked(gtx) {
-		go v.pickDir(&v.outboxEditor, "Select outbox directory")
+		go v.pickDir(pickOutbox, "Select outbox directory")
 	}
 	if v.saveBtn.Clicked(gtx) {
 		c := GetConfig()
@@ -145,11 +177,13 @@ func (v *SettingsView) Layout(gtx layout.Context, th *Theme) layout.Dimensions {
 		c.OutboxDir = v.outboxEditor.Text()
 		c.SDCardAutoDetect = v.sdAutoDetect.Value
 		c.ShowShortcutHints = v.showShortcuts.Value
+		msg := "Saved to " + configPath()
 		if err := SaveConfig(c); err != nil {
-			v.statusMsg = "Save failed: " + err.Error()
-		} else {
-			v.statusMsg = "Saved to " + configPath()
+			msg = "Save failed: " + err.Error()
 		}
+		v.mu.Lock()
+		v.statusMsg = msg
+		v.mu.Unlock()
 	}
 	// Persist the toggle immediately so the watcher reacts even if the user
 	// flips it and then closes without clicking Save.
@@ -205,7 +239,10 @@ func (v *SettingsView) Layout(gtx layout.Context, th *Theme) layout.Dimensions {
 			}),
 			layout.Rigid(layout.Spacer{Height: unit.Dp(4)}.Layout),
 			layout.Rigid(func(gtx layout.Context) layout.Dimensions {
-				lbl := material.Label(th.Theme, unit.Sp(11), v.statusMsg)
+				v.mu.Lock()
+				msg := v.statusMsg
+				v.mu.Unlock()
+				lbl := material.Label(th.Theme, unit.Sp(11), msg)
 				lbl.Color = th.Foreground
 				return lbl.Layout(gtx)
 			}),
@@ -444,10 +481,12 @@ func (v *SettingsView) editorRow(th *Theme, label string, ed *widget.Editor, hin
 	}
 }
 
-// pickDir shells out to zenity for a directory picker and writes the result
-// into ed on success. Runs on its own goroutine since zenity blocks. Falls
-// back silently if zenity is missing — the user can still type a path.
-func (v *SettingsView) pickDir(ed *widget.Editor, title string) {
+// pickDir shells out to zenity for a directory picker and stashes the result
+// for the target editor (pickInbox / pickOutbox). Runs on its own goroutine
+// since zenity blocks, so it must not touch the widget.Editor directly — it
+// records the path in a pending field that Layout applies on the UI thread.
+// Falls back silently if zenity is missing — the user can still type a path.
+func (v *SettingsView) pickDir(target int, title string) {
 	path, err := runZenity("--file-selection", "--directory", "--title="+title)
 	if err != nil {
 		v.mu.Lock()
@@ -461,7 +500,14 @@ func (v *SettingsView) pickDir(ed *widget.Editor, title string) {
 	if path == "" {
 		return
 	}
-	ed.SetText(path)
+	v.mu.Lock()
+	switch target {
+	case pickInbox:
+		v.pendingInbox = &path
+	case pickOutbox:
+		v.pendingOutbox = &path
+	}
+	v.mu.Unlock()
 	if v.invalidate != nil {
 		v.invalidate()
 	}

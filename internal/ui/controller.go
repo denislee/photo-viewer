@@ -6,6 +6,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"maps"
 	"os"
 	"path/filepath"
 	"sort"
@@ -337,8 +338,8 @@ func (c *Controller) IndexStatus() IndexStatus {
 	return st
 }
 
-// Rebuild wipes the on-disk cache (sqlite db + thumbs), reopens the index,
-// and kicks off a full rescan of the library root. The active grid view is
+// Rebuild empties the index in place, forgets every generated thumbnail, and
+// kicks off a full rescan of the library root. The active grid view is
 // preserved — the rescan surfaces only as a process-bar entry, and entries
 // are repopulated as scan batches land via the usual refresh path.
 func (c *Controller) Rebuild() error {
@@ -346,27 +347,33 @@ func (c *Controller) Rebuild() error {
 	if c.scanCancel != nil {
 		c.scanCancel()
 	}
-	// Rebuild wipes the thumbs+db that an in-flight warm-up would be writing
-	// to, so cancel the warm-up as well — otherwise it races the Wipe call.
+	// Rebuild removes the thumbs an in-flight warm-up would be writing to, so
+	// cancel the warm-up as well — otherwise it races the removal below.
 	if c.warmUpCancel != nil {
 		c.warmUpCancel()
 		c.warmUpCancel = nil
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	c.scanCancel = cancel
+	idx := c.index
 	c.mu.Unlock()
 
-	dbPath := filepath.Join(c.libraryRoot, ".photo-viewer.db")
-	if err := cache.Wipe(dbPath, c.cacheDir); err != nil {
+	// Reset the index in place instead of deleting and reopening the db.
+	// Keeping the same *cache.Index handle means the duplicates view, fuzzy
+	// search, and webserver — which captured the pointer at startup — keep
+	// querying the live database after a rebuild, there is no orphaned WAL to
+	// replay into a freshly recreated file, and c.index is never reassigned
+	// (so the lock-free readers of it no longer race). cache.IndexPath's
+	// read-only-root handling is irrelevant here since we touch no db path.
+	if err := idx.Clear(); err != nil {
 		return err
 	}
-	idx, err := cache.Load(dbPath)
-	if err != nil {
+	// Forget every generated thumbnail so they regenerate from the rescanned
+	// originals. Thumbs live under cacheDir (always writable), so this works
+	// even when the library root itself is read-only.
+	if err := os.RemoveAll(filepath.Join(c.cacheDir, "thumbs")); err != nil {
 		return err
 	}
-	c.mu.Lock()
-	c.index = idx
-	c.mu.Unlock()
 	go c.scanInto(ctx, c.libraryRoot)
 	return nil
 }
@@ -528,6 +535,11 @@ func (c *Controller) patchLocalDeletion(paths []string, intoTrash bool) {
 		c.entries = kept
 	}
 	if c.dirCounts != nil {
+		// Clone-swap rather than mutate in place: the sidebar reads the map
+		// returned by DirCounts() lock-free every frame, so decrementing the
+		// published map here would race that reader (fatal error: concurrent
+		// map read and map write). Patch a copy and swap the pointer under mu.
+		next := maps.Clone(c.dirCounts)
 		// Walk each deleted path up its ancestor chain and decrement the
 		// matching dirCounts keys. This is O(deleted × depth) map lookups
 		// rather than O(dirCounts × deleted) prefix comparisons — the old
@@ -538,10 +550,10 @@ func (c *Controller) patchLocalDeletion(paths []string, intoTrash bool) {
 				if cur == "" || cur == FavoritesView || cur == TrashView {
 					break
 				}
-				if _, ok := c.dirCounts[cur]; ok {
-					c.dirCounts[cur]--
-					if c.dirCounts[cur] < 0 {
-						c.dirCounts[cur] = 0
+				if _, ok := next[cur]; ok {
+					next[cur]--
+					if next[cur] < 0 {
+						next[cur] = 0
 					}
 				}
 				parent := filepath.Dir(cur)
@@ -552,11 +564,12 @@ func (c *Controller) patchLocalDeletion(paths []string, intoTrash bool) {
 			}
 		}
 		if favCount > 0 {
-			c.dirCounts[FavoritesView] -= favCount
-			if c.dirCounts[FavoritesView] < 0 {
-				c.dirCounts[FavoritesView] = 0
+			next[FavoritesView] -= favCount
+			if next[FavoritesView] < 0 {
+				next[FavoritesView] = 0
 			}
 		}
+		c.dirCounts = next
 	}
 	c.mu.Unlock()
 
@@ -686,7 +699,11 @@ func (c *Controller) bumpTrashCount(delta int) {
 		c.trashCount = 0
 	}
 	if c.dirCounts != nil {
-		c.dirCounts[TrashView] = c.trashCount
+		// Clone-swap: the published map is read lock-free by the sidebar
+		// every frame, so writing TrashView in place would race that reader.
+		next := maps.Clone(c.dirCounts)
+		next[TrashView] = c.trashCount
+		c.dirCounts = next
 	}
 	c.mu.Unlock()
 }
@@ -697,7 +714,11 @@ func (c *Controller) resetTrashCount() {
 	c.trashCount = 0
 	c.trashCountValid = true
 	if c.dirCounts != nil {
-		c.dirCounts[TrashView] = 0
+		// Clone-swap rather than mutate the published map in place — the
+		// sidebar reads it lock-free. See bumpTrashCount.
+		next := maps.Clone(c.dirCounts)
+		next[TrashView] = 0
+		c.dirCounts = next
 	}
 	c.mu.Unlock()
 }

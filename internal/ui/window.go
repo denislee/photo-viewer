@@ -64,9 +64,6 @@ func Run(w *app.Window, ctrl *Controller) error {
 	dups.SetProcessRegistry(processes)
 	imports.SetProcessRegistry(processes)
 	organize.SetProcessRegistry(processes)
-	// Kick off the initial indexing now that the registry is wired so it
-	// shows up in the process bar like every other scan.
-	go ctrl.SelectDir(ctrl.LibraryRoot())
 	processBar := NewProcessBar(processes)
 	processBar.OnOpen = func(kind ProcKind) {
 		switch kind {
@@ -198,6 +195,11 @@ func Run(w *app.Window, ctrl *Controller) error {
 	splitter := &sidebarSplitter{}
 
 	ctrl.SetInvalidate(w.Invalidate)
+	// Kick off the initial indexing only after both the process registry and
+	// the invalidate callback are wired. Starting it earlier let SelectDir's
+	// background goroutines read c.invalidate while SetInvalidate was still
+	// racing to publish it (and it still surfaces in the process bar).
+	go ctrl.SelectDir(ctrl.LibraryRoot())
 
 	var ops op.Ops
 	for {

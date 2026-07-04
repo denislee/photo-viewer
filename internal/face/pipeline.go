@@ -5,6 +5,7 @@ import (
 	"log"
 	"runtime"
 	"sync"
+	"sync/atomic"
 
 	"github.com/dns/photo-viewer/internal/cache"
 	"github.com/dns/photo-viewer/internal/scan"
@@ -31,7 +32,9 @@ type Pipeline struct {
 	mu       sync.Mutex
 	cancel   context.CancelFunc
 	onChange OnClusterChange
-	enabled  bool
+	// enabled is read lock-free by acceptJob on every Submit while Recheck can
+	// flip it from another goroutine, so it's atomic rather than mu-guarded.
+	enabled atomic.Bool
 
 	// clusterMu guards the in-memory cluster cache and serialises the
 	// assignment step across workers. Detection runs in parallel; only the
@@ -53,18 +56,17 @@ type Pipeline struct {
 // is disabled — Submit becomes a no-op and Start returns immediately. This
 // matches the graceful-degrade behaviour of the thumbnail backends.
 func NewPipeline(idx *cache.Index, onChange OnClusterChange) *Pipeline {
-	return &Pipeline{
+	p := &Pipeline{
 		idx:      idx,
 		onChange: onChange,
-		enabled:  Available(),
 	}
+	p.enabled.Store(Available())
+	return p
 }
 
 // Enabled reports whether the helper binary was found on construction.
 func (p *Pipeline) Enabled() bool {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	return p.enabled
+	return p.enabled.Load()
 }
 
 // Recheck re-probes the helper and updates Enabled. Returns the fresh
@@ -73,9 +75,7 @@ func (p *Pipeline) Enabled() bool {
 // its own, to avoid surprising the caller.
 func (p *Pipeline) Recheck() Status {
 	s := Probe()
-	p.mu.Lock()
-	p.enabled = s.Working
-	p.mu.Unlock()
+	p.enabled.Store(s.Working)
 	return s
 }
 
@@ -83,7 +83,7 @@ func (p *Pipeline) Recheck() Status {
 func (p *Pipeline) Start(parent context.Context) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if p.cancel != nil || !p.enabled {
+	if p.cancel != nil || !p.enabled.Load() {
 		return
 	}
 	ctx, cancel := context.WithCancel(parent)
@@ -154,7 +154,7 @@ func (p *Pipeline) SubmitBlocking(ctx context.Context, j Job) bool {
 
 // acceptJob runs the cheap pre-checks and returns the live jobs channel.
 func (p *Pipeline) acceptJob(j Job) (chan Job, bool) {
-	if !p.enabled {
+	if !p.enabled.Load() {
 		return nil, false
 	}
 	switch j.Entry.Type {

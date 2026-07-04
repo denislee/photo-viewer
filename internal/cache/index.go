@@ -4,7 +4,6 @@ import (
 	"crypto/sha1"
 	"database/sql"
 	"encoding/hex"
-	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -668,10 +667,33 @@ func (i *Index) IsFavorite(path string) bool {
 	return v != 0
 }
 
-// Wipe deletes the database and thumbs folder.
-func Wipe(dbPath, cacheDir string) error {
-	os.RemoveAll(filepath.Join(cacheDir, "thumbs"))
-	return os.Remove(dbPath)
+// Clear empties the index in place — every entry, face, and face cluster is
+// deleted in a single transaction while the database file and connection stay
+// open. This is the "Rebuild index" primitive.
+//
+// Resetting the live handle (rather than deleting the db file and reopening a
+// fresh *Index) is deliberate: the old file-delete path left the WAL/SHM
+// sidecar files behind, which SQLite could replay into the freshly recreated
+// database and resurrect deleted rows. It also swapped the *Index pointer,
+// invalidating the long-lived captures held by the duplicates view, fuzzy
+// search, and the webserver. Clearing in place avoids both — callers keep the
+// same handle and see the emptied index immediately.
+func (i *Index) Clear() error {
+	tx, err := i.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	for _, stmt := range []string{
+		"DELETE FROM entries",
+		"DELETE FROM faces",
+		"DELETE FROM face_clusters",
+	} {
+		if _, err := tx.Exec(stmt); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
 }
 
 // ThumbIDFor returns the deterministic thumbnail identifier for a media path.

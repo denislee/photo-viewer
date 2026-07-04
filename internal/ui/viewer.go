@@ -12,6 +12,7 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
 
 	"gioui.org/f32"
 	"gioui.org/layout"
@@ -84,9 +85,13 @@ type Viewer struct {
 	// It's kept alive between videos so navigation between clips doesn't
 	// pay the libmpv-init cost each time; the player itself is also a
 	// no-op when libmpv failed to load on this machine.
+	// player is stored atomically: playerOnce.Do initialises it on whichever
+	// goroutine first calls Player() (often the preload goroutine), while
+	// Close / stopVideoIfRunning read it from the UI thread. An atomic pointer
+	// lets those readers observe it without racing the Once's write.
 	playerOnce sync.Once
 	playerErr  error
-	player     *video.Player
+	player     atomic.Pointer[video.Player]
 
 	invalidate func()
 }
@@ -132,7 +137,12 @@ type cachedInfo struct {
 func (v *Viewer) SetInvalidate(f func()) { v.invalidate = f }
 
 func (v *Viewer) Show(entries []cache.Entry, idx int) {
-	v.entries = entries
+	// Copy the slice: the caller hands us the controller's live entries
+	// (via Snapshot), whose backing array the grid keeps reading. ConfirmDelete
+	// shifts elements in place and the 'F' favorite toggle writes through
+	// &v.entries[i]; both would corrupt the array shared with the grid, so the
+	// viewer owns its own copy instead.
+	v.entries = append([]cache.Entry(nil), entries...)
 	v.Index = idx
 	v.Open = true
 	v.preloadVideoIfNeeded()
@@ -154,8 +164,8 @@ func (v *Viewer) Close() {
 	v.recent = nil
 	v.prefetching = nil
 	v.recentMu.Unlock()
-	if v.player != nil {
-		v.player.Stop()
+	if p := v.player.Load(); p != nil {
+		p.Stop()
 	}
 }
 
@@ -163,11 +173,12 @@ func (v *Viewer) Close() {
 // video. Called from Next/Prev so paging away from a clip releases its
 // decoder; the player itself stays warm for the next video.
 func (v *Viewer) stopVideoIfRunning() {
-	if v.player == nil {
+	p := v.player.Load()
+	if p == nil {
 		return
 	}
 	if v.Index < 0 || v.Index >= len(v.entries) || v.entries[v.Index].Type != scan.TypeVideo {
-		v.player.Stop()
+		p.Stop()
 	}
 }
 
@@ -340,9 +351,11 @@ func (v *Viewer) Prev() {
 // return the cached instance.
 func (v *Viewer) Player() *video.Player {
 	v.playerOnce.Do(func() {
-		v.player, v.playerErr = video.New(v.invalidate)
+		p, err := video.New(v.invalidate)
+		v.playerErr = err
+		v.player.Store(p)
 	})
-	return v.player
+	return v.player.Load()
 }
 
 // playVideo loads the current entry into mpv if it isn't already, renders

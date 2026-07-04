@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"image"
 	"io"
@@ -1017,7 +1018,7 @@ func (v *ImportView) runImport(ctx context.Context, cfg Config, importDirs, zipF
 		}
 		v.setStatus("Extracting ZIP: " + filepath.Base(z))
 		v.appendLog("Extracting " + z + " ...")
-		extracted := v.extractZipToInbox(z, cfg.InboxDir)
+		extracted := v.extractZipToInbox(ctx, z, cfg.InboxDir)
 		v.appendLog(fmt.Sprintf("Extracted %d media files from %s.", len(extracted), filepath.Base(z)))
 	}
 
@@ -1090,7 +1091,7 @@ func (v *ImportView) runImport(ctx context.Context, cfg Config, importDirs, zipF
 			}
 			v.setStatus("Extracting ZIP: " + filepath.Base(z))
 			v.appendLog("Extracting " + z + " ...")
-			extracted := v.extractZipToInbox(z, cfg.InboxDir)
+			extracted := v.extractZipToInbox(ctx, z, cfg.InboxDir)
 			if len(extracted) == 0 {
 				continue
 			}
@@ -1240,9 +1241,21 @@ func (v *ImportView) processBatch(ctx context.Context, outboxDir string, entries
 			ext := filepath.Ext(baseName)
 			dest = filepath.Join(destDir, fmt.Sprintf("%s_%d%s", base, time.Now().UnixNano(), ext))
 		}
-		if err := os.Rename(src, dest); err != nil {
+		moveErr := os.Rename(src, dest)
+		if moveErr != nil && errors.Is(moveErr, syscall.EXDEV) {
+			// os.Rename can't cross filesystems (EXDEV): when the inbox and
+			// outbox live on different mounts, every move would otherwise
+			// fail and the files would stay stuck in the inbox. Fall back to
+			// a crash-safe copy + remove so they still land in the library.
+			// Gate strictly on EXDEV so genuine errors (permission denied,
+			// disk full) still surface as failures instead of silent copies.
+			if moveErr = copyFile(src, dest); moveErr == nil {
+				moveErr = os.Remove(src)
+			}
+		}
+		if moveErr != nil {
 			atomic.AddInt64(&v.statErrors, 1)
-			v.appendLog("[ERROR] Could not move " + baseName + ": " + err.Error())
+			v.appendLog("[ERROR] Could not move " + baseName + ": " + moveErr.Error())
 		} else {
 			atomic.AddInt64(&v.statMoved, 1)
 			v.appendLog(fmt.Sprintf("[OK] Moved %s -> %s", baseName, filepath.Join(dateFolder, filepath.Base(dest))))
@@ -1251,7 +1264,7 @@ func (v *ImportView) processBatch(ctx context.Context, outboxDir string, entries
 	}
 }
 
-func (v *ImportView) extractZipToInbox(zipPath, inboxDir string) []string {
+func (v *ImportView) extractZipToInbox(ctx context.Context, zipPath, inboxDir string) []string {
 	r, err := zip.OpenReader(zipPath)
 	if err != nil {
 		v.appendLog("[ERROR] Failed to open ZIP: " + err.Error())
@@ -1260,6 +1273,15 @@ func (v *ImportView) extractZipToInbox(zipPath, inboxDir string) []string {
 	defer r.Close()
 	var extracted []string
 	for _, f := range r.File {
+		// Honour Pause / Cancel between archive entries so a multi-GB ZIP
+		// stops promptly instead of extracting to completion after the user
+		// hit Cancel. (A partial file from an interrupted io.Copy below is
+		// removed in that entry's error path, so an early return here leaves
+		// no truncated file behind.)
+		v.waitIfPaused()
+		if ctx.Err() != nil {
+			return extracted
+		}
 		if f.FileInfo().IsDir() {
 			continue
 		}
@@ -1350,21 +1372,48 @@ func sameDevice(a, b string) bool {
 	return sa.Dev == sb.Dev
 }
 
+// copyFile copies src to dst crash-safely: it streams into a sibling
+// dst+".tmp", fsyncs it to stable storage, and only then renames it into
+// place. This closes two data-safety holes. First, a yanked SD card or full
+// disk mid-copy leaves at most the .tmp (removed here on any error), never a
+// truncated file at dst — otherwise the next import's inbox walk would file
+// that partial file into the library as if it were valid. Second, the Sync
+// before the rename backstops "Delete source after import": the caller's
+// os.Remove(src) must not run while dst's bytes are still only in the page
+// cache, or a power loss would destroy the sole copy. (dst's .tmp is a real
+// *os.File, so plain io.Copy still gets the kernel copy_file_range/sendfile
+// fast path — no pooled buffer needed.)
 func copyFile(src, dst string) error {
 	in, err := os.Open(src)
 	if err != nil {
 		return err
 	}
 	defer in.Close()
-	out, err := os.Create(dst)
+	tmp := dst + ".tmp"
+	out, err := os.Create(tmp)
 	if err != nil {
 		return err
 	}
 	if _, err := io.Copy(out, in); err != nil {
 		out.Close()
+		os.Remove(tmp) // best-effort: never leave a partial temp behind
 		return err
 	}
-	return out.Close()
+	// A failed Sync is exactly the "bytes still only in the page cache" case,
+	// so treat it as a copy failure: drop the temp and report the error so no
+	// caller deletes the source believing the copy is durable.
+	if err := out.Sync(); err != nil {
+		out.Close()
+		os.Remove(tmp)
+		return err
+	}
+	if err := out.Close(); err != nil {
+		os.Remove(tmp)
+		return err
+	}
+	// Rename is atomic within a filesystem: dst either doesn't exist or is the
+	// fully-written, fsynced file — never a half-copy.
+	return os.Rename(tmp, dst)
 }
 
 func sameContent(a, b string) (bool, error) {
