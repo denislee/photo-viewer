@@ -55,6 +55,12 @@ func Run(w *app.Window, ctrl *Controller) error {
 	dups.SetBatchDeleter(ctrl.DeletePaths)
 	imports := NewImportView(w.Invalidate)
 	organize := NewOrganizeView(w.Invalidate)
+	// Wire the organize move pass to the controller's index/thumbnail
+	// bookkeeping + grid refresh, the same way the duplicates view is wired to
+	// the controller's delete path above. Without this the move pass renames
+	// files but leaves the grid showing broken/stale entries until a rebuild.
+	organize.SetMover(ctrl.ApplyMove)
+	organize.SetRefresh(ctrl.RefreshActive)
 
 	// Process registry surfaces background work (scan, warm-up, import,
 	// duplicate hash, organize) in the main-screen process bar so the user

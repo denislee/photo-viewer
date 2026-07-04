@@ -41,7 +41,12 @@ type OrganizeView struct {
 	statusMsg    string
 	logVisible   []string
 	logBuf       []string
-	cancelFn     context.CancelFunc
+	// Separate cancel funcs for the two passes: the metadata scan and the move.
+	// Keeping them apart guarantees the Cancel button (and the process bar)
+	// aborts the pass that is actually running — a re-entrant scan can never
+	// clobber the cancel of an in-flight move, and vice-versa.
+	scanCancel context.CancelFunc
+	moveCancel context.CancelFunc
 
 	closeBtn    widget.Clickable
 	cancelBtn   widget.Clickable
@@ -49,6 +54,13 @@ type OrganizeView struct {
 	logList     widget.List
 
 	invalidate func()
+
+	// applyMove keeps the index + thumbnail store consistent after each on-disk
+	// rename in the move pass; refreshActive repaints the grid once at the end.
+	// Both are wired to the controller in window.go (mirroring how the
+	// duplicates view is wired to the delete path).
+	applyMove     func(old, new string) error
+	refreshActive func()
 
 	processes *ProcessRegistry
 	proc      *Process
@@ -65,9 +77,30 @@ func NewOrganizeView(invalidate func()) *OrganizeView {
 // bar so the scan + move passes show up with pause / cancel controls.
 func (v *OrganizeView) SetProcessRegistry(r *ProcessRegistry) { v.processes = r }
 
+// SetMover wires the per-rename index/thumbnail bookkeeping callback. Without
+// it the move pass would still rename files, but the grid would show broken
+// entries (and regenerate thumbnails) until a manual rebuild.
+func (v *OrganizeView) SetMover(f func(old, new string) error) { v.applyMove = f }
+
+// SetRefresh wires the callback that repaints the grid from the index once the
+// whole move pass finishes.
+func (v *OrganizeView) SetRefresh(f func()) { v.refreshActive = f }
+
 func (v *OrganizeView) Show(idx *cache.Index, root string) {
-	v.Open = true
 	v.mu.Lock()
+	// Running-guard: if a scan or move pass is already in flight (e.g. the user
+	// reopened the modal from the process bar), just re-surface the existing
+	// state instead of kicking off a SECOND concurrent exiftool scan. A second
+	// scan would orphan the first scan's cancel func and, worse, if the move
+	// pass is running it would replace the move's cancel so the Cancel button
+	// would abort the scan instead of the in-flight move. Mirrors the
+	// ImportView / DuplicatesView running-guards.
+	if v.scanning || v.running {
+		v.Open = true
+		v.mu.Unlock()
+		return
+	}
+	v.Open = true
 	v.mismatched = nil
 	v.scanning = true
 	v.running = false
@@ -76,19 +109,20 @@ func (v *OrganizeView) Show(idx *cache.Index, root string) {
 	v.logBuf = nil
 
 	ctx, cancel := context.WithCancel(context.Background())
-	v.cancelFn = cancel
+	v.scanCancel = cancel
 	v.mu.Unlock()
 
 	go v.scanForMismatched(ctx, idx, root)
 }
 
 func (v *OrganizeView) Close() {
-	v.mu.Lock()
-	if v.cancelFn != nil {
-		v.cancelFn()
-		v.cancelFn = nil
-	}
-	v.mu.Unlock()
+	// Closing the modal only hides it — any scan or move pass keeps running in
+	// the background and stays visible (with a Cancel control) in the process
+	// bar, matching the import flow. Reopening via the process bar re-attaches
+	// to the same pass thanks to the running-guard in Show. Cancellation is an
+	// explicit user action (the Cancel button or the process bar), never a
+	// side effect of closing the window — which is what lets a long move
+	// continue safely while the user browses.
 	v.Open = false
 	if v.OnClose != nil {
 		v.OnClose()
@@ -100,7 +134,7 @@ func (v *OrganizeView) scanForMismatched(ctx context.Context, idx *cache.Index, 
 	if v.processes != nil {
 		proc = v.processes.Begin(ProcOrganize, "Organize: scan", func() {
 			v.mu.Lock()
-			c := v.cancelFn
+			c := v.scanCancel
 			v.mu.Unlock()
 			if c != nil {
 				c()
@@ -192,7 +226,7 @@ func (v *OrganizeView) scanForMismatched(ctx context.Context, idx *cache.Index, 
 	defer v.mu.Unlock()
 	v.mismatched = mismatched
 	v.scanning = false
-	v.cancelFn = nil
+	v.scanCancel = nil
 	if ctx.Err() != nil {
 		v.statusMsg = "Scan cancelled."
 	} else if len(mismatched) == 0 {
@@ -220,14 +254,14 @@ func (v *OrganizeView) setStatus(msg string) {
 
 func (v *OrganizeView) startOrganize(root string) {
 	v.mu.Lock()
-	if v.running || len(v.mismatched) == 0 {
+	if v.running || v.scanning || len(v.mismatched) == 0 {
 		v.mu.Unlock()
 		return
 	}
 	v.running = true
 	mismatched := append([]MismatchedVideo(nil), v.mismatched...)
 	ctx, cancel := context.WithCancel(context.Background())
-	v.cancelFn = cancel
+	v.moveCancel = cancel
 	v.mu.Unlock()
 
 	atomic.StoreInt64(&v.progressDone, 0)
@@ -239,7 +273,7 @@ func (v *OrganizeView) startOrganize(root string) {
 		if v.processes != nil {
 			proc = v.processes.Begin(ProcOrganize, "Organize: move", func() {
 				v.mu.Lock()
-				c := v.cancelFn
+				c := v.moveCancel
 				v.mu.Unlock()
 				if c != nil {
 					c()
@@ -251,14 +285,22 @@ func (v *OrganizeView) startOrganize(root string) {
 			v.proc = proc
 			v.mu.Unlock()
 		}
+		movedAny := false
 		defer func() {
 			v.mu.Lock()
 			v.running = false
-			v.cancelFn = nil
+			v.moveCancel = nil
 			v.proc = nil
 			v.mu.Unlock()
 			if proc != nil {
 				proc.End()
+			}
+			// One refresh at the end (not per file): the index rows were already
+			// relocated in lockstep with each rename by applyMove, so a single
+			// coalesced repaint surfaces the whole batch. Skipped when nothing
+			// moved so a cancelled/no-op pass doesn't churn the grid.
+			if movedAny && v.refreshActive != nil {
+				v.refreshActive()
 			}
 			if v.invalidate != nil {
 				v.invalidate()
@@ -272,7 +314,9 @@ func (v *OrganizeView) startOrganize(root string) {
 			if ctx.Err() != nil {
 				v.appendLog("Organization cancelled.")
 				v.setStatus("Cancelled.")
-				return
+				// break, not return, so the deferred end-of-pass refresh still
+				// surfaces the files that were moved before the cancel.
+				break
 			}
 			dateFolder := m.ExpectedDate.Format("2006-01-02")
 			destDir := filepath.Join(root, dateFolder)
@@ -286,7 +330,10 @@ func (v *OrganizeView) startOrganize(root string) {
 			baseName := filepath.Base(m.Entry.Path)
 			dest := filepath.Join(destDir, baseName)
 
-			// Handle collisions
+			// Handle collisions. The organize move stays within the library
+			// root, so source and destination are always on the same
+			// filesystem — os.Rename is atomic here and the EXDEV copy fallback
+			// that pv-organize needs doesn't apply.
 			if _, err := os.Stat(dest); err == nil {
 				ext := filepath.Ext(baseName)
 				base := strings.TrimSuffix(baseName, ext)
@@ -296,13 +343,26 @@ func (v *OrganizeView) startOrganize(root string) {
 			if err := os.Rename(m.Entry.Path, dest); err != nil {
 				v.appendLog(fmt.Sprintf("[ERROR] Move %s: %v", baseName, err))
 			} else {
+				// Relocate the index row + thumbnail so the grid resolves the
+				// entry at its new path instead of showing a broken row and
+				// re-decoding the video thumbnail from scratch.
+				if v.applyMove != nil {
+					if err := v.applyMove(m.Entry.Path, dest); err != nil {
+						v.appendLog(fmt.Sprintf("[WARN] Index update after moving %s: %v", baseName, err))
+					}
+				}
+				movedAny = true
 				v.appendLog(fmt.Sprintf("[OK] Moved %s -> %s", baseName, dateFolder))
 			}
 			v.bumpProgress()
 		}
 
 		v.mu.Lock()
-		v.statusMsg = "Organization complete."
+		// Preserve the "Cancelled." status set above; only declare completion
+		// when the pass ran to the end.
+		if ctx.Err() == nil {
+			v.statusMsg = "Organization complete."
+		}
 		v.mismatched = nil
 		v.mu.Unlock()
 	}()
@@ -350,8 +410,12 @@ func (v *OrganizeView) Layout(gtx layout.Context, th *Theme, root string) layout
 	}
 	if v.cancelBtn.Clicked(gtx) {
 		v.mu.Lock()
-		if v.cancelFn != nil {
-			v.cancelFn()
+		// Cancel whichever pass is actually in flight. The scan and move keep
+		// separate cancel funcs, so cancelling one never aborts the other.
+		if v.scanning && v.scanCancel != nil {
+			v.scanCancel()
+		} else if v.running && v.moveCancel != nil {
+			v.moveCancel()
 		}
 		v.mu.Unlock()
 	}

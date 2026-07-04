@@ -641,6 +641,62 @@ func (c *Controller) performDeletion(paths []string) {
 	_ = c.index.RemoveEntries(paths)
 }
 
+// ApplyMove keeps the index and thumbnail store consistent after the organize
+// pass has renamed a media file from oldPath to newPath on disk. Without it the
+// grid would show a broken row for the vanished old path and — because the
+// thumb id is derived from the absolute path — regenerate the thumbnail from
+// scratch at the new path (an expensive video decode) on the next scan.
+//
+// Mirrors performDeletion's index+thumb bookkeeping, but for a move rather than
+// a delete: the row is relocated (favorite flag + already-probed video duration
+// preserved) instead of dropped. Deliberately does NOT refresh the grid — the
+// caller fires a single RefreshActive once the whole batch of moves is done so
+// a long organize pass doesn't trigger one grid refresh per file.
+func (c *Controller) ApplyMove(oldPath, newPath string) error {
+	if oldPath == "" || newPath == "" || oldPath == newPath {
+		return nil
+	}
+	// Carry the existing thumbnail over so it isn't regenerated. Missing source
+	// thumbs are treated as success by Rename, so this is safe even if the
+	// thumb was never generated.
+	if c.store != nil {
+		_ = c.store.Rename(cache.ThumbIDFor(oldPath), cache.ThumbIDFor(newPath))
+	}
+	// Read the old row before we drop it so we can carry over the favorite flag
+	// and the already-probed duration: newPath is a brand-new row, so a fresh
+	// reconcile would default favorite to false and (with duration 0) force a
+	// re-probe of the video on the next scan.
+	old, hadOld := c.index.GetEntry(oldPath)
+	if info, err := os.Stat(newPath); err == nil {
+		var durationMs int64
+		if hadOld {
+			durationMs = old.DurationMs
+		}
+		c.index.ReconcileBatch([]scan.Result{{
+			Path:       newPath,
+			Type:       scan.DetectType(newPath),
+			Size:       info.Size(),
+			ModTime:    info.ModTime(),
+			DurationMs: durationMs,
+		}})
+		if hadOld && old.Favorite {
+			_ = c.index.SetFavorite(newPath, true)
+		}
+	}
+	// Drop the stale row last so an in-flight scan can't re-observe the old path
+	// after we've already relocated its row (the file itself is already gone
+	// from the old path on disk, so the scan won't re-add it).
+	return c.index.RemoveEntry(oldPath)
+}
+
+// RefreshActive re-queries the index for the directory currently shown in the
+// grid and repaints. Exposed so flows that mutate the index outside the normal
+// scan path (the organize move pass via ApplyMove) can surface their changes
+// with a single coalesced refresh once their batch completes.
+func (c *Controller) RefreshActive() {
+	c.scheduleRefresh(c.activeDir())
+}
+
 // isInTrash reports whether path lives under the trash dir. Used so a
 // "delete" gesture inside the Trash view permanently removes the item
 // instead of trying to soft-delete it (which would be a no-op rename onto
