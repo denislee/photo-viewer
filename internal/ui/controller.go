@@ -519,12 +519,21 @@ func (c *Controller) patchLocalDeletion(paths []string, intoTrash bool) {
 
 	c.mu.Lock()
 	favCount := 0
+	// present holds only the paths we actually removed from the live entry
+	// list this call. Idempotency guard: a second delete of the same path
+	// (e.g. clicking delete on a duplicates "phantom" that reappeared before
+	// the async index DELETE landed) finds it already gone from c.entries, so
+	// it lands in neither present nor favCount — and therefore can't
+	// double-decrement dirCounts into a low/negative drift that only a
+	// restart clears. Counts are only ever adjusted for real removals.
+	present := make(map[string]bool, len(paths))
 	if len(c.entries) > 0 {
 		// New backing array — Snapshot returns c.entries directly and
 		// callers may still be reading the old slice header.
 		kept := make([]cache.Entry, 0, len(c.entries))
 		for _, e := range c.entries {
 			if deleted[e.Path] {
+				present[e.Path] = true
 				if e.Favorite {
 					favCount++
 				}
@@ -540,12 +549,14 @@ func (c *Controller) patchLocalDeletion(paths []string, intoTrash bool) {
 		// published map here would race that reader (fatal error: concurrent
 		// map read and map write). Patch a copy and swap the pointer under mu.
 		next := maps.Clone(c.dirCounts)
-		// Walk each deleted path up its ancestor chain and decrement the
-		// matching dirCounts keys. This is O(deleted × depth) map lookups
-		// rather than O(dirCounts × deleted) prefix comparisons — the old
-		// approach rescanned every sidebar dir for every deleted file, which
-		// stalled the UI on large deletions in deep trees.
-		for p := range deleted {
+		// Walk each *actually-removed* path up its ancestor chain and
+		// decrement the matching dirCounts keys. Iterating present (not
+		// deleted) is what makes the decrement idempotent. This is
+		// O(present × depth) map lookups rather than O(dirCounts × deleted)
+		// prefix comparisons — the old approach rescanned every sidebar dir
+		// for every deleted file, which stalled the UI on large deletions in
+		// deep trees.
+		for p := range present {
 			for cur := p; ; {
 				if cur == "" || cur == FavoritesView || cur == TrashView {
 					break

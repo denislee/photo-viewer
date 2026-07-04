@@ -101,6 +101,16 @@ const hashBatchSize = 500
 // the hashing pass without restarting it. It must be cheap and safe to
 // call from any goroutine.
 func (i *Index) EnsureHashes(ctx context.Context, progress func(done, total int), waitIfPaused func()) error {
+	// Derive a cancellable child context so that every return path — a flush
+	// error in particular — tears the worker pools down before returning.
+	// Without this, an early return leaves the results channel with no reader:
+	// the hash workers block forever on their send, so wg.Wait never fires and
+	// the closer + feeder goroutines leak (up to NumCPU*3 hashers per failed
+	// pass, stacking on every re-run). The deferred cancel below fires on any
+	// return and is what unblocks the ctx.Done() arm of each worker's send.
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
 	type cand struct {
 		path  string
 		size  int64
@@ -204,7 +214,14 @@ func (i *Index) EnsureHashes(ctx context.Context, progress func(done, total int)
 						}
 						continue
 					}
-					results <- qres{path: t.path, quick: q}
+					// Select on ctx.Done() so the worker can't wedge on this
+					// send once the reader has bailed out early (flush error);
+					// the deferred cancel releases every blocked worker.
+					select {
+					case results <- qres{path: t.path, quick: q}:
+					case <-ctx.Done():
+						return
+					}
 				}
 			}()
 		}
@@ -327,7 +344,13 @@ func (i *Index) EnsureHashes(ctx context.Context, progress func(done, total int)
 					}
 					continue
 				}
-				results2 <- fres{path: c.path, hash: h}
+				// Same ctx.Done() guard as phase 1: never block on the send
+				// when the reader may have returned on a flush error.
+				select {
+				case results2 <- fres{path: c.path, hash: h}:
+				case <-ctx.Done():
+					return
+				}
 			}
 		}()
 	}

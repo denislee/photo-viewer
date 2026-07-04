@@ -41,8 +41,14 @@ type DuplicatesView struct {
 	// a Controller.
 	batchDeleter func(paths []string) error
 
-	mu        sync.Mutex
-	hashing   bool
+	mu      sync.Mutex
+	hashing bool
+	// gen is bumped by startHash on every fresh pass. The background
+	// hashAndScan goroutine captures the value at launch and drops any state
+	// write once d.gen no longer matches — so a pass that Rescan superseded
+	// (its ctx cancelled) can't clobber the new pass's state during teardown
+	// (e.g. writing "Error: context canceled" / hashing=false over it).
+	gen       int
 	done      int
 	total     int
 	groups    []cache.DuplicateGroup
@@ -157,12 +163,18 @@ func (d *DuplicatesView) startHash() {
 	d.confirming = false
 	d.confirmingAll = false
 	d.statusMsg = "Hashing files…"
+	// Bump the generation before launching so any still-winding-down
+	// goroutine from a prior pass (one Rescan just cancelled) recognises
+	// itself as stale and drops its terminal writes instead of overwriting
+	// this fresh "Hashing…" state. See hashAndScan's gen checks.
+	d.gen++
+	gen := d.gen
 	ctx, cancel := context.WithCancel(context.Background())
 	d.cancel = cancel
 	d.mu.Unlock()
 	go func() {
 		defer cancel()
-		d.hashAndScan(ctx)
+		d.hashAndScan(ctx, gen)
 	}()
 }
 
@@ -176,7 +188,7 @@ func (d *DuplicatesView) Close() {
 	}
 }
 
-func (d *DuplicatesView) hashAndScan(ctx context.Context) {
+func (d *DuplicatesView) hashAndScan(ctx context.Context, gen int) {
 	// Publish to the main-screen process bar so the user can pause /
 	// resume / cancel without keeping the modal open.
 	var proc *Process
@@ -191,11 +203,18 @@ func (d *DuplicatesView) hashAndScan(ctx context.Context) {
 		}, true)
 		proc.SetStatus("Hashing files…")
 		d.mu.Lock()
-		d.proc = proc
+		// Only claim the shared d.proc slot if we're still the current pass —
+		// a superseded goroutine must not overwrite the live pass's proc, nor
+		// nil it out on the way down (that's why the defer is gen-gated too).
+		if d.gen == gen {
+			d.proc = proc
+		}
 		d.mu.Unlock()
 		defer func() {
 			d.mu.Lock()
-			d.proc = nil
+			if d.gen == gen {
+				d.proc = nil
+			}
 			d.mu.Unlock()
 			proc.End()
 		}()
@@ -203,12 +222,19 @@ func (d *DuplicatesView) hashAndScan(ctx context.Context) {
 
 	err := d.idx.EnsureHashes(ctx, func(done, total int) {
 		d.mu.Lock()
-		d.done = done
-		d.total = total
-		if total > 0 {
-			d.statusMsg = fmt.Sprintf("Hashing %d / %d", done, total)
-		} else {
-			d.statusMsg = "Nothing to hash"
+		// Drop progress writes from a superseded pass: a Rescan bumps d.gen
+		// and starts a new goroutine, but this (old) EnsureHashes may still
+		// emit a few progress ticks while tearing down. Writing them would
+		// stomp the new pass's freshly-published state. Our own proc updates
+		// below stay unconditional — that Process belongs to this goroutine.
+		if d.gen == gen {
+			d.done = done
+			d.total = total
+			if total > 0 {
+				d.statusMsg = fmt.Sprintf("Hashing %d / %d", done, total)
+			} else {
+				d.statusMsg = "Nothing to hash"
+			}
 		}
 		d.mu.Unlock()
 		if proc != nil {
@@ -224,9 +250,15 @@ func (d *DuplicatesView) hashAndScan(ctx context.Context) {
 		}
 	})
 	if err != nil {
+		// The error branch runs *before* the ctx.Err() check below, so a
+		// Rescan-cancelled pass returns here with "context canceled". Gate the
+		// write on gen: otherwise this stale teardown overwrites the new
+		// pass's status/hashing flag — the Rescan-clobber bug.
 		d.mu.Lock()
-		d.statusMsg = "Error: " + err.Error()
-		d.hashing = false
+		if d.gen == gen {
+			d.statusMsg = "Error: " + err.Error()
+			d.hashing = false
+		}
 		d.mu.Unlock()
 		if d.invalidate != nil {
 			d.invalidate()
@@ -238,9 +270,12 @@ func (d *DuplicatesView) hashAndScan(ctx context.Context) {
 	}
 	groups := d.pruneMissing(d.idx.FindDuplicates())
 	d.mu.Lock()
-	d.hashing = false
-	d.groups = groups
-	d.statusMsg = fmt.Sprintf("%d duplicate group(s)", len(groups))
+	// Publish results only if we're still the current pass.
+	if d.gen == gen {
+		d.hashing = false
+		d.groups = groups
+		d.statusMsg = fmt.Sprintf("%d duplicate group(s)", len(groups))
+	}
 	d.mu.Unlock()
 	if d.invalidate != nil {
 		d.invalidate()
@@ -371,11 +406,53 @@ func (d *DuplicatesView) deleteNewer() {
 		paths = append(paths, v.Path)
 	}
 	d.removeBatch(paths)
-	groups := d.pruneMissing(d.idx.FindDuplicates())
+	// Patch the in-memory groups directly instead of re-querying
+	// FindDuplicates. The controller does the actual index DELETE on a
+	// background goroutine, so an immediate re-query races ahead of it and
+	// re-materialises this just-resolved group as a "phantom" from rows that
+	// aren't gone yet. We already know exactly which paths we removed, so
+	// drop them locally; a real re-query only happens on explicit Rescan.
+	d.applyDeletion(paths)
+}
+
+// applyDeletion removes the given paths from the in-memory duplicate groups,
+// drops any group that falls below two surviving copies, clamps the selection,
+// and republishes under the view mutex. This is the race-free alternative to
+// re-running FindDuplicates right after a delete: the real index/filesystem
+// removal happens asynchronously in the controller, so a re-query could still
+// observe the just-deleted rows and rebuild a phantom group. Patching what we
+// already know to be gone closes that window entirely.
+func (d *DuplicatesView) applyDeletion(paths []string) {
+	if len(paths) == 0 {
+		return
+	}
+	deleted := make(map[string]bool, len(paths))
+	for _, p := range paths {
+		deleted[p] = true
+	}
 	d.mu.Lock()
-	d.groups = groups
-	d.statusMsg = fmt.Sprintf("%d duplicate group(s)", len(groups))
-	if d.selected >= len(groups) {
+	// Fresh backing arrays throughout — Layout snapshots d.groups (and each
+	// group's Entries) under the mutex and then reads them lock-free, so a
+	// prior frame may still hold the old headers. Never mutate in place.
+	next := make([]cache.DuplicateGroup, 0, len(d.groups))
+	for _, g := range d.groups {
+		kept := make([]cache.Entry, 0, len(g.Entries))
+		for _, e := range g.Entries {
+			if deleted[e.Path] {
+				continue
+			}
+			kept = append(kept, e)
+		}
+		// A set that drops to a single (or zero) surviving copy is no longer
+		// a duplicate group — leaving it would show as a 1-item phantom.
+		if len(kept) >= 2 {
+			g.Entries = kept
+			next = append(next, g)
+		}
+	}
+	d.groups = next
+	d.statusMsg = fmt.Sprintf("%d duplicate group(s)", len(next))
+	if d.selected >= len(next) {
 		d.selected = -1
 	}
 	d.mu.Unlock()
@@ -401,15 +478,10 @@ func (d *DuplicatesView) deleteAllNewer() {
 		}
 	}
 	d.removeBatch(paths)
-	newGroups := d.pruneMissing(d.idx.FindDuplicates())
-	d.mu.Lock()
-	d.groups = newGroups
-	d.statusMsg = fmt.Sprintf("%d duplicate group(s)", len(newGroups))
-	d.selected = -1
-	d.mu.Unlock()
-	if d.invalidate != nil {
-		d.invalidate()
-	}
+	// In-memory patch rather than a re-query — see deleteNewer/applyDeletion.
+	// Removing every newer copy drops each group to its single oldest member,
+	// so applyDeletion empties the list; a fresh scan only runs on Rescan.
+	d.applyDeletion(paths)
 }
 
 // removeBatch routes through batchDeleter when wired so the Controller can
