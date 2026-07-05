@@ -11,8 +11,63 @@ import (
 	"time"
 
 	"github.com/dns/photo-viewer/internal/scan"
-	_ "github.com/mattn/go-sqlite3"
+	sqlite3 "github.com/mattn/go-sqlite3"
 )
+
+// pvDriverName is the name under which we register a customised sqlite3 driver.
+// It differs from the stock "sqlite3" driver only by a ConnectHook (see
+// registerDriver) that applies the PRAGMAs the DSN can't carry to *every*
+// pooled connection.
+const pvDriverName = "sqlite3_pv"
+
+// registerDriverOnce guards the one-time sql.Register below. Load runs on every
+// "Rebuild index" and repeatedly across the test suite; sql.Register panics on
+// a duplicate driver name, so registration must happen exactly once per process.
+var registerDriverOnce sync.Once
+
+// registerDriver installs pvDriverName: the stock go-sqlite3 driver plus a
+// ConnectHook that runs the PRAGMAs the DSN param set doesn't cover
+// (mmap_size, temp_store) on EVERY connection database/sql opens.
+//
+// Why a hook rather than a single db.Exec: database/sql pools several
+// connections and opens them lazily. The scan writer, the UI, the webserver
+// and the face pipeline all read/write concurrently, so several connections
+// exist at once. The pre-I-08 code ran the PRAGMAs via one db.Exec, which only
+// configured whichever single connection happened to serve that call; every
+// other pooled connection fell back to SQLite's defaults — temp_store=DEFAULT
+// in particular, which spills temp b-trees (the dir/year sorts) to disk. A
+// ConnectHook fires on connection creation, so the settings stick pool-wide.
+// (journal_mode/synchronous/cache_size/busy_timeout are carried by the DSN,
+// which go-sqlite3 also applies per-connection.)
+func registerDriver() {
+	registerDriverOnce.Do(func() {
+		sql.Register(pvDriverName, &sqlite3.SQLiteDriver{
+			ConnectHook: func(conn *sqlite3.SQLiteConn) error {
+				// Run one PRAGMA per Exec so a parse hiccup on either can't
+				// mask the other.
+				for _, pragma := range []string{
+					"PRAGMA mmap_size = 268435456", // 256 MiB memory-mapped I/O
+					"PRAGMA temp_store = MEMORY",   // keep temp b-trees off disk
+				} {
+					if _, err := conn.Exec(pragma, nil); err != nil {
+						return err
+					}
+				}
+				return nil
+			},
+		})
+	})
+}
+
+// pvDSN builds the connection string for dbPath. The per-connection PRAGMAs
+// go-sqlite3 understands as DSN params (journal_mode/synchronous/cache_size/
+// busy_timeout) are set here so they apply to every pooled connection, not just
+// the first — the values match the historical single-connection PRAGMA block.
+// mmap_size and temp_store are not DSN-expressible, so registerDriver's hook
+// carries those. go-sqlite3 splits the path from the query on the first '?'.
+func pvDSN(dbPath string) string {
+	return dbPath + "?_journal_mode=WAL&_synchronous=NORMAL&_cache_size=-64000&_busy_timeout=5000"
+}
 
 // Entry is one media file recorded in the index.
 type Entry struct {
@@ -45,18 +100,17 @@ type Index struct {
 
 // Load opens the SQLite database index.
 func Load(dbPath string) (*Index, error) {
-	db, err := sql.Open("sqlite3", dbPath)
+	// Open through pvDriverName so the mmap_size/temp_store PRAGMAs (carried by
+	// its ConnectHook) and the DSN PRAGMAs apply to every pooled connection —
+	// see registerDriver/pvDSN. The former single-connection PRAGMA block only
+	// configured one of the pool's connections.
+	registerDriver()
+	db, err := sql.Open(pvDriverName, pvDSN(dbPath))
 	if err != nil {
 		return nil, err
 	}
 
 	_, err = db.Exec(`
-		PRAGMA journal_mode = WAL;
-		PRAGMA synchronous = NORMAL;
-		PRAGMA mmap_size = 268435456;
-		PRAGMA cache_size = -64000;
-		PRAGMA busy_timeout = 5000;
-		PRAGMA temp_store = MEMORY;
 		CREATE TABLE IF NOT EXISTS entries (
 			path TEXT PRIMARY KEY,
 			type INTEGER,
@@ -82,11 +136,35 @@ func Load(dbPath string) (*Index, error) {
 	}
 	_, _ = db.Exec("ALTER TABLE entries ADD COLUMN quick_hash TEXT")
 	_, _ = db.Exec("ALTER TABLE entries ADD COLUMN year INTEGER")
-	if _, err := db.Exec("CREATE INDEX IF NOT EXISTS idx_entries_year ON entries(year)"); err != nil {
+	_, _ = db.Exec("ALTER TABLE entries ADD COLUMN duration_ms INTEGER NOT NULL DEFAULT 0")
+
+	// idx_entries_thumb backs GetEntryByThumbID, which fronts every /thumb/,
+	// /media/, /view/, /hls/ and /api/* request. Without it that lookup was a
+	// full table SCAN per HTTP request (≈200 scans of a 100k-row table per
+	// gallery page); with it EXPLAIN reports
+	// "SEARCH entries USING INDEX idx_entries_thumb (thumb_id=?)".
+	//
+	// Non-UNIQUE on purpose. thumb_id is sha1(path) and path is the PRIMARY
+	// KEY, so values are unique in practice — but a UNIQUE index would abort
+	// Load if any legacy database ever held a duplicate, and this index backs
+	// every request, so a failed open would take the whole app down. A plain
+	// index yields the identical SEARCH plan (verified via EXPLAIN QUERY PLAN),
+	// so we trade the unenforced constraint for a guaranteed-safe migration.
+	if _, err := db.Exec("CREATE INDEX IF NOT EXISTS idx_entries_thumb ON entries(thumb_id)"); err != nil {
 		return nil, err
 	}
-	_, _ = db.Exec("ALTER TABLE entries ADD COLUMN duration_ms INTEGER NOT NULL DEFAULT 0")
-	if _, err := db.Exec("CREATE INDEX IF NOT EXISTS idx_entries_duration ON entries(duration_ms)"); err != nil {
+	// idx_entries_yearexpr is an EXPRESSION index whose expression is textually
+	// identical to yearExpr. SQLite only uses an expression index when the query
+	// expression is structurally equal to the index's, so this MUST stay in sync
+	// with the yearExpr constant. It lets Years()'s GROUP BY/ORDER BY stream off
+	// the ordered index instead of "SCAN entries + USE TEMP B-TREE FOR GROUP BY",
+	// and turns ListByYear/year-Neighbors from a full scan into
+	// "SEARCH entries USING INDEX idx_entries_yearexpr (<expr>=?)". The plain
+	// column index idx_entries_year could never serve yearExpr (the COALESCE/
+	// strftime wrapper hides the bare column), so it's dropped in the v5 block.
+	if _, err := db.Exec(
+		"CREATE INDEX IF NOT EXISTS idx_entries_yearexpr ON entries(" + yearExpr + ")",
+	); err != nil {
 		return nil, err
 	}
 
@@ -94,7 +172,7 @@ func Load(dbPath string) (*Index, error) {
 	// hash/value format changes so stale rows are invalidated. user_version is
 	// written once, after every migration below has run, so a crash mid-upgrade
 	// re-runs the migrations rather than skipping them.
-	const schemaVersion = 4
+	const schemaVersion = 5
 	var userVersion int
 	_ = db.QueryRow("PRAGMA user_version").Scan(&userVersion)
 	if userVersion < 1 {
@@ -154,6 +232,18 @@ func Load(dbPath string) (*Index, error) {
 		// so the deletes are harmless no-ops.
 		_, _ = db.Exec("DELETE FROM faces")
 		_, _ = db.Exec("DELETE FROM face_clusters")
+	}
+
+	if userVersion < 5 {
+		// v5 (I-08): drop two write-only indexes that no query reads. Both cost
+		// a b-tree maintenance write on every upsert while serving zero reads.
+		//   - idx_entries_year: the plain `year` column index. Every year query
+		//     goes through yearExpr (COALESCE/strftime), which the column index
+		//     can't serve; idx_entries_yearexpr (created above) replaces it.
+		//   - idx_entries_duration: no query ever filters or orders by
+		//     duration_ms.
+		_, _ = db.Exec("DROP INDEX IF EXISTS idx_entries_year")
+		_, _ = db.Exec("DROP INDEX IF EXISTS idx_entries_duration")
 	}
 
 	if userVersion < schemaVersion {
@@ -331,23 +421,41 @@ func dirRange(dir string) (string, string) {
 }
 
 // ListDir returns a slice of entries under the specific directory prefix.
+//
+// The former "(range) OR path = ?" query forced a MULTI-INDEX OR plus a
+// "USE TEMP B-TREE FOR ORDER BY" — the whole recursive result set was
+// materialised and re-sorted on every listing. The pure range form below
+// streams straight off the covering primary-key index in path order with no
+// temp b-tree. The dropped `path = dir` disjunct matched the case where a
+// *file* path was passed as dir (the web /dir?path= handler doesn't force a
+// directory) — that exact row lives outside [dir+"/", ...), so we recover it
+// with a standalone point lookup and prepend it. dir sorts strictly before
+// dir+"/" (the range's lower bound), so the exact row is always element 0 and
+// prepending preserves path order byte-for-byte.
 func (i *Index) ListDir(dir string) []Entry {
 
 	lower, upper := dirRange(dir)
-
-	rows, err := i.db.Query(
-		"SELECT path, type, size, mtime, thumb_id, favorite, duration_ms FROM entries WHERE (path >= ? AND path < ?) OR path = ? ORDER BY path",
-		lower, upper, dir,
-	)
-	if err != nil {
-		return nil
-	}
-	defer rows.Close()
 
 	// Grown via append rather than pre-sized: a COUNT(*) pre-pass would walk
 	// the same b-tree range a second time, which costs more than the slice
 	// regrowth it would save.
 	var out []Entry
+	if e := i.queryOne(
+		"SELECT path, type, size, mtime, thumb_id, favorite, duration_ms FROM entries WHERE path = ? LIMIT 1",
+		dir,
+	); e != nil {
+		out = append(out, *e)
+	}
+
+	rows, err := i.db.Query(
+		"SELECT path, type, size, mtime, thumb_id, favorite, duration_ms FROM entries WHERE path >= ? AND path < ? ORDER BY path",
+		lower, upper,
+	)
+	if err != nil {
+		return out
+	}
+	defer rows.Close()
+
 	for rows.Next() {
 		var e Entry
 		var mtimeUnix int64
