@@ -8,6 +8,9 @@ import (
 	_ "image/jpeg"
 	"os"
 	"os/exec"
+	"strings"
+
+	"github.com/dns/photo-viewer/internal/scan"
 )
 
 // RAW extracts an embedded JPEG preview from a camera RAW file and resamples
@@ -70,10 +73,22 @@ func LoadRAWPreview(ctx context.Context, src string) ([]byte, error) {
 		return nil, errors.New("exiftool not installed")
 	}
 
-	// Try common preview tags in order of descending typical quality/size.
-	tags := []string{"-PreviewImage", "-JpgFromRaw", "-ThumbnailImage", "-PreviewTIFF", "-OtherImage"}
-	for _, tag := range tags {
-		b, err := extractEmbedded(ctx, src, tag)
+	// Common preview tags in descending order of typical quality/size.
+	tags := []string{"PreviewImage", "JpgFromRaw", "ThumbnailImage", "PreviewTIFF", "OtherImage"}
+
+	// One shared-daemon metadata read reports which of those tags this file
+	// actually carries, so we run "exiftool -b" only for previews that exist
+	// instead of forking it once per candidate tag (up to five sequential
+	// processes per RAW). The probe rides the -stay_open daemon (no fork); only
+	// the binary extraction below spawns a process. When the probe can't
+	// classify the file (daemon missing, unusual layout) it returns nil and we
+	// fall back to trying every tag, so no format regresses.
+	candidates := presentPreviewTags(src, tags)
+	if len(candidates) == 0 {
+		candidates = tags
+	}
+	for _, tag := range candidates {
+		b, err := extractEmbedded(ctx, src, "-"+tag)
 		if err == nil && len(b) > 0 {
 			// Quick check: is this actually an image?
 			if _, _, err := image.DecodeConfig(bytes.NewReader(b)); err == nil {
@@ -83,6 +98,38 @@ func LoadRAWPreview(ctx context.Context, src string) ([]byte, error) {
 	}
 
 	return nil, errors.New("no embedded preview found")
+}
+
+// presentPreviewTags returns the subset of candidate preview tags that src
+// actually contains, preserving the caller's priority order. It issues a single
+// textual exiftool read through the shared -stay_open daemon (no per-tag fork):
+// with "-S", a present binary tag prints "TagName: (Binary data N bytes ...)"
+// while absent tags print nothing. Returns nil on any error so the caller can
+// fall back to trying every tag.
+func presentPreviewTags(src string, candidates []string) []string {
+	args := make([]string, 0, len(candidates)+2)
+	args = append(args, "-S")
+	for _, t := range candidates {
+		args = append(args, "-"+t)
+	}
+	args = append(args, src)
+	out, err := scan.RunExiftool(args...)
+	if err != nil {
+		return nil
+	}
+	found := make(map[string]bool, len(candidates))
+	for _, line := range strings.Split(string(out), "\n") {
+		if tag, _, ok := strings.Cut(line, ":"); ok {
+			found[strings.TrimSpace(tag)] = true
+		}
+	}
+	var present []string
+	for _, t := range candidates {
+		if found[t] {
+			present = append(present, t)
+		}
+	}
+	return present
 }
 
 func extractEmbedded(ctx context.Context, src, tag string) ([]byte, error) {

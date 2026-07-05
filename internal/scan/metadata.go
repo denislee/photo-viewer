@@ -1,6 +1,7 @@
 package scan
 
 import (
+	"encoding/json"
 	"fmt"
 	"math/big"
 	"os"
@@ -24,6 +25,14 @@ type MediaInfo struct {
 	FocalLength  string
 }
 
+// dateLayouts are the timestamp formats exiftool emits for creation-date tags:
+// naive local time and the two zoned variants. Shared by every date reader.
+var dateLayouts = []string{
+	"2006:01:02 15:04:05",
+	"2006:01:02 15:04:05-07:00",
+	"2006:01:02 15:04:05Z",
+}
+
 // GetMediaInfo returns extended metadata found in the file's metadata.
 func GetMediaInfo(path string) MediaInfo {
 	var info MediaInfo
@@ -33,43 +42,47 @@ func GetMediaInfo(path string) MediaInfo {
 	// -stay_open daemon (see exiftool.go) so bulk reads avoid one fork per
 	// file; first-failure falls back to per-call exec under the hood.
 	if _, err := exec.LookPath("exiftool"); err == nil {
-		// Target tags for settings.
-		out, err := runExiftool("-s", "-S",
+		// Read the settings tags as JSON. The old "-s -S" + "Tag: value" parse
+		// was a silent no-op: "-s -S" is short-format level 3 (bare values, no
+		// tag names), so every line failed the "Tag: value" split and nothing
+		// was ever extracted — camera info came only from the goexif fallback
+		// below (JPEG/TIFF only, never LensModel; nothing for HEIC/RAW/video).
+		// "-j" gives an unambiguous tag→value map that covers all those formats.
+		// (The date readers below deliberately keep the values-only short format
+		// and must not be switched — don't "fix" them to match this.)
+		out, err := runExiftool("-j",
 			"-Model", "-LensModel",
 			"-CreateDate", "-DateTimeOriginal", "-MediaCreateDate",
 			"-FNumber", "-ExposureTime", "-ISO", "-FocalLength",
 			path)
 		if err == nil {
-			lines := strings.Split(strings.TrimSpace(string(out)), "\n")
-			for _, line := range lines {
-				parts := strings.SplitN(line, ": ", 2)
-				if len(parts) < 2 {
-					continue
+			var records []map[string]json.RawMessage
+			if json.Unmarshal(out, &records) == nil && len(records) > 0 {
+				rec := records[0]
+				info.Camera = exifJSONString(rec, "Model")
+				info.Lens = exifJSONString(rec, "LensModel")
+				if v := exifJSONString(rec, "FNumber"); v != "" {
+					info.Aperture = "f/" + v
 				}
-				tag, val := parts[0], parts[1]
-				switch tag {
-				case "Model":
-					info.Camera = val
-				case "LensModel":
-					info.Lens = val
-				case "FNumber":
-					info.Aperture = "f/" + val
-				case "ExposureTime":
-					info.ShutterSpeed = val + "s"
-				case "ISO":
-					info.ISO = val
-				case "FocalLength":
-					info.FocalLength = val
-				case "CreateDate", "DateTimeOriginal", "MediaCreateDate":
-					if !dateFound {
-						for _, layout := range []string{"2006:01:02 15:04:05", "2006:01:02 15:04:05-07:00", "2006:01:02 15:04:05Z"} {
-							t, err := time.Parse(layout, val)
-							if err == nil {
-								info.Created = t
-								dateFound = true
-								break
-							}
+				if v := exifJSONString(rec, "ExposureTime"); v != "" {
+					info.ShutterSpeed = v + "s"
+				}
+				info.ISO = exifJSONString(rec, "ISO")
+				info.FocalLength = exifJSONString(rec, "FocalLength")
+				for _, tag := range []string{"CreateDate", "DateTimeOriginal", "MediaCreateDate"} {
+					v := exifJSONString(rec, tag)
+					if v == "" {
+						continue
+					}
+					for _, layout := range dateLayouts {
+						if t, err := time.Parse(layout, v); err == nil {
+							info.Created = t
+							dateFound = true
+							break
 						}
+					}
+					if dateFound {
+						break
 					}
 				}
 			}
@@ -133,6 +146,22 @@ func GetMediaInfo(path string) MediaInfo {
 	}
 
 	return info
+}
+
+// exifJSONString returns rec[key] as a plain string whether exiftool encoded it
+// as a JSON string ("1/250", "50.0 mm") or a bare JSON number (FNumber 2.8,
+// ISO 400). A missing key yields "".
+func exifJSONString(rec map[string]json.RawMessage, key string) string {
+	raw, ok := rec[key]
+	if !ok {
+		return ""
+	}
+	var s string
+	if json.Unmarshal(raw, &s) == nil {
+		return s
+	}
+	// Non-string JSON scalar (number/bool): the raw token is the value.
+	return strings.TrimSpace(string(raw))
 }
 
 func safeRat(tag *tiff.Tag) (rat *big.Rat) {
@@ -212,7 +241,7 @@ func readMetadataDate(path string) (time.Time, bool) {
 				if line == "" {
 					continue
 				}
-				for _, layout := range []string{"2006:01:02 15:04:05", "2006:01:02 15:04:05-07:00", "2006:01:02 15:04:05Z"} {
+				for _, layout := range dateLayouts {
 					if t, err := time.Parse(layout, line); err == nil {
 						return t, true
 					}
@@ -247,7 +276,7 @@ func GetMediaDate(path string) time.Time {
 					continue
 				}
 				// Try common formats.
-				for _, layout := range []string{"2006:01:02 15:04:05", "2006:01:02 15:04:05-07:00", "2006:01:02 15:04:05Z"} {
+				for _, layout := range dateLayouts {
 					t, err := time.Parse(layout, line)
 					if err == nil {
 						return t

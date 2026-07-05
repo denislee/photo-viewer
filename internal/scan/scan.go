@@ -30,6 +30,12 @@ type WalkOptions struct {
 	// Used by the controller to skip re-probing every video on incremental
 	// scans when the cached duration is already in the index.
 	KnownDurationMs func(path string) int64
+
+	// SkipDurationProbe, when true, suppresses the per-video ffprobe entirely
+	// so Result.DurationMs is always 0 for videos. Callers that never read the
+	// duration (e.g. pv-organize, which only needs paths + dates) set this to
+	// avoid forking ffprobe once per clip.
+	SkipDurationProbe bool
 }
 
 // Walk emits a Result for each media file under root and all its subdirectories.
@@ -89,6 +95,16 @@ func WalkWith(ctx context.Context, root string, opts WalkOptions) <-chan Result 
 					ModTime: info.ModTime(),
 				}
 				if w.t == TypeVideo {
+					if opts.SkipDurationProbe {
+						// Caller doesn't need durations; emit straight through
+						// without forking ffprobe.
+						select {
+						case out <- r:
+						case <-ctx.Done():
+							return
+						}
+						continue
+					}
 					if opts.KnownDurationMs != nil {
 						r.DurationMs = opts.KnownDurationMs(w.path)
 					}

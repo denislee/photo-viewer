@@ -12,7 +12,6 @@ import (
 	"path/filepath"
 	"strings"
 	"syscall"
-	"time"
 
 	"github.com/dns/photo-viewer/internal/scan"
 )
@@ -54,16 +53,19 @@ func main() {
 	// dry-run printed the same destination twice and lied about the outcome.
 	claimed := map[string]bool{}
 
-	for res := range scan.Walk(context.Background(), *srcDir) {
+	// SkipDurationProbe: pv-organize only needs each file's path and date, never
+	// a video's duration, so suppress the per-video ffprobe fork that a plain
+	// Walk would pay for every clip.
+	for res := range scan.WalkWith(context.Background(), *srcDir, scan.WalkOptions{SkipDurationProbe: true}) {
 		if res.Type == scan.TypeUnknown {
 			continue
 		}
 
-		date, err := getMediaDate(res.Path)
-		if err != nil {
-			log.Printf("Warning: could not get date for %s: %v. Using file modification time.", res.Path, err)
-			date = res.ModTime
-		}
+		// scan.GetMediaDate rides the shared -stay_open exiftool daemon
+		// (≈two orders of magnitude faster than a fresh process per file) and
+		// already falls back to the file's mtime when no metadata date exists,
+		// so the old per-file exec + manual mtime fallback is gone.
+		date := scan.GetMediaDate(res.Path)
 
 		destSubDir := filepath.Join(absDst, date.Format("2006/01/02"))
 		baseName := filepath.Base(res.Path)
@@ -308,39 +310,4 @@ func statTaken(p string) bool {
 		return true
 	}
 	return !os.IsNotExist(err)
-}
-
-func getMediaDate(path string) (time.Time, error) {
-	// Try common date tags. -s -S gives just the value.
-	// We use -CreateDate, -DateTimeOriginal, and -MediaCreateDate.
-	cmd := exec.Command("exiftool", "-s", "-S", "-CreateDate", "-DateTimeOriginal", "-MediaCreateDate", path)
-	out, err := cmd.Output()
-	if err != nil {
-		return time.Time{}, err
-	}
-
-	lines := strings.Split(strings.TrimSpace(string(out)), "\n")
-	for _, line := range lines {
-		line = strings.TrimSpace(line)
-		if line == "" {
-			continue
-		}
-		// ExifTool format is usually 2024:05:04 12:34:56
-		// Sometimes it might include a timezone like +00:00
-		t, err := time.Parse("2006:01:02 15:04:05", line)
-		if err == nil {
-			return t, nil
-		}
-		// Try with timezone if the above fails
-		t, err = time.Parse("2006:01:02 15:04:05-07:00", line)
-		if err == nil {
-			return t, nil
-		}
-		t, err = time.Parse("2006:01:02 15:04:05Z", line)
-		if err == nil {
-			return t, nil
-		}
-	}
-
-	return time.Time{}, fmt.Errorf("no valid date tag found")
 }

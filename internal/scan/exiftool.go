@@ -42,6 +42,17 @@ var exiftoolReqTimeout = 15 * time.Second
 // back to the one-shot exec, and the next caller transparently respawns it.
 var errExiftoolTimeout = errors.New("exiftool: request timed out")
 
+// RunExiftool runs an exiftool request through this package's shared
+// -stay_open daemon and returns its stdout, so callers outside the package
+// (e.g. internal/thumb's RAW preview probe) don't pay a fresh fork per read.
+//
+// It is for textual metadata reads only. Do NOT use it for "-b" binary
+// extraction: the daemon protocol is newline-framed, so binary output can
+// desync the stream — extract binary via a one-shot exec.Command instead.
+func RunExiftool(args ...string) ([]byte, error) {
+	return runExiftool(args...)
+}
+
 // runExiftool sends an exiftool request to the package daemon and returns
 // its stdout. The first call spawns the daemon; subsequent calls reuse it.
 // On any I/O error (or a timeout) the daemon is torn down and exiftool falls

@@ -13,6 +13,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -1137,7 +1138,8 @@ func (v *ImportView) runImport(ctx context.Context, cfg Config, importDirs, zipF
 			if deleteSrc && sameDevice(sd, cfg.OutboxDir) {
 				v.setStatus(fmt.Sprintf("Filing %d files from %s directly into %s…", len(files), sd, filepath.Base(cfg.OutboxDir)))
 				v.appendLog(fmt.Sprintf("Same-device shortcut: moving %d files from %s straight to Outbox (no Inbox copy).", len(files), sd))
-				v.setProgress(0, int64(len(files)))
+				// processBatch owns the progress bar (it spans a date-read pass
+				// and a move pass), so no setProgress here.
 				v.processBatch(ctx, cfg.OutboxDir, files)
 				continue
 			}
@@ -1167,7 +1169,8 @@ func (v *ImportView) runImport(ctx context.Context, cfg Config, importDirs, zipF
 				continue
 			}
 			v.setStatus(fmt.Sprintf("Filing %d files into %s…", len(batch), filepath.Base(cfg.OutboxDir)))
-			v.setProgress(0, int64(len(batch)))
+			// processBatch owns the progress bar across its date-read + move
+			// passes, so no setProgress here.
 			v.processBatch(ctx, cfg.OutboxDir, batch)
 		}
 	}
@@ -1193,6 +1196,18 @@ func (v *ImportView) runImport(ctx context.Context, cfg Config, importDirs, zipF
 // processBatch is the Fyne flow: read EXIF, group by base name, move into the
 // outbox under YYYY-MM-DD folders.
 func (v *ImportView) processBatch(ctx context.Context, outboxDir string, entries []string) {
+	if len(entries) == 0 {
+		return
+	}
+	// The batch is visited twice — once to read every file's date, once to move
+	// it — so the progress bar spans 2*len(entries). The date probes fork
+	// exiftool per file (~50–200 ms each); running them strictly sequentially
+	// stalled a multi-thousand-file card at 0% for minutes, so they go through a
+	// small worker pool (mirroring internal/ui/organize.go's scan pass) that
+	// bumps the bar as it reads.
+	v.setProgress(0, int64(2*len(entries)))
+	v.setStatus(fmt.Sprintf("Reading dates from %d files…", len(entries)))
+
 	baseDates := make(map[string]time.Time)
 	// Files whose mtime predates their declared EXIF/metadata date — rewrite
 	// the metadata to mtime after we've decided the destination so subsequent
@@ -1202,21 +1217,61 @@ func (v *ImportView) processBatch(ctx context.Context, outboxDir string, entries
 		when time.Time
 	}
 	var mtimeFixes []mtimeFix
-	for _, src := range entries {
-		v.waitIfPaused()
-		if ctx.Err() != nil {
-			return
+
+	// Phase 1: read every file's date concurrently. Results are indexed by
+	// input position so the fold below stays deterministic.
+	type dateResult struct {
+		oldest     time.Time
+		mtimeOlder bool
+		ok         bool
+	}
+	results := make([]dateResult, len(entries))
+	jobs := make(chan int, len(entries))
+	numWorkers := runtime.NumCPU()
+	if numWorkers > 4 {
+		numWorkers = 4 // cap the concurrent exiftool forks
+	}
+	var wg sync.WaitGroup
+	for i := 0; i < numWorkers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for idx := range jobs {
+				v.waitIfPaused()
+				if ctx.Err() != nil {
+					return
+				}
+				oldest, _, mtimeOlder := scan.GetOldestMediaDate(entries[idx])
+				results[idx] = dateResult{oldest: oldest, mtimeOlder: mtimeOlder, ok: true}
+				v.bumpProgress()
+			}
+		}()
+	}
+	for i := range entries {
+		jobs <- i
+	}
+	close(jobs)
+	wg.Wait()
+	if ctx.Err() != nil {
+		return
+	}
+	// Fold per-file results in input order so the "oldest date wins per base
+	// name" tie-break is deterministic.
+	for i, src := range entries {
+		r := results[i]
+		if !r.ok {
+			continue
 		}
-		oldest, _, mtimeOlder := scan.GetOldestMediaDate(src)
-		if mtimeOlder {
-			mtimeFixes = append(mtimeFixes, mtimeFix{path: src, when: oldest})
+		if r.mtimeOlder {
+			mtimeFixes = append(mtimeFixes, mtimeFix{path: src, when: r.oldest})
 		}
 		baseName := filepath.Base(src)
 		base := strings.TrimSuffix(baseName, filepath.Ext(baseName))
-		if existing, ok := baseDates[base]; !ok || oldest.Before(existing) {
-			baseDates[base] = oldest
+		if existing, ok := baseDates[base]; !ok || r.oldest.Before(existing) {
+			baseDates[base] = r.oldest
 		}
 	}
+	v.setStatus(fmt.Sprintf("Filing %d files into %s…", len(entries), filepath.Base(outboxDir)))
 	for _, fix := range mtimeFixes {
 		if ctx.Err() != nil {
 			break
