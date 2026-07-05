@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"sync"
+	"time"
 
 	"github.com/dns/photo-viewer/internal/scan"
 	"github.com/dns/photo-viewer/internal/thumb"
@@ -14,6 +15,17 @@ import (
 
 // ThumbSize is the target longest-edge of cached thumbnails.
 const ThumbSize = 256
+
+// thumbGenTimeout bounds a single thumbnail generation. Each of the four
+// thumbnailers shells out under exec.CommandContext, but nothing ever fed
+// them a deadline — so a hung ffmpeg/exiftool/heif-convert would block its
+// goroutine forever, permanently burn its cpuSem/extSem slot and (via the
+// singleflight below) wedge every future Path() for that thumb id on a
+// channel that never closes. That is the "viewer gradually stops producing
+// thumbnails until restart" failure mode. Arming the ctx here is what
+// actually fires the thumbnailers' kill paths; a timeout then unwinds
+// exactly like any other generation failure.
+const thumbGenTimeout = 30 * time.Second
 
 // ThumbStore turns Entry → on-disk thumbnail JPEG path. It generates the
 // thumbnail on demand if the file does not yet exist.
@@ -133,9 +145,18 @@ func (s *ThumbStore) Path(e Entry) (string, error) {
 	}
 	tmp := dst + ".tmp"
 
+	// Bound generation so a wedged decoder can't hold the semaphore slot (or
+	// the singleflight channel) forever. On timeout generate returns the
+	// context error just like any other failure: the deferred close(ch) above
+	// still fires, releasing followers, and the caller falls back to a
+	// placeholder — never a hang. cancel is deferred to after the rename so
+	// the ctx outlives the whole generation, then is released promptly.
+	ctx, cancel := context.WithTimeout(context.Background(), thumbGenTimeout)
+	defer cancel()
+
 	sem := s.semFor(e.Type)
 	sem <- struct{}{}
-	err := s.generate(context.Background(), e, tmp)
+	err := s.generate(ctx, e, tmp)
 	<-sem
 
 	if err != nil {

@@ -1,7 +1,10 @@
 package webserver
 
 import (
+	"bytes"
+	"context"
 	"fmt"
+	"log"
 	"math"
 	"net/http"
 	"os"
@@ -10,6 +13,7 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/dns/photo-viewer/internal/cache"
 	"github.com/dns/photo-viewer/internal/scan"
@@ -33,6 +37,17 @@ const (
 	hlsMaxW    = 1280 // cap width so per-segment transcode keeps up on the fly
 	hlsSegMime = "video/mp2t"
 	hlsM3UMime = "application/vnd.apple.mpegurl"
+
+	// hlsSegTimeout caps one on-the-fly segment transcode and hlsProbeTimeout
+	// caps the playlist duration probe. Both guard the same wedge: ffmpeg /
+	// ffprobe holds one of only NumCPU/2 hlsSem slots, so a handful of hung
+	// children would starve HLS entirely until restart. The per-op deadlines
+	// are further derived from r.Context() (see below) so a client disconnect
+	// — e.g. a seek-happy Safari session that has already moved on — cancels
+	// the transcode instead of leaving minutes of dead work queued ahead of
+	// the segment actually wanted.
+	hlsSegTimeout   = 2 * time.Minute
+	hlsProbeTimeout = 15 * time.Second
 )
 
 // handleHLS routes /hls/<id>/index.m3u8 (playlist) and /hls/<id>/seg<k>.ts
@@ -70,7 +85,7 @@ func (s *Server) handleHLS(w http.ResponseWriter, r *http.Request) {
 // fixed-length segments. Cheap enough to do per request (one ffprobe call),
 // so the duration isn't cached.
 func (s *Server) serveHLSPlaylist(w http.ResponseWriter, r *http.Request, id string, e cache.Entry) {
-	dur, err := probeDuration(e.Path)
+	dur, err := probeDuration(r.Context(), e.Path)
 	if err != nil || dur <= 0 {
 		http.Error(w, "cannot probe video duration", http.StatusInternalServerError)
 		return
@@ -112,7 +127,7 @@ func (s *Server) serveHLSSegment(w http.ResponseWriter, r *http.Request, id stri
 		os.Remove(dst)
 	}
 
-	if err := s.transcodeSegment(id, e, k, dst); err != nil {
+	if err := s.transcodeSegment(r.Context(), id, e, k, dst); err != nil {
 		http.Error(w, "segment transcode failed", http.StatusInternalServerError)
 		return
 	}
@@ -130,14 +145,21 @@ func (s *Server) serveSegmentFile(w http.ResponseWriter, r *http.Request, dst st
 // total parallel transcodes with a semaphore. Writes to a temp file and
 // atomically renames, so a killed transcode never leaves a half-written
 // segment in the cache.
-func (s *Server) transcodeSegment(id string, e cache.Entry, k int, dst string) error {
+func (s *Server) transcodeSegment(ctx context.Context, id string, e cache.Entry, k int, dst string) error {
 	s.hlsInit()
 
 	// Singleflight on the destination path.
 	s.hlsFlightMu.Lock()
 	if ch, ok := s.hlsInflight[dst]; ok {
 		s.hlsFlightMu.Unlock()
-		<-ch
+		// Wait for the leader, but not on a dead transcode: if *this* client
+		// has disconnected (Safari seeked away), bail immediately rather than
+		// block on a leader that may itself be a minutes-long transcode.
+		select {
+		case <-ch:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
 		if info, err := os.Stat(dst); err == nil && !info.ModTime().Before(e.ModTime) {
 			return nil
 		}
@@ -188,8 +210,20 @@ func (s *Server) transcodeSegment(id string, e cache.Entry, k int, dst string) e
 		"-muxdelay", "0", "-muxpreload", "0",
 		"-f", "mpegts", tmp,
 	}
-	if err := exec.Command("ffmpeg", args...).Run(); err != nil {
+	// Deadline derived from the client's request ctx: a client disconnect
+	// cancels ffmpeg (no more dead transcodes for a browser that's gone), and
+	// hlsSegTimeout caps a single transcode so a stuck ffmpeg can't hold its
+	// hlsSem slot indefinitely. Capture stderr so a failure surfaces the real
+	// ffmpeg diagnostic in the logs instead of an opaque generic 500.
+	tctx, cancel := context.WithTimeout(ctx, hlsSegTimeout)
+	defer cancel()
+	var stderr bytes.Buffer
+	cmd := exec.CommandContext(tctx, "ffmpeg", args...)
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
 		os.Remove(tmp)
+		log.Printf("hls: transcode %s seg%d failed: %v: %s",
+			e.Path, k, err, strings.TrimSpace(stderr.String()))
 		return err
 	}
 	return os.Rename(tmp, dst)
@@ -213,12 +247,17 @@ func (s *Server) hlsInit() {
 	})
 }
 
-// probeDuration returns the container duration in seconds via ffprobe.
-func probeDuration(path string) (float64, error) {
+// probeDuration returns the container duration in seconds via ffprobe. The
+// probe is bounded by hlsProbeTimeout (and cancelled if the requesting client
+// disconnects) so a wedged ffprobe can't hang the playlist request or hold a
+// worker; on failure the caller returns a 500, exactly as before.
+func probeDuration(ctx context.Context, path string) (float64, error) {
 	if _, err := exec.LookPath("ffprobe"); err != nil {
 		return 0, fmt.Errorf("ffprobe not installed")
 	}
-	out, err := exec.Command("ffprobe",
+	pctx, cancel := context.WithTimeout(ctx, hlsProbeTimeout)
+	defer cancel()
+	out, err := exec.CommandContext(pctx, "ffprobe",
 		"-v", "error",
 		"-show_entries", "format=duration",
 		"-of", "default=nw=1:nk=1",

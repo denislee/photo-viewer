@@ -6,7 +6,15 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 )
+
+// probeTimeout bounds a single ffprobe call. Derived per-probe from the scan
+// ctx so a wedged ffprobe (a truncated or malformed file it can't parse)
+// returns the "unknown duration" sentinel (0) and frees the scan worker,
+// instead of parking that worker on a dead child until the *entire* scan is
+// cancelled.
+const probeTimeout = 10 * time.Second
 
 // ffprobeOnce caches whether ffprobe is available on PATH. We probe a lot of
 // files per scan, so a per-call exec.LookPath would dominate when the binary
@@ -36,6 +44,11 @@ func probeVideoDurationMs(ctx context.Context, path string) int64 {
 	if !haveFFprobe() {
 		return 0
 	}
+	// Bound this probe independently of the whole-scan ctx (see probeTimeout).
+	// On timeout cmd.Output() errors and we return 0, which the pipeline
+	// already treats as "duration unknown".
+	ctx, cancel := context.WithTimeout(ctx, probeTimeout)
+	defer cancel()
 	cmd := exec.CommandContext(ctx,
 		"ffprobe",
 		"-v", "error",

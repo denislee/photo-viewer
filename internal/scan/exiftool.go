@@ -7,6 +7,7 @@ import (
 	"os/exec"
 	"strings"
 	"sync"
+	"time"
 )
 
 // exiftoolDaemon is a long-running exiftool process used by metadata readers
@@ -27,11 +28,34 @@ var (
 	exifFailed bool
 )
 
+// exiftoolReqTimeout bounds a single -stay_open round-trip. The daemon is a
+// shared, long-lived process guarded by exifMu; before this bound existed a
+// request that never produced "{ready}" (a hung child, a pathological file the
+// tool stalls on) would hold exifMu forever and freeze *every* metadata
+// feature until the app was restarted. It is a var, not a const, only so tests
+// can shrink it — production code never reassigns it.
+var exiftoolReqTimeout = 15 * time.Second
+
+// errExiftoolTimeout marks a request that blew exiftoolReqTimeout. It flows
+// through runExiftool's existing "any error retires the daemon" path, so a
+// timed-out request tears the daemon down (killing the wedged child) and falls
+// back to the one-shot exec, and the next caller transparently respawns it.
+var errExiftoolTimeout = errors.New("exiftool: request timed out")
+
 // runExiftool sends an exiftool request to the package daemon and returns
 // its stdout. The first call spawns the daemon; subsequent calls reuse it.
-// On any I/O error the daemon is torn down and exiftool falls back to a
-// per-call exec.Command. The callers can be either; both work.
+// On any I/O error (or a timeout) the daemon is torn down and exiftool falls
+// back to a per-call exec.Command. The callers can be either; both work.
 func runExiftool(args ...string) ([]byte, error) {
+	// The -stay_open argfile stream is newline-delimited and treats a leading
+	// '#' as a comment, so any argument carrying a newline/carriage-return or
+	// starting with '#' would corrupt the request framing and desync the daemon
+	// for every later caller. Route those (pathological filenames) straight to
+	// the one-shot exec, which passes argv directly and has no such hazard.
+	if argsUnsafeForDaemon(args) {
+		return runExiftoolOneShot(args...)
+	}
+
 	exifMu.Lock()
 	if exifFailed {
 		exifMu.Unlock()
@@ -101,18 +125,61 @@ func (d *exiftoolDaemon) run(args []string) ([]byte, error) {
 	if _, err := d.stdin.Write([]byte(req.String())); err != nil {
 		return nil, err
 	}
-	var out []byte
-	for {
-		line, err := d.stdout.ReadBytes('\n')
-		if err != nil {
-			return nil, err
-		}
-		// exiftool prints "{ready}\n" between requests in -stay_open mode.
-		if strings.HasPrefix(string(line), "{ready}") {
-			return out, nil
-		}
-		out = append(out, line...)
+
+	// Read the response off a goroutine and race it against exiftoolReqTimeout.
+	// The blocking ReadBytes is what used to pin exifMu indefinitely; running it
+	// off-thread lets us give up on a wedged request. On timeout we kill the
+	// child, which unblocks the in-flight ReadBytes (its pipe closes) so the
+	// goroutine can't leak, and return errExiftoolTimeout for the caller to
+	// retire the daemon on.
+	type readResult struct {
+		out []byte
+		err error
 	}
+	done := make(chan readResult, 1)
+	go func() {
+		var out []byte
+		for {
+			line, err := d.stdout.ReadBytes('\n')
+			if err != nil {
+				done <- readResult{nil, err}
+				return
+			}
+			// exiftool prints "{ready}\n" between requests in -stay_open mode.
+			if strings.HasPrefix(string(line), "{ready}") {
+				done <- readResult{out, nil}
+				return
+			}
+			out = append(out, line...)
+		}
+	}()
+
+	timer := time.NewTimer(exiftoolReqTimeout)
+	defer timer.Stop()
+	select {
+	case res := <-done:
+		return res.out, res.err
+	case <-timer.C:
+		if d.cmd.Process != nil {
+			_ = d.cmd.Process.Kill()
+		}
+		return nil, errExiftoolTimeout
+	}
+}
+
+// argsUnsafeForDaemon reports whether any argument would corrupt the daemon's
+// newline-delimited -stay_open argfile stream: an embedded newline/carriage
+// return reads as a premature end-of-argument (or a stray -execute), and a
+// leading '#' is silently swallowed as an argfile comment. Such arguments —
+// in practice only exotic filenames — must take the one-shot exec path, which
+// passes them as a real argv vector.
+func argsUnsafeForDaemon(args []string) bool {
+	for _, a := range args {
+		if strings.ContainsAny(a, "\n\r") || strings.HasPrefix(a, "#") {
+			return true
+		}
+	}
+	return false
 }
 
 func (d *exiftoolDaemon) close() error {
