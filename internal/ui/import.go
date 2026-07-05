@@ -328,11 +328,12 @@ func (v *ImportView) setStatus(msg string) {
 	proc := v.proc
 	v.mu.Unlock()
 	if proc != nil {
+		// SetStatus notifies through the registry coalescer; skip the direct
+		// invalidate to avoid a redundant second wakeup for the same change.
 		proc.SetStatus(msg)
+		return
 	}
-	if v.invalidate != nil {
-		v.invalidate()
-	}
+	v.scheduleInvalidate()
 }
 
 // waitIfPaused blocks while the import is paused via the process bar.
@@ -347,15 +348,32 @@ func (v *ImportView) waitIfPaused() {
 	}
 }
 
+// scheduleInvalidate wakes the Gio frame loop through the process registry's
+// ~30Hz coalescer when one is wired up. Import's per-file paths (appendLog,
+// setProgress, bumpProgress) fire once per file — thousands/sec during a
+// same-device rename — so calling v.invalidate directly from them would peg a
+// core repainting a log that scrolls far faster than the eye can read. The
+// registry coalesces to ~30Hz with a guaranteed trailing flush, so the final
+// log line / progress value still lands. Falls back to the raw invalidate when
+// no registry is set (e.g. tests, or one-shot messages before an import
+// starts) — those paths aren't in a per-file storm.
+func (v *ImportView) scheduleInvalidate() {
+	if v.processes != nil {
+		v.processes.notify()
+		return
+	}
+	if v.invalidate != nil {
+		v.invalidate()
+	}
+}
+
 func (v *ImportView) appendLog(msg string) {
 	v.mu.Lock()
 	v.logBuf = append(v.logBuf, msg)
 	v.logFull.WriteString(msg)
 	v.logFull.WriteByte('\n')
 	v.mu.Unlock()
-	if v.invalidate != nil {
-		v.invalidate()
-	}
+	v.scheduleInvalidate()
 }
 
 // drainLog moves buffered lines into logVisible (capped). Called from the UI
@@ -1320,12 +1338,14 @@ func (v *ImportView) setProgress(done, max int64) {
 	proc := v.proc
 	v.mu.Unlock()
 	if proc != nil {
+		// proc.SetDone/SetTotal already route through the registry's ~30Hz
+		// coalescer, so no direct v.invalidate() here — that would re-add the
+		// per-file storm this initiative removes.
 		proc.SetDone(done)
 		proc.SetTotal(max)
+		return
 	}
-	if v.invalidate != nil {
-		v.invalidate()
-	}
+	v.scheduleInvalidate()
 }
 
 func (v *ImportView) bumpProgress() {
@@ -1334,11 +1354,12 @@ func (v *ImportView) bumpProgress() {
 	proc := v.proc
 	v.mu.Unlock()
 	if proc != nil {
+		// proc.AddDone already coalesces the redraw through the registry; a
+		// direct v.invalidate() per file is exactly the storm we're killing.
 		proc.AddDone(1)
+		return
 	}
-	if v.invalidate != nil {
-		v.invalidate()
-	}
+	v.scheduleInvalidate()
 }
 
 // File helpers (mirrored from internal/ui/import.go).

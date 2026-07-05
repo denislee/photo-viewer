@@ -238,10 +238,15 @@ func (d *DuplicatesView) hashAndScan(ctx context.Context, gen int) {
 		}
 		d.mu.Unlock()
 		if proc != nil {
+			// EnsureHashes fires this callback once per hashed candidate — a
+			// storm on a large library. proc.SetDone routes through the
+			// registry's ~30Hz coalescer (with a trailing flush that still
+			// lands the final 100%), so we drop the per-candidate direct
+			// d.invalidate() that used to peg a core here. The terminal
+			// results below still repaint immediately via d.invalidate().
 			proc.SetTotal(int64(total))
 			proc.SetDone(int64(done))
-		}
-		if d.invalidate != nil {
+		} else if d.invalidate != nil {
 			d.invalidate()
 		}
 	}, func() {

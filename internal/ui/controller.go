@@ -86,6 +86,17 @@ type Controller struct {
 	scanBatched   int // entries reconciled during the current/last scan
 	scanLastErr   string
 
+	// IndexStatus is polled every frame the index-info modal is open, and its
+	// TotalRows is a LIKE-prefix COUNT over the whole index — precisely while a
+	// scan is hammering the same DB with ReconcileBatch writes. Cache the count
+	// behind a short TTL so the modal costs at most one COUNT per idxStatusTTL
+	// instead of one per frame. Slight staleness is fine for a status readout.
+	// Guarded by its own mutex (not c.mu) so a poll never blocks the scan.
+	idxStatusMu     sync.Mutex
+	idxStatusRows   int
+	idxStatusRoot   string // library root the cached count was computed for
+	idxStatusExpiry time.Time
+
 	// yearPreviewDirs holds the date subdirs whose union is shown when
 	// currentDir is a YearViewPrefix sentinel. refreshFromIndex reads this
 	// to recompute entries when scan flushes trigger a refresh.
@@ -333,9 +344,32 @@ func (c *Controller) IndexStatus() IndexStatus {
 	idx := c.index
 	c.mu.Unlock()
 	if idx != nil {
-		st.TotalRows = idx.CountDir(st.LibraryRoot)
+		st.TotalRows = c.cachedTotalRows(idx, st.LibraryRoot)
 	}
 	return st
+}
+
+// indexStatusTTL bounds how stale the index-info modal's row count may be. A
+// few hundred ms is imperceptible for a status readout but collapses a
+// per-frame COUNT storm into at most one COUNT per interval.
+const indexStatusTTL = 400 * time.Millisecond
+
+// cachedTotalRows returns the index row count under st.LibraryRoot, recomputing
+// the expensive CountDir COUNT at most once per indexStatusTTL. Called only
+// from IndexStatus (the info modal); the cache is invalidated implicitly when
+// the library root changes.
+func (c *Controller) cachedTotalRows(idx *cache.Index, root string) int {
+	c.idxStatusMu.Lock()
+	defer c.idxStatusMu.Unlock()
+	now := time.Now()
+	if root == c.idxStatusRoot && now.Before(c.idxStatusExpiry) {
+		return c.idxStatusRows
+	}
+	n := idx.CountDir(root)
+	c.idxStatusRows = n
+	c.idxStatusRoot = root
+	c.idxStatusExpiry = now.Add(indexStatusTTL)
+	return n
 }
 
 // Rebuild empties the index in place, forgets every generated thumbnail, and
