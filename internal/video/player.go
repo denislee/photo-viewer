@@ -191,6 +191,22 @@ func New(invalidate func()) (*Player, error) {
 		// decode removes that class of frame entirely. Set PV_HWDEC to
 		// override (e.g. "auto-safe") on a box with a working GPU stack.
 		{"hwdec", hwdecMode()},
+		// Defer all cropping to mpv's own (params-consistent) VO crop rather
+		// than letting libavcodec crop inside the decoder. With the default
+		// vd-apply-cropping=yes, libavcodec applies only the alignment-aligned
+		// part of a codec/container crop and shrinks the emitted frame to a
+		// per-frame aligned width, leaving the sub-alignment remainder in the
+		// frame's crop_* fields. The libmpv SW renderer, meanwhile, derives its
+		// source crop rect from the VO's img_params (captured at reconfig), then
+		// crops the *current* frame to it (libmpv_sw.c render()). When the
+		// aligned frame comes out a few pixels narrower than the params-declared
+		// size, that src rect overshoots the frame and libmpv aborts the whole
+		// process on mp_image_crop's `x1 <= img->w` assertion. Forcing
+		// apply-cropping=no makes every decoded frame the full, constant coded
+		// size, so the params-derived crop rect is always in bounds. (hwdec=no
+		// above only removes a *different* source of frame/params disagreement —
+		// half-initialised hwdec frames — and does not cover this SW-decode path.)
+		{"vd-apply-cropping", "no"},
 		{"loop-file", "inf"},
 		{"keep-open", "always"},
 		{"audio-display", "no"},
