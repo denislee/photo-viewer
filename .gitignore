@@ -39,4 +39,8 @@ CLAUDE.md
 GEMINI.md
 pv-face-detect
 pv-organize
+pv-export-favorites
 .photo-viewer.*
+
+# Session handoff / audit notes (kept local, not part of the repo)
+OPTIMIZATION_*.md
