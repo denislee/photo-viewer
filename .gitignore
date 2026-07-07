@@ -31,15 +31,18 @@ go.work.sum
 # .idea/
 # .vscode/
 
-# Project binaries
-photo-viewer
-pv-scan
+# Project binaries — repo-root build outputs. Anchored with a leading slash so
+# each matches only the built binary at the repo root, NOT the cmd/<name>
+# source directory of the same name. (An un-anchored "pv-scan" had silently
+# hidden the whole cmd/pv-scan/ source tree from git.)
+/photo-viewer
+/pv-scan
+/pv-organize
+/pv-export-favorites
+/pv-face-detect
 
 CLAUDE.md
 GEMINI.md
-pv-face-detect
-pv-organize
-pv-export-favorites
 .photo-viewer.*
 
 # Session handoff / audit notes (kept local, not part of the repo)
