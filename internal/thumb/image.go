@@ -1,6 +1,7 @@
 package thumb
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"image"
@@ -9,12 +10,15 @@ import (
 	_ "image/png"
 	"os"
 	"os/exec"
+	"strings"
 	"sync"
 
 	_ "golang.org/x/image/bmp"
 	"golang.org/x/image/draw"
 	_ "golang.org/x/image/tiff"
 	_ "golang.org/x/image/webp"
+
+	"github.com/dns/photo-viewer/internal/imgorient"
 )
 
 // imageFfmpegThreshold is the source-size watershed above which we shell out
@@ -44,26 +48,80 @@ func Image(ctx context.Context, src, dst string, size int) error {
 	if err != nil {
 		return err
 	}
+	// Go's image decoders ignore the EXIF Orientation tag (and jpeg.Encode
+	// writes none), so a rotated small JPEG would thumbnail sideways here —
+	// the ffmpeg path above already auto-applies orientation, so only this
+	// in-process fallback needs the manual transpose. Bake it in before scale.
+	img = imgorient.Apply(img, imgorient.ReadOrientation(src))
 	return writeThumb(img, dst, size)
+}
+
+// ffmpegScaleFilter builds the `-vf` scale expression that fits the longest
+// edge to size while preserving aspect ratio. Shared by the image and RAW
+// ffmpeg fast paths (video.go keeps its own copy for its two-stage seek run).
+func ffmpegScaleFilter(size int) string {
+	return fmt.Sprintf("scale='if(gt(iw,ih),%d,-2)':'if(gt(iw,ih),-2,%d)'", size, size)
+}
+
+// ffmpegError folds ffmpeg's stderr (captured via -loglevel error) into the
+// returned error so a failure reports *why* instead of a bare "exit status 1".
+func ffmpegError(err error, stderr *bytes.Buffer) error {
+	if msg := strings.TrimSpace(stderr.String()); msg != "" {
+		return fmt.Errorf("ffmpeg: %s", msg)
+	}
+	return err
 }
 
 // imageViaFfmpeg uses ffmpeg's hardware-accelerated decoder + scale filter to
 // produce a JPEG thumbnail directly, sidestepping a full pixel-buffer decode
-// in Go. The scale filter matches the one used for video thumbs.
+// in Go. The scale filter matches the one used for video thumbs. ffmpeg
+// auto-applies EXIF orientation, so the output is already upright.
 func imageViaFfmpeg(ctx context.Context, src, dst string, size int) error {
-	vf := fmt.Sprintf("scale='if(gt(iw,ih),%d,-2)':'if(gt(iw,ih),-2,%d)'", size, size)
 	cmd := exec.CommandContext(ctx, "ffmpeg",
 		"-loglevel", "error",
 		"-y",
 		"-i", src,
 		"-frames:v", "1",
-		"-vf", vf,
+		"-vf", ffmpegScaleFilter(size),
 		"-f", "image2",
 		dst,
 	)
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
 	if err := cmd.Run(); err != nil {
 		os.Remove(dst)
+		return ffmpegError(err, &stderr)
+	}
+	if _, err := os.Stat(dst); err != nil {
 		return err
+	}
+	return nil
+}
+
+// imageBytesViaFfmpeg DCT-scales an in-memory JPEG straight to dst, streaming
+// it to ffmpeg over stdin so no temp file is needed. It exists for RAW embedded
+// previews, which are full-resolution JPEGs (10–45 MP) that are far cheaper to
+// scale through libjpeg-turbo's DCT decode than to expand into a huge RGBA in
+// Go. ffmpeg auto-applies whatever orientation the preview JPEG carries; on any
+// ffmpeg error the caller falls back to the Go decoder, so a build that can't
+// read from a pipe degrades to (slower) correctness rather than failure.
+func imageBytesViaFfmpeg(ctx context.Context, data []byte, dst string, size int) error {
+	cmd := exec.CommandContext(ctx, "ffmpeg",
+		"-loglevel", "error",
+		"-y",
+		"-f", "image2pipe",
+		"-i", "pipe:0",
+		"-frames:v", "1",
+		"-vf", ffmpegScaleFilter(size),
+		"-f", "image2",
+		dst,
+	)
+	cmd.Stdin = bytes.NewReader(data)
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		os.Remove(dst)
+		return ffmpegError(err, &stderr)
 	}
 	if _, err := os.Stat(dst); err != nil {
 		return err
@@ -95,8 +153,11 @@ func writeThumb(src image.Image, dst string, size int) error {
 	thumb.Stride = 4 * tw
 	thumb.Rect = image.Rect(0, 0, tw, th)
 	// draw.Src overwrites every destination pixel, so reusing the buffer
-	// without zeroing is safe.
-	draw.ApproxBiLinear.Scale(thumb, thumb.Rect, src, b, draw.Src, nil)
+	// without zeroing is safe. CatmullRom (a 4×4 cubic kernel) is used over
+	// ApproxBiLinear because bilinear aliases badly at the large downscale
+	// factors thumbnails hit (a multi-MP source → 256 px); it costs more CPU,
+	// but this runs once per thumbnail under the store's cpuSem/extSem bound.
+	draw.CatmullRom.Scale(thumb, thumb.Rect, src, b, draw.Src, nil)
 
 	out, err := os.Create(dst)
 	if err != nil {

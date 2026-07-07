@@ -80,6 +80,7 @@ func EnsureThumb(cacheDir, srcThumb string, faceID int64, bbox [4]int) (string, 
 		return "", err
 	}
 	if err := os.Rename(tmp, dst); err != nil {
+		os.Remove(tmp)
 		return "", err
 	}
 	return dst, nil

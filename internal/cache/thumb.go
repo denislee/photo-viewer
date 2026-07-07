@@ -83,11 +83,7 @@ func (s *ThumbStore) CacheDir() string {
 // it to cheaply skip the (usually large) set of already-cached thumbnails
 // before paying the cost of entering Path's generation machinery.
 func (s *ThumbStore) Has(e Entry) bool {
-	info, err := os.Stat(s.thumbPath(e.ThumbID))
-	if err != nil {
-		return false
-	}
-	return !info.ModTime().Before(e.ModTime)
+	return s.fresh(s.thumbPath(e.ThumbID), e.ModTime)
 }
 
 // WarmUpConcurrency is the number of worker goroutines a bulk warm-up should
@@ -111,12 +107,8 @@ func (s *ThumbStore) thumbPath(id string) string {
 // failed (e.g. tool not installed).
 func (s *ThumbStore) Path(e Entry) (string, error) {
 	dst := s.thumbPath(e.ThumbID)
-	if info, err := os.Stat(dst); err == nil {
-		if info.ModTime().After(e.ModTime) || info.ModTime().Equal(e.ModTime) {
-			return dst, nil
-		}
-		// Stale: source changed since the thumb was written. Regenerate.
-		os.Remove(dst)
+	if s.fresh(dst, e.ModTime) {
+		return dst, nil
 	}
 
 	// Singleflight: dedupe concurrent calls for the same thumb id.
@@ -124,8 +116,7 @@ func (s *ThumbStore) Path(e Entry) (string, error) {
 	if ch, ok := s.inflight[e.ThumbID]; ok {
 		s.flightMu.Unlock()
 		<-ch
-		if info, err := os.Stat(dst); err == nil &&
-			(info.ModTime().After(e.ModTime) || info.ModTime().Equal(e.ModTime)) {
+		if s.fresh(dst, e.ModTime) {
 			return dst, nil
 		}
 		return "", fmt.Errorf("thumb generation failed for %s", e.Path)
@@ -140,10 +131,33 @@ func (s *ThumbStore) Path(e Entry) (string, error) {
 		close(ch)
 	}()
 
+	// Re-check under the flight: a prior leader may have generated the thumb and
+	// closed its channel in the window between our fast-path stat above and our
+	// acquiring the flight.
+	if s.fresh(dst, e.ModTime) {
+		return dst, nil
+	}
+	// A stale thumb (older than the source) is removed here, inside the flight,
+	// so a concurrent follower can't stat/remove a thumb this leader is about to
+	// regenerate. (The stale check used to run before the flight — a TOCTOU that
+	// could drop a freshly written file.)
+	os.Remove(dst)
+
 	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
 		return "", err
 	}
-	tmp := dst + ".tmp"
+
+	// Unique temp name. The GUI and pv-scan share this cache directory, so a
+	// fixed "<id>.jpg.tmp" would collide across processes and let one truncate
+	// the other's half-written thumb; os.CreateTemp gives each writer its own.
+	// We only need the name — the thumbnailers (re)write it via their own fd —
+	// so close our handle immediately.
+	tmpf, err := os.CreateTemp(filepath.Dir(dst), e.ThumbID+"-*.tmp")
+	if err != nil {
+		return "", err
+	}
+	tmp := tmpf.Name()
+	tmpf.Close()
 
 	// Bound generation so a wedged decoder can't hold the semaphore slot (or
 	// the singleflight channel) forever. On timeout generate returns the
@@ -156,17 +170,47 @@ func (s *ThumbStore) Path(e Entry) (string, error) {
 
 	sem := s.semFor(e.Type)
 	sem <- struct{}{}
-	err := s.generate(ctx, e, tmp)
+	err = s.generate(ctx, e, tmp)
 	<-sem
 
 	if err != nil {
 		os.Remove(tmp)
 		return "", err
 	}
+	// fsync the finished thumb before publishing it. Without this a crash after
+	// the rename but before writeback can leave a zero-byte file whose mtime
+	// still passes the freshness check forever — a permanently broken thumb.
+	// The rename then makes the complete, durable thumb visible atomically.
+	if err := syncFile(tmp); err != nil {
+		os.Remove(tmp)
+		return "", err
+	}
 	if err := os.Rename(tmp, dst); err != nil {
+		os.Remove(tmp)
 		return "", err
 	}
 	return dst, nil
+}
+
+// fresh reports whether a thumbnail at dst exists and is at least as new as the
+// source's mod time (i.e. not stale).
+func (s *ThumbStore) fresh(dst string, srcMod time.Time) bool {
+	info, err := os.Stat(dst)
+	return err == nil && !info.ModTime().Before(srcMod)
+}
+
+// syncFile fsyncs the file at path so its contents are durable before a rename
+// publishes it.
+func syncFile(path string) error {
+	f, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	if err := f.Sync(); err != nil {
+		f.Close()
+		return err
+	}
+	return f.Close()
 }
 
 func (s *ThumbStore) semFor(t scan.MediaType) chan struct{} {

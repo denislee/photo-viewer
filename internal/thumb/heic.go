@@ -10,7 +10,16 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sync/atomic"
 )
+
+// ffmpegNoHEIC latches true the first time ffmpeg fails to open a HEIC that the
+// heif-convert fallback then decodes fine — strong evidence this ffmpeg build
+// simply lacks a HEIC/HEVC decoder (a corrupt file would have failed the
+// fallback too). Once set, HEIC() skips the ffmpeg attempt so a HEIC-heavy
+// library doesn't pay one doomed fork per file forever. One-way; a process
+// restart re-probes.
+var ffmpegNoHEIC atomic.Bool
 
 // HEIC converts a HEIC/HEIF file to JPEG and resamples it.
 //
@@ -21,11 +30,15 @@ import (
 // The previous implementation always wrote a full-resolution JPEG then
 // re-decoded + re-scaled + re-encoded it, paying for two JPEG codec passes.
 func HEIC(ctx context.Context, src, dst string, size int) error {
-	if _, err := exec.LookPath("ffmpeg"); err == nil {
-		if err := imageViaFfmpeg(ctx, src, dst, size); err == nil {
-			return nil
+	ffmpegTried := false
+	if !ffmpegNoHEIC.Load() {
+		if _, err := exec.LookPath("ffmpeg"); err == nil {
+			ffmpegTried = true
+			if err := imageViaFfmpeg(ctx, src, dst, size); err == nil {
+				return nil
+			}
+			// fall through — ffmpeg either lacks HEIC or refused this file.
 		}
-		// fall through — ffmpeg either lacks HEIC or refused this file.
 	}
 
 	tmpDir, err := os.MkdirTemp("", "photo-viewer-heic-")
@@ -36,6 +49,11 @@ func HEIC(ctx context.Context, src, dst string, size int) error {
 	jpg, lastErr := decodeHEIC(ctx, src, tmpDir)
 	if lastErr != nil {
 		return lastErr
+	}
+	// The fallback decoded a file ffmpeg had just refused: latch that ffmpeg
+	// can't do HEIC so future files skip the wasted fork (see ffmpegNoHEIC).
+	if ffmpegTried {
+		ffmpegNoHEIC.Store(true)
 	}
 	// jpg is a freshly written JPEG of unknown size. Skip the os.Stat /
 	// ffmpeg-threshold branch inside Image() (we know exactly where the

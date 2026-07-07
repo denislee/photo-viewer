@@ -10,14 +10,43 @@ import (
 	"os/exec"
 	"strings"
 
+	"github.com/dns/photo-viewer/internal/imgorient"
 	"github.com/dns/photo-viewer/internal/scan"
 )
 
 // RAW extracts an embedded JPEG preview from a camera RAW file and resamples
-// it into a thumbnail. Falls back to ffmpeg if no embedded preview is found.
+// it into a thumbnail. Falls back to decoding the full RAW via ffmpeg.
 func RAW(ctx context.Context, src, dst string, size int) error {
-	img, err := LoadRAWImage(ctx, src)
+	data, previewErr := LoadRAWPreview(ctx, src)
+	if previewErr == nil && len(data) > 0 {
+		// A full-resolution embedded preview (often 10–45 MP) is far cheaper to
+		// DCT-scale through ffmpeg than to expand into a huge RGBA in Go — the
+		// same >=imageFfmpegThreshold watershed the plain-image path uses. On
+		// ffmpeg failure we fall through to the Go decoder below.
+		if len(data) >= imageFfmpegThreshold {
+			if _, err := exec.LookPath("ffmpeg"); err == nil {
+				if err := imageBytesViaFfmpeg(ctx, data, dst, size); err == nil {
+					return nil
+				}
+			}
+		}
+		if img, _, err := image.Decode(bytes.NewReader(data)); err == nil {
+			// The Go decoder ignores EXIF orientation; the preview is stored in
+			// sensor orientation, so apply the RAW's Orientation tag before
+			// scaling. (The ffmpeg fast path above relies on ffmpeg's autorotate
+			// instead — a large preview that lacks its own tag is no worse than
+			// the pre-I-12 behaviour, which never rotated at all.)
+			img = imgorient.Apply(img, imgorient.ReadOrientation(src))
+			return writeThumb(img, dst, size)
+		}
+	}
+
+	// Fallback: ffmpeg decodes the full RAW directly (and autorotates).
+	img, err := decodeRAWViaFfmpeg(ctx, src)
 	if err != nil {
+		if previewErr != nil {
+			return previewErr
+		}
 		return err
 	}
 	return writeThumb(img, dst, size)
@@ -25,33 +54,45 @@ func RAW(ctx context.Context, src, dst string, size int) error {
 
 // LoadRAWImage returns a decoded image.Image from a RAW file. It tries
 // embedded previews first (via exiftool) and falls back to decoding the
-// full RAW via ffmpeg.
+// full RAW via ffmpeg. Used by the full-resolution viewer path; the thumbnail
+// path (RAW) has its own ffmpeg fast/orientation handling.
 func LoadRAWImage(ctx context.Context, src string) (image.Image, error) {
 	data, err := LoadRAWPreview(ctx, src)
 	if err == nil {
-		img, _, err := image.Decode(bytes.NewReader(data))
-		if err == nil {
+		img, _, derr := image.Decode(bytes.NewReader(data))
+		if derr == nil {
 			return img, nil
 		}
 	}
 
-	// Fallback: ffmpeg can decode many RAW formats (DNG, CR2, etc) directly.
-	if _, err := exec.LookPath("ffmpeg"); err == nil {
-		cmd := exec.CommandContext(ctx, "ffmpeg", "-i", src, "-frames:v", "1", "-f", "image2pipe", "-vcodec", "mjpeg", "-")
-		var out bytes.Buffer
-		cmd.Stdout = &out
-		if err := cmd.Run(); err == nil {
-			img, _, err := image.Decode(&out)
-			if err == nil {
-				return img, nil
-			}
-		}
+	img, ferr := decodeRAWViaFfmpeg(ctx, src)
+	if ferr == nil {
+		return img, nil
 	}
-
 	if err != nil {
 		return nil, err
 	}
 	return nil, errors.New("could not decode RAW file")
+}
+
+// decodeRAWViaFfmpeg decodes the full RAW via ffmpeg (which handles DNG, CR2,
+// etc. and auto-applies orientation), returning the decoded image.
+func decodeRAWViaFfmpeg(ctx context.Context, src string) (image.Image, error) {
+	if _, err := exec.LookPath("ffmpeg"); err != nil {
+		return nil, err
+	}
+	cmd := exec.CommandContext(ctx, "ffmpeg", "-i", src, "-frames:v", "1", "-f", "image2pipe", "-vcodec", "mjpeg", "-")
+	var out, stderr bytes.Buffer
+	cmd.Stdout = &out
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		return nil, ffmpegError(err, &stderr)
+	}
+	img, _, err := image.Decode(&out)
+	if err != nil {
+		return nil, err
+	}
+	return img, nil
 }
 
 // LoadRAWPreview returns the bytes of an embedded JPEG/TIFF preview.

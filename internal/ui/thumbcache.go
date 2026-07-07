@@ -31,6 +31,18 @@ const thumbCacheCapacity = 1024
 // shard contention is rare even under bursty scrolling.
 const thumbCacheShards = 16
 
+// A thumbnail whose generation fails (corrupt file, or a missing external tool
+// in the supported degraded mode) must not be re-queued every frame — that
+// re-runs ThumbStore.Path, which for RAW/HEIC/video forks exiftool/heif-convert/
+// ffmpeg once per frame per broken file, a constant fork loop that pegs a core.
+// Instead a failed entry is marked and retried no sooner than an exponential
+// backoff from thumbRetryBase up to thumbRetryMax, so a transient failure still
+// heals while a permanent one costs one attempt per (growing) interval.
+const (
+	thumbRetryBase = 3 * time.Second
+	thumbRetryMax  = 5 * time.Minute
+)
+
 // thumbCache lazily resolves thumbnail JPEGs into paint.ImageOp values and
 // caches them with an LRU policy. Multiple frames may request the same thumb
 // concurrently; only one decode is queued per entry. When a decode completes,
@@ -69,6 +81,12 @@ type thumbEntry struct {
 	op     paint.ImageOp
 	size   image.Point
 	queued bool
+	// failed is set when the last decode attempt failed; retryAfter is the
+	// earliest time the entry may be re-queued, and failCount drives the
+	// exponential backoff. A successful decode clears all three.
+	failed     bool
+	failCount  int
+	retryAfter time.Time
 }
 
 func newThumbCache(store *cache.ThumbStore, invalidate func()) *thumbCache {
@@ -150,6 +168,12 @@ func (tc *thumbCache) Get(e cache.Entry) (paint.ImageOp, image.Point, bool) {
 		op, sz := te.op, te.size
 		sh.mu.Unlock()
 		return op, sz, true
+	}
+	// A previously-failed entry stays on the placeholder until its backoff
+	// window elapses, so a broken file isn't re-forked every frame.
+	if te.failed && time.Now().Before(te.retryAfter) {
+		sh.mu.Unlock()
+		return paint.ImageOp{}, image.Point{}, false
 	}
 	if !te.queued {
 		te.queued = true
@@ -244,12 +268,31 @@ func (tc *thumbCache) worker() {
 			te.op = op
 			te.size = sz
 			te.ready = true
+			te.failed = false
+			te.failCount = 0
+		} else {
+			te.failCount++
+			te.failed = true
+			te.retryAfter = time.Now().Add(thumbBackoff(te.failCount))
 		}
 		sh.mu.Unlock()
 		if ok {
 			tc.dirty.Store(true)
 		}
 	}
+}
+
+// thumbBackoff returns the retry delay for the failCount-th consecutive decode
+// failure: thumbRetryBase doubled each attempt, capped at thumbRetryMax.
+func thumbBackoff(failCount int) time.Duration {
+	d := thumbRetryBase
+	for i := 1; i < failCount; i++ {
+		d *= 2
+		if d >= thumbRetryMax {
+			return thumbRetryMax
+		}
+	}
+	return d
 }
 
 func (tc *thumbCache) decode(e cache.Entry) (paint.ImageOp, image.Point, bool) {

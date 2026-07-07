@@ -1,9 +1,9 @@
 package thumb
 
 import (
+	"bytes"
 	"context"
 	"errors"
-	"fmt"
 	"os"
 	"os/exec"
 )
@@ -17,7 +17,7 @@ func Video(ctx context.Context, src, dst string, size int) error {
 	}
 	// -ss before -i is fast (keyframe seek); -frames:v 1 grabs a single frame.
 	// -vf scale fits longest edge to size while preserving aspect ratio.
-	vf := fmt.Sprintf("scale='if(gt(iw,ih),%d,-2)':'if(gt(iw,ih),-2,%d)'", size, size)
+	vf := ffmpegScaleFilter(size)
 	run := func(seek bool) error {
 		args := []string{"-loglevel", "error", "-y"}
 		if seek {
@@ -30,7 +30,13 @@ func Video(ctx context.Context, src, dst string, size int) error {
 			"-f", "image2",
 			dst,
 		)
-		return exec.CommandContext(ctx, "ffmpeg", args...).Run()
+		cmd := exec.CommandContext(ctx, "ffmpeg", args...)
+		var stderr bytes.Buffer
+		cmd.Stderr = &stderr
+		if err := cmd.Run(); err != nil {
+			return ffmpegError(err, &stderr)
+		}
+		return nil
 	}
 	if err := run(true); err != nil {
 		// Retry from start in case the file is shorter than 1s.
