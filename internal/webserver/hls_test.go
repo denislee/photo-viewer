@@ -162,6 +162,128 @@ func TestHLSSegmentCached(t *testing.T) {
 	t.Logf("cached fetch took %s", time.Since(start))
 }
 
+// indexedVideoServer wires a Server around an index holding one video entry
+// with the given duration, without touching ffmpeg. The source file is created
+// empty just so lookups resolve; tests here exercise paths that never decode
+// it (playlist synthesis from the indexed duration, out-of-range rejection).
+func indexedVideoServer(t *testing.T, durationMs int64) (*Server, string, func()) {
+	t.Helper()
+	tmp, err := os.MkdirTemp("", "pv-hls-idx-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	libRoot := filepath.Join(tmp, "lib")
+	os.MkdirAll(libRoot, 0o755)
+	vid := filepath.Join(libRoot, "clip.mkv")
+	os.WriteFile(vid, []byte("x"), 0o644)
+	info, _ := os.Stat(vid)
+
+	idx, err := cache.Load(filepath.Join(tmp, "index.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	store, err := cache.NewThumbStore(tmp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	idx.ReconcileBatch([]scan.Result{{
+		Path:       vid,
+		Type:       scan.TypeVideo,
+		Size:       info.Size(),
+		ModTime:    info.ModTime(),
+		DurationMs: durationMs,
+	}})
+	s := New(idx, store, libRoot)
+	return s, cache.ThumbIDFor(vid), func() {
+		idx.Close()
+		os.RemoveAll(tmp)
+	}
+}
+
+func TestHLSPlaylistUsesIndexDuration(t *testing.T) {
+	// 14s indexed → 3 segments, synthesised without any ffprobe fork (ffmpeg
+	// isn't even required for this path).
+	s, id, cleanup := indexedVideoServer(t, 14000)
+	defer cleanup()
+	ts := httptest.NewServer(http.HandlerFunc(s.handleHLS))
+	defer ts.Close()
+
+	resp, err := http.Get(ts.URL + "/hls/" + id + "/index.m3u8")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		t.Fatalf("playlist status = %d", resp.StatusCode)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	pl := string(body)
+	if segs := strings.Count(pl, ".ts"); segs != 3 {
+		t.Errorf("segment count = %d, want 3 (14s/6s):\n%s", segs, pl)
+	}
+	if !strings.Contains(pl, "seg2.ts") || strings.Contains(pl, "seg3.ts") {
+		t.Errorf("expected seg0..seg2 only:\n%s", pl)
+	}
+}
+
+func TestHLSSegmentRejectsOutOfRange(t *testing.T) {
+	// 8s indexed → ceil(8/6) = 2 segments (seg0, seg1). seg2+ is past EOF and
+	// must 404 rather than spawn an ffmpeg seek past the end and cache junk.
+	s, id, cleanup := indexedVideoServer(t, 8000)
+	defer cleanup()
+	ts := httptest.NewServer(http.HandlerFunc(s.handleHLS))
+	defer ts.Close()
+
+	resp, err := http.Get(ts.URL + "/hls/" + id + "/seg5.ts")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusNotFound {
+		t.Errorf("out-of-range segment status = %d, want 404", resp.StatusCode)
+	}
+}
+
+func TestSweepHLSDir(t *testing.T) {
+	root := t.TempDir()
+	now := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
+
+	// Helper to place a file with a specific size and mtime under root.
+	place := func(rel string, size int, age time.Duration) string {
+		p := filepath.Join(root, filepath.FromSlash(rel))
+		os.MkdirAll(filepath.Dir(p), 0o755)
+		if err := os.WriteFile(p, make([]byte, size), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		mt := now.Add(-age)
+		os.Chtimes(p, mt, mt)
+		return p
+	}
+
+	oldTmp := place("aa/aaid/seg9.ts.tmp", 10, 2*time.Hour)   // crash-orphaned, stale
+	freshTmp := place("aa/aaid/seg8.ts.tmp", 10, time.Minute) // in-flight, keep
+	oldSeg := place("aa/aaid/seg0.ts", 1000, 3*time.Hour)     // evict first
+	midSeg := place("bb/bbid/seg0.ts", 1000, 2*time.Hour)     // evict second
+	newSeg := place("cc/ccid/seg0.ts", 1000, time.Minute)     // keep (newest)
+
+	// Cap at 1500 bytes: total seg bytes = 3000, so two oldest must go.
+	sweepHLSDir(root, 1500, time.Hour, now)
+
+	exists := func(p string) bool { _, err := os.Stat(p); return err == nil }
+	if exists(oldTmp) {
+		t.Errorf("stale .tmp not swept")
+	}
+	if !exists(freshTmp) {
+		t.Errorf("fresh .tmp wrongly swept")
+	}
+	if exists(oldSeg) || exists(midSeg) {
+		t.Errorf("oldest segments not evicted under cap")
+	}
+	if !exists(newSeg) {
+		t.Errorf("newest segment wrongly evicted")
+	}
+}
+
 func TestHLSRejectsNonVideo(t *testing.T) {
 	// A bogus id that resolves to nothing must 404, not 500.
 	id, ts, cleanup := hlsFixture(t, "clip.mkv", 4)

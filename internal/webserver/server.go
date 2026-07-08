@@ -7,6 +7,7 @@
 package webserver
 
 import (
+	"compress/gzip"
 	"context"
 	"crypto/subtle"
 	"encoding/json"
@@ -85,6 +86,44 @@ type Server struct {
 	hlsSem      chan struct{}
 	hlsFlightMu sync.Mutex
 	hlsInflight map[string]chan struct{}
+
+	// hlsSweepAt throttles the segment-cache sweep (see maybeSweepHLS): the
+	// cache is walked and evicted back under its size cap at most once per
+	// hlsSweepInterval, tied to segment-serving activity.
+	hlsSweepMu sync.Mutex
+	hlsSweepAt time.Time
+
+	// Sidebar aggregate cache. renderSidebar runs several aggregate scans
+	// (CountView×2, Years, CountChildDirsFiltered, os.ReadDir) that are
+	// identical across every gallery navigation sharing the same filter/raw
+	// toggles; caching the model per (filter, showRAW) for sidebarCacheTTL
+	// coalesces a navigation burst the way trashEntries does for /trash.
+	sidebarMu    sync.Mutex
+	sidebarCache map[sidebarKey]sidebarEntry
+}
+
+// sidebarKey identifies a cached sidebar aggregate: the two toolbar toggles
+// that change every count in it.
+type sidebarKey struct {
+	filter  string
+	showRAW bool
+}
+
+// sidebarAgg holds the expensive, view-independent inputs the sidebar needs:
+// the All/Favorites totals, the library-root child directories with their
+// filtered counts, and the per-year totals. Active-row highlighting and the
+// per-directory drill-down are cheap and stay out of the cache.
+type sidebarAgg struct {
+	allCount int
+	favCount int
+	subdirs  []string
+	counts   map[string]int
+	years    []cache.YearStat
+}
+
+type sidebarEntry struct {
+	agg *sidebarAgg
+	at  time.Time
 }
 
 // New constructs an idle server. libraryRoot is used to enumerate the
@@ -131,18 +170,24 @@ func (s *Server) Start(host string, port int, password string) error {
 		return err
 	}
 	mux := http.NewServeMux()
-	mux.HandleFunc("/", s.handleIndex)
-	mux.HandleFunc("/favorites", s.handleFavorites)
-	mux.HandleFunc("/trash", s.handleTrash)
-	mux.HandleFunc("/year/", s.handleYear)
-	mux.HandleFunc("/dir", s.handleDir)
-	mux.HandleFunc("/view/", s.handleView)
+	// gz wraps text routes (HTML pages + JSON APIs) with gzip. The binary
+	// routes (/thumb, /media, /hls segments) are left on the raw
+	// ResponseWriter: their payloads are already compressed, and http.ServeFile
+	// there relies on range requests and the io.ReaderFrom sendfile fast path
+	// that a wrapping writer would defeat.
+	gz := func(h http.HandlerFunc) http.HandlerFunc { return gzipMiddleware(h).ServeHTTP }
+	mux.HandleFunc("/", gz(s.handleIndex))
+	mux.HandleFunc("/favorites", gz(s.handleFavorites))
+	mux.HandleFunc("/trash", gz(s.handleTrash))
+	mux.HandleFunc("/year/", gz(s.handleYear))
+	mux.HandleFunc("/dir", gz(s.handleDir))
+	mux.HandleFunc("/view/", gz(s.handleView))
 	mux.HandleFunc("/thumb/", s.handleThumb)
 	mux.HandleFunc("/media/", s.handleMedia)
 	mux.HandleFunc("/hls/", s.handleHLS)
-	mux.HandleFunc("/api/page", s.handleAPIPage)
-	mux.HandleFunc("/api/favorite", s.handleAPIFavorite)
-	mux.HandleFunc("/api/info", s.handleAPIInfo)
+	mux.HandleFunc("/api/page", gz(s.handleAPIPage))
+	mux.HandleFunc("/api/favorite", gz(s.handleAPIFavorite))
+	mux.HandleFunc("/api/info", gz(s.handleAPIInfo))
 
 	var handler http.Handler = mux
 	if password != "" {
@@ -204,6 +249,74 @@ func basicAuth(next http.Handler, password string) http.Handler {
 		}
 		next.ServeHTTP(w, r)
 	})
+}
+
+// gzipMiddleware wraps next so text responses are gzip-compressed when the
+// client advertises support. The ~50 KB gallery HTML and the infinite-scroll
+// JSON compress roughly 5×, which matters on the phone-over-WiFi use case this
+// server targets. Whether to compress is decided from the Content-Type the
+// handler sets (see gzipResponseWriter), so binary responses accidentally
+// routed through here still pass straight through.
+func gzipMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !strings.Contains(r.Header.Get("Accept-Encoding"), "gzip") {
+			next.ServeHTTP(w, r)
+			return
+		}
+		gw := &gzipResponseWriter{ResponseWriter: w}
+		defer gw.Close()
+		next.ServeHTTP(gw, r)
+	})
+}
+
+// gzipResponseWriter compresses the body only when the handler's declared
+// Content-Type is a text payload worth compressing (text/html, application/
+// json). It decides lazily at the first WriteHeader/Write so it can read the
+// Content-Type the handler set; anything else — images, video, an empty 304 —
+// passes through uncompressed with headers untouched.
+type gzipResponseWriter struct {
+	http.ResponseWriter
+	gz          *gzip.Writer
+	wroteHeader bool
+}
+
+func (g *gzipResponseWriter) WriteHeader(status int) {
+	if g.wroteHeader {
+		return
+	}
+	g.wroteHeader = true
+	ct := g.Header().Get("Content-Type")
+	if g.Header().Get("Content-Encoding") == "" &&
+		(strings.HasPrefix(ct, "text/html") || strings.HasPrefix(ct, "application/json")) {
+		// Length changes once compressed; drop the handler's declared length so
+		// net/http switches to chunked framing.
+		g.Header().Del("Content-Length")
+		g.Header().Set("Content-Encoding", "gzip")
+		g.Header().Add("Vary", "Accept-Encoding")
+		g.gz = gzip.NewWriter(g.ResponseWriter)
+	}
+	g.ResponseWriter.WriteHeader(status)
+}
+
+func (g *gzipResponseWriter) Write(b []byte) (int, error) {
+	if !g.wroteHeader {
+		// Mirror net/http's implicit 200 on first Write so the Content-Type
+		// sniff above runs against the header the handler has already set.
+		g.WriteHeader(http.StatusOK)
+	}
+	if g.gz != nil {
+		return g.gz.Write(b)
+	}
+	return g.ResponseWriter.Write(b)
+}
+
+// Close flushes and finishes the gzip stream. A no-op when the response was
+// not compressed. Called via defer by gzipMiddleware.
+func (g *gzipResponseWriter) Close() error {
+	if g.gz != nil {
+		return g.gz.Close()
+	}
+	return nil
 }
 
 // viewInfo couples a cache.View with the user-facing metadata the
@@ -860,11 +973,11 @@ func (s *Server) renderSidebar(w http.ResponseWriter, vi viewInfo) {
 	withExtra := func(href string) string { return appendQuery(href, extra) }
 
 	v := vi.v
+	agg := s.rootSidebarAgg(v.Filter, v.ShowRAW)
 	fmt.Fprint(w, `<nav class="sidebar"><div class="sec">Library</div>`)
 
-	favCount := s.index.CountView(cache.View{Kind: "favorites", Filter: v.Filter, ShowRAW: v.ShowRAW})
-	s.sidebarRow(w, withExtra("/"), "All media", "", s.index.CountView(cache.View{Kind: "all", Filter: v.Filter, ShowRAW: v.ShowRAW}), vi.kind == "all")
-	s.sidebarRow(w, withExtra("/favorites"), "Favorites", "★", favCount, vi.kind == "favorites")
+	s.sidebarRow(w, withExtra("/"), "All media", "", agg.allCount, vi.kind == "all")
+	s.sidebarRow(w, withExtra("/favorites"), "Favorites", "★", agg.favCount, vi.kind == "favorites")
 
 	trashCount := s.countTrash()
 	if trashCount > 0 || vi.kind == "trash" {
@@ -873,28 +986,28 @@ func (s *Server) renderSidebar(w http.ResponseWriter, vi viewInfo) {
 
 	// Top-level subdirectories. Sourced from the filesystem (mirroring the
 	// native sidebar) so newly-created folders show up without a rebuild.
-	subdirs := listSubdirs(s.libraryRoot)
-	if len(subdirs) > 0 {
+	if len(agg.subdirs) > 0 {
 		fmt.Fprint(w, `<div class="sec">Folders</div>`)
-		s.renderSubdirsGrouped(w, s.libraryRoot, subdirs, vi)
+		s.renderSubdirsGrouped(w, agg.subdirs, agg.counts, vi)
 	}
 
 	// When viewing a directory, surface its child folders as a nested
 	// section so the user can drill down instead of paginating through
-	// a 100k-photo flat list.
+	// a 100k-photo flat list. This is per-directory, so it stays off the
+	// cached root aggregate and pays one live count query for the open dir.
 	if v.Kind == "dir" {
 		children := listSubdirs(v.Dir)
 		if len(children) > 0 {
+			childCounts := s.index.CountChildDirsFiltered(v.Dir, v.Filter, v.ShowRAW)
 			fmt.Fprintf(w, `<div class="sec">In %s</div>`, html.EscapeString(filepath.Base(v.Dir)))
-			s.renderSubdirsGrouped(w, v.Dir, children, vi)
+			s.renderSubdirsGrouped(w, children, childCounts, vi)
 		}
 	}
 
 	// Year list. Includes per-year counts that respect the active filter.
-	years := s.index.Years(v.Filter, v.ShowRAW)
-	if len(years) > 0 {
+	if len(agg.years) > 0 {
 		fmt.Fprint(w, `<div class="sec">Years</div>`)
-		for _, y := range years {
+		for _, y := range agg.years {
 			ys := strconv.Itoa(y.Year)
 			active := vi.kind == "year" && v.Year == y.Year
 			s.sidebarRow(w, withExtra("/year/"+ys), ys, "", y.Count, active)
@@ -903,15 +1016,48 @@ func (s *Server) renderSidebar(w http.ResponseWriter, vi viewInfo) {
 	fmt.Fprint(w, `</nav>`)
 }
 
-// renderSubdirsGrouped renders the immediate child directories of parent.
-// Subdirs whose basename matches YYYY-MM-DD are bucketed under collapsible
-// YYYY <details> groups so a folder with thousands of date-named children
-// doesn't blow out the sidebar. Non-date directories render normally
-// above the year buckets.
-func (s *Server) renderSubdirsGrouped(w http.ResponseWriter, parent string, subdirs []string, vi viewInfo) {
+// sidebarCacheTTL bounds how long a cached sidebar aggregate is reused. Like
+// trashEntriesTTL, a few seconds coalesces a navigation burst (every page
+// render re-derives the same aggregate scans) without letting counts drift
+// noticeably after an import, rebuild, or favorite toggle — all of which
+// self-heal on the next refresh past the window.
+const sidebarCacheTTL = 5 * time.Second
+
+// rootSidebarAgg returns the cached library-root sidebar aggregate for the
+// given filter/raw toggles, recomputing it when the entry is missing or older
+// than sidebarCacheTTL. The lock is held across the recompute (as trashEntries
+// does) so a navigation burst blocks briefly on the first render then hits the
+// cache; correctness doesn't depend on it, only on serving a recent snapshot.
+func (s *Server) rootSidebarAgg(filter string, showRAW bool) *sidebarAgg {
+	key := sidebarKey{filter: filter, showRAW: showRAW}
+	s.sidebarMu.Lock()
+	defer s.sidebarMu.Unlock()
+	if e, ok := s.sidebarCache[key]; ok && time.Since(e.at) < sidebarCacheTTL {
+		return e.agg
+	}
+	agg := &sidebarAgg{
+		allCount: s.index.CountView(cache.View{Kind: "all", Filter: filter, ShowRAW: showRAW}),
+		favCount: s.index.CountView(cache.View{Kind: "favorites", Filter: filter, ShowRAW: showRAW}),
+		subdirs:  listSubdirs(s.libraryRoot),
+		counts:   s.index.CountChildDirsFiltered(s.libraryRoot, filter, showRAW),
+		years:    s.index.Years(filter, showRAW),
+	}
+	if s.sidebarCache == nil {
+		s.sidebarCache = make(map[sidebarKey]sidebarEntry)
+	}
+	s.sidebarCache[key] = sidebarEntry{agg: agg, at: time.Now()}
+	return agg
+}
+
+// renderSubdirsGrouped renders the given child directories, using the supplied
+// per-directory counts (fetched once by the caller so the cached root sidebar
+// doesn't re-query). Subdirs whose basename matches YYYY-MM-DD are bucketed
+// under collapsible YYYY <details> groups so a folder with thousands of
+// date-named children doesn't blow out the sidebar. Non-date directories render
+// normally above the year buckets.
+func (s *Server) renderSubdirsGrouped(w http.ResponseWriter, subdirs []string, counts map[string]int, vi viewInfo) {
 	extra := extraQuery(vi.v.Filter, vi.v.ShowRAW)
 	withExtra := func(href string) string { return appendQuery(href, extra) }
-	counts := s.index.CountChildDirsFiltered(parent, vi.v.Filter, vi.v.ShowRAW)
 
 	type bucket struct {
 		dirs  []string
@@ -1244,16 +1390,27 @@ func (s *Server) handleThumb(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
-	etag := `"` + id + `"`
-	if match := r.Header.Get("If-None-Match"); match != "" && strings.Contains(match, etag) {
-		w.Header().Set("ETag", etag)
-		w.Header().Set("Cache-Control", "public, max-age=86400, immutable")
-		w.WriteHeader(http.StatusNotModified)
-		return
-	}
+	// Resolve the entry before the conditional check so the ETag can fold in
+	// the source mtime — cheap now that GetEntryByThumbID is index-backed
+	// (I-08). The old ETag was the bare thumb id (== sha1 of the path), so it
+	// never changed when a file was edited in place and remote browsers 304'd
+	// on the stale thumb forever. Keying on mtime as well means an edit yields
+	// a fresh ETag and the next revalidation fetches the regenerated thumb.
 	e, ok := s.lookupEntry(id)
 	if !ok {
 		http.NotFound(w, r)
+		return
+	}
+	etag := fmt.Sprintf(`"%s-%d"`, id, e.ModTime.Unix())
+	// Cacheable for a day but no longer "immutable": immutable told browsers to
+	// skip revalidation entirely within max-age, which — combined with the
+	// static ETag — is what pinned stale thumbs. Dropping it lets a reload
+	// revalidate against the mtime-keyed ETag and pick up edits.
+	const thumbCacheControl = "public, max-age=86400"
+	if match := r.Header.Get("If-None-Match"); match != "" && strings.Contains(match, etag) {
+		w.Header().Set("ETag", etag)
+		w.Header().Set("Cache-Control", thumbCacheControl)
+		w.WriteHeader(http.StatusNotModified)
 		return
 	}
 	thumbPath, err := s.store.Path(e)
@@ -1262,7 +1419,7 @@ func (s *Server) handleThumb(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.Header().Set("Content-Type", "image/jpeg")
-	w.Header().Set("Cache-Control", "public, max-age=86400, immutable")
+	w.Header().Set("Cache-Control", thumbCacheControl)
 	w.Header().Set("ETag", etag)
 	http.ServeFile(w, r, thumbPath)
 }

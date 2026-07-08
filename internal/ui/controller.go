@@ -408,6 +408,15 @@ func (c *Controller) Rebuild() error {
 	if err := os.RemoveAll(filepath.Join(c.cacheDir, "thumbs")); err != nil {
 		return err
 	}
+	// Drop the on-the-fly HLS transcode cache too. Segments there are keyed by
+	// thumb id + source mtime, so a rebuild that re-derives them from changed
+	// originals must not keep serving stale segments — and, unlike the
+	// per-request staleness check, this reclaims the whole tree (including any
+	// crash-orphaned .tmp files) that would otherwise grow unbounded on the
+	// media drive. Best-effort: the dir may not exist if the webserver never ran.
+	if err := os.RemoveAll(filepath.Join(c.cacheDir, "hls")); err != nil {
+		return err
+	}
 	go c.scanInto(ctx, c.libraryRoot)
 	return nil
 }
