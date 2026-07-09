@@ -397,10 +397,7 @@ func (v *FuzzySearchView) statusLine() string {
 
 func (v *FuzzySearchView) layoutSearchBox(gtx layout.Context, th *Theme) layout.Dimensions {
 	v.editor.SingleLine = true
-	w2 := gtx.Constraints.Max.X
-	if w2 < 200 {
-		w2 = 200
-	}
+	w2 := max(gtx.Constraints.Max.X, 200)
 	h := gtx.Dp(unit.Dp(40))
 	rect := image.Rectangle{Max: image.Pt(w2, h)}
 	ca := clip.Rect(rect).Push(gtx.Ops)

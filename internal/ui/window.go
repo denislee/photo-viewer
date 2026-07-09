@@ -584,7 +584,7 @@ func isViewerVideo(viewer *Viewer) bool {
 	return viewer.entries[viewer.Index].Type == scan.TypeVideo
 }
 
-func handleGridKey(ke key.Event, grid *Grid, sidebar *Sidebar, sidebarFocus *bool, viewer *Viewer, total int, ctrl *Controller, w *app.Window) {
+func handleGridKey(ke key.Event, grid *Grid, _ *Sidebar, sidebarFocus *bool, viewer *Viewer, total int, ctrl *Controller, w *app.Window) {
 	// While the delete-confirmation modal is up, only Enter / Esc / Ctrl+[
 	// are meaningful — all other grid navigation is suppressed so a stray
 	// j/k can't move the selection out from under the prompt.
@@ -1073,9 +1073,7 @@ func drawRoot(gtx layout.Context, th *Theme, ctrl *Controller, tb *Toolbar, sb *
 	bodyH := totalH - tbH - sbH - pbH
 	minW := gtx.Dp(unit.Dp(sidebarMinDp))
 	maxW := gtx.Dp(unit.Dp(sidebarMaxDp))
-	if maxW > totalW-minW {
-		maxW = totalW - minW
-	}
+	maxW = min(maxW, totalW-minW)
 	leftW := gtx.Dp(unit.Dp(GetConfig().SidebarWidthDp))
 	if leftW <= 0 {
 		leftW = totalW * 22 / 100
@@ -1186,14 +1184,8 @@ func layoutSplitter(gtx layout.Context, th *Theme, sp *sidebarSplitter, w, h, le
 				continue
 			}
 			delta := int(pe.Position.X - sp.startX)
-			newW := sp.startW + delta
-			if newW < minW {
-				newW = minW
-			}
-			cap := totalW - minW - w
-			if cap < minW {
-				cap = minW
-			}
+			newW := max(sp.startW+delta, minW)
+			cap := max(totalW-minW-w, minW)
 			if newW > maxW {
 				newW = maxW
 			}

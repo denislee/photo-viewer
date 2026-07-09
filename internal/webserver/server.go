@@ -618,10 +618,7 @@ func (s *Server) renderGalleryPage(w http.ResponseWriter, r *http.Request, vi vi
 			offset = 0
 			page = 1
 		}
-		end := offset + pageSize
-		if end > total {
-			end = total
-		}
+		end := min(offset+pageSize, total)
 		entries = all[offset:end]
 		hasNext = end < total
 	} else {
@@ -697,14 +694,8 @@ func (s *Server) handleAPIPage(w http.ResponseWriter, r *http.Request) {
 	if vi.kind == "trash" {
 		all := s.trashEntries()
 		total = len(all)
-		offset := (page - 1) * pageSize
-		if offset > total {
-			offset = total
-		}
-		end := offset + pageSize
-		if end > total {
-			end = total
-		}
+		offset := min((page-1)*pageSize, total)
+		end := min(offset+pageSize, total)
 		entries = all[offset:end]
 	} else {
 		offset := (page - 1) * pageSize

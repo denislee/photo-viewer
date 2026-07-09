@@ -129,7 +129,7 @@ func (v *OrganizeView) Close() {
 	}
 }
 
-func (v *OrganizeView) scanForMismatched(ctx context.Context, idx *cache.Index, root string) {
+func (v *OrganizeView) scanForMismatched(ctx context.Context, idx *cache.Index, _ string) {
 	var proc *Process
 	if v.processes != nil {
 		proc = v.processes.Begin(ProcOrganize, "Organize: scan", func() {
@@ -174,15 +174,10 @@ func (v *OrganizeView) scanForMismatched(ctx context.Context, idx *cache.Index, 
 	results := make(chan MismatchedVideo, total)
 	var wg sync.WaitGroup
 
-	numWorkers := runtime.NumCPU()
-	if numWorkers > 4 {
-		numWorkers = 4 // Don't overwhelm the system with too many exiftool processes
-	}
+	numWorkers := min(runtime.NumCPU(), 4) // Don't overwhelm the system with too many exiftool processes
 
-	for i := 0; i < numWorkers; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+	for range numWorkers {
+		wg.Go(func() {
 			for e := range jobs {
 				if proc != nil {
 					proc.Wait()
@@ -204,7 +199,7 @@ func (v *OrganizeView) scanForMismatched(ctx context.Context, idx *cache.Index, 
 					}
 				}
 			}
-		}()
+		})
 	}
 
 	for _, v := range videos {

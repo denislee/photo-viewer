@@ -1254,10 +1254,7 @@ func (c *Controller) WarmUp() {
 		// sit mostly idle. Running WarmUpConcurrency workers lets both pools
 		// saturate; the channel back-pressures the producer so we never hold
 		// more than a small window of entries in memory.
-		workers := c.store.WarmUpConcurrency()
-		if workers < 1 {
-			workers = 1
-		}
+		workers := max(c.store.WarmUpConcurrency(), 1)
 		jobs := make(chan cache.Entry, workers*2)
 
 		// Throttle the redraw notifications so a burst of fast thumb decodes
@@ -1288,10 +1285,8 @@ func (c *Controller) WarmUp() {
 		}
 
 		var wg sync.WaitGroup
-		for w := 0; w < workers; w++ {
-			wg.Add(1)
-			go func() {
-				defer wg.Done()
+		for range workers {
+			wg.Go(func() {
 				for e := range jobs {
 					if proc != nil {
 						proc.Wait()
@@ -1307,7 +1302,7 @@ func (c *Controller) WarmUp() {
 					}
 					notify(atomic.AddInt64(&done, 1))
 				}
-			}()
+			})
 		}
 
 		c.index.ForEachEntry(func(e cache.Entry) bool {

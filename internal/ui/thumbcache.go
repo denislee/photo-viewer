@@ -100,11 +100,8 @@ func newThumbCache(store *cache.ThumbStore, invalidate func()) *thumbCache {
 		tc.shards[i].entries = make(map[string]*list.Element)
 		tc.shards[i].lru = list.New()
 	}
-	workers := runtime.NumCPU()
-	if workers < 4 {
-		workers = 4
-	}
-	for i := 0; i < workers; i++ {
+	workers := max(runtime.NumCPU(), 4)
+	for range workers {
 		go tc.worker()
 	}
 	go tc.coalescer()

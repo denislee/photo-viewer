@@ -155,10 +155,7 @@ func (g *Grid) ensureCells(n int) {
 		// Grow with ~20% slack so repeated viewport stretches and scroll
 		// past the end of large lists don't trigger a realloc on every
 		// frame. The minimum bump keeps the very-small case sane.
-		grown := n + n/5
-		if grown < n+8 {
-			grown = n + 8
-		}
+		grown := max(n+n/5, n+8)
 		next := make([]*widget.Clickable, n, grown)
 		copy(next, g.cells)
 		g.cells = next
@@ -308,18 +305,9 @@ func (g *Grid) Layout(gtx layout.Context, th *Theme, entries []cache.Entry, ctrl
 	// (they weren't laid out), so polling them is wasted work — and on
 	// large grids that's tens of thousands of Clicked() calls per frame.
 	first, count := g.list.Position.First, g.list.Position.Count
-	cols := g.cols
-	if cols < 1 {
-		cols = 1
-	}
-	clickStart := first * cols
-	clickEnd := (first + count + 1) * cols
-	if clickStart < 0 {
-		clickStart = 0
-	}
-	if clickEnd > len(g.cells) {
-		clickEnd = len(g.cells)
-	}
+	cols := max(g.cols, 1)
+	clickStart := max(first*cols, 0)
+	clickEnd := min((first+count+1)*cols, len(g.cells))
 	for i := clickStart; i < clickEnd; i++ {
 		if g.cells[i] == nil {
 			continue
@@ -337,10 +325,7 @@ func (g *Grid) Layout(gtx layout.Context, th *Theme, entries []cache.Entry, ctrl
 	cellPx := gtx.Dp(g.cellSize)
 	gapPx := gtx.Dp(cellGapDp)
 	width := gtx.Constraints.Max.X
-	cols = (width + gapPx) / (cellPx + gapPx)
-	if cols < 1 {
-		cols = 1
-	}
+	cols = max((width+gapPx)/(cellPx+gapPx), 1)
 	g.cols = cols
 	rowH := cellPx + gapPx
 	if rowH > 0 {
@@ -363,19 +348,12 @@ func (g *Grid) Layout(gtx layout.Context, th *Theme, entries []cache.Entry, ctrl
 		case count == 0:
 			// First frame — defer until we know the viewport.
 		case selRow-margin < first:
-			target := selRow - margin
-			if target < 0 {
-				target = 0
-			}
-			g.list.ScrollTo(target)
+			g.list.ScrollTo(max(selRow-margin, 0))
 			g.pendingScroll = false
 		case selRow+margin >= first+count:
 			// ScrollTo aligns the row to the top; bias by the visible row
 			// count so the selection lands one row above the bottom edge.
-			target := selRow + margin - count + 1
-			if target < 0 {
-				target = 0
-			}
+			target := max(selRow+margin-count+1, 0)
 			g.list.ScrollTo(target)
 			g.pendingScroll = false
 		default:
@@ -390,10 +368,7 @@ func (g *Grid) Layout(gtx layout.Context, th *Theme, entries []cache.Entry, ctrl
 
 func (g *Grid) layoutRow(gtx layout.Context, th *Theme, entries []cache.Entry, ctrl *Controller, row, cols, cellPx, gapPx int) layout.Dimensions {
 	start := row * cols
-	end := start + cols
-	if end > len(entries) {
-		end = len(entries)
-	}
+	end := min(start+cols, len(entries))
 	// Hoist loop-invariants so the inner loop only does per-cell work:
 	// offset and the IsSelected map lookup. cellSize is fixed for the row,
 	// as are the thumb cache, selection mode, and stride.
@@ -598,10 +573,7 @@ func drawDurationBadge(gtx layout.Context, th *Theme, cell image.Rectangle, badg
 	paint.PaintOp{}.Add(gtx.Ops)
 	ca.Pop()
 
-	textY := y0 + (pillH-lblDims.Size.Y)/2
-	if textY < y0 {
-		textY = y0
-	}
+	textY := max(y0+(pillH-lblDims.Size.Y)/2, y0)
 	stack := op.Offset(image.Pt(x0+padX, textY)).Push(gtx.Ops)
 	labelCall.Add(gtx.Ops)
 	stack.Pop()

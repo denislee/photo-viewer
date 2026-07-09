@@ -98,7 +98,7 @@ func (s *Server) handleHLS(w http.ResponseWriter, r *http.Request) {
 // duration comes from the index row the caller already fetched (via
 // hlsDuration), so the common path costs no ffprobe fork — only videos indexed
 // without a duration fall back to probing.
-func (s *Server) serveHLSPlaylist(w http.ResponseWriter, r *http.Request, id string, e cache.Entry) {
+func (s *Server) serveHLSPlaylist(w http.ResponseWriter, r *http.Request, _ string, e cache.Entry) {
 	dur := s.hlsDuration(r.Context(), e)
 	if dur <= 0 {
 		http.Error(w, "cannot probe video duration", http.StatusInternalServerError)
@@ -112,7 +112,7 @@ func (s *Server) serveHLSPlaylist(w http.ResponseWriter, r *http.Request, id str
 	b.WriteString("#EXT-X-PLAYLIST-TYPE:VOD\n")
 	fmt.Fprintf(&b, "#EXT-X-TARGETDURATION:%d\n", int(math.Ceil(hlsSegDur)))
 	b.WriteString("#EXT-X-MEDIA-SEQUENCE:0\n")
-	for i := 0; i < n; i++ {
+	for i := range n {
 		segLen := hlsSegDur
 		if rem := dur - float64(i)*hlsSegDur; rem < segLen {
 			segLen = rem
@@ -169,7 +169,7 @@ func (s *Server) serveSegmentFile(w http.ResponseWriter, r *http.Request, dst st
 // total parallel transcodes with a semaphore. Writes to a temp file and
 // atomically renames, so a killed transcode never leaves a half-written
 // segment in the cache.
-func (s *Server) transcodeSegment(ctx context.Context, id string, e cache.Entry, k int, dst string) error {
+func (s *Server) transcodeSegment(ctx context.Context, _ string, e cache.Entry, k int, dst string) error {
 	s.hlsInit()
 
 	// Singleflight on the destination path.
@@ -270,10 +270,7 @@ func (s *Server) hlsSegPath(id string, k int) string {
 // transcodes orphaned and to enforce the size cap from segments cached earlier.
 func (s *Server) hlsInit() {
 	s.hlsOnce.Do(func() {
-		n := runtime.NumCPU() / 2
-		if n < 1 {
-			n = 1
-		}
+		n := max(runtime.NumCPU()/2, 1)
 		s.hlsSem = make(chan struct{}, n)
 		s.hlsInflight = make(map[string]chan struct{})
 		s.hlsSweepMu.Lock()

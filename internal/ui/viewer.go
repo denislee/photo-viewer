@@ -14,7 +14,6 @@ import (
 	"sync"
 	"sync/atomic"
 
-	"gioui.org/f32"
 	"gioui.org/layout"
 	"gioui.org/op"
 	"gioui.org/op/clip"
@@ -404,9 +403,7 @@ func (v *Viewer) Layout(gtx layout.Context, th *Theme, tc *thumbCache) layout.Di
 	infoW := 0
 	if v.ShowInfo {
 		infoW = gtx.Dp(unit.Dp(300))
-		if infoW > size.X/2 {
-			infoW = size.X / 2
-		}
+		infoW = min(infoW, size.X/2)
 		imgArea = image.Rectangle{Max: image.Pt(size.X-infoW, size.Y)}
 	}
 
@@ -525,14 +522,8 @@ func (v *Viewer) layoutInfoPanel(gtx layout.Context, th *Theme, e cache.Entry, r
 	info := v.mediaInfoFor(e)
 
 	pad := gtx.Dp(unit.Dp(12))
-	innerW := rect.Dx() - pad*2
-	if innerW < 80 {
-		innerW = 80
-	}
-	innerH := rect.Dy() - pad*2
-	if innerH < 60 {
-		innerH = 60
-	}
+	innerW := max(rect.Dx()-pad*2, 80)
+	innerH := max(rect.Dy()-pad*2, 60)
 	innerGtx := gtx
 	innerGtx.Constraints.Max = image.Pt(innerW, innerH)
 	innerGtx.Constraints.Min = image.Pt(0, 0)
@@ -942,10 +933,7 @@ func decodeOriginal(ctx context.Context, e cache.Entry) (paint.ImageOp, image.Po
 func downscalePreview(img image.Image, maxSide int) image.Image {
 	b := img.Bounds()
 	w, h := b.Dx(), b.Dy()
-	longSide := w
-	if h > longSide {
-		longSide = h
-	}
+	longSide := max(w, h)
 	if longSide <= maxSide {
 		return img
 	}
@@ -963,11 +951,3 @@ func downscalePreview(img image.Image, maxSide int) image.Image {
 	return dst
 }
 
-// dim is a helper that returns layout.Dimensions of the given size.
-func dim(sz image.Point) layout.Dimensions { return layout.Dimensions{Size: sz} }
-
-// affineTranslate is currently unused; kept for documentation in case a
-// future iteration adds pan/zoom and needs an explicit translation.
-func affineTranslate(dx, dy float32) f32.Affine2D {
-	return f32.Affine2D{}.Offset(f32.Pt(dx, dy))
-}
