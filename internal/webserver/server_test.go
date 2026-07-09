@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"mime"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -315,5 +316,123 @@ func TestDirOutsideRootRejected(t *testing.T) {
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusForbidden {
 		t.Errorf("status = %d, want 403", resp.StatusCode)
+	}
+}
+
+// apiFixture creates a minimal test server with only /api/favorite registered
+// — enough for CSRF boundary tests that need no actual index data.
+func apiFixture(t *testing.T) (*httptest.Server, func()) {
+	t.Helper()
+	tmp, err := os.MkdirTemp("", "pv-api-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	idx, err := cache.Load(filepath.Join(tmp, "index.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	store, err := cache.NewThumbStore(tmp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := New(idx, store, tmp)
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/favorite", s.handleAPIFavorite)
+	ts := httptest.NewServer(mux)
+	return ts, func() {
+		ts.Close()
+		idx.Close()
+		os.RemoveAll(tmp)
+	}
+}
+
+func TestAPIFavoriteRejectsBadContentType(t *testing.T) {
+	ts, cleanup := apiFixture(t)
+	defer cleanup()
+
+	body := strings.NewReader(`{"id":"` + strings.Repeat("a", 40) + `","toggle":true}`)
+	req, _ := http.NewRequest(http.MethodPost, ts.URL+"/api/favorite", body)
+	req.Header.Set("Content-Type", "text/plain")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusUnsupportedMediaType {
+		t.Errorf("status = %d, want 415 (Unsupported Media Type)", resp.StatusCode)
+	}
+}
+
+func TestAPIFavoriteRejectsCrossOrigin(t *testing.T) {
+	ts, cleanup := apiFixture(t)
+	defer cleanup()
+
+	body := strings.NewReader(`{"id":"` + strings.Repeat("a", 40) + `","toggle":true}`)
+	req, _ := http.NewRequest(http.MethodPost, ts.URL+"/api/favorite", body)
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Origin", "http://evil.example")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusForbidden {
+		t.Errorf("status = %d, want 403 (Forbidden)", resp.StatusCode)
+	}
+}
+
+func TestContentDispositionEscapesQuote(t *testing.T) {
+	tmp, err := os.MkdirTemp("", "pv-media-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(tmp)
+
+	// Create a real file whose name contains a double-quote character.
+	// On Linux any character except '/' and NUL is valid in a filename.
+	fname := `a"b.jpg`
+	fpath := filepath.Join(tmp, fname)
+	if err := os.WriteFile(fpath, []byte("\xff\xd8\xff"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	idx, err := cache.Load(filepath.Join(tmp, "index.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer idx.Close()
+
+	store, err := cache.NewThumbStore(tmp)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	idx.ReconcileBatch([]scan.Result{{
+		Path:    fpath,
+		Type:    scan.TypePhoto,
+		Size:    3,
+		ModTime: time.Now(),
+	}})
+
+	s := New(idx, store, tmp)
+	mux := http.NewServeMux()
+	mux.HandleFunc("/media/", s.handleMedia)
+	ts := httptest.NewServer(mux)
+	defer ts.Close()
+
+	id := cache.ThumbIDFor(fpath)
+	resp, err := http.Get(ts.URL + "/media/" + id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("GET /media/%s status = %d, want 200", id, resp.StatusCode)
+	}
+
+	cd := resp.Header.Get("Content-Disposition")
+	want := mime.FormatMediaType("inline", map[string]string{"filename": fname})
+	if cd != want {
+		t.Errorf("Content-Disposition = %q, want %q", cd, want)
 	}
 }

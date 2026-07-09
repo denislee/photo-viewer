@@ -15,6 +15,7 @@ import (
 	"fmt"
 	"html"
 	"image"
+	"mime"
 	_ "image/gif"
 	_ "image/jpeg"
 	_ "image/png"
@@ -749,6 +750,16 @@ func (s *Server) handleAPIFavorite(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
+	if ct := r.Header.Get("Content-Type"); !strings.HasPrefix(ct, "application/json") {
+		http.Error(w, "unsupported media type", http.StatusUnsupportedMediaType)
+		return
+	}
+	origin := r.Header.Get("Origin")
+	secFetch := r.Header.Get("Sec-Fetch-Site")
+	if origin != "" || (secFetch != "" && secFetch != "same-origin" && secFetch != "none") {
+		http.Error(w, "forbidden", http.StatusForbidden)
+		return
+	}
 	var req favoriteRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		http.Error(w, "bad request", http.StatusBadRequest)
@@ -1443,7 +1454,7 @@ func (s *Server) handleMedia(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Cache-Control", "private, max-age=3600")
 	// Make browser save with the original filename instead of the opaque id.
 	w.Header().Set("Content-Disposition",
-		fmt.Sprintf(`inline; filename="%s"`, filepath.Base(e.Path)))
+		mime.FormatMediaType("inline", map[string]string{"filename": filepath.Base(e.Path)}))
 	http.ServeFile(w, r, e.Path)
 }
 

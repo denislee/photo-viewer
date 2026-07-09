@@ -206,6 +206,10 @@ func (v *WebServerView) handleStart() {
 		host = "0.0.0.0"
 	}
 	password := v.passwordEditor.Text()
+	if host != "127.0.0.1" && strings.TrimSpace(password) == "" {
+		v.setStatus("Password required when binding to all interfaces.")
+		return
+	}
 	if err := v.srv.Start(host, port, password); err != nil {
 		v.setStatus("Start failed: " + err.Error())
 		return
