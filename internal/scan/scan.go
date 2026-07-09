@@ -36,6 +36,12 @@ type WalkOptions struct {
 	// duration (e.g. pv-organize, which only needs paths + dates) set this to
 	// avoid forking ffprobe once per clip.
 	SkipDurationProbe bool
+
+	// OnError, if non-nil, is called for each filesystem error encountered
+	// while walking (permission denied, stale symlinks, etc.). The walk
+	// continues into sibling paths after the callback returns. If nil,
+	// errors are silently ignored — preserving the historical behaviour.
+	OnError func(path string, err error)
 }
 
 // Walk emits a Result for each media file under root and all its subdirectories.
@@ -152,6 +158,9 @@ func WalkWith(ctx context.Context, root string, opts WalkOptions) <-chan Result 
 	go func() {
 		_ = filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
 			if err != nil {
+				if opts.OnError != nil {
+					opts.OnError(path, err)
+				}
 				return nil
 			}
 			if ctx.Err() != nil {
