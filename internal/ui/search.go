@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 
 	"gioui.org/io/event"
 	"gioui.org/io/key"
@@ -35,25 +36,41 @@ type FuzzySearchView struct {
 	list     widget.List
 	closeBtn widget.Clickable
 
-	// candidates is built once on Show from the current index snapshot.
-	// rebuilding on every keystroke would be wasteful and the dataset
-	// rarely shifts under the user during a search session.
+	// mu guards candidates and candidatesReady, which are written from the
+	// background goroutine started in Show and read on the UI goroutine.
+	mu              sync.Mutex
+	candidatesReady bool
+
+	// candidates is built asynchronously on Show from the current index
+	// snapshot. rebuilding on every keystroke would be wasteful and the
+	// dataset rarely shifts under the user during a search session.
 	candidates []searchCandidate
 
-	// results are indexes into candidates, sorted best→worst. Recomputed
+	// activeCandidates is a UI-goroutine-only snapshot of candidates taken
+	// once per frame in recomputeResults. layoutResults and Activate use this
+	// to ensure they operate on the same slice that produced v.results, even
+	// if the background goroutine replaces v.candidates in the interim.
+	activeCandidates []searchCandidate
+
+	// results are indexes into activeCandidates, sorted best→worst. Recomputed
 	// whenever the editor text changes between frames.
 	results   []searchResult
 	lastQuery string
 	selected  int
 
 	rowTags []*searchRowTag
+
+	// invalidate wakes the Gio frame loop; set via SetInvalidate.
+	invalidate func()
 }
 
 type searchCandidate struct {
-	path  string // absolute
-	rel   string // relative to library root, used for display+matching
-	base  string
-	isDir bool
+	path      string // absolute
+	rel       string // relative to library root, used for display+matching
+	base      string
+	isDir     bool
+	baseLower string // strings.ToLower(base), precomputed
+	relLower  string // strings.ToLower(rel), precomputed
 }
 
 type searchResult struct {
@@ -73,15 +90,28 @@ func NewFuzzySearchView(idx *cache.Index) *FuzzySearchView {
 	return v
 }
 
-// Show snapshots the index into the candidate list and reveals the modal.
-// The text editor is reset and refocused on each open so Ctrl+K always
-// behaves like a fresh palette.
+// SetInvalidate registers a callback used to wake the Gio frame loop after
+// the background candidate-build completes.
+func (v *FuzzySearchView) SetInvalidate(f func()) { v.invalidate = f }
+
+// Show reveals the palette and starts building the candidate list in the
+// background. The text editor is reset and refocused on each open so Ctrl+K
+// always behaves like a fresh palette.
 func (v *FuzzySearchView) Show(libraryRoot string) {
 	v.Open = true
 	v.editor.SetText("")
 	v.lastQuery = "\x00" // force rebuild on next Layout
 	v.selected = 0
-	v.rebuildCandidates(libraryRoot)
+	v.mu.Lock()
+	v.candidates = nil
+	v.candidatesReady = false
+	v.mu.Unlock()
+	go func() {
+		v.rebuildCandidates(libraryRoot)
+		if v.invalidate != nil {
+			v.invalidate()
+		}
+	}()
 }
 
 // Close hides the palette.
@@ -91,7 +121,10 @@ func (v *FuzzySearchView) Close() {
 
 func (v *FuzzySearchView) rebuildCandidates(libraryRoot string) {
 	if v.idx == nil {
+		v.mu.Lock()
 		v.candidates = nil
+		v.candidatesReady = true
+		v.mu.Unlock()
 		return
 	}
 	all := v.idx.All()
@@ -101,21 +134,32 @@ func (v *FuzzySearchView) rebuildCandidates(libraryRoot string) {
 		dir := filepath.Dir(e.Path)
 		if _, ok := seenDirs[dir]; !ok {
 			seenDirs[dir] = struct{}{}
+			rel := relTo(libraryRoot, dir)
+			base := filepath.Base(dir)
 			cand = append(cand, searchCandidate{
-				path:  dir,
-				rel:   relTo(libraryRoot, dir),
-				base:  filepath.Base(dir),
-				isDir: true,
+				path:      dir,
+				rel:       rel,
+				base:      base,
+				isDir:     true,
+				baseLower: strings.ToLower(base),
+				relLower:  strings.ToLower(rel),
 			})
 		}
+		rel := relTo(libraryRoot, e.Path)
+		base := filepath.Base(e.Path)
 		cand = append(cand, searchCandidate{
-			path:  e.Path,
-			rel:   relTo(libraryRoot, e.Path),
-			base:  filepath.Base(e.Path),
-			isDir: false,
+			path:      e.Path,
+			rel:       rel,
+			base:      base,
+			isDir:     false,
+			baseLower: strings.ToLower(base),
+			relLower:  strings.ToLower(rel),
 		})
 	}
+	v.mu.Lock()
 	v.candidates = cand
+	v.candidatesReady = true
+	v.mu.Unlock()
 }
 
 // relTo returns path relative to root, or path itself if it's outside.
@@ -141,16 +185,25 @@ func (v *FuzzySearchView) recomputeResults() {
 	v.lastQuery = q
 	v.selected = 0
 
+	// Snapshot the candidate slice under the mutex so the background
+	// rebuild goroutine can safely replace v.candidates concurrently.
+	// activeCandidates is the UI-goroutine-only copy used by layoutResults
+	// and Activate for the rest of this frame.
+	v.mu.Lock()
+	candidates := v.candidates
+	v.mu.Unlock()
+	v.activeCandidates = candidates
+
 	if q == "" {
-		out := make([]searchResult, 0, min(500, len(v.candidates)))
-		for i, c := range v.candidates {
+		out := make([]searchResult, 0, min(500, len(candidates)))
+		for i, c := range candidates {
 			out = append(out, searchResult{idx: i, score: len(c.rel)})
 			if len(out) >= 500 {
 				break
 			}
 		}
 		sort.SliceStable(out, func(i, j int) bool {
-			return v.candidates[out[i].idx].rel < v.candidates[out[j].idx].rel
+			return candidates[out[i].idx].rel < candidates[out[j].idx].rel
 		})
 		v.results = out
 		return
@@ -158,9 +211,9 @@ func (v *FuzzySearchView) recomputeResults() {
 
 	ql := strings.ToLower(q)
 	out := make([]searchResult, 0, 256)
-	for i, c := range v.candidates {
-		base := strings.ToLower(c.base)
-		rel := strings.ToLower(c.rel)
+	for i, c := range candidates {
+		base := c.baseLower
+		rel := c.relLower
 		if ok, sc := fuzzyScore(ql, base); ok {
 			out = append(out, searchResult{idx: i, score: sc})
 			continue
@@ -175,7 +228,7 @@ func (v *FuzzySearchView) recomputeResults() {
 		if out[i].score != out[j].score {
 			return out[i].score < out[j].score
 		}
-		return v.candidates[out[i].idx].rel < v.candidates[out[j].idx].rel
+		return candidates[out[i].idx].rel < candidates[out[j].idx].rel
 	})
 	if len(out) > 500 {
 		out = out[:500]
@@ -234,7 +287,11 @@ func (v *FuzzySearchView) Activate() {
 	if v.OnPick == nil || v.selected < 0 || v.selected >= len(v.results) {
 		return
 	}
-	c := v.candidates[v.results[v.selected].idx]
+	idx := v.results[v.selected].idx
+	if idx < 0 || idx >= len(v.activeCandidates) {
+		return
+	}
+	c := v.activeCandidates[idx]
 	v.OnPick(c.path, c.isDir)
 }
 
@@ -320,8 +377,14 @@ func (v *FuzzySearchView) Layout(gtx layout.Context, th *Theme) layout.Dimension
 }
 
 func (v *FuzzySearchView) statusLine() string {
+	v.mu.Lock()
+	ready := v.candidatesReady
+	nCands := len(v.candidates)
+	v.mu.Unlock()
 	switch {
-	case len(v.candidates) == 0:
+	case !ready:
+		return "Loading…"
+	case nCands == 0:
 		return "Index is empty — scan the library first."
 	case len(v.results) == 0:
 		return "No matches."
@@ -357,14 +420,27 @@ func (v *FuzzySearchView) layoutSearchBox(gtx layout.Context, th *Theme) layout.
 }
 
 func (v *FuzzySearchView) layoutResults(gtx layout.Context, th *Theme) layout.Dimensions {
+	v.mu.Lock()
+	ready := v.candidatesReady
+	v.mu.Unlock()
+	if !ready {
+		lbl := material.Label(th.Theme, unit.Sp(13), "Loading…")
+		lbl.Color = th.Muted
+		return lbl.Layout(gtx)
+	}
 	if len(v.results) == 0 {
 		return layout.Dimensions{Size: gtx.Constraints.Min}
 	}
 	if v.selected >= len(v.results) {
 		v.selected = len(v.results) - 1
 	}
+	cands := v.activeCandidates
 	return v.list.Layout(gtx, len(v.results), func(gtx layout.Context, i int) layout.Dimensions {
-		c := v.candidates[v.results[i].idx]
+		idx := v.results[i].idx
+		if idx < 0 || idx >= len(cands) {
+			return layout.Dimensions{}
+		}
+		c := cands[idx]
 		return v.drawResultRow(gtx, th, c, i == v.selected, v.rowTags[i])
 	})
 }

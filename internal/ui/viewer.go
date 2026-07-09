@@ -69,6 +69,7 @@ type Viewer struct {
 	recentMu    sync.Mutex
 	recent      []recentImage
 	prefetching map[string]bool
+	prefetchSem chan struct{} // 2-slot semaphore; limits concurrent full-res decodes
 
 	// Decoded dimensions are cached per path. Decoding happens off the UI
 	// goroutine so opening the viewer doesn't stutter on big originals.
@@ -821,18 +822,37 @@ func (v *Viewer) prefetchAt(idx int) {
 	v.prefetching[e.Path] = true
 	v.recentMu.Unlock()
 
-	go func(e cache.Entry) {
+	if v.prefetchSem == nil {
+		v.prefetchSem = make(chan struct{}, 2)
+	}
+	go func(e cache.Entry, idx int) {
 		defer func() {
 			v.recentMu.Lock()
 			delete(v.prefetching, e.Path)
 			v.recentMu.Unlock()
 		}()
+		// Non-blocking acquire: if both slots are taken, skip this prefetch.
+		select {
+		case v.prefetchSem <- struct{}{}:
+		default:
+			return
+		}
+		defer func() { <-v.prefetchSem }()
+
+		// Stale check: abort if we've navigated far away.
+		v.recentMu.Lock()
+		dist := v.Index - idx
+		v.recentMu.Unlock()
+		if dist < -2 || dist > 2 {
+			return
+		}
+
 		op, sz, ok := decodeOriginal(context.Background(), e)
 		if !ok {
 			return
 		}
 		v.cachePut(e.Path, op, sz)
-	}(e)
+	}(e, idx)
 }
 
 // videoPrefetchBytes is the head-of-file window we read into the OS page

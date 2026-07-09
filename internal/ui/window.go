@@ -96,6 +96,7 @@ func Run(w *app.Window, ctrl *Controller) error {
 	indexInfo := NewIndexInfoView(ctrl.IndexStatus)
 	webView := NewWebServerView(ctrl.WebServer())
 	search := NewFuzzySearchView(ctrl.Index())
+	search.SetInvalidate(func() { w.Invalidate() })
 	search.OnPick = func(path string, isDir bool) {
 		_, prev, _, _ := ctrl.Snapshot()
 		grid.RememberFor(prev)
@@ -1201,9 +1202,6 @@ func layoutSplitter(gtx layout.Context, th *Theme, sp *sidebarSplitter, w, h, le
 			}
 			if newW != sp.pendingW {
 				sp.pendingW = newW
-				c := GetConfig()
-				c.SidebarWidthDp = pxToDp(gtx, newW)
-				_ = SaveConfig(c)
 				win.Invalidate()
 			}
 		case pointer.Release, pointer.Cancel:

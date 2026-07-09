@@ -3,6 +3,7 @@ package ui
 import (
 	"image"
 	"image/color"
+	"time"
 
 	"gioui.org/f32"
 	"gioui.org/layout"
@@ -59,6 +60,10 @@ type Grid struct {
 	// has visited so revisiting restores their place. In-memory only — not
 	// persisted across launches.
 	lastSelByDir map[string]int
+
+	// zoomSaveTimer debounces SaveConfig calls on zoom so rapid
+	// scroll-wheel zooming doesn't hammer the config file.
+	zoomSaveTimer *time.Timer
 }
 
 // RequestDelete opens the delete-confirmation modal for the entry at idx.
@@ -228,9 +233,15 @@ func (g *Grid) Zoom(dir int) bool {
 		g.cellSize = maxCellDp
 	}
 	if g.cellSize != old {
-		c := GetConfig()
-		c.GridCellDp = int(g.cellSize)
-		_ = SaveConfig(c)
+		if g.zoomSaveTimer != nil {
+			g.zoomSaveTimer.Stop()
+		}
+		sz := g.cellSize
+		g.zoomSaveTimer = time.AfterFunc(500*time.Millisecond, func() {
+			c := GetConfig()
+			c.GridCellDp = int(sz)
+			_ = SaveConfig(c)
+		})
 		return true
 	}
 	return false

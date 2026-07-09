@@ -1142,7 +1142,7 @@ func (c *Controller) scanInto(ctx context.Context, dir string) {
 			return
 		}
 		batch = append(batch, r)
-		if len(batch) >= 1000 || (len(batch)%100 == 0 && time.Now().After(flushAt)) {
+		if len(batch) >= 1000 || (len(batch) > 0 && time.Now().After(flushAt)) {
 			flush()
 		}
 	}
