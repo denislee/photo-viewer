@@ -101,6 +101,11 @@ type Server struct {
 	// coalesces a navigation burst the way trashEntries does for /trash.
 	sidebarMu    sync.Mutex
 	sidebarCache map[sidebarKey]sidebarEntry
+
+	// viewCountCache caches CountView per View for viewCountTTL so repeated
+	// gallery page loads at the same view avoid repeated O(N) index scans.
+	viewCountMu    sync.Mutex
+	viewCountCache map[cache.View]viewCountEntry
 }
 
 // sidebarKey identifies a cached sidebar aggregate: the two toolbar toggles
@@ -125,6 +130,11 @@ type sidebarAgg struct {
 type sidebarEntry struct {
 	agg *sidebarAgg
 	at  time.Time
+}
+
+type viewCountEntry struct {
+	n  int
+	at time.Time
 }
 
 // New constructs an idle server. libraryRoot is used to enumerate the
@@ -622,7 +632,7 @@ func (s *Server) renderGalleryPage(w http.ResponseWriter, r *http.Request, vi vi
 		entries = all[offset:end]
 		hasNext = end < total
 	} else {
-		total = s.index.CountView(vi.v)
+		total = s.cachedCountView(vi.v)
 		offset := (page - 1) * pageSize
 		if offset > total {
 			offset = 0
@@ -690,17 +700,24 @@ func (s *Server) handleAPIPage(w http.ResponseWriter, r *http.Request) {
 	page := pageNumber(q.Get("p"))
 
 	var entries []cache.Entry
-	var total int
+	var hasNext bool
 	if vi.kind == "trash" {
 		all := s.trashEntries()
-		total = len(all)
+		total := len(all)
 		offset := min((page-1)*pageSize, total)
 		end := min(offset+pageSize, total)
 		entries = all[offset:end]
+		hasNext = end < total
 	} else {
 		offset := (page - 1) * pageSize
-		entries = s.index.ListPage(vi.v, offset, pageSize)
-		total = s.index.CountView(vi.v)
+		// Fetch one extra entry to detect the next page without a CountView scan.
+		raw := s.index.ListPage(vi.v, offset, pageSize+1)
+		hasNext = len(raw) > pageSize
+		if hasNext {
+			entries = raw[:pageSize]
+		} else {
+			entries = raw
+		}
 	}
 
 	items := make([]cellJSON, 0, len(entries))
@@ -712,13 +729,12 @@ func (s *Server) handleAPIPage(w http.ResponseWriter, r *http.Request) {
 			Favorite: e.Favorite,
 		})
 	}
-	offset := (page - 1) * pageSize
 	resp := struct {
 		Items   []cellJSON `json:"items"`
 		HasNext bool       `json:"hasNext"`
 	}{
 		Items:   items,
-		HasNext: offset+len(entries) < total,
+		HasNext: hasNext,
 	}
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	_ = json.NewEncoder(w).Encode(resp)
@@ -1024,6 +1040,25 @@ func (s *Server) renderSidebar(w http.ResponseWriter, vi viewInfo) {
 // noticeably after an import, rebuild, or favorite toggle — all of which
 // self-heal on the next refresh past the window.
 const sidebarCacheTTL = 5 * time.Second
+
+const viewCountTTL = 5 * time.Second
+
+// cachedCountView returns the count for v, reusing a cached value if it is
+// fresh enough. The TTL matches sidebarCacheTTL — a navigation burst hits
+// the cache; counts self-heal within the window after an import or rebuild.
+func (s *Server) cachedCountView(v cache.View) int {
+	s.viewCountMu.Lock()
+	defer s.viewCountMu.Unlock()
+	if e, ok := s.viewCountCache[v]; ok && time.Since(e.at) < viewCountTTL {
+		return e.n
+	}
+	n := s.index.CountView(v)
+	if s.viewCountCache == nil {
+		s.viewCountCache = make(map[cache.View]viewCountEntry)
+	}
+	s.viewCountCache[v] = viewCountEntry{n: n, at: time.Now()}
+	return n
+}
 
 // rootSidebarAgg returns the cached library-root sidebar aggregate for the
 // given filter/raw toggles, recomputing it when the entry is missing or older

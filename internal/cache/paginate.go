@@ -160,13 +160,11 @@ func (i *Index) Neighbors(v View, path string) (prev, next *Entry, pos, total in
 			where+" AND path > ? ORDER BY path ASC LIMIT 1",
 		nextArgs...)
 
-	posArgs := append([]any{}, args...)
-	posArgs = append(posArgs, path)
+	// Single pass: COUNT(*) = total rows, SUM(path<=?) = rows at or before path = pos.
+	countArgs := append([]any{path}, args...)
 	_ = i.db.QueryRow(
-		"SELECT COUNT(*) FROM entries WHERE "+where+" AND path <= ?", posArgs...).Scan(&pos)
-
-	totalArgs := append([]any{}, args...)
-	_ = i.db.QueryRow("SELECT COUNT(*) FROM entries WHERE "+where, totalArgs...).Scan(&total)
+		"SELECT COUNT(*), COALESCE(SUM(path <= ?), 0) FROM entries WHERE "+where,
+		countArgs...).Scan(&total, &pos)
 
 	// Fold in the dir view's exact-path row (see dirExactEntry). Its path
 	// (== Dir) sorts strictly before every range row, so relative to the probe

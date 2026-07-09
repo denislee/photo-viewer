@@ -172,6 +172,47 @@ func TestAPIPageLastPage(t *testing.T) {
 	}
 }
 
+// TestAPIPageHasNextBoundary verifies the pageSize+1 heuristic at the exact
+// boundary: with pageSize+1 entries, page 1 must report hasNext=true (there is
+// a page 2) and page 2 must report hasNext=false (nothing more).
+func TestAPIPageHasNextBoundary(t *testing.T) {
+	_, ts, cleanup := fixture(t, pageSize+1)
+	defer cleanup()
+
+	type resp struct {
+		Items   []struct{} `json:"items"`
+		HasNext bool       `json:"hasNext"`
+	}
+
+	fetch := func(p int) resp {
+		t.Helper()
+		r, err := http.Get(fmt.Sprintf("%s/api/page?from=all&p=%d", ts.URL, p))
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer r.Body.Close()
+		var out resp
+		json.NewDecoder(r.Body).Decode(&out)
+		return out
+	}
+
+	p1 := fetch(1)
+	if len(p1.Items) != pageSize {
+		t.Errorf("page 1 items = %d, want %d", len(p1.Items), pageSize)
+	}
+	if !p1.HasNext {
+		t.Errorf("page 1 hasNext = false, want true (one more page)")
+	}
+
+	p2 := fetch(2)
+	if len(p2.Items) != 1 {
+		t.Errorf("page 2 items = %d, want 1", len(p2.Items))
+	}
+	if p2.HasNext {
+		t.Errorf("page 2 hasNext = true, want false (no more pages)")
+	}
+}
+
 func TestThumbETag(t *testing.T) {
 	_, ts, cleanup := fixture(t, 1)
 	defer cleanup()
