@@ -148,7 +148,11 @@ func (s *Server) serveHLSSegment(w http.ResponseWriter, r *http.Request, id stri
 			s.serveSegmentFile(w, r, dst)
 			return
 		}
-		os.Remove(dst)
+		if rerr := os.Remove(dst); rerr != nil {
+			log.Printf("webserver: HLS: remove stale segment %s: %v", dst, rerr)
+		}
+	} else if !os.IsNotExist(err) {
+		log.Printf("webserver: HLS: stat segment %s: %v", dst, err)
 	}
 
 	if err := s.transcodeSegment(r.Context(), id, e, k, dst); err != nil {

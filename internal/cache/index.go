@@ -294,10 +294,7 @@ func (i *Index) ReconcileBatch(results []scan.Result) []Entry {
 	}
 
 	for start := 0; start < len(results); start += reconcileChunkSize {
-		end := start + reconcileChunkSize
-		if end > len(results) {
-			end = len(results)
-		}
+		end := min(start+reconcileChunkSize, len(results))
 		if err := i.reconcileChunk(results[start:end], &out); err != nil {
 			log.Printf("cache: ReconcileBatch: %v", err)
 		}

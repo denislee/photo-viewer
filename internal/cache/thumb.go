@@ -52,14 +52,8 @@ func NewThumbStore(cacheDir string) (*ThumbStore, error) {
 	if err := os.MkdirAll(d, 0o755); err != nil {
 		return nil, err
 	}
-	cpu := runtime.NumCPU()
-	if cpu < 2 {
-		cpu = 2
-	}
-	ext := cpu * 3
-	if ext < 6 {
-		ext = 6
-	}
+	cpu := max(runtime.NumCPU(), 2)
+	ext := max(cpu*3, 6)
 	return &ThumbStore{
 		dir:      d,
 		cpuSem:   make(chan struct{}, cpu),

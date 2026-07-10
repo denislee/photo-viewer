@@ -77,9 +77,7 @@ func main() {
 		var mu sync.Mutex
 		var wg sync.WaitGroup
 		for range workers {
-			wg.Add(1)
-			go func() {
-				defer wg.Done()
+			wg.Go(func() {
 				for w := range jobs {
 					p, perr := store.Path(w.e)
 					fmt.Printf("  %s -> %s (err=%v)\n", w.e.Path, p, perr)
@@ -91,7 +89,7 @@ func main() {
 						}
 					}
 				}
-			}()
+			})
 		}
 		for _, e := range entries {
 			jobs <- work{e: e}

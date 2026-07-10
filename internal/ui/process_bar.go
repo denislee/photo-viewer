@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"image"
 	"image/color"
+	"strings"
 
 	"gioui.org/layout"
 	"gioui.org/op"
@@ -68,11 +69,9 @@ func (pb *ProcessBar) HeightDp(snap []ProcessSnapshot) int {
 // much vertical space it consumed. Pass an already-taken snapshot so
 // height and content agree within a frame.
 func (pb *ProcessBar) Layout(gtx layout.Context, th *Theme, snap []ProcessSnapshot) layout.Dimensions {
-	if len(snap) == 0 {
-		return layout.Dimensions{Size: image.Pt(gtx.Constraints.Max.X, 0)}
-	}
-
-	// Prune stale row-button entries.
+	// Prune stale row-button entries. Runs before the early return so that
+	// when the last process finishes (snap becomes empty) any leftover row
+	// entries are cleaned up rather than accumulating indefinitely.
 	live := make(map[int64]bool, len(snap))
 	for _, s := range snap {
 		live[s.ID] = true
@@ -82,6 +81,11 @@ func (pb *ProcessBar) Layout(gtx layout.Context, th *Theme, snap []ProcessSnapsh
 			delete(pb.row, id)
 		}
 	}
+
+	if len(snap) == 0 {
+		return layout.Dimensions{Size: image.Pt(gtx.Constraints.Max.X, 0)}
+	}
+
 	for _, s := range snap {
 		if _, ok := pb.row[s.ID]; !ok {
 			pb.row[s.ID] = &processRowButtons{}
@@ -349,10 +353,7 @@ func drawProcessBar(gtx layout.Context, th *Theme, s ProcessSnapshot) layout.Dim
 
 func processCountText(s ProcessSnapshot) string {
 	if s.Total > 0 {
-		pct := int(float32(s.Done) / float32(s.Total) * 100)
-		if pct > 100 {
-			pct = 100
-		}
+		pct := min(int(float32(s.Done)/float32(s.Total)*100), 100)
 		return fmt.Sprintf("%d / %d  (%d%%)", s.Done, s.Total, pct)
 	}
 	if s.Done > 0 {
@@ -362,26 +363,24 @@ func processCountText(s ProcessSnapshot) string {
 }
 
 func summarizeProcesses(snap []ProcessSnapshot) string {
-	parts := ""
+	var b strings.Builder
 	for i, s := range snap {
 		if i > 0 {
-			parts += "   •   "
+			b.WriteString("   •   ")
 		}
 		label := s.Kind.String()
 		if s.Paused {
 			label = "⏸ " + label
 		}
 		if s.Total > 0 {
-			pct := int(float32(s.Done) / float32(s.Total) * 100)
-			if pct > 100 {
-				pct = 100
-			}
-			parts += fmt.Sprintf("%s %d%%", label, pct)
+			pct := min(int(float32(s.Done)/float32(s.Total)*100), 100)
+			fmt.Fprintf(&b, "%s %d%%", label, pct)
 		} else if s.Done > 0 {
-			parts += fmt.Sprintf("%s %d", label, s.Done)
+			fmt.Fprintf(&b, "%s %d", label, s.Done)
 		} else {
-			parts += label + " …"
+			b.WriteString(label)
+			b.WriteString(" …")
 		}
 	}
-	return parts
+	return b.String()
 }

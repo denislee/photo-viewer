@@ -36,8 +36,8 @@ type OrganizeView struct {
 	mismatched   []MismatchedVideo
 	scanning     bool
 	running      bool
-	progressDone int64
-	progressMax  int64
+	progressDone atomic.Int64
+	progressMax  atomic.Int64
 	statusMsg    string
 	logVisible   []string
 	logBuf       []string
@@ -161,8 +161,8 @@ func (v *OrganizeView) scanForMismatched(ctx context.Context, idx *cache.Index, 
 	}
 
 	total := len(videos)
-	atomic.StoreInt64(&v.progressMax, int64(total))
-	atomic.StoreInt64(&v.progressDone, 0)
+	v.progressMax.Store(int64(total))
+	v.progressDone.Store(0)
 	if proc != nil {
 		proc.SetTotal(int64(total))
 	}
@@ -189,11 +189,11 @@ func (v *OrganizeView) scanForMismatched(ctx context.Context, idx *cache.Index, 
 				if !scan.SameDateFolder(e.Path, date) {
 					results <- MismatchedVideo{Entry: e, ExpectedDate: date}
 				}
-				atomic.AddInt64(&v.progressDone, 1)
+				v.progressDone.Add(1)
 				if proc != nil {
 					proc.AddDone(1)
 				}
-				if atomic.LoadInt64(&v.progressDone)%10 == 0 {
+				if v.progressDone.Load()%10 == 0 {
 					if v.invalidate != nil {
 						v.invalidate()
 					}
@@ -259,8 +259,8 @@ func (v *OrganizeView) startOrganize(root string) {
 	v.moveCancel = cancel
 	v.mu.Unlock()
 
-	atomic.StoreInt64(&v.progressDone, 0)
-	atomic.StoreInt64(&v.progressMax, int64(len(mismatched)))
+	v.progressDone.Store(0)
+	v.progressMax.Store(int64(len(mismatched)))
 
 	go func() {
 		defer cancel()
@@ -373,7 +373,7 @@ func (v *OrganizeView) appendLog(msg string) {
 }
 
 func (v *OrganizeView) bumpProgress() {
-	atomic.AddInt64(&v.progressDone, 1)
+	v.progressDone.Add(1)
 	v.mu.Lock()
 	proc := v.proc
 	v.mu.Unlock()
@@ -423,8 +423,8 @@ func (v *OrganizeView) Layout(gtx layout.Context, th *Theme, root string) layout
 	scanning := v.scanning
 	running := v.running
 	mismatchedCount := len(v.mismatched)
-	progressDone := atomic.LoadInt64(&v.progressDone)
-	progressMax := atomic.LoadInt64(&v.progressMax)
+	progressDone := v.progressDone.Load()
+	progressMax := v.progressMax.Load()
 	logVisible := v.logVisible
 	v.mu.Unlock()
 

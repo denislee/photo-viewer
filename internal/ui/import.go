@@ -14,6 +14,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -73,8 +74,7 @@ type ImportView struct {
 
 	// Buffered log lines from worker goroutines, drained into logVisible by
 	// the UI thread once per frame to avoid mutex thrash.
-	logBuf  []string
-	logFull strings.Builder
+	logBuf []string
 
 	// UI state.
 	closeBtn      widget.Clickable
@@ -144,7 +144,6 @@ func (v *ImportView) Show() {
 	v.zipFiles = nil
 	v.logVisible = nil
 	v.logBuf = nil
-	v.logFull.Reset()
 	v.progressDone = 0
 	v.progressMax = 0
 	v.statMoved = 0
@@ -296,13 +295,7 @@ func (v *ImportView) handleSDDeviceClick(dev removableDevice) {
 
 	v.mu.Lock()
 	v.sdBusyDev = ""
-	already := false
-	for _, p := range v.importDirs {
-		if p == mountPath {
-			already = true
-			break
-		}
-	}
+	already := slices.Contains(v.importDirs, mountPath)
 	if !already {
 		v.importDirs = append(v.importDirs, mountPath)
 	}
@@ -371,8 +364,9 @@ func (v *ImportView) scheduleInvalidate() {
 func (v *ImportView) appendLog(msg string) {
 	v.mu.Lock()
 	v.logBuf = append(v.logBuf, msg)
-	v.logFull.WriteString(msg)
-	v.logFull.WriteByte('\n')
+	if len(v.logBuf) > 500 {
+		v.logBuf = v.logBuf[len(v.logBuf)-500:]
+	}
 	v.mu.Unlock()
 	v.scheduleInvalidate()
 }
@@ -811,14 +805,7 @@ func (v *ImportView) pickFolder() {
 		if path == "" {
 			continue
 		}
-		exists := false
-		for _, p := range v.importDirs {
-			if p == path {
-				exists = true
-				break
-			}
-		}
-		if !exists {
+		if !slices.Contains(v.importDirs, path) {
 			v.importDirs = append(v.importDirs, path)
 			added = true
 		}
@@ -846,14 +833,7 @@ func (v *ImportView) pickZip() {
 		if path == "" {
 			continue
 		}
-		exists := false
-		for _, p := range v.zipFiles {
-			if p == path {
-				exists = true
-				break
-			}
-		}
-		if !exists {
+		if !slices.Contains(v.zipFiles, path) {
 			v.zipFiles = append(v.zipFiles, path)
 			added = true
 		}
@@ -889,17 +869,13 @@ func (v *ImportView) commitAddPath(asDir bool) {
 	v.mu.Lock()
 	defer v.mu.Unlock()
 	if asDir {
-		for _, p := range v.importDirs {
-			if p == text {
-				return
-			}
+		if slices.Contains(v.importDirs, text) {
+			return
 		}
 		v.importDirs = append(v.importDirs, text)
 	} else {
-		for _, p := range v.zipFiles {
-			if p == text {
-				return
-			}
+		if slices.Contains(v.zipFiles, text) {
+			return
 		}
 		v.zipFiles = append(v.zipFiles, text)
 	}
@@ -1228,14 +1204,10 @@ func (v *ImportView) processBatch(ctx context.Context, outboxDir string, entries
 	results := make([]dateResult, len(entries))
 	jobs := make(chan int, len(entries))
 	numWorkers := runtime.NumCPU()
-	if numWorkers > 4 {
-		numWorkers = 4 // cap the concurrent exiftool forks
-	}
+	numWorkers = min(numWorkers, 4) // cap the concurrent exiftool forks
 	var wg sync.WaitGroup
-	for i := 0; i < numWorkers; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+	for range numWorkers {
+		wg.Go(func() {
 			for idx := range jobs {
 				v.waitIfPaused()
 				if ctx.Err() != nil {
@@ -1245,7 +1217,7 @@ func (v *ImportView) processBatch(ctx context.Context, outboxDir string, entries
 				results[idx] = dateResult{oldest: oldest, mtimeOlder: mtimeOlder, ok: true}
 				v.bumpProgress()
 			}
-		}()
+		})
 	}
 	for i := range entries {
 		jobs <- i

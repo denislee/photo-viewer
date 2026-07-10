@@ -150,14 +150,8 @@ func (i *Index) EnsureHashes(ctx context.Context, progress func(done, total int)
 	// so oversubscribe (NumCPU * 3) to keep the disk queue saturated on SSD.
 	// Full SHA-256 reads every byte and the digest itself burns CPU, so cap
 	// at NumCPU. Matches the cpu/ext split that ThumbStore uses.
-	cpuWorkers := runtime.NumCPU()
-	if cpuWorkers < 4 {
-		cpuWorkers = 4
-	}
-	ioWorkers := cpuWorkers * 3
-	if ioWorkers < 6 {
-		ioWorkers = 6
-	}
+	cpuWorkers := max(runtime.NumCPU(), 4)
+	ioWorkers := max(cpuWorkers*3, 6)
 
 	// Phase 1: quick-hash candidates that don't have a cached quick hash.
 	var phase1 []cand
@@ -197,10 +191,8 @@ func (i *Index) EnsureHashes(ctx context.Context, progress func(done, total int)
 		}()
 		results := make(chan qres, ioWorkers*2)
 		var wg sync.WaitGroup
-		for w := 0; w < ioWorkers; w++ {
-			wg.Add(1)
-			go func() {
-				defer wg.Done()
+		for range ioWorkers {
+			wg.Go(func() {
 				for t := range jobs {
 					if waitIfPaused != nil {
 						waitIfPaused()
@@ -224,7 +216,7 @@ func (i *Index) EnsureHashes(ctx context.Context, progress func(done, total int)
 						return
 					}
 				}
-			}()
+			})
 		}
 		go func() { wg.Wait(); close(results) }()
 
@@ -327,10 +319,8 @@ func (i *Index) EnsureHashes(ctx context.Context, progress func(done, total int)
 	}()
 	results2 := make(chan fres, cpuWorkers*2)
 	var wg2 sync.WaitGroup
-	for w := 0; w < cpuWorkers; w++ {
-		wg2.Add(1)
-		go func() {
-			defer wg2.Done()
+	for range cpuWorkers {
+		wg2.Go(func() {
 			for c := range jobs2 {
 				if waitIfPaused != nil {
 					waitIfPaused()
@@ -353,7 +343,7 @@ func (i *Index) EnsureHashes(ctx context.Context, progress func(done, total int)
 					return
 				}
 			}
-		}()
+		})
 	}
 	go func() { wg2.Wait(); close(results2) }()
 

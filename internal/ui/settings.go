@@ -103,7 +103,7 @@ func (v *SettingsView) favoritesStatus() string {
 	if v.ctrl == nil || v.ctrl.Index() == nil {
 		return ""
 	}
-	n := len(v.ctrl.Index().ListFavorites())
+	n := v.ctrl.Index().CountFavorites("", true)
 	if n == 0 {
 		return "No favorites to export"
 	}

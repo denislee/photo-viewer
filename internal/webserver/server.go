@@ -1065,6 +1065,10 @@ func (s *Server) cachedCountView(v cache.View) int {
 // than sidebarCacheTTL. The lock is held across the recompute (as trashEntries
 // does) so a navigation burst blocks briefly on the first render then hits the
 // cache; correctness doesn't depend on it, only on serving a recent snapshot.
+//
+// Note: a Controller.Rebuild wipes the index (Index.Clear) but does not
+// invalidate this cache. The 5-second TTL means sidebar counts are at most
+// sidebarCacheTTL stale after a rebuild — cosmetic and self-healing.
 func (s *Server) rootSidebarAgg(filter string, showRAW bool) *sidebarAgg {
 	key := sidebarKey{filter: filter, showRAW: showRAW}
 	s.sidebarMu.Lock()

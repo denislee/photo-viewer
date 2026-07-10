@@ -13,57 +13,66 @@ import (
 
 const shortcutBarHeightDp = 22
 
-// shortcutHints returns the list of "key: action" labels for the active pane.
-func shortcutHints(viewerOpen, sidebarFocus, selectionMode bool) []string {
+// Precomputed hint strings for each mode — joining is done once at init
+// rather than every frame inside drawShortcutBar.
+var (
+	shortcutTextViewer = strings.Join([]string{
+		"h/l ←/→: prev/next",
+		"j/k ↓/↑: prev/next",
+		"f: favorite",
+		"d: delete",
+		"space: play/pause",
+		"[/]: seek 5s",
+		"m: mute",
+		"o: open mpv",
+		"esc/q/ctrl+[: close",
+	}, "   ·   ")
+	shortcutTextSidebar = strings.Join([]string{
+		"j/k ↓/↑: select dir",
+		"ctrl f/b: page",
+		"enter: open",
+		"l/→: focus grid",
+		"esc: cancel",
+		"q: quit",
+	}, "   ·   ")
+	shortcutTextSelection = strings.Join([]string{
+		"h/j/k/l: navigate/select",
+		"v: exit selection",
+		"enter: open selected",
+		"e: export selected",
+		"o: open mpv",
+		"q: quit",
+	}, "   ·   ")
+	shortcutTextDefault = strings.Join([]string{
+		"h/j/k/l: navigate",
+		"v: selection mode",
+		"enter: open",
+		"f: favorite",
+		"d: delete",
+		"o: open mpv",
+		"h at left: focus tree",
+		"ctrl k: search",
+		"ctrl +/-: zoom",
+		"ctrl f/b: page",
+		"ctrl i: import",
+		"ctrl d: duplicates",
+		"ctrl e: export favorites",
+		",: settings",
+		"q: quit",
+	}, "   ·   ")
+)
+
+// shortcutHints returns the precomputed "key: action" bar text for the active pane.
+func shortcutHints(viewerOpen, sidebarFocus, selectionMode bool) string {
 	switch {
 	case viewerOpen:
-		return []string{
-			"h/l ←/→: prev/next",
-			"j/k ↓/↑: prev/next",
-			"f: favorite",
-			"d: delete",
-			"space: play/pause",
-			"[/]: seek 5s",
-			"m: mute",
-			"o: open mpv",
-			"esc/q/ctrl+[: close",
-		}
+		return shortcutTextViewer
 	case sidebarFocus:
-		return []string{
-			"j/k ↓/↑: select dir",
-			"ctrl f/b: page",
-			"enter: open",
-			"l/→: focus grid",
-			"esc: cancel",
-			"q: quit",
-		}
+		return shortcutTextSidebar
 	case selectionMode:
-		return []string{
-			"h/j/k/l: navigate/select",
-			"v: exit selection",
-			"enter: open selected",
-			"e: export selected",
-			"o: open mpv",
-			"q: quit",
-		}
+		return shortcutTextSelection
 	default:
-		return []string{
-			"h/j/k/l: navigate",
-			"v: selection mode",
-			"enter: open",
-			"f: favorite",
-			"d: delete",
-			"o: open mpv",
-			"h at left: focus tree",
-			"ctrl k: search",
-			"ctrl +/-: zoom",
-			"ctrl f/b: page",
-			"ctrl i: import",
-			"ctrl d: duplicates",
-			"ctrl e: export favorites",
-			",: settings",
-			"q: quit",
-		}
+		return shortcutTextDefault
 	}
 }
 
@@ -79,8 +88,7 @@ func drawShortcutBar(gtx layout.Context, th *Theme, viewerOpen, sidebarFocus, se
 	paint.PaintOp{}.Add(gtx.Ops)
 	clipArea.Pop()
 
-	hints := shortcutHints(viewerOpen, sidebarFocus, selectionMode)
-	text := strings.Join(hints, "   ·   ")
+	text := shortcutHints(viewerOpen, sidebarFocus, selectionMode)
 
 	pad := layout.Inset{Left: unit.Dp(10), Right: unit.Dp(10), Top: unit.Dp(3), Bottom: unit.Dp(3)}
 	pad.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
