@@ -9,6 +9,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/dns/photo-viewer/internal/scan"
@@ -87,6 +88,11 @@ type Entry struct {
 type Index struct {
 	db *sql.DB
 
+	// generation is bumped by Clear so that caches keyed on the index contents
+	// (e.g. the webserver's rootSidebarAgg cache) can detect a rebuild and
+	// drop stale entries immediately rather than waiting for their TTL.
+	generation atomic.Uint64
+
 	// Long-lived prepared statements. SQLite reprepares are not free in
 	// Go's database/sql layer — caching the statements for the lifetime of
 	// the *Index keeps hot writers (scan reconcile, face writes) from
@@ -97,6 +103,13 @@ type Index struct {
 	faceUpdClusterStmt *sql.Stmt
 	faceNewClusterStmt *sql.Stmt
 	faceSetClusterStmt *sql.Stmt
+}
+
+// Generation returns a monotonically increasing counter that is bumped by
+// Clear. External caches may compare the generation before and after their TTL
+// window to detect a rebuild and discard stale entries immediately.
+func (i *Index) Generation() uint64 {
+	return i.generation.Load()
 }
 
 // Load opens the SQLite database index.
@@ -850,7 +863,11 @@ func (i *Index) Clear() error {
 			return err
 		}
 	}
-	return tx.Commit()
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	i.generation.Add(1)
+	return nil
 }
 
 // ThumbIDFor returns the deterministic thumbnail identifier for a media path.

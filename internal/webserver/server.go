@@ -128,13 +128,15 @@ type sidebarAgg struct {
 }
 
 type sidebarEntry struct {
-	agg *sidebarAgg
-	at  time.Time
+	agg      *sidebarAgg
+	at       time.Time
+	indexGen uint64 // Index.Generation() at cache-fill time; stale if changed
 }
 
 type viewCountEntry struct {
-	n  int
-	at time.Time
+	n        int
+	at       time.Time
+	indexGen uint64 // Index.Generation() at cache-fill time; stale if changed
 }
 
 // New constructs an idle server. libraryRoot is used to enumerate the
@@ -1044,36 +1046,33 @@ const sidebarCacheTTL = 5 * time.Second
 const viewCountTTL = 5 * time.Second
 
 // cachedCountView returns the count for v, reusing a cached value if it is
-// fresh enough. The TTL matches sidebarCacheTTL — a navigation burst hits
-// the cache; counts self-heal within the window after an import or rebuild.
+// fresh enough and the index has not been cleared since the value was computed.
 func (s *Server) cachedCountView(v cache.View) int {
+	gen := s.index.Generation()
 	s.viewCountMu.Lock()
 	defer s.viewCountMu.Unlock()
-	if e, ok := s.viewCountCache[v]; ok && time.Since(e.at) < viewCountTTL {
+	if e, ok := s.viewCountCache[v]; ok && e.indexGen == gen && time.Since(e.at) < viewCountTTL {
 		return e.n
 	}
 	n := s.index.CountView(v)
 	if s.viewCountCache == nil {
 		s.viewCountCache = make(map[cache.View]viewCountEntry)
 	}
-	s.viewCountCache[v] = viewCountEntry{n: n, at: time.Now()}
+	s.viewCountCache[v] = viewCountEntry{n: n, at: time.Now(), indexGen: gen}
 	return n
 }
 
 // rootSidebarAgg returns the cached library-root sidebar aggregate for the
-// given filter/raw toggles, recomputing it when the entry is missing or older
-// than sidebarCacheTTL. The lock is held across the recompute (as trashEntries
-// does) so a navigation burst blocks briefly on the first render then hits the
-// cache; correctness doesn't depend on it, only on serving a recent snapshot.
-//
-// Note: a Controller.Rebuild wipes the index (Index.Clear) but does not
-// invalidate this cache. The 5-second TTL means sidebar counts are at most
-// sidebarCacheTTL stale after a rebuild — cosmetic and self-healing.
+// given filter/raw toggles, recomputing it when the entry is missing, older
+// than sidebarCacheTTL, or the index was cleared (generation mismatch). The
+// lock is held across the recompute (as trashEntries does) so a navigation
+// burst blocks briefly on the first render then hits the cache.
 func (s *Server) rootSidebarAgg(filter string, showRAW bool) *sidebarAgg {
+	gen := s.index.Generation()
 	key := sidebarKey{filter: filter, showRAW: showRAW}
 	s.sidebarMu.Lock()
 	defer s.sidebarMu.Unlock()
-	if e, ok := s.sidebarCache[key]; ok && time.Since(e.at) < sidebarCacheTTL {
+	if e, ok := s.sidebarCache[key]; ok && e.indexGen == gen && time.Since(e.at) < sidebarCacheTTL {
 		return e.agg
 	}
 	agg := &sidebarAgg{
@@ -1086,7 +1085,7 @@ func (s *Server) rootSidebarAgg(filter string, showRAW bool) *sidebarAgg {
 	if s.sidebarCache == nil {
 		s.sidebarCache = make(map[sidebarKey]sidebarEntry)
 	}
-	s.sidebarCache[key] = sidebarEntry{agg: agg, at: time.Now()}
+	s.sidebarCache[key] = sidebarEntry{agg: agg, at: time.Now(), indexGen: gen}
 	return agg
 }
 
