@@ -1327,29 +1327,31 @@ func (c *Controller) WarmUp() {
 // puts the longest videos first; entries without a duration (photos, RAW,
 // HEIC, or videos whose duration couldn't be probed) fall to the end ordered
 // by path so the listing stays stable.
+//
+// SortByName is a no-op: ListDir returns rows ordered by path via the PK
+// index, and the filter pass that precedes this call is a linear scan that
+// preserves that order.
 func sortEntries(entries []cache.Entry, mode string) {
-	switch normalizeSort(mode) {
-	case SortByDuration:
-		// Path is a unique tie-breaker (it's the index primary key), so the
-		// comparator is a total order and stability is irrelevant — sort.Slice
-		// is faster and allocation-free.
-		sort.Slice(entries, func(i, j int) bool {
-			di, dj := entries[i].DurationMs, entries[j].DurationMs
-			if di != dj {
-				// Non-video / unknown duration → end of list.
-				if di == 0 {
-					return false
-				}
-				if dj == 0 {
-					return true
-				}
-				return di > dj
-			}
-			return entries[i].Path < entries[j].Path
-		})
-	default:
-		sort.Slice(entries, func(i, j int) bool { return entries[i].Path < entries[j].Path })
+	if normalizeSort(mode) != SortByDuration {
+		return
 	}
+	// Path is a unique tie-breaker (it's the index primary key), so the
+	// comparator is a total order and stability is irrelevant — sort.Slice
+	// is faster and allocation-free.
+	sort.Slice(entries, func(i, j int) bool {
+		di, dj := entries[i].DurationMs, entries[j].DurationMs
+		if di != dj {
+			// Non-video / unknown duration → end of list.
+			if di == 0 {
+				return false
+			}
+			if dj == 0 {
+				return true
+			}
+			return di > dj
+		}
+		return entries[i].Path < entries[j].Path
+	})
 }
 
 // listSubdirs returns the immediate child directories of dir, sorted by name,
