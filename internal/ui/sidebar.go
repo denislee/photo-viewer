@@ -65,6 +65,20 @@ type Sidebar struct {
 	// 'g' completes the vim-style jump-to-top. Cleared by the window key
 	// handler on any other key.
 	GPending bool
+
+	// buildRows memo fields. buildRows is called every Layout frame, but its
+	// inputs rarely change between frames. We cache the last result and return
+	// it immediately when all inputs match, avoiding the O(N log N) sort and
+	// per-subdir regex scan on idle frames.
+	expandedRev     int // bumped by toggleYear; invalidates the memo
+	memoRoot        string
+	memoTreeDir     string
+	memoSubLen      int
+	memoSubFirst    string
+	memoCountsVer   uint64 // DirCountsWithVersion() tag; bumped on every map swap
+	memoGroupByYear bool
+	memoExpandedRev int
+	memoRows        []sidebarRow
 }
 
 // sidebarRowKind tells the click / keyboard handlers what to do with a row.
@@ -124,8 +138,8 @@ type sidebarRow struct {
 // (filter-aware) and may be nil; missing entries render without a count.
 // When groupByYear is true, child dirs whose basename matches YYYY-MM-DD are
 // bucketed under collapsible YYYY headers.
-func (s *Sidebar) Layout(gtx layout.Context, th *Theme, root, treeDir, highlight string, subdirs []string, counts map[string]int, groupByYear bool) layout.Dimensions {
-	rows := s.buildRows(root, treeDir, subdirs, counts, groupByYear)
+func (s *Sidebar) Layout(gtx layout.Context, th *Theme, root, treeDir, highlight string, subdirs []string, counts map[string]int, countsVer uint64, groupByYear bool) layout.Dimensions {
+	rows := s.buildRows(root, treeDir, subdirs, counts, countsVer, groupByYear)
 	s.rows = rows
 
 	if cap(s.tags) < len(rows) {
@@ -191,8 +205,32 @@ func (s *Sidebar) Layout(gtx layout.Context, th *Theme, root, treeDir, highlight
 //     children when expanded
 //
 // When grouping is off the original "every subdir as-is" layout is restored.
-func (s *Sidebar) buildRows(root, treeDir string, subdirs []string, counts map[string]int, groupByYear bool) []sidebarRow {
-	rows := []sidebarRow{
+func (s *Sidebar) buildRows(root, treeDir string, subdirs []string, counts map[string]int, countsVer uint64, groupByYear bool) (rows []sidebarRow) {
+	// Fast path: return the cached rows when nothing has changed. countsVer is
+	// the monotonic version from DirCountsWithVersion — it increments on every
+	// clone-swap, so a changed map always yields a different version.
+	subFirst := ""
+	if len(subdirs) > 0 {
+		subFirst = subdirs[0]
+	}
+	if root == s.memoRoot && treeDir == s.memoTreeDir &&
+		len(subdirs) == s.memoSubLen && subFirst == s.memoSubFirst &&
+		countsVer == s.memoCountsVer && groupByYear == s.memoGroupByYear &&
+		s.expandedRev == s.memoExpandedRev {
+		return s.memoRows
+	}
+
+	// On return from the slow path, update the memo so the next frame is fast.
+	defer func() {
+		s.memoRoot, s.memoTreeDir = root, treeDir
+		s.memoSubLen, s.memoSubFirst = len(subdirs), subFirst
+		s.memoCountsVer = countsVer
+		s.memoGroupByYear = groupByYear
+		s.memoExpandedRev = s.expandedRev
+		s.memoRows = rows
+	}()
+
+	rows = []sidebarRow{
 		{label: "Favorites", path: FavoritesView, kind: rowPath, favorite: true},
 		{label: "Trash", path: TrashView, kind: rowPath, trash: true},
 		{label: filepath.Base(root), path: root, kind: rowPath},
@@ -300,6 +338,7 @@ func (s *Sidebar) toggleYear(year string) {
 		s.expandedYears = map[string]bool{}
 	}
 	s.expandedYears[year] = !s.expandedYears[year]
+	s.expandedRev++
 }
 
 // Preview fires OnPreview (or OnPreviewYear for year headers) for the

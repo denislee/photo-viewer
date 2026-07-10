@@ -107,7 +107,10 @@ type Controller struct {
 	// dirCounts maps absolute path → file count (recursive, current filter
 	// applied) for the rows the sidebar renders: library root, parent of
 	// treeDir, and each immediate subdir. Recomputed by refreshFromIndex.
-	dirCounts map[string]int
+	// dirCountsVer is incremented on every clone-swap so callers can
+	// cheaply detect changes without comparing the map contents.
+	dirCounts    map[string]int
+	dirCountsVer uint64
 
 	// Coalesces refreshFromIndex calls so back-to-back scan flushes don't
 	// pile up dozens of concurrent refresh goroutines (each one re-runs the
@@ -215,6 +218,16 @@ func (c *Controller) DirCounts() map[string]int {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return c.dirCounts
+}
+
+// DirCountsWithVersion returns DirCounts alongside a monotonically increasing
+// version that is bumped on every clone-swap of the underlying map. Callers
+// that memoize the sidebar row list can compare the version instead of the map
+// contents to cheaply detect staleness.
+func (c *Controller) DirCountsWithVersion() (map[string]int, uint64) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.dirCounts, c.dirCountsVer
 }
 
 // SelectDir is the equivalent of the Fyne Controller.SelectDir — it cancels
@@ -624,6 +637,7 @@ func (c *Controller) patchLocalDeletion(paths []string, intoTrash bool) {
 			}
 		}
 		c.dirCounts = next
+		c.dirCountsVer++
 	}
 	c.mu.Unlock()
 
@@ -814,6 +828,7 @@ func (c *Controller) bumpTrashCount(delta int) {
 		next := maps.Clone(c.dirCounts)
 		next[TrashView] = c.trashCount
 		c.dirCounts = next
+		c.dirCountsVer++
 	}
 	c.mu.Unlock()
 }
@@ -829,6 +844,7 @@ func (c *Controller) resetTrashCount() {
 		next := maps.Clone(c.dirCounts)
 		next[TrashView] = 0
 		c.dirCounts = next
+		c.dirCountsVer++
 	}
 	c.mu.Unlock()
 }
@@ -1064,6 +1080,7 @@ func (c *Controller) refreshFromIndex(dir string) {
 	}
 	if c.treeDir == treeDir {
 		c.dirCounts = counts
+		c.dirCountsVer++
 	}
 	c.mu.Unlock()
 	if c.invalidate != nil {
@@ -1186,6 +1203,18 @@ func (c *Controller) IsSelected(path string) bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return c.SelectedPaths[path]
+}
+
+// SnapshotSelected returns a copy of the current selected-path set. Callers
+// that need to check multiple paths per frame (e.g. the grid row renderer)
+// should snapshot once and iterate the copy rather than calling IsSelected
+// per entry, which would acquire the mutex once per cell per frame.
+func (c *Controller) SnapshotSelected() map[string]bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	snap := make(map[string]bool, len(c.SelectedPaths))
+	maps.Copy(snap, c.SelectedPaths)
+	return snap
 }
 
 func (c *Controller) activeDir() string {

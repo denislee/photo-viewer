@@ -2,7 +2,6 @@ package ui
 
 import (
 	"image"
-	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
@@ -11,6 +10,7 @@ import (
 	"gioui.org/io/event"
 	"gioui.org/io/key"
 	"gioui.org/io/pointer"
+	"gioui.org/io/system"
 	"gioui.org/layout"
 	"gioui.org/op"
 	"gioui.org/op/clip"
@@ -827,7 +827,7 @@ func handleGridKey(ke key.Event, grid *Grid, _ *Sidebar, sidebarFocus *bool, vie
 			}
 		}
 	case "Q":
-		os.Exit(0)
+		w.Perform(system.ActionClose)
 	}
 	if moved {
 		if ctrl.SelectionMode {
@@ -910,7 +910,7 @@ func handleSidebarKey(ke key.Event, sidebar *Sidebar, sidebarFocus *bool, w *app
 		w.Invalidate()
 		return
 	case "Q":
-		os.Exit(0)
+		w.Perform(system.ActionClose)
 	}
 	if moved {
 		// Auto-load the newly-highlighted directory so the grid on the right
@@ -1093,7 +1093,8 @@ func drawRoot(gtx layout.Context, th *Theme, ctrl *Controller, tb *Toolbar, sb *
 		gtx2.Constraints.Max = image.Pt(leftW, bodyH)
 		gtx2.Constraints.Min = image.Pt(leftW, bodyH)
 		stack := op.Offset(image.Pt(0, bodyY)).Push(gtx.Ops)
-		sb.Layout(gtx2, th, ctrl.LibraryRoot(), treeDir, currentDir, subdirs, ctrl.DirCounts(), GetConfig().GroupByYear)
+		counts, countsVer := ctrl.DirCountsWithVersion()
+		sb.Layout(gtx2, th, ctrl.LibraryRoot(), treeDir, currentDir, subdirs, counts, countsVer, GetConfig().GroupByYear)
 		stack.Pop()
 	}
 	// Splitter (drag handle) — visually a thin separator with a wider hit area

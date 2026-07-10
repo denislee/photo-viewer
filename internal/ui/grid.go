@@ -336,6 +336,12 @@ func (g *Grid) Layout(gtx layout.Context, th *Theme, entries []cache.Entry, ctrl
 	// visible cell count can exceed the default cap; without this the cache
 	// would evict and re-decode cells every frame.
 	ctrl.Thumbs().EnsureCapacity(cols * (g.viewportRows + 4))
+	// Snapshot the selected-path set once per frame rather than acquiring
+	// Controller.mu per visible cell. Only meaningful in selection mode.
+	var selectedSnap map[string]bool
+	if ctrl.SelectionMode {
+		selectedSnap = ctrl.SnapshotSelected()
+	}
 	rowCount := (len(entries) + cols - 1) / cols
 	g.SelectedIndex(len(entries))
 
@@ -362,16 +368,16 @@ func (g *Grid) Layout(gtx layout.Context, th *Theme, entries []cache.Entry, ctrl
 	}
 
 	return g.list.Layout(gtx, rowCount, func(gtx layout.Context, row int) layout.Dimensions {
-		return g.layoutRow(gtx, th, entries, ctrl, row, cols, cellPx, gapPx)
+		return g.layoutRow(gtx, th, entries, ctrl, selectedSnap, row, cols, cellPx, gapPx)
 	})
 }
 
-func (g *Grid) layoutRow(gtx layout.Context, th *Theme, entries []cache.Entry, ctrl *Controller, row, cols, cellPx, gapPx int) layout.Dimensions {
+func (g *Grid) layoutRow(gtx layout.Context, th *Theme, entries []cache.Entry, ctrl *Controller, selectedSnap map[string]bool, row, cols, cellPx, gapPx int) layout.Dimensions {
 	start := row * cols
 	end := min(start+cols, len(entries))
-	// Hoist loop-invariants so the inner loop only does per-cell work:
-	// offset and the IsSelected map lookup. cellSize is fixed for the row,
-	// as are the thumb cache, selection mode, and stride.
+	// Hoist loop-invariants so the inner loop only does per-cell work.
+	// selectedSnap is pre-captured once per frame by the caller, avoiding
+	// per-cell Controller.mu acquisitions during selection mode.
 	rowH := cellPx + gapPx
 	stride := cellPx + gapPx
 	yOff := gapPx / 2
@@ -386,7 +392,7 @@ func (g *Grid) layoutRow(gtx layout.Context, th *Theme, entries []cache.Entry, c
 		x := (i - start) * stride
 		stack := op.Offset(image.Pt(x, yOff)).Push(gtx.Ops)
 		e := entries[i]
-		isSelected := selectionMode && ctrl.IsSelected(e.Path)
+		isSelected := selectionMode && selectedSnap[e.Path]
 		drawCell(cellGtx, th, e, thumbs, g.cellAt(i), cellPx, i == selected, isSelected, selectionMode)
 		stack.Pop()
 	}
@@ -526,7 +532,7 @@ func drawVideoBadge(gtx layout.Context, th *Theme, cell image.Rectangle, duratio
 	stack.Pop()
 
 	if durationMs > 0 {
-		drawDurationBadge(gtx, th, cell, x0, y1, formatDuration(durationMs))
+		drawDurationBadge(gtx, th, cell, x0, y1, cachedFormatDuration(durationMs))
 	}
 }
 
@@ -577,6 +583,21 @@ func drawDurationBadge(gtx layout.Context, th *Theme, cell image.Rectangle, badg
 	stack := op.Offset(image.Pt(x0+padX, textY)).Push(gtx.Ops)
 	labelCall.Add(gtx.Ops)
 	stack.Pop()
+}
+
+// durationTextCache memoizes formatDuration results. Rendering is
+// single-threaded (Gio layout goroutine), so a plain map is safe here.
+// A typical library has far fewer distinct DurationMs values than entries
+// (many videos cluster in common lengths), so the cache hit rate is high.
+var durationTextCache = map[int64]string{}
+
+func cachedFormatDuration(ms int64) string {
+	if s, ok := durationTextCache[ms]; ok {
+		return s
+	}
+	s := formatDuration(ms)
+	durationTextCache[ms] = s
+	return s
 }
 
 // formatDuration renders milliseconds as M:SS, MM:SS, or H:MM:SS.

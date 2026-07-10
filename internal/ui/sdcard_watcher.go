@@ -13,26 +13,28 @@ import (
 	"gioui.org/widget/material"
 )
 
-// SDCardWatcher polls lsblk on a fixed interval and reports newly-attached
-// removable devices via a queue of pending prompts. Devices present at the
-// time the watcher starts are seeded into `known` so the user isn't pestered
-// about drives that were already plugged in. A device the user dismisses is
-// suppressed until it's physically unplugged.
+// SDCardWatcher polls lsblk on a fixed interval when auto-detect is enabled
+// and reports newly-attached removable devices via a queue of pending prompts.
+// Devices present at the time the watcher starts (or the toggle is first
+// enabled) are seeded into `known` so the user isn't pestered about drives
+// already plugged in. A device the user dismisses is suppressed until it is
+// physically unplugged.
 //
-// The watcher always polls; auto-detect just gates whether new attachments
-// surface as prompts. Polling regardless lets the watcher track plug/unplug
-// state continuously so toggling the setting on doesn't immediately enqueue
-// every currently-present device.
+// While auto-detect is off, no lsblk forks are issued. On the first tick
+// after auto-detect is enabled, the watcher re-seeds `known` from the current
+// device list (no prompts) so that already-present drives don't immediately
+// enqueue. From the following tick onward, newly-inserted drives surface normally.
 type SDCardWatcher struct {
 	invalidate func()
 	interval   time.Duration
 
-	mu        sync.Mutex
-	running   bool
-	stopCh    chan struct{}
-	known     map[string]bool
-	dismissed map[string]bool
-	pending   []removableDevice
+	mu          sync.Mutex
+	running     bool
+	stopCh      chan struct{}
+	known       map[string]bool
+	dismissed   map[string]bool
+	pending     []removableDevice
+	prevEnabled bool // whether auto-detect was on during the previous tick
 }
 
 // NewSDCardWatcher constructs a watcher. invalidate is called whenever a new
@@ -65,6 +67,7 @@ func (w *SDCardWatcher) Start() {
 		for _, d := range devs {
 			w.known[d.Path] = true
 		}
+		w.prevEnabled = true // seeding done; first real tick may enqueue
 		w.mu.Unlock()
 	}
 
@@ -95,11 +98,21 @@ func (w *SDCardWatcher) Stop() {
 }
 
 func (w *SDCardWatcher) tick() {
+	enabled := GetConfig().SDCardAutoDetect
+
+	w.mu.Lock()
+	prev := w.prevEnabled
+	w.prevEnabled = enabled
+	w.mu.Unlock()
+
+	if !enabled {
+		return // skip lsblk entirely when auto-detect is off
+	}
+
 	devs, err := listRemovableDevices()
 	if err != nil {
 		return
 	}
-	enabled := GetConfig().SDCardAutoDetect
 	w.mu.Lock()
 	seen := make(map[string]bool, len(devs))
 	var newDevs []removableDevice
@@ -121,11 +134,14 @@ func (w *SDCardWatcher) tick() {
 	}
 	for _, d := range newDevs {
 		w.known[d.Path] = true
-		if enabled {
+		if prev {
+			// Only enqueue on subsequent ticks (prev==true), not on the first
+			// tick after auto-detect is enabled (re-seed pass). This ensures
+			// drives already connected at toggle-on time don't flood the prompt.
 			w.pending = append(w.pending, d)
 		}
 	}
-	hasNew := enabled && len(newDevs) > 0
+	hasNew := prev && len(newDevs) > 0
 	w.mu.Unlock()
 	if hasNew && w.invalidate != nil {
 		w.invalidate()

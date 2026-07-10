@@ -57,16 +57,17 @@ type thumbCache struct {
 	invalidate func()
 	// capPerShard is the per-shard LRU ceiling. Read under each shard's mutex
 	// during eviction but written from the Gio layout goroutine via
-	// EnsureCapacity, so it's atomic to avoid a data race. Grow-only.
+	// EnsureCapacity, so it's atomic to avoid a data race.
 	capPerShard atomic.Int64
 
 	shards [thumbCacheShards]thumbCacheShard
 	queue  chan cache.Entry
 
-	// Coalescing: workers bump dirty; a single coalescer goroutine fires
-	// invalidate at most once every ~16ms so a burst of decodes doesn't
-	// hammer the Gio frame loop with one redraw per thumbnail.
+	// Coalescing: workers set dirty and signal wake; the coalescer goroutine
+	// wakes on the channel, sleeps 16 ms to batch concurrent completions, then
+	// fires invalidate. When idle the coalescer blocks on wake (no ticker).
 	dirty atomic.Bool
+	wake  chan struct{}
 }
 
 type thumbCacheShard struct {
@@ -94,6 +95,7 @@ func newThumbCache(store *cache.ThumbStore, invalidate func()) *thumbCache {
 		store:      store,
 		invalidate: invalidate,
 		queue:      make(chan cache.Entry, 256),
+		wake:       make(chan struct{}, 1),
 	}
 	tc.capPerShard.Store((thumbCacheCapacity + thumbCacheShards - 1) / thumbCacheShards)
 	for i := range tc.shards {
@@ -108,24 +110,16 @@ func newThumbCache(store *cache.ThumbStore, invalidate func()) *thumbCache {
 	return tc
 }
 
-// EnsureCapacity raises the total LRU ceiling so it can hold at least
-// `working` decoded thumbnails — the count the grid currently needs resident
-// (visible cells plus a scroll buffer). Called once per layout frame. It only
-// ever grows the cap (never below thumbCacheCapacity) so zooming out on a big
-// display stops the cache from evicting cells it's about to repaint, while
-// zooming back in doesn't churn the cap up and down.
+// EnsureCapacity sets the total LRU ceiling to accommodate at least `working`
+// decoded thumbnails — the count the grid currently needs resident (visible
+// cells plus a scroll buffer). Called once per layout frame from the single
+// Gio layout goroutine, so a plain Store is safe. The cap is floored at
+// thumbCacheCapacity; it shrinks freely so zooming back in after a 4K zoom-out
+// lets the LRU reclaim the enlarged resident set as new entries push old ones out.
 func (tc *thumbCache) EnsureCapacity(working int) {
 	working = max(working, thumbCacheCapacity)
 	per := int64((working + thumbCacheShards - 1) / thumbCacheShards)
-	for {
-		cur := tc.capPerShard.Load()
-		if per <= cur {
-			return
-		}
-		if tc.capPerShard.CompareAndSwap(cur, per) {
-			return
-		}
-	}
+	tc.capPerShard.Store(per)
 }
 
 // shardFor returns the shard responsible for path. FNV-1a is cheap and
@@ -140,14 +134,13 @@ func (tc *thumbCache) shardFor(path string) *thumbCacheShard {
 	return &tc.shards[h%thumbCacheShards]
 }
 
-// coalescer wakes the Gio frame loop at most ~60 times per second when one or
-// more decodes have completed since the last wake. This avoids per-thumbnail
-// invalidate storms when the user scrolls quickly and dozens of workers
-// finish decoding at roughly the same instant.
+// coalescer wakes the Gio frame loop when one or more thumbnail decodes have
+// completed. It blocks on the wake channel while idle — no ticker fires when
+// nothing is happening. When a worker signals wake, the coalescer sleeps 16 ms
+// to coalesce any concurrent completions, then calls invalidate exactly once.
 func (tc *thumbCache) coalescer() {
-	t := time.NewTicker(16 * time.Millisecond)
-	defer t.Stop()
-	for range t.C {
+	for range tc.wake {
+		time.Sleep(16 * time.Millisecond)
 		if tc.dirty.Swap(false) && tc.invalidate != nil {
 			tc.invalidate()
 		}
@@ -275,6 +268,10 @@ func (tc *thumbCache) worker() {
 		sh.mu.Unlock()
 		if ok {
 			tc.dirty.Store(true)
+			select {
+			case tc.wake <- struct{}{}:
+			default: // coalescer already has a pending wake signal
+			}
 		}
 	}
 }
