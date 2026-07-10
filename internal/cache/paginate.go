@@ -2,6 +2,7 @@ package cache
 
 import (
 	"database/sql"
+	"log"
 	"time"
 )
 
@@ -219,6 +220,9 @@ func scanEntries(rows *sql.Rows) []Entry {
 		e.ModTime = time.Unix(mtimeUnix, 0)
 		e.Favorite = fav != 0
 		out = append(out, e)
+	}
+	if err := rows.Err(); err != nil {
+		log.Printf("cache: scanEntries: %v", err)
 	}
 	return out
 }

@@ -3,6 +3,7 @@ package cache
 import (
 	"database/sql"
 	"encoding/binary"
+	"log"
 	"math"
 	"time"
 )
@@ -79,6 +80,9 @@ func (i *Index) LoadFaceFreshness() map[string]int64 {
 		if err := rows.Scan(&p, &mt); err == nil {
 			out[p] = mt
 		}
+	}
+	if err := rows.Err(); err != nil {
+		log.Printf("cache: LoadFaceFreshness: %v", err)
 	}
 	return out
 }
@@ -240,6 +244,9 @@ func (i *Index) AllClusters() []Cluster {
 			out = append(out, c)
 		}
 	}
+	if err := rows.Err(); err != nil {
+		log.Printf("cache: AllClusters: %v", err)
+	}
 	return out
 }
 
@@ -265,6 +272,9 @@ func (i *Index) PathsInCluster(clusterID int64) []string {
 		if rows.Scan(&p) == nil {
 			out = append(out, p)
 		}
+	}
+	if err := rows.Err(); err != nil {
+		log.Printf("cache: PathsInCluster: %v", err)
 	}
 	return out
 }

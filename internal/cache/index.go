@@ -4,6 +4,7 @@ import (
 	"crypto/sha1"
 	"database/sql"
 	"encoding/hex"
+	"log"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -297,7 +298,9 @@ func (i *Index) ReconcileBatch(results []scan.Result) []Entry {
 		if end > len(results) {
 			end = len(results)
 		}
-		i.reconcileChunk(results[start:end], &out)
+		if err := i.reconcileChunk(results[start:end], &out); err != nil {
+			log.Printf("cache: ReconcileBatch: %v", err)
+		}
 	}
 	return out
 }
@@ -320,15 +323,17 @@ func (i *Index) reconcileStatement() (*sql.Stmt, error) {
 }
 
 // reconcileChunk writes one bounded transaction's worth of results and
-// appends the corresponding Entries to out.
-func (i *Index) reconcileChunk(chunk []scan.Result, out *[]Entry) {
+// appends the corresponding Entries to out. Returns an error if the
+// statement prepare, transaction begin, any row exec, or commit fails;
+// entries are only appended to out when the transaction commits successfully.
+func (i *Index) reconcileChunk(chunk []scan.Result, out *[]Entry) error {
 	stmt, err := i.reconcileStatement()
 	if err != nil {
-		return
+		return err
 	}
 	tx, err := i.db.Begin()
 	if err != nil {
-		return
+		return err
 	}
 	defer tx.Rollback()
 
@@ -338,6 +343,9 @@ func (i *Index) reconcileChunk(chunk []scan.Result, out *[]Entry) {
 	txStmt := tx.Stmt(stmt)
 	defer txStmt.Close()
 
+	// Build entries locally; only append to *out after a successful Commit
+	// so the caller never sees entries that weren't actually persisted.
+	local := make([]Entry, 0, len(chunk))
 	for _, r := range chunk {
 		e := Entry{
 			Path:       r.Path,
@@ -351,10 +359,16 @@ func (i *Index) reconcileChunk(chunk []scan.Result, out *[]Entry) {
 		if y := pathYear(r.Path); y != 0 {
 			yearArg = y
 		}
-		_, _ = txStmt.Exec(e.Path, e.Type, e.Size, e.ModTime.Unix(), e.ThumbID, yearArg, e.DurationMs)
-		*out = append(*out, e)
+		if _, err := txStmt.Exec(e.Path, e.Type, e.Size, e.ModTime.Unix(), e.ThumbID, yearArg, e.DurationMs); err != nil {
+			return err
+		}
+		local = append(local, e)
 	}
-	_ = tx.Commit()
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	*out = append(*out, local...)
+	return nil
 }
 
 // Prune drops index entries whose path is not in the given set. Returns the
@@ -466,6 +480,9 @@ func (i *Index) ListDir(dir string) []Entry {
 			out = append(out, e)
 		}
 	}
+	if err := rows.Err(); err != nil {
+		log.Printf("cache: ListDir: %v", err)
+	}
 	return out
 }
 
@@ -566,6 +583,9 @@ func (i *Index) Years(filter string, showRAW bool) []YearStat {
 			out = append(out, YearStat{Year: y, Count: c})
 		}
 	}
+	if err := rows.Err(); err != nil {
+		log.Printf("cache: Years: %v", err)
+	}
 	return out
 }
 
@@ -594,6 +614,9 @@ func (i *Index) ListByYear(year int, filter string, showRAW bool) []Entry {
 		e.ModTime = time.Unix(mtimeUnix, 0)
 		e.Favorite = fav != 0
 		out = append(out, e)
+	}
+	if err := rows.Err(); err != nil {
+		log.Printf("cache: ListByYear: %v", err)
 	}
 	return out
 }
@@ -689,6 +712,9 @@ func (i *Index) All() []Entry {
 			out = append(out, e)
 		}
 	}
+	if err := rows.Err(); err != nil {
+		log.Printf("cache: All: %v", err)
+	}
 	return out
 }
 
@@ -731,6 +757,9 @@ func (i *Index) ForEachEntry(visit func(Entry) bool) {
 				break
 			}
 		}
+		if err := rows.Err(); err != nil {
+			log.Printf("cache: ForEachEntry: %v", err)
+		}
 		rows.Close()
 		if stop || seen == 0 {
 			return
@@ -760,6 +789,9 @@ func (i *Index) ListFavorites() []Entry {
 			e.Favorite = fav != 0
 			out = append(out, e)
 		}
+	}
+	if err := rows.Err(); err != nil {
+		log.Printf("cache: ListFavorites: %v", err)
 	}
 	return out
 }
@@ -892,6 +924,9 @@ func (i *Index) CountChildDirsFiltered(parent, filter string, showRAW bool) map[
 		if err := rows.Scan(&name, &n); err == nil && name != "" {
 			out[filepath.Join(parent, name)] = n
 		}
+	}
+	if err := rows.Err(); err != nil {
+		log.Printf("cache: CountChildDirsFiltered: %v", err)
 	}
 	return out
 }

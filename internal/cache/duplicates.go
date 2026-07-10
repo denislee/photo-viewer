@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"io"
+	"log"
 	"os"
 	"runtime"
 	"sync"
@@ -437,6 +438,9 @@ func (i *Index) FindDuplicates() []DuplicateGroup {
 			order = append(order, hash)
 		}
 		g.Entries = append(g.Entries, e)
+	}
+	if err := rows.Err(); err != nil {
+		log.Printf("cache: FindDuplicates: %v", err)
 	}
 
 	out := make([]DuplicateGroup, 0, len(order))
