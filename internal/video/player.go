@@ -394,6 +394,11 @@ func (p *Player) Render(w, h int) (*image.RGBA, bool) {
 	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	// Re-check after acquiring mu: Close may have freed p.ctx in the window
+	// between the atomic checks above and this lock.
+	if p.closed.Load() {
+		return nil, false
+	}
 
 	if p.buf == nil || p.buf.Rect.Dx() != w || p.buf.Rect.Dy() != h {
 		p.buf = image.NewRGBA(image.Rect(0, 0, w, h))
@@ -436,9 +441,16 @@ func (p *Player) Close() {
 	if !p.closed.CompareAndSwap(false, true) {
 		return
 	}
-	if p.ctx != nil {
-		C.mpv_render_context_free(p.ctx)
-		p.ctx = nil
+	// Swap p.ctx out under mu so any in-progress Render either completes
+	// before we free the render context, or sees closed=true when it
+	// re-checks under mu. Render never touches p.ctx after seeing
+	// closed=true, so no call reaches a freed pointer.
+	p.mu.Lock()
+	ctx := p.ctx
+	p.ctx = nil
+	p.mu.Unlock()
+	if ctx != nil {
+		C.mpv_render_context_free(ctx)
 	}
 	if p.h != nil {
 		// mpv_terminate_destroy posts MPV_EVENT_SHUTDOWN to the event
