@@ -76,6 +76,13 @@ type FuzzySearchView struct {
 	lastQuery string
 	selected  int
 
+	// resultsTruncated records whether the last recomputeResults hit the 500
+	// result cap. The incremental-narrowing fast path (G-05) may only rescan
+	// the previous result set when that set was *complete* — if the prior pass
+	// was capped, candidates that would now rank into the top 500 could have
+	// been dropped, so an extension must fall back to a full rescan.
+	resultsTruncated bool
+
 	rowTags []*searchRowTag
 
 	// invalidate wakes the Gio frame loop; set via SetInvalidate.
@@ -292,6 +299,15 @@ func (v *FuzzySearchView) recomputeResults() {
 	if q == v.lastQuery {
 		return
 	}
+	// Capture the previous pass's state before we overwrite it — the
+	// incremental fast path below interprets v.results against the candidate
+	// slice they were scored on (v.activeCandidates), and needs to know both
+	// the old query and whether that pass was capped.
+	prevQuery := v.lastQuery
+	prevResults := v.results
+	prevCandidates := v.activeCandidates
+	prevTruncated := v.resultsTruncated
+
 	v.lastQuery = q
 	v.selected = 0
 
@@ -316,34 +332,96 @@ func (v *FuzzySearchView) recomputeResults() {
 			return candidates[out[i].idx].rel < candidates[out[j].idx].rel
 		})
 		v.results = out
+		v.resultsTruncated = len(out) >= 500
 		return
 	}
 
 	ql := strings.ToLower(q)
+
+	// Incremental narrowing (G-05): fuzzyScore is a subsequence match, so if
+	// the new query merely extends the previous one (typing forward, the
+	// common case), every candidate that matches the longer query already
+	// matched the shorter one. We can therefore rescan only the previous
+	// result set instead of every candidate. Two guards keep this exact:
+	//   - the previous pass must not have been truncated at the cap, or a
+	//     candidate that would now rank into the top 500 could be missing;
+	//   - the candidate slice must be the very one those results were scored
+	//     against (the background rebuild may have swapped v.candidates since,
+	//     in which case the old indexes no longer refer to the same entries).
+	if prevQuery != "" && !prevTruncated &&
+		strings.HasPrefix(q, prevQuery) &&
+		sameCandidateSlice(candidates, prevCandidates) {
+		out := make([]searchResult, 0, len(prevResults))
+		for _, r := range prevResults {
+			i := r.idx
+			if i < 0 || i >= len(candidates) {
+				continue
+			}
+			out = appendFuzzyResult(out, ql, i, candidates[i])
+		}
+		sortSearchResults(out, candidates)
+		// A subset of a complete (untruncated) set cannot exceed the cap, so
+		// the narrowed result set is likewise complete.
+		v.results = out
+		v.resultsTruncated = false
+		return
+	}
+
 	out := make([]searchResult, 0, 256)
 	for i, c := range candidates {
-		base := c.baseLower
-		rel := c.relLower
-		if ok, sc := fuzzyScore(ql, base); ok {
-			out = append(out, searchResult{idx: i, score: sc})
-			continue
-		}
-		if ok, sc := fuzzyScore(ql, rel); ok {
-			// Penalize matches that only hit the path prefix so basename
-			// hits float to the top.
-			out = append(out, searchResult{idx: i, score: sc + 50})
-		}
+		out = appendFuzzyResult(out, ql, i, c)
 	}
+	sortSearchResults(out, candidates)
+	truncated := false
+	if len(out) > 500 {
+		out = out[:500]
+		truncated = true
+	}
+	v.results = out
+	v.resultsTruncated = truncated
+}
+
+// appendFuzzyResult scores candidate c (at index i) against the lowercased
+// query ql and appends a searchResult to out when it matches. A basename hit
+// wins outright; a path-only hit is penalized (+50) so basename matches float
+// to the top. Shared by the full and incremental scan paths so both assign
+// identical scores.
+func appendFuzzyResult(out []searchResult, ql string, i int, c searchCandidate) []searchResult {
+	if ok, sc := fuzzyScore(ql, c.baseLower); ok {
+		return append(out, searchResult{idx: i, score: sc})
+	}
+	if ok, sc := fuzzyScore(ql, c.relLower); ok {
+		return append(out, searchResult{idx: i, score: sc + 50})
+	}
+	return out
+}
+
+// sortSearchResults orders results best→worst: lower score first, ties broken
+// by relative path (which is unique per candidate, making the order total and
+// deterministic). Shared so the incremental and full scans produce identical
+// ordering.
+func sortSearchResults(out []searchResult, candidates []searchCandidate) {
 	sort.Slice(out, func(i, j int) bool {
 		if out[i].score != out[j].score {
 			return out[i].score < out[j].score
 		}
 		return candidates[out[i].idx].rel < candidates[out[j].idx].rel
 	})
-	if len(out) > 500 {
-		out = out[:500]
+}
+
+// sameCandidateSlice reports whether a and b share the same backing array (and
+// length) — i.e. the candidate snapshot has not been replaced by the
+// background rebuild goroutine since the previous frame. rebuildCandidates
+// always publishes a freshly allocated slice, so pointer identity of the first
+// element is an exact "unchanged" signal.
+func sameCandidateSlice(a, b []searchCandidate) bool {
+	if len(a) != len(b) {
+		return false
 	}
-	v.results = out
+	if len(a) == 0 {
+		return true
+	}
+	return &a[0] == &b[0]
 }
 
 // fuzzyScore returns (matched, score) for query as a subsequence of s.
