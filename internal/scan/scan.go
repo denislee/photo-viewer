@@ -3,6 +3,7 @@ package scan
 import (
 	"context"
 	"io/fs"
+	"os"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -93,6 +94,17 @@ func WalkWith(ctx context.Context, root string, opts WalkOptions) <-chan Result 
 				info, err := w.d.Info()
 				if err != nil {
 					continue
+				}
+				// filepath.WalkDir doesn't follow symlinks, so a symlinked media
+				// file arrives with the *link's* lstat metadata (a few dozen
+				// bytes, the link's mtime) rather than the target's. Follow it so
+				// size-based duplicate detection and the thumb "source newer?"
+				// check operate on the real file; skip links whose target is
+				// missing (dangling) or not a regular file (e.g. a dir).
+				if info.Mode()&fs.ModeSymlink != 0 {
+					if info, err = os.Stat(w.path); err != nil || !info.Mode().IsRegular() {
+						continue
+					}
 				}
 				r := Result{
 					Path:    w.path,

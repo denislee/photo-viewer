@@ -59,3 +59,39 @@ func TestWalkSkipsHiddenFiles(t *testing.T) {
 		t.Fatalf("walk returned %v, want [b.jpg] (hidden files must be skipped)", got)
 	}
 }
+
+// TestWalkSymlinkFollowsTarget verifies a symlinked media file is emitted with
+// the *target's* size (not the link's tiny lstat size), and a dangling symlink
+// is skipped rather than indexed with bogus metadata (S-16).
+func TestWalkSymlinkFollowsTarget(t *testing.T) {
+	targetDir := t.TempDir()
+	walkDir := t.TempDir()
+
+	// Real file lives outside the walked dir so only the symlink is under test.
+	target := filepath.Join(targetDir, "real.jpg")
+	content := make([]byte, 500)
+	if err := os.WriteFile(target, content, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(target, filepath.Join(walkDir, "link.jpg")); err != nil {
+		t.Skipf("symlinks unsupported here: %v", err)
+	}
+	if err := os.Symlink(filepath.Join(targetDir, "gone.jpg"), filepath.Join(walkDir, "dangling.jpg")); err != nil {
+		t.Fatal(err)
+	}
+
+	var got []Result
+	for r := range Walk(context.Background(), walkDir) {
+		got = append(got, r)
+	}
+
+	if len(got) != 1 {
+		t.Fatalf("walk returned %d results, want 1 (dangling symlink must be skipped): %v", len(got), got)
+	}
+	if base := filepath.Base(got[0].Path); base != "link.jpg" {
+		t.Fatalf("emitted %s, want link.jpg", base)
+	}
+	if got[0].Size != int64(len(content)) {
+		t.Errorf("Size = %d, want %d (must follow the symlink to the target, not the link's lstat size)", got[0].Size, len(content))
+	}
+}
