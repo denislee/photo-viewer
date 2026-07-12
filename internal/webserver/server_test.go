@@ -694,6 +694,132 @@ func TestStopForceClosesActiveConnections(t *testing.T) {
 	}
 }
 
+// trashFixture builds a server whose mux registers /trash (the shared fixture
+// omits it) plus n seeded index entries so the sidebar renders category links.
+func trashFixture(t *testing.T, n int) (*httptest.Server, func()) {
+	t.Helper()
+	tmp, err := os.MkdirTemp("", "pv-trash-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	libRoot := filepath.Join(tmp, "lib")
+	if err := os.MkdirAll(libRoot, 0755); err != nil {
+		t.Fatal(err)
+	}
+	idx, err := cache.Load(filepath.Join(tmp, "index.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	store, err := cache.NewThumbStore(tmp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	results := make([]scan.Result, 0, n)
+	for i := range n {
+		results = append(results, scan.Result{
+			Path:    filepath.Join(libRoot, fmt.Sprintf("%06d.jpg", i)),
+			Type:    scan.TypePhoto,
+			Size:    int64(1000 + i),
+			ModTime: time.Date(2024, 1, 1, 0, 0, i, 0, time.UTC),
+		})
+	}
+	idx.ReconcileBatch(results)
+
+	s := New(idx, store, libRoot)
+	mux := http.NewServeMux()
+	mux.HandleFunc("/trash", s.handleTrash)
+	ts := httptest.NewServer(mux)
+	return ts, func() {
+		ts.Close()
+		idx.Close()
+		os.RemoveAll(tmp)
+	}
+}
+
+// sidebarHTML extracts the <nav class="sidebar">…</nav> fragment so an
+// assertion targets only the sidebar links, not the whole page.
+func sidebarHTML(t *testing.T, body string) string {
+	t.Helper()
+	start := strings.Index(body, `<nav class="sidebar">`)
+	if start < 0 {
+		t.Fatalf("sidebar nav not found in page")
+	}
+	rest := body[start:]
+	inner, _, ok := strings.Cut(rest, `</nav>`)
+	if !ok {
+		t.Fatalf("sidebar nav not closed")
+	}
+	return inner
+}
+
+// TestTrashSidebarDefaultState guards W-04: the /trash page must build its
+// sidebar links from the default toolbar state (filter "All", RAW visible),
+// not a zero-value View. Before the fix, renderSidebar computed
+// extraQuery("", false), so every sidebar link carried ?filter=&raw=0 —
+// clicking "All media" from /trash silently hid all RAW files.
+func TestTrashSidebarDefaultState(t *testing.T) {
+	ts, cleanup := trashFixture(t, 3)
+	defer cleanup()
+
+	resp, err := http.Get(ts.URL + "/trash")
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, err := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.StatusCode != 200 {
+		t.Fatalf("status = %d", resp.StatusCode)
+	}
+	sb := sidebarHTML(t, string(raw))
+	if strings.Contains(sb, "raw=0") {
+		t.Errorf("trash sidebar links carry raw=0 (would flip RAW off): %s", sb)
+	}
+	if strings.Contains(sb, "filter=") {
+		t.Errorf("trash sidebar links carry filter= (would flip filter): %s", sb)
+	}
+	// The "All media" link must be the bare default, matching the sidebar
+	// rendered from /.
+	if !strings.Contains(sb, `href="/"`) {
+		t.Errorf(`trash sidebar missing default "All media" href="/": %s`, sb)
+	}
+}
+
+// TestTrashSidebarPreservesRAWToggle guards W-04's other half: an explicit
+// raw=0 on /trash must thread through the sidebar links so navigating out to a
+// gallery keeps the user's RAW-hidden toggle instead of resetting it.
+func TestTrashSidebarPreservesRAWToggle(t *testing.T) {
+	ts, cleanup := trashFixture(t, 3)
+	defer cleanup()
+
+	resp, err := http.Get(ts.URL + "/trash?raw=0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, err := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.StatusCode != 200 {
+		t.Fatalf("status = %d", resp.StatusCode)
+	}
+	sb := sidebarHTML(t, string(raw))
+	// The "All media" and "Favorites" category links must preserve raw=0.
+	if !strings.Contains(sb, `href="/?raw=0"`) {
+		t.Errorf(`trash sidebar "All media" link dropped raw=0: %s`, sb)
+	}
+	if !strings.Contains(sb, `href="/favorites?raw=0"`) {
+		t.Errorf(`trash sidebar "Favorites" link dropped raw=0: %s`, sb)
+	}
+	// Only the raw toggle was set — no spurious filter= should appear.
+	if strings.Contains(sb, "filter=") {
+		t.Errorf("trash sidebar links carry filter= with only raw toggled: %s", sb)
+	}
+}
+
 func TestContentDispositionEscapesQuote(t *testing.T) {
 	tmp, err := os.MkdirTemp("", "pv-media-")
 	if err != nil {

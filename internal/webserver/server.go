@@ -399,6 +399,13 @@ func parseShowRAW(q url.Values) bool {
 // onto sidebar / cell / viewer links so navigation preserves the user's
 // toolbar state. Returns "" when both toggles are at their defaults.
 func extraQuery(filter string, showRAW bool) string {
+	// Treat an empty filter as the "All" default so a zero-value View (one
+	// that skipped parseFilter) doesn't emit a spurious `filter=` that would
+	// override the receiving handler's own default. The raw default is
+	// "visible" (parseShowRAW), so only an explicit hide emits `raw=0`.
+	if filter == "" {
+		filter = "All"
+	}
 	parts := []string{}
 	if filter != "All" {
 		parts = append(parts, "filter="+url.QueryEscape(filter))
@@ -452,12 +459,18 @@ func (s *Server) viewFromQuery(q url.Values) (viewInfo, bool) {
 			contextURL: withExtra("/favorites"),
 		}, true
 	case "trash":
+		// Trash isn't in the index, so vi.v drives no listing here — but the
+		// sidebar rendered on the trash page reads vi.v.Filter/ShowRAW to build
+		// its links, so carry the toolbar state through exactly like the other
+		// views instead of leaving a zero-value (Filter:"", ShowRAW:false) that
+		// would flip the user's RAW/filter state (W-04).
 		return viewInfo{
+			v:          cache.View{Filter: filter, ShowRAW: showRAW},
 			kind:       "trash",
 			title:      "Trash",
 			backHref:   "/trash",
 			backLabel:  "Trash",
-			ctxQuery:   buildCtxQuery("trash", "", "", "All", true),
+			ctxQuery:   buildCtxQuery("trash", "", "", filter, showRAW),
 			contextURL: "/trash",
 		}, true
 	case "year":
@@ -553,12 +566,20 @@ func (s *Server) handleFavorites(w http.ResponseWriter, r *http.Request) {
 // handleTrash serves a listing of soft-deleted files. Trashed items are
 // not in the index — they're read from the trash directory directly.
 func (s *Server) handleTrash(w http.ResponseWriter, r *http.Request) {
+	q := r.URL.Query()
+	filter := parseFilter(q.Get("filter"))
+	showRAW := parseShowRAW(q)
+	// vi.v doesn't drive the trash listing (trashEntries does), but renderSidebar
+	// reads vi.v.Filter/ShowRAW to build its links. Parse them from the query
+	// like every other handler so the sidebar carries the user's toolbar state
+	// instead of a zero-value view that hides RAW and forces filter= (W-04).
 	vi := viewInfo{
+		v:          cache.View{Filter: filter, ShowRAW: showRAW},
 		kind:       "trash",
 		title:      "Trash",
 		backHref:   "/trash",
 		backLabel:  "Trash",
-		ctxQuery:   buildCtxQuery("trash", "", "", "All", true),
+		ctxQuery:   buildCtxQuery("trash", "", "", filter, showRAW),
 		contextURL: "/trash",
 	}
 	s.renderGalleryPage(w, r, vi)
