@@ -6,6 +6,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"time"
 
 	"gioui.org/io/event"
 	"gioui.org/io/key"
@@ -36,8 +37,9 @@ type FuzzySearchView struct {
 	list     widget.List
 	closeBtn widget.Clickable
 
-	// mu guards candidates and candidatesReady, which are written from the
-	// background goroutine started in Show and read on the UI goroutine.
+	// mu guards candidates, candidatesReady and the memoization bookkeeping
+	// below, which are written from the background goroutine started in Show
+	// and read on the UI goroutine.
 	mu              sync.Mutex
 	candidatesReady bool
 
@@ -45,6 +47,22 @@ type FuzzySearchView struct {
 	// snapshot. rebuilding on every keystroke would be wasteful and the
 	// dataset rarely shifts under the user during a search session.
 	candidates []searchCandidate
+
+	// Candidate memoization across palette opens (G-04). Building candidates
+	// runs Index.All() over the whole table and allocates ~5 strings per
+	// entry; on a large library that is a visible pause on *every* Ctrl+K.
+	// cacheGen/cacheRows/builtAt record the index state the current
+	// candidates were built from, so a Show can reuse them when nothing has
+	// changed. See candidatesFresh for the staleness rules.
+	cacheGen  uint64    // Index.Generation() captured at build time
+	cacheRows int       // Index row count captured at build time
+	builtAt   time.Time // when candidates were last built (zero = never)
+
+	// countCache memoizes the SELECT COUNT(*) staleness probe so a burst of
+	// opens within countTTL doesn't re-hit SQLite once per open.
+	countCache int
+	countAt    time.Time
+	countValid bool
 
 	// activeCandidates is a UI-goroutine-only snapshot of candidates taken
 	// once per frame in recomputeResults. layoutResults and Activate use this
@@ -94,14 +112,41 @@ func NewFuzzySearchView(idx *cache.Index) *FuzzySearchView {
 // the background candidate-build completes.
 func (v *FuzzySearchView) SetInvalidate(f func()) { v.invalidate = f }
 
+const (
+	// searchCacheTTL bounds how long a memoized candidate list is trusted
+	// with no cheaper staleness signal firing. Even when the generation and
+	// row count are unchanged, a list older than this is rebuilt so an
+	// in-place edit that leaves the row count identical (e.g. a file replaced
+	// at the same path) can't leave the palette permanently stale.
+	searchCacheTTL = 60 * time.Second
+	// searchCountTTL bounds how often the row-count staleness probe hits
+	// SQLite. Back-to-back opens within this window reuse the last count
+	// rather than re-running SELECT COUNT(*).
+	searchCountTTL = 5 * time.Second
+)
+
 // Show reveals the palette and starts building the candidate list in the
 // background. The text editor is reset and refocused on each open so Ctrl+K
 // always behaves like a fresh palette.
+//
+// The candidate list itself is memoized across opens (G-04): when the index
+// hasn't changed since the last build and the cache hasn't aged out, Show
+// reuses the existing candidates instead of re-running Index.All() and
+// reallocating ~5 strings per entry. The editor/selection are still reset so
+// the palette always *behaves* fresh; only the expensive rebuild is skipped.
 func (v *FuzzySearchView) Show(libraryRoot string) {
 	v.Open = true
 	v.editor.SetText("")
-	v.lastQuery = "\x00" // force rebuild on next Layout
+	v.lastQuery = "\x00" // force recompute on next Layout
 	v.selected = 0
+
+	if v.candidatesFresh() {
+		// Reuse the memoized list. Leave v.candidates/v.candidatesReady intact
+		// so recomputeResults re-derives results from the reset query on the
+		// next frame — no query, no allocation, no "Loading…" pause.
+		return
+	}
+
 	v.mu.Lock()
 	v.candidates = nil
 	v.candidatesReady = false
@@ -114,6 +159,57 @@ func (v *FuzzySearchView) Show(libraryRoot string) {
 	}()
 }
 
+// candidatesFresh reports whether the memoized candidate list can be reused
+// without a rebuild. It is fresh when a build has completed and: the index
+// generation is unchanged (no Rebuild/Clear since), the total row count is
+// unchanged (no incremental add/remove), and the list is younger than
+// searchCacheTTL. The row-count probe is itself TTL-cached (see rowCount) so
+// rapid re-opens stay cheap.
+func (v *FuzzySearchView) candidatesFresh() bool {
+	if v.idx == nil {
+		return false
+	}
+	v.mu.Lock()
+	ready := v.candidatesReady
+	builtAt := v.builtAt
+	cacheGen := v.cacheGen
+	cacheRows := v.cacheRows
+	v.mu.Unlock()
+
+	if !ready || builtAt.IsZero() {
+		return false
+	}
+	if time.Since(builtAt) > searchCacheTTL {
+		return false
+	}
+	if v.idx.Generation() != cacheGen {
+		return false
+	}
+	return v.rowCount() == cacheRows
+}
+
+// rowCount returns the index row count, memoized for searchCountTTL so a burst
+// of palette opens runs at most one SELECT COUNT(*). The DB is queried outside
+// the mutex so a slow count never serializes UI reads of the candidate slice.
+func (v *FuzzySearchView) rowCount() int {
+	v.mu.Lock()
+	if v.countValid && time.Since(v.countAt) < searchCountTTL {
+		n := v.countCache
+		v.mu.Unlock()
+		return n
+	}
+	v.mu.Unlock()
+
+	n := v.idx.Count()
+
+	v.mu.Lock()
+	v.countCache = n
+	v.countAt = time.Now()
+	v.countValid = true
+	v.mu.Unlock()
+	return n
+}
+
 // Close hides the palette.
 func (v *FuzzySearchView) Close() {
 	v.Open = false
@@ -124,9 +220,15 @@ func (v *FuzzySearchView) rebuildCandidates(libraryRoot string) {
 		v.mu.Lock()
 		v.candidates = nil
 		v.candidatesReady = true
+		v.builtAt = time.Now()
 		v.mu.Unlock()
 		return
 	}
+	// Capture the generation *before* reading the rows so any Clear that races
+	// the All() below leaves cacheGen behind the data it produced — the next
+	// Show then sees the generation move and rebuilds rather than trusting a
+	// snapshot that may straddle the wipe.
+	gen := v.idx.Generation()
 	all := v.idx.All()
 	cand := make([]searchCandidate, 0, len(all)+64)
 	seenDirs := make(map[string]struct{})
@@ -159,6 +261,14 @@ func (v *FuzzySearchView) rebuildCandidates(libraryRoot string) {
 	v.mu.Lock()
 	v.candidates = cand
 	v.candidatesReady = true
+	v.cacheGen = gen
+	v.cacheRows = len(all)
+	v.builtAt = time.Now()
+	// Invalidate the row-count probe rather than seeding it: the first
+	// staleness check after this build then re-counts, so an incremental scan
+	// that adds rows without bumping the generation is picked up promptly
+	// (within one COUNT(*), not one full searchCountTTL of blindness).
+	v.countValid = false
 	v.mu.Unlock()
 }
 
