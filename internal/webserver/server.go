@@ -1114,6 +1114,15 @@ const sidebarCacheTTL = 5 * time.Second
 
 const viewCountTTL = 5 * time.Second
 
+// viewCountCacheCap bounds viewCountCache before the miss path sweeps it. The
+// cache keys on the full cache.View (dir path × filter × raw), so a long-lived
+// server browsing many directories would otherwise accumulate one entry per
+// distinct view ever rendered — the TTL only marks entries stale and overwrites
+// them in place, it never deletes, so the map grows without bound (W-07). Past
+// this many entries the miss path drops everything the TTL has already made
+// stale in one O(n) pass; the cap keeps that pass off the common path.
+const viewCountCacheCap = 1024
+
 // cachedCountView returns the count for v, reusing a cached value if it is
 // fresh enough and the index has not been cleared since the value was computed.
 func (s *Server) cachedCountView(v cache.View) int {
@@ -1126,6 +1135,18 @@ func (s *Server) cachedCountView(v cache.View) int {
 	n := s.index.CountView(v)
 	if s.viewCountCache == nil {
 		s.viewCountCache = make(map[cache.View]viewCountEntry)
+	}
+	// Bound the map: once it grows past the cap, drop every entry the TTL has
+	// already made stale in a single pass so browsing many dir views over a
+	// long uptime doesn't leak one entry per view forever (W-07). Only runs
+	// past the cap, so the common path stays a plain insert; the fresh entry
+	// written just below survives the sweep by definition.
+	if len(s.viewCountCache) > viewCountCacheCap {
+		for k, e := range s.viewCountCache {
+			if time.Since(e.at) >= viewCountTTL {
+				delete(s.viewCountCache, k)
+			}
+		}
 	}
 	s.viewCountCache[v] = viewCountEntry{n: n, at: time.Now(), indexGen: gen}
 	return n

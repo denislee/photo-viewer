@@ -875,3 +875,54 @@ func TestContentDispositionEscapesQuote(t *testing.T) {
 		t.Errorf("Content-Disposition = %q, want %q", cd, want)
 	}
 }
+
+// TestViewCountCacheSweepsPastCap verifies the W-07 fix: once viewCountCache
+// grows past its cap, the locked miss path sweeps entries the TTL has already
+// made stale, shrinking the map, while fresh entries survive.
+func TestViewCountCacheSweepsPastCap(t *testing.T) {
+	s, _, cleanup := fixture(t, 1)
+	defer cleanup()
+
+	s.viewCountMu.Lock()
+	s.viewCountCache = make(map[cache.View]viewCountEntry)
+	// Seed past the cap with entries whose timestamps are older than the TTL,
+	// so the sweep considers every one of them stale.
+	stale := time.Now().Add(-time.Hour)
+	for i := range viewCountCacheCap + 50 {
+		key := cache.View{Kind: "dir", Dir: fmt.Sprintf("/stale/%d", i)}
+		s.viewCountCache[key] = viewCountEntry{n: i, at: stale}
+	}
+	// Two fresh entries that must survive the sweep.
+	freshKeyA := cache.View{Kind: "dir", Dir: "/fresh/a"}
+	freshKeyB := cache.View{Kind: "dir", Dir: "/fresh/b"}
+	s.viewCountCache[freshKeyA] = viewCountEntry{n: 1, at: time.Now()}
+	s.viewCountCache[freshKeyB] = viewCountEntry{n: 2, at: time.Now()}
+	before := len(s.viewCountCache)
+	s.viewCountMu.Unlock()
+
+	if before <= viewCountCacheCap {
+		t.Fatalf("seed size %d is not past cap %d", before, viewCountCacheCap)
+	}
+
+	// A brand-new key is a miss, so cachedCountView takes the locked insert
+	// path — which runs the sweep because len(cache) > cap.
+	s.cachedCountView(cache.View{Kind: "all", Filter: "All", ShowRAW: true})
+
+	s.viewCountMu.Lock()
+	defer s.viewCountMu.Unlock()
+	after := len(s.viewCountCache)
+	if after >= before {
+		t.Fatalf("cache did not shrink: before=%d after=%d", before, after)
+	}
+	if _, ok := s.viewCountCache[freshKeyA]; !ok {
+		t.Errorf("fresh entry A was evicted by the sweep")
+	}
+	if _, ok := s.viewCountCache[freshKeyB]; !ok {
+		t.Errorf("fresh entry B was evicted by the sweep")
+	}
+	// Every stale entry is gone; only the two fresh entries plus the just-
+	// inserted "all" view remain.
+	if after != 3 {
+		t.Errorf("post-sweep size = %d, want 3 (two fresh + inserted)", after)
+	}
+}
