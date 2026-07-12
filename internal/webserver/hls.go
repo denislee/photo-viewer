@@ -208,7 +208,20 @@ func (s *Server) transcodeSegment(ctx context.Context, _ string, e cache.Entry, 
 		return nil
 	}
 
-	s.hlsSem <- struct{}{}
+	// Wait for a transcode slot, but abandon the wait if the client has already
+	// disconnected. An unconditional send would keep a dead request queued for
+	// one of only NumCPU/2 slots (each held by up to a hlsSegTimeout-long
+	// transcode) while it still holds singleflight leadership for dst — stalling
+	// live followers of the same segment behind work no one is waiting for. Only
+	// the success case takes a slot, so the release defer is set up after it and
+	// never fires on the cancel path (we don't return a slot we never took). The
+	// leadership defer installed above still runs on this early return, so the
+	// inflight entry is deleted and followers are released to retry.
+	select {
+	case s.hlsSem <- struct{}{}:
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 	defer func() { <-s.hlsSem }()
 
 	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {

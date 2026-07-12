@@ -1,6 +1,8 @@
 package webserver
 
 import (
+	"context"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -241,6 +243,57 @@ func TestHLSSegmentRejectsOutOfRange(t *testing.T) {
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusNotFound {
 		t.Errorf("out-of-range segment status = %d, want 404", resp.StatusCode)
+	}
+}
+
+func TestHLSSegmentHonorsCancellation(t *testing.T) {
+	// A request whose client has already disconnected must not block waiting for
+	// a transcode slot when the semaphore is saturated (each held slot is up to
+	// a hlsSegTimeout-long transcode). It should return context.Canceled
+	// promptly, without taking/releasing a slot it never acquired, and must
+	// release its singleflight leadership so a later live request can retake it.
+	// This exercises the pre-ffmpeg cancel path, so no ffmpeg fixture is needed.
+	s, id, cleanup := indexedVideoServer(t, 60000)
+	defer cleanup()
+
+	e, ok := s.lookupEntry(id)
+	if !ok {
+		t.Fatal("video entry not found")
+	}
+	dst := s.hlsSegPath(id, 0)
+
+	// Initialise the semaphore/singleflight, then occupy every slot so a real
+	// transcode could not proceed.
+	s.hlsInit()
+	for range cap(s.hlsSem) {
+		s.hlsSem <- struct{}{}
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // client already gone
+
+	done := make(chan error, 1)
+	go func() { done <- s.transcodeSegment(ctx, id, e, 0, dst) }()
+
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("transcodeSegment err = %v, want context.Canceled", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("transcodeSegment blocked on a saturated semaphore despite a cancelled context")
+	}
+
+	// The cancelled request must not have consumed (or released) a slot.
+	if got := len(s.hlsSem); got != cap(s.hlsSem) {
+		t.Errorf("semaphore occupancy = %d, want %d (cancel path must not take or release a slot)", got, cap(s.hlsSem))
+	}
+	// Leadership for dst must have been released via the deferred delete.
+	s.hlsFlightMu.Lock()
+	_, stillLeader := s.hlsInflight[dst]
+	s.hlsFlightMu.Unlock()
+	if stillLeader {
+		t.Error("singleflight leadership not released on the cancel path")
 	}
 }
 
