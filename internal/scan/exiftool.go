@@ -5,8 +5,10 @@ import (
 	"errors"
 	"io"
 	"os/exec"
+	"runtime"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -22,18 +24,49 @@ type exiftoolDaemon struct {
 	stdout *bufio.Reader
 }
 
+// exiftool daemons are pooled rather than kept as a single shared instance so
+// that concurrent metadata readers (the import date pass runs up to
+// min(NumCPU,4) workers; pv-organize's video-date loop; an interactive viewer
+// info read) don't serialize behind one daemon's request round-trip. Each pool
+// slot holds either a live daemon or nil (an empty slot spawned on demand): a
+// request checks a slot out, runs on it, and checks it back in, retiring just
+// that daemon (returning nil) on any error so only the failing instance is torn
+// down. exifFailed latches a spawn failure to the one-shot path for every
+// caller (see S-05 for un-latching it).
 var (
-	exifMu     sync.Mutex
-	exifD      *exiftoolDaemon
-	exifFailed bool
+	exifPoolMu sync.Mutex
+	exifPool   chan *exiftoolDaemon
+	exifFailed atomic.Bool
 )
 
-// exiftoolReqTimeout bounds a single -stay_open round-trip. The daemon is a
-// shared, long-lived process guarded by exifMu; before this bound existed a
-// request that never produced "{ready}" (a hung child, a pathological file the
-// tool stalls on) would hold exifMu forever and freeze *every* metadata
-// feature until the app was restarted. It is a var, not a const, only so tests
-// can shrink it — production code never reassigns it.
+// exiftoolPoolSize mirrors the face pipeline's worker sizing: at least 2 (so an
+// interactive read isn't stuck behind a single in-flight bulk request) and at
+// most 4, which is where the import date pass caps its own worker count.
+func exiftoolPoolSize() int {
+	return min(max(runtime.NumCPU(), 2), 4)
+}
+
+// exifPoolChan lazily builds the daemon pool as a buffered channel pre-filled
+// with empty (nil) slots, each spawned into a live daemon on first use.
+func exifPoolChan() chan *exiftoolDaemon {
+	exifPoolMu.Lock()
+	defer exifPoolMu.Unlock()
+	if exifPool == nil {
+		n := exiftoolPoolSize()
+		exifPool = make(chan *exiftoolDaemon, n)
+		for range n {
+			exifPool <- nil
+		}
+	}
+	return exifPool
+}
+
+// exiftoolReqTimeout bounds a single -stay_open round-trip. Each daemon is a
+// pooled, long-lived process; before this bound existed a request that never
+// produced "{ready}" (a hung child, a pathological file the tool stalls on)
+// would hold its pool slot forever, and a run of them could drain the pool and
+// stall every metadata feature until the app was restarted. It is a var, not a
+// const, only so tests can shrink it — production code never reassigns it.
 var exiftoolReqTimeout = 15 * time.Second
 
 // errExiftoolTimeout marks a request that blew exiftoolReqTimeout. It flows
@@ -66,34 +99,32 @@ func runExiftool(args ...string) ([]byte, error) {
 	if argsUnsafeForDaemon(args) {
 		return runExiftoolOneShot(args...)
 	}
-
-	exifMu.Lock()
-	if exifFailed {
-		exifMu.Unlock()
+	// A latched spawn failure sends every caller down the one-shot path.
+	if exifFailed.Load() {
 		return runExiftoolOneShot(args...)
 	}
-	if exifD == nil {
-		d, err := spawnExiftoolDaemon()
+
+	pool := exifPoolChan()
+	d := <-pool // check out a slot; blocks only when all daemons are busy
+	if d == nil {
+		spawned, err := spawnExiftoolDaemon()
 		if err != nil {
-			exifFailed = true
-			exifMu.Unlock()
+			exifFailed.Store(true)
+			pool <- nil // return the empty slot
 			return runExiftoolOneShot(args...)
 		}
-		exifD = d
+		d = spawned
 	}
-	d := exifD
 	out, err := d.run(args)
 	if err != nil {
-		// The protocol is line-oriented; one bad request can desync the
-		// stream, so on any error retire the daemon and let the next call
-		// either restart it or fall back to per-call exec.
+		// The protocol is line-oriented; one bad request can desync a daemon's
+		// stream, so retire just this instance and return an empty slot for the
+		// next caller to respawn. Other pool daemons are unaffected.
 		_ = d.close()
-		exifD = nil
-	}
-	exifMu.Unlock()
-	if err != nil {
+		pool <- nil
 		return runExiftoolOneShot(args...)
 	}
+	pool <- d // check the live daemon back in
 	return out, nil
 }
 
@@ -138,9 +169,9 @@ func (d *exiftoolDaemon) run(args []string) ([]byte, error) {
 	}
 
 	// Read the response off a goroutine and race it against exiftoolReqTimeout.
-	// The blocking ReadBytes is what used to pin exifMu indefinitely; running it
-	// off-thread lets us give up on a wedged request. On timeout we kill the
-	// child, which unblocks the in-flight ReadBytes (its pipe closes) so the
+	// The blocking ReadBytes is what used to pin a pool slot indefinitely;
+	// running it off-thread lets us give up on a wedged request. On timeout we
+	// kill the child, which unblocks the in-flight ReadBytes (its pipe closes) so the
 	// goroutine can't leak, and return errExiftoolTimeout for the caller to
 	// retire the daemon on.
 	type readResult struct {
