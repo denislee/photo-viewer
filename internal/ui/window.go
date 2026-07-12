@@ -660,8 +660,10 @@ func handleGridKey(ke key.Event, grid *Grid, _ *Sidebar, sidebarFocus *bool, vie
 			ctrl.SelectionMode = true
 			if total > 0 {
 				_, _, entries, _ := ctrl.Snapshot()
-				idx := grid.SelectedIndex(total)
-				ctrl.ToggleSelection(entries[idx].Path)
+				idx := grid.SelectedIndex(len(entries))
+				if idx >= 0 && idx < len(entries) {
+					ctrl.ToggleSelection(entries[idx].Path)
+				}
 			}
 		}
 		w.Invalidate()
@@ -724,7 +726,7 @@ func handleGridKey(ke key.Event, grid *Grid, _ *Sidebar, sidebarFocus *bool, vie
 		}
 		if total > 0 {
 			_, _, entries, _ := ctrl.Snapshot()
-			viewer.Show(entries, grid.SelectedIndex(total))
+			viewer.Show(entries, grid.SelectedIndex(len(entries)))
 			w.Invalidate()
 		}
 	case "E":
