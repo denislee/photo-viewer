@@ -71,6 +71,13 @@ type Viewer struct {
 	prefetching map[string]bool
 	prefetchSem chan struct{} // 2-slot semaphore; limits concurrent full-res decodes
 
+	// curIdx mirrors Index for cross-goroutine reads. Index itself is only
+	// written on the UI goroutine (lock-free), so background prefetch
+	// goroutines can't read it directly without racing the -race detector.
+	// Every writer of Index also stores it here (via syncIndex); prefetch
+	// stale-checks load it instead of touching Index.
+	curIdx atomic.Int64
+
 	// Decoded dimensions are cached per path. Decoding happens off the UI
 	// goroutine so opening the viewer doesn't stutter on big originals.
 	dimMu    sync.Mutex
@@ -137,6 +144,11 @@ type cachedInfo struct {
 // background dimension decoder finishes.
 func (v *Viewer) SetInvalidate(f func()) { v.invalidate = f }
 
+// syncIndex mirrors the UI-goroutine-owned Index into the atomic curIdx so
+// background goroutines (prefetch stale-checks) can read the current position
+// without racing. Call it from every site that writes Index.
+func (v *Viewer) syncIndex() { v.curIdx.Store(int64(v.Index)) }
+
 func (v *Viewer) Show(entries []cache.Entry, idx int) {
 	// Copy the slice: the caller hands us the controller's live entries
 	// (via Snapshot), whose backing array the grid keeps reading. ConfirmDelete
@@ -145,6 +157,7 @@ func (v *Viewer) Show(entries []cache.Entry, idx int) {
 	// viewer owns its own copy instead.
 	v.entries = append([]cache.Entry(nil), entries...)
 	v.Index = idx
+	v.syncIndex()
 	v.Open = true
 	v.preloadVideoIfNeeded()
 	v.prefetchAt(idx + 1)
@@ -296,6 +309,7 @@ func (v *Viewer) ConfirmDelete(deleter func(path string) error) {
 	if v.Index >= len(v.entries) {
 		v.Index = len(v.entries) - 1
 	}
+	v.syncIndex()
 	// Drop the deleted entry from the recent cache too — the path no
 	// longer exists, and the cache entry would never get evicted otherwise.
 	v.recentMu.Lock()
@@ -322,6 +336,7 @@ func (v *Viewer) cancelLoading() {
 func (v *Viewer) Next() {
 	if v.Index < len(v.entries)-1 {
 		v.Index++
+		v.syncIndex()
 		v.parkLoaded()
 		v.cancelLoading()
 		v.loadedPath = ""
@@ -336,6 +351,7 @@ func (v *Viewer) Next() {
 func (v *Viewer) Prev() {
 	if v.Index > 0 {
 		v.Index--
+		v.syncIndex()
 		v.parkLoaded()
 		v.cancelLoading()
 		v.loadedPath = ""
@@ -838,10 +854,10 @@ func (v *Viewer) prefetchAt(idx int) {
 		}
 		defer func() { <-v.prefetchSem }()
 
-		// Stale check: abort if we've navigated far away.
-		v.recentMu.Lock()
-		dist := v.Index - idx
-		v.recentMu.Unlock()
+		// Stale check: abort if we've navigated far away. curIdx is the
+		// atomic mirror of Index; reading it here avoids racing the
+		// UI-goroutine writers of Index.
+		dist := int(v.curIdx.Load()) - idx
 		if dist < -2 || dist > 2 {
 			return
 		}

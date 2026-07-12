@@ -3,12 +3,14 @@ package ui
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"image"
 	"image/color"
 	"image/jpeg"
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/dns/photo-viewer/internal/cache"
 	"github.com/dns/photo-viewer/internal/scan"
@@ -91,6 +93,48 @@ func TestDecodeOriginalAppliesOrientation(t *testing.T) {
 	// Orientation 6 transposes the axes: stored 40x20 must display as 20x40.
 	if size.X != 20 || size.Y != 40 {
 		t.Fatalf("rotated size = %dx%d, want 20x40 (orientation not applied)", size.X, size.Y)
+	}
+}
+
+// TestPrefetchIndexNoRace is the -race regression guard for G-03: background
+// prefetch goroutines stale-check their target against curIdx (an atomic mirror
+// of Index) while the UI goroutine writes Index through Show/Next/Prev. Before
+// the fix the prefetch goroutine read Index directly under a mutex no writer
+// held, so -race flagged it the moment a prefetch overlapped a keypress. The
+// stub paths don't exist, so decodeOriginal fails harmlessly — only the
+// index-read window is exercised. Meaningful only under `go test -race`.
+func TestPrefetchIndexNoRace(t *testing.T) {
+	const n = 64
+	entries := make([]cache.Entry, n)
+	for i := range entries {
+		entries[i] = cache.Entry{Path: fmt.Sprintf("/nonexistent/g03-%d.jpg", i), Type: scan.TypePhoto}
+	}
+
+	var v Viewer
+	v.Show(entries, 0) // spawns the first prefetch readers
+
+	// Walk the whole range back and forth; every step writes Index on this
+	// goroutine and spawns a prefetch reader of curIdx, overlapping the two.
+	for range 4 {
+		for range n - 1 {
+			v.Next()
+		}
+		for range n - 1 {
+			v.Prev()
+		}
+	}
+
+	// Drain in-flight prefetch goroutines so their curIdx reads land before
+	// the test returns (decode of a missing path returns promptly).
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		v.recentMu.Lock()
+		inflight := len(v.prefetching)
+		v.recentMu.Unlock()
+		if inflight == 0 || time.Now().After(deadline) {
+			break
+		}
+		time.Sleep(time.Millisecond)
 	}
 }
 
