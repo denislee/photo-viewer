@@ -822,6 +822,62 @@ func (i *Index) ForEachEntry(visit func(Entry) bool) {
 	}
 }
 
+// ListByType streams every entry of the given media type to visit, in path
+// order, pushing the `type = ?` filter into SQL so callers don't materialize
+// the whole index just to keep one type. Like ForEachEntry it pages internally
+// (keyset pagination on path) so a slow consumer never pins one long-running
+// read transaction — the organize scan drains this while shelling out to
+// exiftool per video, which can take minutes. Returning false from visit stops
+// iteration early.
+func (i *Index) ListByType(t scan.MediaType, visit func(Entry) bool) {
+	const pageSize = 1000
+	lastPath := ""
+	for {
+		rows, err := i.db.Query(
+			"SELECT path, type, size, mtime, thumb_id, favorite, duration_ms FROM entries WHERE type = ? AND path > ? ORDER BY path LIMIT ?",
+			int(t), lastPath, pageSize)
+		if err != nil {
+			return
+		}
+		seen := 0
+		stop := false
+		for rows.Next() {
+			var e Entry
+			var mtimeUnix int64
+			var fav int
+			if err := rows.Scan(&e.Path, &e.Type, &e.Size, &mtimeUnix, &e.ThumbID, &fav, &e.DurationMs); err != nil {
+				continue
+			}
+			e.ModTime = time.Unix(mtimeUnix, 0)
+			e.Favorite = fav != 0
+			lastPath = e.Path
+			seen++
+			if !visit(e) {
+				stop = true
+				break
+			}
+		}
+		if err := rows.Err(); err != nil {
+			log.Printf("cache: ListByType: %v", err)
+		}
+		rows.Close()
+		if stop || seen == 0 {
+			return
+		}
+	}
+}
+
+// CountByType returns the number of entries of the given media type. Pairs with
+// ListByType so a streaming consumer can still show an up-front total without
+// materializing the rows.
+func (i *Index) CountByType(t scan.MediaType) int {
+	var n int
+	if err := i.db.QueryRow("SELECT COUNT(*) FROM entries WHERE type = ?", int(t)).Scan(&n); err != nil {
+		return 0
+	}
+	return n
+}
+
 // ListFavorites returns all entries flagged as favorites.
 func (i *Index) ListFavorites() []Entry {
 

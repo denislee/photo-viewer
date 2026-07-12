@@ -152,15 +152,7 @@ func (v *OrganizeView) scanForMismatched(ctx context.Context, idx *cache.Index, 
 		}()
 	}
 
-	allEntries := idx.All()
-	var videos []cache.Entry
-	for _, e := range allEntries {
-		if e.Type == scan.TypeVideo {
-			videos = append(videos, e)
-		}
-	}
-
-	total := len(videos)
+	total := idx.CountByType(scan.TypeVideo)
 	v.progressMax.Store(int64(total))
 	v.progressDone.Store(0)
 	if proc != nil {
@@ -169,12 +161,17 @@ func (v *OrganizeView) scanForMismatched(ctx context.Context, idx *cache.Index, 
 
 	v.setStatus(fmt.Sprintf("Scanning %d videos for mismatched dates...", total))
 
-	// Use a worker pool to speed up metadata extraction (exiftool is slow)
-	jobs := make(chan cache.Entry, total)
-	results := make(chan MismatchedVideo, total)
-	var wg sync.WaitGroup
-
+	// Use a worker pool to speed up metadata extraction (exiftool is slow). The
+	// videos are streamed straight out of SQLite (ListByType pushes the type
+	// filter into the query and pages internally) instead of loading the whole
+	// index into RAM and filtering — a large library no longer spikes memory
+	// just to enumerate a handful of clips. The jobs channel is only lightly
+	// buffered so the streaming producer back-pressures against the slow workers
+	// rather than buffering every video up front; results is likewise bounded.
 	numWorkers := min(runtime.NumCPU(), 4) // Don't overwhelm the system with too many exiftool processes
+	jobs := make(chan cache.Entry, numWorkers*2)
+	results := make(chan MismatchedVideo, numWorkers)
+	var wg sync.WaitGroup
 
 	for range numWorkers {
 		wg.Go(func() {
@@ -202,10 +199,22 @@ func (v *OrganizeView) scanForMismatched(ctx context.Context, idx *cache.Index, 
 		})
 	}
 
-	for _, v := range videos {
-		jobs <- v
-	}
-	close(jobs)
+	// Producer: stream the video rows into the bounded jobs channel on its own
+	// goroutine. The select keeps it cancel-safe — once the workers have all
+	// returned on ctx cancel nobody drains jobs, so an unguarded send would
+	// block forever (and leak this goroutine); the ctx.Done() arm stops the
+	// stream and closes jobs instead.
+	go func() {
+		idx.ListByType(scan.TypeVideo, func(e cache.Entry) bool {
+			select {
+			case jobs <- e:
+				return true
+			case <-ctx.Done():
+				return false
+			}
+		})
+		close(jobs)
+	}()
 
 	go func() {
 		wg.Wait()
