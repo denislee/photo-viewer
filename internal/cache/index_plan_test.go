@@ -100,7 +100,9 @@ func TestPlanYears(t *testing.T) {
 }
 
 // TestPlanListByYear proves the year filter uses the expression index (SEARCH)
-// instead of full-scanning the table to evaluate yearExpr per row.
+// instead of full-scanning the table to evaluate yearExpr per row. Since v6
+// appended path to idx_entries_yearexpr, a path-only projection is now served
+// entirely from the index (COVERING) with no table fetch.
 func TestPlanListByYear(t *testing.T) {
 	idx, cleanup := loadEmpty(t)
 	defer cleanup()
@@ -109,7 +111,7 @@ func TestPlanListByYear(t *testing.T) {
 	q := "SELECT path FROM entries WHERE " + yearExpr + " = ?"
 	plan := explainPlan(t, idx, q, 2024)
 
-	mustContain(t, "list-by-year", plan, "SEARCH entries USING INDEX idx_entries_yearexpr")
+	mustContain(t, "list-by-year", plan, "SEARCH entries USING COVERING INDEX idx_entries_yearexpr")
 }
 
 // TestPlanListDirAndListPage proves both the ListDir range query and the
@@ -144,8 +146,10 @@ func TestPlanListDirAndListPage(t *testing.T) {
 	mustNotContain(t, "listpage", plan, "TEMP B-TREE")
 }
 
-// TestDeadIndexesDropped proves the v5 migration removed the two write-only
-// indexes and created the two functional ones.
+// TestDeadIndexesDropped proves the migrations removed the write-only/superseded
+// indexes and created the functional ones: v5 dropped idx_entries_year and
+// idx_entries_duration; v6 replaced the single-column idx_entries_favorite with
+// the covering idx_entries_favorite_path.
 func TestDeadIndexesDropped(t *testing.T) {
 	idx, cleanup := loadEmpty(t)
 	defer cleanup()
@@ -163,12 +167,12 @@ func TestDeadIndexesDropped(t *testing.T) {
 	}
 	rows.Close()
 
-	for _, dead := range []string{"idx_entries_year", "idx_entries_duration"} {
+	for _, dead := range []string{"idx_entries_year", "idx_entries_duration", "idx_entries_favorite"} {
 		if have[dead] {
-			t.Errorf("dead index %s should have been dropped in v5", dead)
+			t.Errorf("dead index %s should have been dropped", dead)
 		}
 	}
-	for _, want := range []string{"idx_entries_thumb", "idx_entries_yearexpr"} {
+	for _, want := range []string{"idx_entries_thumb", "idx_entries_yearexpr", "idx_entries_favorite_path"} {
 		if !have[want] {
 			t.Errorf("expected index %s to exist", want)
 		}
@@ -176,9 +180,63 @@ func TestDeadIndexesDropped(t *testing.T) {
 
 	var uv int
 	_ = idx.db.QueryRow("PRAGMA user_version").Scan(&uv)
-	if uv != 5 {
-		t.Errorf("user_version = %d, want 5", uv)
+	if uv != 6 {
+		t.Errorf("user_version = %d, want 6", uv)
 	}
+}
+
+// TestPlanFavoritesCovering proves the v6 (favorite, path) index makes the
+// favorites page and viewer neighbor probes stream in path order — no temp
+// b-tree materializing and sorting every favorite to return one page/one row.
+func TestPlanFavoritesCovering(t *testing.T) {
+	idx, cleanup := loadEmpty(t)
+	defer cleanup()
+	seed(t, idx, "/lib", 200)
+
+	v := View{Kind: "favorites"}
+	where, args := v.whereClause()
+
+	// ListPage's paginated favorites statement (paginate.go).
+	pageArgs := append(append([]any{}, args...), 60, 0)
+	pagePlan := explainPlan(t, idx,
+		"SELECT path, type, size, mtime, thumb_id, favorite, duration_ms FROM entries WHERE "+
+			where+" ORDER BY path LIMIT ? OFFSET ?", pageArgs...)
+	mustContain(t, "favorites-page", pagePlan, "SEARCH entries USING INDEX idx_entries_favorite_path")
+	mustNotContain(t, "favorites-page", pagePlan, "TEMP B-TREE")
+
+	// Neighbors' "prev" probe (paginate.go).
+	prevArgs := append(append([]any{}, args...), filepath.Join("/lib", "000100.jpg"))
+	prevPlan := explainPlan(t, idx,
+		"SELECT path, type, size, mtime, thumb_id, favorite, duration_ms FROM entries WHERE "+
+			where+" AND path < ? ORDER BY path DESC LIMIT 1", prevArgs...)
+	mustContain(t, "favorites-neighbor", prevPlan, "SEARCH entries USING INDEX idx_entries_favorite_path")
+	mustNotContain(t, "favorites-neighbor", prevPlan, "TEMP B-TREE")
+}
+
+// TestPlanYearCovering proves the v6 (yearExpr, path) index makes the year
+// gallery page and viewer neighbor probes stream in path order instead of
+// sorting the whole year via a temp b-tree.
+func TestPlanYearCovering(t *testing.T) {
+	idx, cleanup := loadEmpty(t)
+	defer cleanup()
+	seed(t, idx, "/lib", 200)
+
+	v := View{Kind: "year", Year: 2024}
+	where, args := v.whereClause()
+
+	pageArgs := append(append([]any{}, args...), 60, 0)
+	pagePlan := explainPlan(t, idx,
+		"SELECT path, type, size, mtime, thumb_id, favorite, duration_ms FROM entries WHERE "+
+			where+" ORDER BY path LIMIT ? OFFSET ?", pageArgs...)
+	mustContain(t, "year-page", pagePlan, "SEARCH entries USING INDEX idx_entries_yearexpr")
+	mustNotContain(t, "year-page", pagePlan, "TEMP B-TREE")
+
+	prevArgs := append(append([]any{}, args...), filepath.Join("/lib", "000100.jpg"))
+	prevPlan := explainPlan(t, idx,
+		"SELECT path, type, size, mtime, thumb_id, favorite, duration_ms FROM entries WHERE "+
+			where+" AND path < ? ORDER BY path DESC LIMIT 1", prevArgs...)
+	mustContain(t, "year-neighbor", prevPlan, "SEARCH entries USING INDEX idx_entries_yearexpr")
+	mustNotContain(t, "year-neighbor", prevPlan, "TEMP B-TREE")
 }
 
 // TestDirViewFilePath preserves the pre-I-08 semantics of the dropped

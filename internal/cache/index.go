@@ -145,7 +145,14 @@ func Load(dbPath string) (*Index, error) {
 		return nil, err
 	}
 	_, _ = db.Exec("ALTER TABLE entries ADD COLUMN favorite INTEGER NOT NULL DEFAULT 0")
-	if _, err := db.Exec("CREATE INDEX IF NOT EXISTS idx_entries_favorite ON entries(favorite)"); err != nil {
+	// idx_entries_favorite_path (v6) is composite (favorite, path): the leading
+	// column serves `WHERE favorite = 1` and the trailing path lets the
+	// favorites page and viewer prev/next neighbor probes stream in path order
+	// straight off the b-tree. The old single-column idx_entries_favorite
+	// served the filter but left `ORDER BY path` to a temp b-tree that
+	// materialized and sorted every favorite to return one page/one neighbor;
+	// it's dropped in the v6 migration block below.
+	if _, err := db.Exec("CREATE INDEX IF NOT EXISTS idx_entries_favorite_path ON entries(favorite, path)"); err != nil {
 		return nil, err
 	}
 	_, _ = db.Exec("ALTER TABLE entries ADD COLUMN quick_hash TEXT")
@@ -167,17 +174,21 @@ func Load(dbPath string) (*Index, error) {
 	if _, err := db.Exec("CREATE INDEX IF NOT EXISTS idx_entries_thumb ON entries(thumb_id)"); err != nil {
 		return nil, err
 	}
-	// idx_entries_yearexpr is an EXPRESSION index whose expression is textually
-	// identical to yearExpr. SQLite only uses an expression index when the query
-	// expression is structurally equal to the index's, so this MUST stay in sync
-	// with the yearExpr constant. It lets Years()'s GROUP BY/ORDER BY stream off
-	// the ordered index instead of "SCAN entries + USE TEMP B-TREE FOR GROUP BY",
-	// and turns ListByYear/year-Neighbors from a full scan into
-	// "SEARCH entries USING INDEX idx_entries_yearexpr (<expr>=?)". The plain
-	// column index idx_entries_year could never serve yearExpr (the COALESCE/
-	// strftime wrapper hides the bare column), so it's dropped in the v5 block.
+	// idx_entries_yearexpr is an EXPRESSION index whose leading expression is
+	// textually identical to yearExpr. SQLite only uses an expression index when
+	// the query expression is structurally equal to the index's, so this MUST
+	// stay in sync with the yearExpr constant. It lets Years()'s GROUP BY/ORDER
+	// BY stream off the ordered index instead of "SCAN entries + USE TEMP B-TREE
+	// FOR GROUP BY". The trailing path column (v6) additionally makes the year
+	// gallery page and viewer prev/next probes covering — `WHERE <expr> = ?
+	// ORDER BY path` streams off the b-tree instead of sorting the whole year via
+	// a temp b-tree. The plain column index idx_entries_year could never serve
+	// yearExpr (the COALESCE/strftime wrapper hides the bare column), so it's
+	// dropped in the v5 block. NOTE: on a pre-v6 database this CREATE IF NOT
+	// EXISTS is a no-op (the path-less index already exists under this name); the
+	// v6 migration block force-recreates it with path appended.
 	if _, err := db.Exec(
-		"CREATE INDEX IF NOT EXISTS idx_entries_yearexpr ON entries(" + yearExpr + ")",
+		"CREATE INDEX IF NOT EXISTS idx_entries_yearexpr ON entries(" + yearExpr + ", path)",
 	); err != nil {
 		return nil, err
 	}
@@ -186,7 +197,7 @@ func Load(dbPath string) (*Index, error) {
 	// hash/value format changes so stale rows are invalidated. user_version is
 	// written once, after every migration below has run, so a crash mid-upgrade
 	// re-runs the migrations rather than skipping them.
-	const schemaVersion = 5
+	const schemaVersion = 6
 	var userVersion int
 	_ = db.QueryRow("PRAGMA user_version").Scan(&userVersion)
 	if userVersion < 1 {
@@ -258,6 +269,40 @@ func Load(dbPath string) (*Index, error) {
 		//     duration_ms.
 		_, _ = db.Exec("DROP INDEX IF EXISTS idx_entries_year")
 		_, _ = db.Exec("DROP INDEX IF EXISTS idx_entries_duration")
+	}
+
+	if userVersion < 6 {
+		// v6: make the favorites and year-view page/neighbor probes covering,
+		// and sweep face rows orphaned before the delete/move cleanup landed.
+		//
+		// (a) Favorites (C-02): the covering idx_entries_favorite_path
+		// (favorite, path) was created above; drop the superseded single-column
+		// idx_entries_favorite so favorites pages/neighbors stop paying a temp
+		// b-tree for `ORDER BY path`. Write cost is unchanged (one b-tree either
+		// way).
+		_, _ = db.Exec("DROP INDEX IF EXISTS idx_entries_favorite")
+
+		// (b) Year (C-03): recreate idx_entries_yearexpr with path appended. The
+		// index name is unchanged, so the top-level CREATE IF NOT EXISTS is a
+		// no-op on a pre-v6 database (the path-less index already exists under
+		// this name); DROP+CREATE forces the new covering definition. On a fresh
+		// database the top-level CREATE already built the (expr, path) form, so
+		// this rebuilds an empty index — negligible. The expression MUST stay
+		// textually identical to yearExpr for SQLite to keep using the index.
+		_, _ = db.Exec("DROP INDEX IF EXISTS idx_entries_yearexpr")
+		_, _ = db.Exec("CREATE INDEX IF NOT EXISTS idx_entries_yearexpr ON entries(" + yearExpr + ", path)")
+
+		// (c) Face-row hygiene (C-01, one-time): deletes and organize moves before
+		// e07d4ed left face rows keyed to paths no longer in entries — they kept
+		// loading on every pipeline start (LoadFaceFreshness) and kept weighting
+		// cluster centroids toward vanished files. Sweep the orphans, then null
+		// any cluster sample_face_id left dangling by the sweep. Both statements
+		// are no-ops on a database that never had orphans (e.g. a fresh one).
+		// Going forward RemoveEntry/RemoveEntries delete face rows and MoveFaces
+		// relocates them, so no new orphans accrue.
+		_, _ = db.Exec("DELETE FROM faces WHERE path NOT IN (SELECT path FROM entries)")
+		_, _ = db.Exec("UPDATE face_clusters SET sample_face_id = NULL " +
+			"WHERE sample_face_id IS NOT NULL AND sample_face_id NOT IN (SELECT id FROM faces)")
 	}
 
 	if userVersion < schemaVersion {
