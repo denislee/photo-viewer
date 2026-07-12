@@ -15,10 +15,10 @@ import (
 	"fmt"
 	"html"
 	"image"
-	"mime"
 	_ "image/gif"
 	_ "image/jpeg"
 	_ "image/png"
+	"mime"
 	"net"
 	"net/http"
 	"net/url"
@@ -644,11 +644,27 @@ func (s *Server) renderGalleryPage(w http.ResponseWriter, r *http.Request, vi vi
 		hasNext = offset+len(entries) < total
 	}
 
+	// For a directory view both the sidebar's "In <dir>" section and the
+	// large-folder chip strip need the same child directories and their
+	// filtered counts. Compute them once here and hand them to both renderers
+	// so the os.ReadDir and the O(subtree) grouped-count scan
+	// (CountChildDirsFiltered) each run a single time per page instead of once
+	// per renderer (W-08). Non-dir views leave both nil and neither renderer
+	// touches them.
+	var dirChildren []string
+	var dirChildCounts map[string]int
+	if vi.v.Kind == "dir" {
+		dirChildren = listSubdirs(vi.v.Dir)
+		if len(dirChildren) > 0 {
+			dirChildCounts = s.index.CountChildDirsFiltered(vi.v.Dir, vi.v.Filter, vi.v.ShowRAW)
+		}
+	}
+
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	fmt.Fprint(w, pageHeader)
 	fmt.Fprint(w, `<input type="checkbox" id="navtoggle" class="navtoggle" hidden>`)
 	fmt.Fprint(w, `<div class="layout">`)
-	s.renderSidebar(w, vi)
+	s.renderSidebar(w, vi, dirChildren, dirChildCounts)
 	fmt.Fprint(w, `<main class="content">`)
 	fmt.Fprint(w, mobileTopBar)
 	s.renderToolbar(w, vi)
@@ -656,7 +672,7 @@ func (s *Server) renderGalleryPage(w http.ResponseWriter, r *http.Request, vi vi
 		html.EscapeString(vi.title), total)
 
 	if vi.v.Kind == "dir" && total > largeFolderThreshold {
-		s.renderSubdirChips(w, vi.v.Dir, vi)
+		s.renderSubdirChips(w, vi, dirChildren, dirChildCounts)
 	}
 
 	fmt.Fprint(w, `<div class="grid" id="grid"`)
@@ -999,7 +1015,7 @@ func (s *Server) basePathFor(vi viewInfo) string {
 // top-level subdirectories (with year grouping), and a year list. Active row
 // matches the currently-rendered view. Each link preserves the filter+raw
 // toolbar state so toggling a category doesn't reset the view options.
-func (s *Server) renderSidebar(w http.ResponseWriter, vi viewInfo) {
+func (s *Server) renderSidebar(w http.ResponseWriter, vi viewInfo, dirChildren []string, dirChildCounts map[string]int) {
 	extra := extraQuery(vi.v.Filter, vi.v.ShowRAW)
 	withExtra := func(href string) string { return appendQuery(href, extra) }
 
@@ -1025,14 +1041,12 @@ func (s *Server) renderSidebar(w http.ResponseWriter, vi viewInfo) {
 	// When viewing a directory, surface its child folders as a nested
 	// section so the user can drill down instead of paginating through
 	// a 100k-photo flat list. This is per-directory, so it stays off the
-	// cached root aggregate and pays one live count query for the open dir.
-	if v.Kind == "dir" {
-		children := listSubdirs(v.Dir)
-		if len(children) > 0 {
-			childCounts := s.index.CountChildDirsFiltered(v.Dir, v.Filter, v.ShowRAW)
-			fmt.Fprintf(w, `<div class="sec">In %s</div>`, html.EscapeString(filepath.Base(v.Dir)))
-			s.renderSubdirsGrouped(w, children, childCounts, vi)
-		}
+	// cached root aggregate and pays one live count query for the open dir —
+	// which renderGalleryPage runs once and passes in as dirChildren/
+	// dirChildCounts, shared with renderSubdirChips (W-08).
+	if v.Kind == "dir" && len(dirChildren) > 0 {
+		fmt.Fprintf(w, `<div class="sec">In %s</div>`, html.EscapeString(filepath.Base(v.Dir)))
+		s.renderSubdirsGrouped(w, dirChildren, dirChildCounts, vi)
 	}
 
 	// Year list. Includes per-year counts that respect the active filter.
@@ -1170,14 +1184,15 @@ func (s *Server) renderSubdirsGrouped(w http.ResponseWriter, subdirs []string, c
 
 // renderSubdirChips renders a compact strip of child-folder chips above
 // the grid for large directories. Cheap visual cue that there are
-// subfolders worth drilling into without scrolling past the grid.
-func (s *Server) renderSubdirChips(w http.ResponseWriter, dir string, vi viewInfo) {
-	children := listSubdirs(dir)
+// subfolders worth drilling into without scrolling past the grid. The
+// child directories and their filtered counts are supplied by the caller
+// (renderGalleryPage) so the os.ReadDir + grouped-count scan run once per
+// page, shared with the sidebar's "In <dir>" section (W-08).
+func (s *Server) renderSubdirChips(w http.ResponseWriter, vi viewInfo, children []string, counts map[string]int) {
 	if len(children) == 0 {
 		return
 	}
 	extra := extraQuery(vi.v.Filter, vi.v.ShowRAW)
-	counts := s.index.CountChildDirsFiltered(dir, vi.v.Filter, vi.v.ShowRAW)
 	type chip struct {
 		path  string
 		name  string
@@ -1223,11 +1238,19 @@ func (s *Server) sidebarRow(w http.ResponseWriter, href, label, glyph string, co
 	)
 }
 
+// listSubdirsHook, when non-nil, is invoked with every listSubdirs argument.
+// Test-only seam (see server_test.go) used to assert that a large-directory
+// gallery page scans each directory's children exactly once (W-08).
+var listSubdirsHook func(dir string)
+
 // listSubdirs returns the immediate child directories of dir, sorted by
 // name, with dotfile directories filtered out (matching the native
 // sidebar's behavior). Errors are silently swallowed — a missing or
 // unreadable directory just yields an empty sidebar section.
 func listSubdirs(dir string) []string {
+	if listSubdirsHook != nil {
+		listSubdirsHook(dir)
+	}
 	if dir == "" {
 		return nil
 	}

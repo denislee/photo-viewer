@@ -8,9 +8,11 @@ import (
 	"mime"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -483,6 +485,109 @@ func TestAPIFavoriteAcceptsSameOrigin(t *testing.T) {
 	}
 	if e, ok := idx.GetEntryByThumbID(id); !ok || !e.Favorite {
 		t.Errorf("favorite not persisted: ok=%v favorite=%v", ok, e.Favorite)
+	}
+}
+
+// TestGalleryPageScansSubdirsOnce guards W-08: a large-directory gallery page
+// renders both the sidebar "In <dir>" section and the above-grid chip strip,
+// but the child-directory scan for the open directory must run exactly once.
+// Before W-08 renderSidebar and renderSubdirChips each scanned it independently
+// (two os.ReadDir + two O(subtree) grouped-count queries per page); now
+// renderGalleryPage computes it once and shares it with both.
+func TestGalleryPageScansSubdirsOnce(t *testing.T) {
+	tmp, err := os.MkdirTemp("", "pv-web-w08-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(tmp)
+
+	libRoot := filepath.Join(tmp, "lib")
+	bigDir := filepath.Join(libRoot, "big")
+	subDir := filepath.Join(bigDir, "sub")
+	if err := os.MkdirAll(subDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	idx, err := cache.Load(filepath.Join(tmp, "index.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer idx.Close()
+	store, err := cache.NewThumbStore(tmp)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Enough entries directly under big/ to cross largeFolderThreshold (so the
+	// chip strip renders), plus a handful in the child sub/ so it earns a
+	// non-zero drill-down count.
+	var results []scan.Result
+	for i := range largeFolderThreshold + 5 {
+		results = append(results, scan.Result{
+			Path:    filepath.Join(bigDir, fmt.Sprintf("%06d.jpg", i)),
+			Type:    scan.TypePhoto,
+			Size:    int64(1000 + i),
+			ModTime: time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC),
+		})
+	}
+	for i := range 5 {
+		results = append(results, scan.Result{
+			Path:    filepath.Join(subDir, fmt.Sprintf("%06d.jpg", i)),
+			Type:    scan.TypePhoto,
+			Size:    int64(2000 + i),
+			ModTime: time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC),
+		})
+	}
+	idx.ReconcileBatch(results)
+
+	s := New(idx, store, libRoot)
+	mux := http.NewServeMux()
+	mux.HandleFunc("/dir", s.handleDir)
+	ts := httptest.NewServer(mux)
+	defer ts.Close()
+
+	// Count listSubdirs calls for the open directory only. The separate scan of
+	// the library root (for the "Folders" section) keys on a different path and
+	// doesn't affect this assertion.
+	var mu sync.Mutex
+	calls := map[string]int{}
+	listSubdirsHook = func(dir string) {
+		mu.Lock()
+		calls[dir]++
+		mu.Unlock()
+	}
+	defer func() { listSubdirsHook = nil }()
+
+	resp, err := http.Get(ts.URL + "/dir?path=" + url.QueryEscape(bigDir))
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, err := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.StatusCode != 200 {
+		t.Fatalf("status = %d", resp.StatusCode)
+	}
+
+	mu.Lock()
+	got := calls[bigDir]
+	mu.Unlock()
+	if got != 1 {
+		t.Errorf("listSubdirs(%q) called %d times, want 1 (sidebar + chips must share one scan)", bigDir, got)
+	}
+
+	// Both surfaces that consume the shared scan must still render.
+	page := string(raw)
+	if !strings.Contains(page, `class="chips"`) {
+		t.Errorf("large-dir chip strip missing from gallery page")
+	}
+	if !strings.Contains(page, `class="chip"`) {
+		t.Errorf("no chip rendered for child directory")
+	}
+	if !strings.Contains(page, "In big") {
+		t.Errorf(`sidebar "In <dir>" section missing from gallery page`)
 	}
 }
 
