@@ -27,6 +27,7 @@ import (
 	_ "golang.org/x/image/webp"
 
 	"github.com/dns/photo-viewer/internal/cache"
+	"github.com/dns/photo-viewer/internal/imgorient"
 	"github.com/dns/photo-viewer/internal/scan"
 	"github.com/dns/photo-viewer/internal/thumb"
 	"github.com/dns/photo-viewer/internal/video"
@@ -635,7 +636,14 @@ func decodeDimensions(path string) string {
 	if err != nil {
 		return "—"
 	}
-	return fmt.Sprintf("%d × %d", cfg.Width, cfg.Height)
+	w, h := cfg.Width, cfg.Height
+	// DecodeConfig reports the stored (unrotated) dimensions; EXIF orientations
+	// 5–8 transpose the image, so the displayed size — and what decodeOriginal
+	// now paints — has width and height swapped.
+	if imgorient.ReadOrientation(path) >= 5 {
+		w, h = h, w
+	}
+	return fmt.Sprintf("%d × %d", w, h)
 }
 
 // mediaInfoFor returns the extended metadata for the entry, or empty/placeholder
@@ -922,6 +930,17 @@ func decodeOriginal(ctx context.Context, e cache.Entry) (paint.ImageOp, image.Po
 		return paint.ImageOp{}, image.Point{}, false
 	}
 	img = downscalePreview(img, viewerMaxPreviewSide)
+	// The RAW and HEIC branches already deliver an upright image (LoadRAWImage
+	// applies the RAW Orientation tag; heif-convert/ffmpeg bake in the HEIF
+	// rotation), but Go's JPEG/TIFF/PNG decoders ignore EXIF Orientation, so a
+	// portrait photo shot on a phone/DSLR would render sideways here — the same
+	// fix thumb.Image and export/recompress already carry. Apply it *after* the
+	// downscale: rotation is a lossless remap that commutes with scaling, and
+	// imgorient.Apply is per-pixel At/Set, so orienting the small preview costs
+	// ~1 ms where full-res would cost seconds on a 24 MP source.
+	if e.Type == scan.TypePhoto {
+		img = imgorient.Apply(img, imgorient.ReadOrientation(e.Path))
+	}
 	op := paint.NewImageOp(img)
 	op.Filter = paint.FilterLinear
 	return op, img.Bounds().Size(), true
