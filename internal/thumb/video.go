@@ -3,7 +3,6 @@ package thumb
 import (
 	"bytes"
 	"context"
-	"errors"
 	"os"
 	"os/exec"
 )
@@ -12,8 +11,8 @@ import (
 // Requires `ffmpeg` on PATH. ffmpeg writes directly to dst (which is the
 // caller's .tmp path) to avoid a tmpdir + cross-filesystem copy.
 func Video(ctx context.Context, src, dst string, size int) error {
-	if _, err := exec.LookPath("ffmpeg"); err != nil {
-		return errors.New("ffmpeg not installed")
+	if !haveFfmpeg() {
+		return errFfmpegNotInstalled
 	}
 	// -ss before -i is fast (keyframe seek); -frames:v 1 grabs a single frame.
 	// -vf scale fits longest edge to size while preserving aspect ratio.

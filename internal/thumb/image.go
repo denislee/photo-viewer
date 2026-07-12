@@ -3,6 +3,7 @@ package thumb
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"image"
 	_ "image/gif"
@@ -27,11 +28,27 @@ import (
 // in-process decoder to avoid the fork+exec overhead.
 const imageFfmpegThreshold = 2 * 1024 * 1024
 
+// External-tool availability is probed once via exec.LookPath and the result
+// cached: LookPath stats every $PATH entry, and the thumbnail pipeline runs
+// these guards on every file, so a 50k-file warm-up would otherwise waste
+// hundreds of thousands of stats. Tool presence can't change meaningfully
+// mid-run. Mirrors haveFFprobe in internal/scan/duration.go; a process restart
+// re-probes.
+var (
+	haveFfmpeg      = sync.OnceValue(func() bool { _, err := exec.LookPath("ffmpeg"); return err == nil })
+	haveExiftool    = sync.OnceValue(func() bool { _, err := exec.LookPath("exiftool"); return err == nil })
+	haveHeifConvert = sync.OnceValue(func() bool { _, err := exec.LookPath("heif-convert"); return err == nil })
+)
+
+// errFfmpegNotInstalled is returned by the ffmpeg-dependent paths when the
+// cached haveFfmpeg probe reports ffmpeg missing.
+var errFfmpegNotInstalled = errors.New("ffmpeg not installed")
+
 // Image decodes src, resamples it to fit within size×size, and writes a JPEG
 // to dst. Aspect ratio is preserved.
 func Image(ctx context.Context, src, dst string, size int) error {
 	if info, err := os.Stat(src); err == nil && info.Size() >= imageFfmpegThreshold {
-		if _, err := exec.LookPath("ffmpeg"); err == nil {
+		if haveFfmpeg() {
 			if err := imageViaFfmpeg(ctx, src, dst, size); err == nil {
 				return nil
 			}

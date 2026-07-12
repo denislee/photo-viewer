@@ -24,7 +24,7 @@ func RAW(ctx context.Context, src, dst string, size int) error {
 		// same >=imageFfmpegThreshold watershed the plain-image path uses. On
 		// ffmpeg failure we fall through to the Go decoder below.
 		if len(data) >= imageFfmpegThreshold {
-			if _, err := exec.LookPath("ffmpeg"); err == nil {
+			if haveFfmpeg() {
 				if err := imageBytesViaFfmpeg(ctx, data, dst, size); err == nil {
 					return nil
 				}
@@ -79,8 +79,8 @@ func LoadRAWImage(ctx context.Context, src string) (image.Image, error) {
 // decodeRAWViaFfmpeg decodes the full RAW via ffmpeg (which handles DNG, CR2,
 // etc. and auto-applies orientation), returning the decoded image.
 func decodeRAWViaFfmpeg(ctx context.Context, src string) (image.Image, error) {
-	if _, err := exec.LookPath("ffmpeg"); err != nil {
-		return nil, err
+	if !haveFfmpeg() {
+		return nil, errFfmpegNotInstalled
 	}
 	cmd := exec.CommandContext(ctx, "ffmpeg", "-i", src, "-frames:v", "1", "-f", "image2pipe", "-vcodec", "mjpeg", "-")
 	var out, stderr bytes.Buffer
@@ -111,7 +111,7 @@ func LoadRAWPreview(ctx context.Context, src string) ([]byte, error) {
 		return os.ReadFile(src)
 	}
 
-	if _, err := exec.LookPath("exiftool"); err != nil {
+	if !haveExiftool() {
 		return nil, errors.New("exiftool not installed")
 	}
 

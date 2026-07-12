@@ -2,6 +2,7 @@ package scan
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"math/big"
 	"os"
@@ -40,50 +41,51 @@ func GetMediaInfo(path string) MediaInfo {
 
 	// Try exiftool first for everything. The reader goes through a shared
 	// -stay_open daemon (see exiftool.go) so bulk reads avoid one fork per
-	// file; first-failure falls back to per-call exec under the hood.
-	if _, err := exec.LookPath("exiftool"); err == nil {
-		// Read the settings tags as JSON. The old "-s -S" + "Tag: value" parse
-		// was a silent no-op: "-s -S" is short-format level 3 (bare values, no
-		// tag names), so every line failed the "Tag: value" split and nothing
-		// was ever extracted — camera info came only from the goexif fallback
-		// below (JPEG/TIFF only, never LensModel; nothing for HEIC/RAW/video).
-		// "-j" gives an unambiguous tag→value map that covers all those formats.
-		// (The date readers below deliberately keep the values-only short format
-		// and must not be switched — don't "fix" them to match this.)
-		out, err := runExiftool("-j",
-			"-Model", "-LensModel",
-			"-CreateDate", "-DateTimeOriginal", "-MediaCreateDate",
-			"-FNumber", "-ExposureTime", "-ISO", "-FocalLength",
-			path)
-		if err == nil {
-			var records []map[string]json.RawMessage
-			if json.Unmarshal(out, &records) == nil && len(records) > 0 {
-				rec := records[0]
-				info.Camera = exifJSONString(rec, "Model")
-				info.Lens = exifJSONString(rec, "LensModel")
-				if v := exifJSONString(rec, "FNumber"); v != "" {
-					info.Aperture = "f/" + v
+	// file; first-failure falls back to per-call exec under the hood, and it
+	// errors out cleanly when exiftool is absent — so no exec.LookPath guard is
+	// needed here (S-06).
+	//
+	// Read the settings tags as JSON. The old "-s -S" + "Tag: value" parse
+	// was a silent no-op: "-s -S" is short-format level 3 (bare values, no
+	// tag names), so every line failed the "Tag: value" split and nothing
+	// was ever extracted — camera info came only from the goexif fallback
+	// below (JPEG/TIFF only, never LensModel; nothing for HEIC/RAW/video).
+	// "-j" gives an unambiguous tag→value map that covers all those formats.
+	// (The date readers below deliberately keep the values-only short format
+	// and must not be switched — don't "fix" them to match this.)
+	out, err := runExiftool("-j",
+		"-Model", "-LensModel",
+		"-CreateDate", "-DateTimeOriginal", "-MediaCreateDate",
+		"-FNumber", "-ExposureTime", "-ISO", "-FocalLength",
+		path)
+	if err == nil {
+		var records []map[string]json.RawMessage
+		if json.Unmarshal(out, &records) == nil && len(records) > 0 {
+			rec := records[0]
+			info.Camera = exifJSONString(rec, "Model")
+			info.Lens = exifJSONString(rec, "LensModel")
+			if v := exifJSONString(rec, "FNumber"); v != "" {
+				info.Aperture = "f/" + v
+			}
+			if v := exifJSONString(rec, "ExposureTime"); v != "" {
+				info.ShutterSpeed = v + "s"
+			}
+			info.ISO = exifJSONString(rec, "ISO")
+			info.FocalLength = exifJSONString(rec, "FocalLength")
+			for _, tag := range []string{"CreateDate", "DateTimeOriginal", "MediaCreateDate"} {
+				v := exifJSONString(rec, tag)
+				if v == "" {
+					continue
 				}
-				if v := exifJSONString(rec, "ExposureTime"); v != "" {
-					info.ShutterSpeed = v + "s"
-				}
-				info.ISO = exifJSONString(rec, "ISO")
-				info.FocalLength = exifJSONString(rec, "FocalLength")
-				for _, tag := range []string{"CreateDate", "DateTimeOriginal", "MediaCreateDate"} {
-					v := exifJSONString(rec, tag)
-					if v == "" {
-						continue
-					}
-					for _, layout := range dateLayouts {
-						if t, err := time.Parse(layout, v); err == nil {
-							info.Created = t
-							dateFound = true
-							break
-						}
-					}
-					if dateFound {
+				for _, layout := range dateLayouts {
+					if t, err := time.Parse(layout, v); err == nil {
+						info.Created = t
+						dateFound = true
 						break
 					}
+				}
+				if dateFound {
+					break
 				}
 			}
 		}
@@ -206,8 +208,8 @@ func GetOldestMediaDate(path string) (oldest time.Time, metaDate time.Time, mtim
 // two stay in sync. Returns an error if exiftool is missing or the write
 // fails.
 func SetMediaDate(path string, t time.Time) error {
-	if _, err := exec.LookPath("exiftool"); err != nil {
-		return fmt.Errorf("exiftool not available: %w", err)
+	if !haveExiftool() {
+		return errors.New("exiftool not available")
 	}
 	stamp := t.Format("2006:01:02 15:04:05")
 	cmd := exec.Command("exiftool",
@@ -232,19 +234,20 @@ func SetMediaDate(path string, t time.Time) error {
 // GetOldestMediaDate. It returns the metadata creation date (if any) and a
 // flag indicating whether one was found.
 func readMetadataDate(path string) (time.Time, bool) {
-	if _, err := exec.LookPath("exiftool"); err == nil {
-		out, err := runExiftool("-s", "-S", "-CreateDate", "-DateTimeOriginal", "-MediaCreateDate", path)
-		if err == nil {
-			lines := strings.Split(strings.TrimSpace(string(out)), "\n")
-			for _, line := range lines {
-				line = strings.TrimSpace(line)
-				if line == "" {
-					continue
-				}
-				for _, layout := range dateLayouts {
-					if t, err := time.Parse(layout, line); err == nil {
-						return t, true
-					}
+	// No exec.LookPath guard: runExiftool errors out cleanly when exiftool is
+	// absent, so the err == nil check below already skips to the goexif
+	// fallback (S-06).
+	out, err := runExiftool("-s", "-S", "-CreateDate", "-DateTimeOriginal", "-MediaCreateDate", path)
+	if err == nil {
+		lines := strings.Split(strings.TrimSpace(string(out)), "\n")
+		for _, line := range lines {
+			line = strings.TrimSpace(line)
+			if line == "" {
+				continue
+			}
+			for _, layout := range dateLayouts {
+				if t, err := time.Parse(layout, line); err == nil {
+					return t, true
 				}
 			}
 		}
@@ -264,23 +267,23 @@ func readMetadataDate(path string) (time.Time, bool) {
 // It tries exiftool first (for videos, RAW, and photos), then falls back to
 // manual EXIF decoding (photos), and finally to the file's modification time.
 func GetMediaDate(path string) time.Time {
-	// First try exiftool for any media type (it handles photos, RAW, and videos).
-	if _, err := exec.LookPath("exiftool"); err == nil {
-		// Use -s -S for short tag names and no spaces/headers.
-		out, err := runExiftool("-s", "-S", "-CreateDate", "-DateTimeOriginal", "-MediaCreateDate", path)
-		if err == nil {
-			lines := strings.Split(strings.TrimSpace(string(out)), "\n")
-			for _, line := range lines {
-				line = strings.TrimSpace(line)
-				if line == "" {
-					continue
-				}
-				// Try common formats.
-				for _, layout := range dateLayouts {
-					t, err := time.Parse(layout, line)
-					if err == nil {
-						return t
-					}
+	// First try exiftool for any media type (it handles photos, RAW, and
+	// videos). No exec.LookPath guard: runExiftool errors out cleanly when
+	// exiftool is absent, so the err == nil check skips to the fallbacks (S-06).
+	// Use -s -S for short tag names and no spaces/headers.
+	out, err := runExiftool("-s", "-S", "-CreateDate", "-DateTimeOriginal", "-MediaCreateDate", path)
+	if err == nil {
+		lines := strings.Split(strings.TrimSpace(string(out)), "\n")
+		for _, line := range lines {
+			line = strings.TrimSpace(line)
+			if line == "" {
+				continue
+			}
+			// Try common formats.
+			for _, layout := range dateLayouts {
+				t, err := time.Parse(layout, line)
+				if err == nil {
+					return t
 				}
 			}
 		}

@@ -32,7 +32,7 @@ var ffmpegNoHEIC atomic.Bool
 func HEIC(ctx context.Context, src, dst string, size int) error {
 	ffmpegTried := false
 	if !ffmpegNoHEIC.Load() {
-		if _, err := exec.LookPath("ffmpeg"); err == nil {
+		if haveFfmpeg() {
 			ffmpegTried = true
 			if err := imageViaFfmpeg(ctx, src, dst, size); err == nil {
 				return nil
@@ -80,7 +80,7 @@ func HEICToJPEG(ctx context.Context, src, tmpDir string) (string, error) {
 
 func decodeHEIC(ctx context.Context, src, tmpDir string) (string, error) {
 	var firstErr error
-	if _, err := exec.LookPath("heif-convert"); err == nil {
+	if haveHeifConvert() {
 		intermediate := filepath.Join(tmpDir, "out.jpg")
 		var stderr bytes.Buffer
 		cmd := exec.CommandContext(ctx, "heif-convert", "-q", "90", "--quiet", src, intermediate)
@@ -108,7 +108,7 @@ func decodeHEIC(ctx context.Context, src, tmpDir string) (string, error) {
 	}
 
 	// Fallback: ffmpeg can decode HEIC via libheif/HEVC and write a JPEG.
-	if _, err := exec.LookPath("ffmpeg"); err == nil {
+	if haveFfmpeg() {
 		out := filepath.Join(tmpDir, "ff-out.jpg")
 		var stderr bytes.Buffer
 		cmd := exec.CommandContext(ctx, "ffmpeg", "-y", "-loglevel", "error",

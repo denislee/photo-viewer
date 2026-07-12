@@ -75,6 +75,16 @@ var exiftoolReqTimeout = 15 * time.Second
 // back to the one-shot exec, and the next caller transparently respawns it.
 var errExiftoolTimeout = errors.New("exiftool: request timed out")
 
+// haveExiftool caches whether exiftool is on PATH. SetMediaDate execs exiftool
+// directly (not through the pooled daemon), so it needs its own presence check;
+// a per-call exec.LookPath in the "fix dates" loop would re-walk $PATH per file.
+// Presence can't change meaningfully mid-run; a process restart re-probes.
+// Mirrors haveFFprobe in duration.go.
+var haveExiftool = sync.OnceValue(func() bool {
+	_, err := exec.LookPath("exiftool")
+	return err == nil
+})
+
 // RunExiftool runs an exiftool request through this package's shared
 // -stay_open daemon and returns its stdout, so callers outside the package
 // (e.g. internal/thumb's RAW preview probe) don't pay a fresh fork per read.
