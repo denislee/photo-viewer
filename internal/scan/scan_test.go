@@ -38,3 +38,24 @@ func TestWalkSkipDurationProbe(t *testing.T) {
 		t.Errorf("DurationMs = %d, want 0 (SkipDurationProbe must win over KnownDurationMs)", got[0].DurationMs)
 	}
 }
+
+// TestWalkSkipsHiddenFiles verifies dot-prefixed files are ignored, so macOS
+// AppleDouble junk (._*) and other hidden files never enter the index even
+// though their extensions match real media (S-01).
+func TestWalkSkipsHiddenFiles(t *testing.T) {
+	dir := t.TempDir()
+	for _, name := range []string{"._IMG_0001.jpg", ".hidden.jpg", "b.jpg"} {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte("x"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	var got []string
+	for r := range Walk(context.Background(), dir) {
+		got = append(got, filepath.Base(r.Path))
+	}
+
+	if len(got) != 1 || got[0] != "b.jpg" {
+		t.Fatalf("walk returned %v, want [b.jpg] (hidden files must be skipped)", got)
+	}
+}

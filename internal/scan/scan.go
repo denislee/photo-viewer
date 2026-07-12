@@ -173,6 +173,14 @@ func WalkWith(ctx context.Context, root string, opts WalkOptions) <-chan Result 
 				}
 				return nil
 			}
+			// Skip hidden files, matching the hidden-directory semantics above.
+			// macOS-written SD cards litter every folder with AppleDouble forks
+			// (._IMG_1234.jpg, ._clip.mov) whose extensions match real media;
+			// without this they get indexed as ~4 KB resource-fork "media" that
+			// pollute the grid and double per-directory counts.
+			if strings.HasPrefix(name, ".") {
+				return nil
+			}
 			t := DetectType(path)
 			if t == TypeUnknown {
 				return nil
