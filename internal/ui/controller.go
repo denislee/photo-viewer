@@ -509,9 +509,9 @@ func (c *Controller) DeletePaths(paths []string) error {
 	if len(paths) == 0 {
 		return nil
 	}
-	// Split: trashed items take the restore branch (no batch path —
-	// restore is rare and needs a refresh per item anyway), the rest are
-	// batched.
+	// Split: trashed items take the restore branch, the rest the delete
+	// branch. Both run their heavy I/O on a background goroutine and
+	// collapse to a single index write + count adjust + refresh.
 	var toDelete, toRestore []string
 	for _, p := range paths {
 		if p == "" {
@@ -527,10 +527,60 @@ func (c *Controller) DeletePaths(paths []string) error {
 		c.patchLocalDeletion(toDelete, c.trashDir != "")
 		go c.performDeletion(toDelete)
 	}
-	for _, p := range toRestore {
-		_ = c.restoreFromTrash(p)
+	if len(toRestore) > 0 {
+		go c.restoreBatch(toRestore)
 	}
 	return nil
+}
+
+// restoreBatch moves a batch of trashed files back to their recorded original
+// locations, then collapses the whole batch into one index write, one trash-
+// count adjustment, and one refresh. Mirrors performDeletion: the slow per-item
+// I/O (sidecar read + JSON parse, MkdirAll, rename, thumb rename, stat) runs
+// here on its own goroutine so a 200-item multi-select restore doesn't block the
+// Gio frame loop on 200 renames + 200 single-row DB transactions + 200 dirCounts
+// clone-swaps + 200 refreshes. A per-item failure is logged and skipped, never
+// aborting the batch. Never mutates widget state directly — the single
+// scheduleRefresh at the end repaints via the Controller's refresh path.
+func (c *Controller) restoreBatch(paths []string) {
+	results, restored := collectRestores(paths, c.store)
+	if len(results) > 0 {
+		c.index.ReconcileBatch(results)
+	}
+	if restored > 0 {
+		c.bumpTrashCount(-restored)
+	}
+	c.scheduleRefresh(c.activeDir())
+}
+
+// collectRestores performs the filesystem half of a trash restore for every
+// path — moving each file back to its original location and gathering the
+// scan.Results that need reconciling into the index. It touches neither the
+// index nor the trash count, so it's a pure, headless-testable unit: the
+// caller issues the single batched writes. restored counts every successful
+// RestoreFromTrash (what the trash count must drop by); it can exceed
+// len(results) if a restored file vanished before its post-restore Stat.
+func collectRestores(paths []string, store *cache.ThumbStore) (results []scan.Result, restored int) {
+	results = make([]scan.Result, 0, len(paths))
+	for _, p := range paths {
+		dst, err := cache.RestoreFromTrash(p, store)
+		if err != nil {
+			log.Printf("trash: restore failed for %s: %v", p, err)
+			continue
+		}
+		restored++
+		info, sErr := os.Stat(dst)
+		if sErr != nil {
+			continue
+		}
+		results = append(results, scan.Result{
+			Path:    dst,
+			Type:    scan.DetectType(dst),
+			Size:    info.Size(),
+			ModTime: info.ModTime(),
+		})
+	}
+	return results, restored
 }
 
 // restoreFromTrash handles the "delete from inside Trash view" case —
