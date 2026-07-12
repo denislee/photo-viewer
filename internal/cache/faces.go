@@ -214,6 +214,17 @@ func (i *Index) WriteFacesForPath(path string, ops []FaceOp) ([]FaceOpResult, er
 	return results, nil
 }
 
+// MoveFaces relocates any face rows from oldPath to newPath after a media file
+// has been renamed on disk (the organize move flow). Because faces are keyed by
+// path, the moved file would otherwise have no rows under newPath — forcing the
+// pipeline to re-detect it from scratch (the exact cost the thumbnail carry-over
+// in ApplyMove avoids) while the old rows orphan. The embeddings and thumb_mtime
+// stay valid because the thumbnail file was renamed, not regenerated.
+func (i *Index) MoveFaces(oldPath, newPath string) error {
+	_, err := i.db.Exec("UPDATE faces SET path = ? WHERE path = ?", newPath, oldPath)
+	return err
+}
+
 // AllClusters returns every cluster with its current face count.
 //
 // The face count comes from one GROUP BY scan over faces joined onto the

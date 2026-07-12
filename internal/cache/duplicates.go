@@ -440,13 +440,28 @@ func (i *Index) FindDuplicates() []DuplicateGroup {
 	return out
 }
 
-// RemoveEntry deletes a single row from the index by path.
+// RemoveEntry deletes a single row from the index by path, together with any
+// face rows keyed to that path. faces.path references entries.path with no
+// foreign key, so without this the face rows orphan forever: they keep loading
+// on every pipeline start (LoadFaceFreshness) and keep weighting cluster
+// centroids toward files that no longer exist, degrading future clustering.
 func (i *Index) RemoveEntry(path string) error {
-	_, err := i.db.Exec("DELETE FROM entries WHERE path = ?", path)
-	return err
+	tx, err := i.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if _, err := tx.Exec("DELETE FROM entries WHERE path = ?", path); err != nil {
+		return err
+	}
+	if _, err := tx.Exec("DELETE FROM faces WHERE path = ?", path); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
-// RemoveEntries deletes multiple rows from the index in a single transaction.
+// RemoveEntries deletes multiple rows from the index in a single transaction,
+// each with its face rows (see RemoveEntry for why the faces cleanup matters).
 // Used by bulk-delete flows so the UI doesn't pay for one DB round-trip per
 // path. Errors on individual rows are swallowed — the transaction commits
 // whichever deletes did succeed.
@@ -459,13 +474,19 @@ func (i *Index) RemoveEntries(paths []string) error {
 		return err
 	}
 	defer tx.Rollback()
-	stmt, err := tx.Prepare("DELETE FROM entries WHERE path = ?")
+	delEntry, err := tx.Prepare("DELETE FROM entries WHERE path = ?")
 	if err != nil {
 		return err
 	}
-	defer stmt.Close()
+	defer delEntry.Close()
+	delFaces, err := tx.Prepare("DELETE FROM faces WHERE path = ?")
+	if err != nil {
+		return err
+	}
+	defer delFaces.Close()
 	for _, p := range paths {
-		_, _ = stmt.Exec(p)
+		_, _ = delEntry.Exec(p)
+		_, _ = delFaces.Exec(p)
 	}
 	return tx.Commit()
 }

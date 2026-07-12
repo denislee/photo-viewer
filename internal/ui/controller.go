@@ -739,10 +739,18 @@ func (c *Controller) ApplyMove(oldPath, newPath string) error {
 		if hadOld && old.Favorite {
 			_ = c.index.SetFavorite(newPath, true)
 		}
+		// Relocate the file's face rows to the new path rather than let them
+		// orphan. The thumbnail was renamed (not regenerated), so the embeddings
+		// and thumb_mtime stay valid — this also spares the pipeline from
+		// re-detecting the moved file from scratch. After this, no faces remain
+		// under oldPath, so RemoveEntry's own face cleanup below is a no-op.
+		_ = c.index.MoveFaces(oldPath, newPath)
 	}
 	// Drop the stale row last so an in-flight scan can't re-observe the old path
 	// after we've already relocated its row (the file itself is already gone
-	// from the old path on disk, so the scan won't re-add it).
+	// from the old path on disk, so the scan won't re-add it). RemoveEntry also
+	// clears any face rows still under oldPath — the safety net when the newPath
+	// stat above failed and MoveFaces was skipped.
 	return c.index.RemoveEntry(oldPath)
 }
 
