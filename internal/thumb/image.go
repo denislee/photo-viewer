@@ -49,11 +49,11 @@ func Image(ctx context.Context, src, dst string, size int) error {
 		return err
 	}
 	// Go's image decoders ignore the EXIF Orientation tag (and jpeg.Encode
-	// writes none), so a rotated small JPEG would thumbnail sideways here —
-	// the ffmpeg path above already auto-applies orientation, so only this
-	// in-process fallback needs the manual transpose. Bake it in before scale.
-	img = imgorient.Apply(img, imgorient.ReadOrientation(src))
-	return writeThumb(img, dst, size)
+	// writes none), so a rotated small JPEG would thumbnail sideways here — the
+	// ffmpeg path above already auto-applies orientation, so only this
+	// in-process fallback passes a non-identity value. writeThumb bakes it in
+	// after the downscale (S-04).
+	return writeThumb(img, dst, size, imgorient.ReadOrientation(src))
 }
 
 // ffmpegScaleFilter builds the `-vf` scale expression that fits the longest
@@ -137,7 +137,11 @@ var rgbaPool = sync.Pool{
 	New: func() any { return &image.RGBA{} },
 }
 
-func writeThumb(src image.Image, dst string, size int) error {
+// writeThumb resamples src to fit within size×size, bakes in the given EXIF
+// orientation, and writes a JPEG to dst. orientation must be one of [1, 8]
+// (1 = already upright / identity); callers that decoded through a tool which
+// already auto-rotates (ffmpeg, heif-convert) pass 1.
+func writeThumb(src image.Image, dst string, size, orientation int) error {
 	b := src.Bounds()
 	w, h := b.Dx(), b.Dy()
 	tw, th := fitWithin(w, h, size)
@@ -159,12 +163,20 @@ func writeThumb(src image.Image, dst string, size int) error {
 	// but this runs once per thumbnail under the store's cpuSem/extSem bound.
 	draw.CatmullRom.Scale(thumb, thumb.Rect, src, b, draw.Src, nil)
 
+	// Bake EXIF orientation in *after* the downscale (S-04): rotation commutes
+	// with scaling, so remapping the small thumbnail costs (src/dst)² less than
+	// orienting the full-resolution source. fitWithin was fed the stored dims,
+	// so for the transpose orientations (5–8) the output's axes swap here —
+	// both edges stay ≤ size, so it still fits. orientation==1 returns thumb
+	// untouched (the common case), so the pooled buffer is reused as-is.
+	oriented := imgorient.Apply(thumb, orientation)
+
 	out, err := os.Create(dst)
 	if err != nil {
 		return err
 	}
 	defer out.Close()
-	return jpeg.Encode(out, thumb, &jpeg.Options{Quality: 82})
+	return jpeg.Encode(out, oriented, &jpeg.Options{Quality: 82})
 }
 
 func fitWithin(w, h, max int) (int, int) {

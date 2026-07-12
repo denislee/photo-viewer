@@ -95,3 +95,60 @@ func TestApplyFlipCorner(t *testing.T) {
 		t.Fatalf("mirror horizontal: top-left pixel = %v at (3,0), want %v", got, topLeft)
 	}
 }
+
+// makeNRGBA mirrors makeImage but produces an *image.NRGBA so the NRGBA fast
+// path (PNG-decoded sources) is exercised.
+func makeNRGBA(w, h int) *image.NRGBA {
+	img := image.NewNRGBA(image.Rect(0, 0, w, h))
+	for y := 0; y < h; y++ {
+		for x := 0; x < w; x++ {
+			img.Set(x, y, color.NRGBA{R: uint8(x), G: uint8(y), B: 0, A: 255})
+		}
+	}
+	return img
+}
+
+// opaqueImage hides a concrete *image.RGBA/*image.NRGBA behind the plain
+// image.Image interface so Apply falls through to the generic At/Set remap
+// instead of taking a packed-Pix fast path.
+type opaqueImage struct{ image.Image }
+
+// sameColor compares two colors through their RGBA() components so an NRGBA and
+// an RGBA holding the same opaque colour compare equal despite differing
+// concrete types.
+func sameColor(a, b color.Color) bool {
+	ar, ag, ab, aa := a.RGBA()
+	br, bg, bb, ba := b.RGBA()
+	return ar == br && ag == bg && ab == bb && aa == ba
+}
+
+// TestApplyFastPathMatchesGeneric is S-04's guard for the packed-Pix fast paths:
+// for both RGBA and NRGBA sources, every orientation must produce pixels
+// identical to the generic At/Set remap (forced by wrapping the source in
+// opaqueImage). This proves the byte-copy remap and the reference remap agree.
+func TestApplyFastPathMatchesGeneric(t *testing.T) {
+	const w, h = 5, 3 // non-square so axis swaps are observable
+	sources := map[string]image.Image{
+		"RGBA":  makeImage(w, h),
+		"NRGBA": makeNRGBA(w, h),
+	}
+	for name, src := range sources {
+		for o := 2; o <= 8; o++ {
+			fast := Apply(src, o)
+			generic := Apply(opaqueImage{src}, o)
+			if fast.Bounds() != generic.Bounds() {
+				t.Fatalf("%s orientation %d: fast bounds %v != generic %v",
+					name, o, fast.Bounds(), generic.Bounds())
+			}
+			b := fast.Bounds()
+			for y := b.Min.Y; y < b.Max.Y; y++ {
+				for x := b.Min.X; x < b.Max.X; x++ {
+					if !sameColor(fast.At(x, y), generic.At(x, y)) {
+						t.Fatalf("%s orientation %d: pixel (%d,%d) fast=%v generic=%v",
+							name, o, x, y, fast.At(x, y), generic.At(x, y))
+					}
+				}
+			}
+		}
+	}
+}

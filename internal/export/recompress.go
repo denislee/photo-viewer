@@ -80,15 +80,19 @@ func recompressImage(src, dst string, maxEdge, quality int) error {
 	// Go's image decoders ignore the EXIF Orientation tag and jpeg.Encode
 	// writes no EXIF, so a portrait camera JPEG (Orientation != 1) would
 	// otherwise export with sideways pixels AND no tag left to correct it —
-	// permanently rotated. Bake the orientation into the pixels here, after
-	// decode and before scaling, so the output JPEG is upright with no
-	// orientation tag needed. (The plain non-recompress copy path keeps the
-	// original bytes incl. the EXIF tag, so it doesn't need this.)
-	img = imgorient.Apply(img, imgorient.ReadOrientation(src))
+	// permanently rotated. Bake the orientation into the pixels so the output
+	// JPEG is upright with no orientation tag needed. (The plain non-recompress
+	// copy path keeps the original bytes incl. the EXIF tag, so it doesn't need
+	// this.) Orient *after* the downscale (S-04): rotation commutes with
+	// scaling, so the remap runs on the small output, not the full-res source.
+	// fitWithin is fed the stored dims; for the transpose orientations (5–8) the
+	// output's axes swap, both staying ≤ maxEdge.
+	orient := imgorient.ReadOrientation(src)
 	b := img.Bounds()
 	tw, th := fitWithin(b.Dx(), b.Dy(), maxEdge)
-	dstImg := image.NewRGBA(image.Rect(0, 0, tw, th))
-	draw.ApproxBiLinear.Scale(dstImg, dstImg.Rect, img, b, draw.Src, nil)
+	scaled := image.NewRGBA(image.Rect(0, 0, tw, th))
+	draw.ApproxBiLinear.Scale(scaled, scaled.Rect, img, b, draw.Src, nil)
+	dstImg := imgorient.Apply(scaled, orient)
 
 	tmp := dst + ".tmp"
 	out, err := os.Create(tmp)

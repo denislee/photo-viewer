@@ -57,7 +57,8 @@ func HEIC(ctx context.Context, src, dst string, size int) error {
 	}
 	// jpg is a freshly written JPEG of unknown size. Skip the os.Stat /
 	// ffmpeg-threshold branch inside Image() (we know exactly where the
-	// file came from) and just decode + writeThumb directly.
+	// file came from) and just decode + writeThumb directly. heif-convert /
+	// ffmpeg already baked in the HEIF rotation, so it's upright (orientation 1).
 	in, err := os.Open(jpg)
 	if err != nil {
 		return err
@@ -67,7 +68,7 @@ func HEIC(ctx context.Context, src, dst string, size int) error {
 	if err != nil {
 		return err
 	}
-	return writeThumb(img, dst, size)
+	return writeThumb(img, dst, size, 1)
 }
 
 // HEICToJPEG decodes a HEIC/HEIF file to a full-resolution JPEG written under

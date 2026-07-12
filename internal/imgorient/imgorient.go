@@ -63,9 +63,13 @@ func ReadOrientation(path string) int {
 //	7 = transverse     (reflect across the anti-diagonal)
 //	8 = rotate 90° CCW
 //
-// The transform is a plain per-pixel remap via At/Set so it works for any
-// image.Image. That is O(w·h) with interface calls — fine for the one-shot
-// export/thumbnail use here, and the hot orientation-1 path is free.
+// For the two packed 4-byte-per-pixel layouts the decode/scale pipeline
+// actually produces — *image.RGBA (from draw.Scale) and *image.NRGBA (from the
+// PNG decoder) — Apply remaps whole pixels through the Pix slice, which skips
+// the per-pixel interface dispatch and (for a YCbCr JPEG source) colour
+// conversion that At/Set would pay. Any other image type falls back to the
+// generic At/Set remap. Both are O(w·h); callers should orient *after*
+// downscaling so the remap runs at output resolution, not source resolution.
 func Apply(img image.Image, orientation int) image.Image {
 	if orientation <= 1 || orientation > 8 {
 		return img
@@ -73,37 +77,75 @@ func Apply(img image.Image, orientation int) image.Image {
 	b := img.Bounds()
 	w, h := b.Dx(), b.Dy()
 
-	// Orientations 5–8 rotate/reflect across a diagonal, which swaps the axes;
-	// the destination is then h wide and w tall.
-	var dst *image.RGBA
-	if orientation >= 5 {
-		dst = image.NewRGBA(image.Rect(0, 0, h, w))
-	} else {
-		dst = image.NewRGBA(image.Rect(0, 0, w, h))
+	switch src := img.(type) {
+	case *image.RGBA:
+		dst := image.NewRGBA(orientedRect(b, orientation))
+		remapPix(src.Pix, src.Stride, dst.Pix, dst.Stride, w, h, orientation)
+		return dst
+	case *image.NRGBA:
+		dst := image.NewNRGBA(orientedRect(b, orientation))
+		remapPix(src.Pix, src.Stride, dst.Pix, dst.Stride, w, h, orientation)
+		return dst
 	}
 
+	// Generic fallback for any other image.Image (e.g. a small, already-≤max
+	// YCbCr JPEG handed over without a downscale): a plain per-pixel At/Set
+	// remap. Correct for every image type, just slower.
+	dst := image.NewRGBA(orientedRect(b, orientation))
 	for y := 0; y < h; y++ {
 		for x := 0; x < w; x++ {
-			// (dx, dy) is where source pixel (x, y) lands after the transform.
-			var dx, dy int
-			switch orientation {
-			case 2: // mirror horizontal
-				dx, dy = w-1-x, y
-			case 3: // rotate 180°
-				dx, dy = w-1-x, h-1-y
-			case 4: // mirror vertical
-				dx, dy = x, h-1-y
-			case 5: // transpose (main diagonal)
-				dx, dy = y, x
-			case 6: // rotate 90° CW
-				dx, dy = h-1-y, x
-			case 7: // transverse (anti-diagonal)
-				dx, dy = h-1-y, w-1-x
-			case 8: // rotate 90° CCW
-				dx, dy = y, w-1-x
-			}
+			dx, dy := destXY(orientation, x, y, w, h)
 			dst.Set(dx, dy, img.At(b.Min.X+x, b.Min.Y+y))
 		}
 	}
 	return dst
+}
+
+// orientedRect returns the origin-anchored bounds of the upright image an
+// orientation produces from a source with bounds b. Orientations 5–8 reflect
+// across a diagonal, swapping the axes.
+func orientedRect(b image.Rectangle, orientation int) image.Rectangle {
+	if orientation >= 5 {
+		return image.Rect(0, 0, b.Dy(), b.Dx())
+	}
+	return image.Rect(0, 0, b.Dx(), b.Dy())
+}
+
+// destXY returns the destination coordinate that source pixel (x, y) — given
+// in local [0,w)×[0,h) coordinates — lands on under the given orientation.
+func destXY(orientation, x, y, w, h int) (int, int) {
+	switch orientation {
+	case 2: // mirror horizontal
+		return w - 1 - x, y
+	case 3: // rotate 180°
+		return w - 1 - x, h - 1 - y
+	case 4: // mirror vertical
+		return x, h - 1 - y
+	case 5: // transpose (main diagonal)
+		return y, x
+	case 6: // rotate 90° CW
+		return h - 1 - y, x
+	case 7: // transverse (anti-diagonal)
+		return h - 1 - y, w - 1 - x
+	case 8: // rotate 90° CCW
+		return y, w - 1 - x
+	}
+	return x, y
+}
+
+// remapPix copies 4-byte pixels from a packed source (spix/sstride, the top-left
+// pixel at spix[0]) into a packed destination (dpix/dstride, sized per
+// orientedRect and origin-anchored) under the given orientation. It handles the
+// RGBA and NRGBA cases identically because both share the same 4-byte layout;
+// copying raw bytes preserves the exact colour, so this is a pure spatial remap.
+func remapPix(spix []uint8, sstride int, dpix []uint8, dstride, w, h, orientation int) {
+	for y := 0; y < h; y++ {
+		so := y * sstride
+		for x := 0; x < w; x++ {
+			dx, dy := destXY(orientation, x, y, w, h)
+			di := dy*dstride + dx*4
+			copy(dpix[di:di+4], spix[so:so+4])
+			so += 4
+		}
+	}
 }

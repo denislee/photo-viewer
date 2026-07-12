@@ -32,16 +32,17 @@ func RAW(ctx context.Context, src, dst string, size int) error {
 		}
 		if img, _, err := image.Decode(bytes.NewReader(data)); err == nil {
 			// The Go decoder ignores EXIF orientation; the preview is stored in
-			// sensor orientation, so apply the RAW's Orientation tag before
-			// scaling. (The ffmpeg fast path above relies on ffmpeg's autorotate
-			// instead — a large preview that lacks its own tag is no worse than
-			// the pre-I-12 behaviour, which never rotated at all.)
-			img = imgorient.Apply(img, imgorient.ReadOrientation(src))
-			return writeThumb(img, dst, size)
+			// sensor orientation, so pass the RAW's Orientation tag to writeThumb,
+			// which bakes it in after the downscale (S-04). (The ffmpeg fast path
+			// above relies on ffmpeg's autorotate instead — a large preview that
+			// lacks its own tag is no worse than the pre-I-12 behaviour, which
+			// never rotated at all.)
+			return writeThumb(img, dst, size, imgorient.ReadOrientation(src))
 		}
 	}
 
-	// Fallback: ffmpeg decodes the full RAW directly (and autorotates).
+	// Fallback: ffmpeg decodes the full RAW directly (and autorotates), so the
+	// image is already upright — pass orientation 1 (identity).
 	img, err := decodeRAWViaFfmpeg(ctx, src)
 	if err != nil {
 		if previewErr != nil {
@@ -49,7 +50,7 @@ func RAW(ctx context.Context, src, dst string, size int) error {
 		}
 		return err
 	}
-	return writeThumb(img, dst, size)
+	return writeThumb(img, dst, size, 1)
 }
 
 // LoadRAWImage returns a decoded image.Image from a RAW file. It tries
