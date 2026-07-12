@@ -1320,9 +1320,10 @@ func (v *ImportView) extractZipToInbox(ctx context.Context, zipPath, inboxDir st
 	for _, f := range r.File {
 		// Honour Pause / Cancel between archive entries so a multi-GB ZIP
 		// stops promptly instead of extracting to completion after the user
-		// hit Cancel. (A partial file from an interrupted io.Copy below is
-		// removed in that entry's error path, so an early return here leaves
-		// no truncated file behind.)
+		// hit Cancel. (writeFileDurable below only publishes an entry via an
+		// atomic rename after fsync, so an interrupted io.Copy leaves at most a
+		// .tmp — never a truncated file at the final name — and an early return
+		// here leaves nothing behind.)
 		v.waitIfPaused()
 		if ctx.Err() != nil {
 			return extracted
@@ -1339,18 +1340,15 @@ func (v *ImportView) extractZipToInbox(ctx context.Context, zipPath, inboxDir st
 			continue
 		}
 		dest := uniqueInboxPath(inboxDir, filepath.Base(f.Name))
-		out, err := os.Create(dest)
-		if err != nil {
-			v.appendLog("[ERROR] Failed to create file: " + err.Error())
-			rc.Close()
-			continue
-		}
-		_, err = io.Copy(out, rc)
-		out.Close()
+		// Crash-safe extract: writeFileDurable streams into dest+".tmp",
+		// fsyncs, and atomically renames — so an interrupted extraction (cancel,
+		// full disk, power loss) leaves at most the .tmp, never a truncated file
+		// at dest that the next import's inbox walk would file into the library
+		// as valid media.
+		err = writeFileDurable(dest, rc)
 		rc.Close()
 		if err != nil {
 			v.appendLog("[ERROR] Failed to extract file: " + err.Error())
-			os.Remove(dest)
 			continue
 		}
 		extracted = append(extracted, dest)
@@ -1437,12 +1435,27 @@ func copyFile(src, dst string) error {
 		return err
 	}
 	defer in.Close()
+	return writeFileDurable(dst, in)
+}
+
+// writeFileDurable streams r into dst crash-safely: it writes into a sibling
+// dst+".tmp", fsyncs it to stable storage, and only then atomically renames it
+// into place. It is the writer half of copyFile, shared so any producer of new
+// inbox bytes (a plain file copy, a ZIP entry) gets the same guarantee: an
+// interrupted write — yanked card, full disk, power loss, cancel — leaves at
+// most the .tmp (removed here on any error), never a truncated file at the final
+// name that the next import's inbox walk would file into the library as valid
+// media. The Sync before the rename also backstops "Delete source after
+// import": a caller must not os.Remove the source while dst's bytes are still
+// only in the page cache. (dst's .tmp is a real *os.File, so plain io.Copy keeps
+// the kernel copy_file_range/sendfile fast path — no pooled buffer needed.)
+func writeFileDurable(dst string, r io.Reader) error {
 	tmp := dst + ".tmp"
 	out, err := os.Create(tmp)
 	if err != nil {
 		return err
 	}
-	if _, err := io.Copy(out, in); err != nil {
+	if _, err := io.Copy(out, r); err != nil {
 		out.Close()
 		os.Remove(tmp) // best-effort: never leave a partial temp behind
 		return err
