@@ -1075,6 +1075,12 @@ func drawRoot(gtx layout.Context, th *Theme, ctrl *Controller, tb *Toolbar, sb *
 	maxW := gtx.Dp(unit.Dp(sidebarMaxDp))
 	maxW = min(maxW, totalW-minW)
 	leftW := gtx.Dp(unit.Dp(GetConfig().SidebarWidthDp))
+	if splitter.dragging {
+		// During an active drag prefer the in-flight width so the divider
+		// tracks the pointer on every invalidated frame; the config write is
+		// still deferred to drag-release (see layoutSplitter).
+		leftW = splitter.pendingW
+	}
 	if leftW <= 0 {
 		leftW = totalW * 22 / 100
 	}
