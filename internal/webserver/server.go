@@ -230,7 +230,21 @@ func (s *Server) Start(host string, port int, password string) error {
 	return nil
 }
 
-// Stop gracefully shuts down the running server. No-op when stopped.
+// shutdownTimeout bounds how long Stop waits for in-flight requests to drain
+// gracefully before force-closing the remaining connections. It is effectively
+// a constant; it stays a var only so tests can shorten it to exercise the
+// timeout→Close path quickly.
+//
+// Deliberately short: with WriteTimeout: 0 (chosen so long video/HLS streams
+// aren't cut by a fixed budget), http.Server.Shutdown never interrupts an
+// active connection, so a /media download or HLS stream would otherwise
+// outlive an explicit Stop indefinitely. For a personal LAN server, cutting a
+// stream the moment the user hits Stop is the right bias (privacy over
+// completing the transfer), so 2 s is plenty of grace before the hard close.
+var shutdownTimeout = 2 * time.Second
+
+// Stop gracefully shuts down the running server, force-closing any connection
+// still active once shutdownTimeout elapses. No-op when stopped.
 func (s *Server) Stop() error {
 	s.mu.Lock()
 	srv := s.srv
@@ -243,9 +257,18 @@ func (s *Server) Stop() error {
 	if srv == nil {
 		return nil
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
 	defer cancel()
-	return srv.Shutdown(ctx)
+	// Shutdown stops accepting and waits for in-flight requests to drain, but
+	// it never interrupts an active connection. On timeout (or any other
+	// Shutdown error) hard-close the listeners and connections outright so a
+	// streaming /media or HLS response actually ends when the user hits Stop,
+	// rather than running on with WriteTimeout: 0 after the GUI reports the
+	// server stopped (W-02).
+	if err := srv.Shutdown(ctx); err != nil {
+		return srv.Close()
+	}
+	return nil
 }
 
 // basicAuth wraps next so that every request must present the configured

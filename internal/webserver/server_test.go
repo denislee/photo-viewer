@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"mime"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -588,6 +589,108 @@ func TestGalleryPageScansSubdirsOnce(t *testing.T) {
 	}
 	if !strings.Contains(page, "In big") {
 		t.Errorf(`sidebar "In <dir>" section missing from gallery page`)
+	}
+}
+
+// TestStopForceClosesActiveConnections guards W-02: an explicit Stop must not
+// let an in-flight streaming response outlive the "stopped" state. With
+// WriteTimeout: 0, http.Server.Shutdown never interrupts an active connection,
+// so on shutdown-timeout Stop must fall back to srv.Close() and drop the
+// connection. The test parks a handler that only returns when its request
+// context is cancelled (mimicking a long /media stream), then asserts Stop
+// returns promptly and the parked handler + in-flight client both observe the
+// force-close.
+func TestStopForceClosesActiveConnections(t *testing.T) {
+	// Shorten the graceful-drain window so the timeout→Close path is fast.
+	orig := shutdownTimeout
+	shutdownTimeout = 100 * time.Millisecond
+	defer func() { shutdownTimeout = orig }()
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	entered := make(chan struct{})
+	released := make(chan struct{})
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/octet-stream")
+		w.WriteHeader(http.StatusOK)
+		if f, ok := w.(http.Flusher); ok {
+			f.Flush() // ship headers so the client's request returns immediately
+		}
+		close(entered)
+		// Simulate a long stream: keep serving until the connection is
+		// force-closed (context cancel) rather than finishing on our own.
+		select {
+		case <-r.Context().Done():
+		case <-time.After(10 * time.Second):
+		}
+		close(released)
+	})
+
+	// WriteTimeout: 0 mirrors the production server (server.go:213) — the very
+	// setting that lets a stream run forever absent the hard close.
+	srv := &http.Server{Handler: handler, WriteTimeout: 0}
+	s := &Server{srv: srv, listener: ln, running: true, addr: ln.Addr().String()}
+	go func() { _ = srv.Serve(ln) }()
+
+	// Fire an in-flight request and wait until it's parked inside the handler.
+	type getResult struct {
+		resp *http.Response
+		err  error
+	}
+	reqDone := make(chan getResult, 1)
+	go func() {
+		resp, err := http.Get("http://" + ln.Addr().String() + "/stream")
+		reqDone <- getResult{resp, err}
+	}()
+
+	select {
+	case <-entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("handler never entered — request didn't reach the server")
+	}
+
+	// Stop must return promptly: Shutdown drains for shutdownTimeout, then the
+	// hard close drops the still-active connection. It must NOT block for the
+	// handler's own 10 s ceiling.
+	stopped := make(chan error, 1)
+	start := time.Now()
+	go func() { stopped <- s.Stop() }()
+
+	select {
+	case err := <-stopped:
+		if err != nil {
+			t.Errorf("Stop returned error: %v", err)
+		}
+		if d := time.Since(start); d > 5*time.Second {
+			t.Errorf("Stop took %v — force-close path not reached promptly", d)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Stop did not return — force-close path not reached")
+	}
+
+	// The force-close must cancel the parked handler's request context.
+	select {
+	case <-released:
+	case <-time.After(5 * time.Second):
+		t.Fatal("handler still parked after Stop — connection was not force-closed")
+	}
+
+	// And the in-flight client must see the dropped connection: either the
+	// request itself errored, or reading the (chunked, unterminated) body fails.
+	select {
+	case r := <-reqDone:
+		if r.err == nil {
+			_, readErr := io.ReadAll(r.resp.Body)
+			r.resp.Body.Close()
+			if readErr == nil {
+				t.Errorf("in-flight response completed cleanly; want a broken/closed connection")
+			}
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("in-flight request never returned after force-close")
 	}
 }
 
