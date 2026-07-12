@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -1110,23 +1111,9 @@ func (c *Controller) scheduleRefresh(dir string) {
 }
 
 func (c *Controller) refreshFromIndex(dir string) {
-	var entries []cache.Entry
-	switch {
-	case dir == FavoritesView:
-		entries = c.index.ListFavorites()
-	case dir == TrashView:
-		entries = cache.ListTrash(c.trashDir)
-	case strings.HasPrefix(dir, YearViewPrefix):
-		c.mu.Lock()
-		yearDirs := append([]string(nil), c.yearPreviewDirs...)
-		c.mu.Unlock()
-		for _, d := range yearDirs {
-			entries = append(entries, c.index.ListDir(d)...)
-		}
-	default:
-		entries = c.index.ListDir(dir)
-	}
-
+	// Snapshot the controller state this refresh reads once, up front, so the
+	// year-preview branch below can scope its query to a treeDir consistent with
+	// the yearPreviewDirs read in the same lock.
 	c.mu.Lock()
 	filter := c.mediaFilter
 	showRAW := c.showRAW
@@ -1134,7 +1121,34 @@ func (c *Controller) refreshFromIndex(dir string) {
 	treeDir := c.treeDir
 	root := c.libraryRoot
 	prevSubdirs := c.subdirs
+	yearDirs := append([]string(nil), c.yearPreviewDirs...)
 	c.mu.Unlock()
+
+	var entries []cache.Entry
+	switch {
+	case dir == FavoritesView:
+		entries = c.index.ListFavorites()
+	case dir == TrashView:
+		entries = cache.ListTrash(c.trashDir)
+	case strings.HasPrefix(dir, YearViewPrefix):
+		// U-08: resolve the year-preview union in a single covering-index query
+		// scoped to treeDir instead of one prefix-LIKE ListDir per date dir. The
+		// yearPreviewDirs are the YYYY-MM-DD children of treeDir bucketed under
+		// this year header, and each entry's year column is derived from that
+		// parent-dir name, so ListByYear(year, …, treeDir) returns exactly their
+		// union with the media filter pushed into SQL. A parse failure (the
+		// sentinel is always built from a YYYY string, so this shouldn't happen)
+		// falls back to the per-dir loop.
+		if y, err := strconv.Atoi(strings.TrimPrefix(dir, YearViewPrefix)); err == nil {
+			entries = c.index.ListByYear(y, filter, showRAW, treeDir)
+		} else {
+			for _, d := range yearDirs {
+				entries = append(entries, c.index.ListDir(d)...)
+			}
+		}
+	default:
+		entries = c.index.ListDir(dir)
+	}
 
 	var filtered []cache.Entry
 	for _, e := range entries {

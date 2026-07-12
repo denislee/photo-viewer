@@ -644,13 +644,32 @@ func (i *Index) Years(filter string, showRAW bool) []YearStat {
 	return out
 }
 
-// ListByYear returns entries whose year (per entryYear) equals year, filtered
-// by the same media-type rules as ui.passesFilter.
-func (i *Index) ListByYear(year int, filter string, showRAW bool) []Entry {
+// ListByYear returns entries whose year (per yearExpr) equals year, filtered by
+// the same media-type rules as ui.passesFilter. When dir is non-empty, results
+// are additionally scoped to the paths recursively under dir; an empty dir means
+// library-global.
+//
+// The dir scoping backs the sidebar's year-preview union (U-08): the date
+// folders bucketed under a YYYY header are the YYYY-MM-DD children of the tree
+// anchor (treeDir), and each entry's year column is derived from that same
+// parent-dir name, so `yearExpr = year AND path under treeDir` returns exactly
+// the union the old per-date-dir ListDir loop produced — in one query instead of
+// one prefix-LIKE query per shooting day. The `path >= ? AND path < ?` range
+// rides the trailing path column of idx_entries_yearexpr, so the year seek and
+// the path range stream off one ordered index with no temp b-tree; `ORDER BY
+// path` is likewise free off that index.
+func (i *Index) ListByYear(year int, filter string, showRAW bool, dir string) []Entry {
 
 	where, args := typeFilterClause(filter, showRAW)
-	q := "SELECT path, type, size, mtime, thumb_id, favorite, duration_ms FROM entries WHERE " + yearExpr + " = ?" + where + " ORDER BY path"
-	queryArgs := append([]any{year}, args...)
+	q := "SELECT path, type, size, mtime, thumb_id, favorite, duration_ms FROM entries WHERE " + yearExpr + " = ?"
+	queryArgs := []any{year}
+	if dir != "" {
+		lower, upper := dirRange(dir)
+		q += " AND path >= ? AND path < ?"
+		queryArgs = append(queryArgs, lower, upper)
+	}
+	q += where + " ORDER BY path"
+	queryArgs = append(queryArgs, args...)
 
 	rows, err := i.db.Query(q, queryArgs...)
 	if err != nil {
