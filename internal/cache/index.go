@@ -938,6 +938,26 @@ func (i *Index) IsFavorite(path string) bool {
 	return v != 0
 }
 
+// ToggleFavorite flips the favorite flag for path in one round-trip and returns
+// the new value. Collapsing the former IsFavorite (SELECT) + SetFavorite
+// (UPDATE) pair into a single `UPDATE ... RETURNING` statement halves the round
+// trips per star keystroke and makes the flip atomic against a concurrent scan
+// reconciling the same row — the SELECT-then-UPDATE pair could otherwise
+// interleave. RETURNING is supported by the embedded SQLite (>= 3.35).
+//
+// A missing path updates no rows, so QueryRow's Scan reports sql.ErrNoRows; the
+// caller treats that as "nothing toggled" and skips the in-memory patch.
+func (i *Index) ToggleFavorite(path string) (bool, error) {
+	var v int
+	if err := i.db.QueryRow(
+		"UPDATE entries SET favorite = 1 - favorite WHERE path = ? RETURNING favorite",
+		path,
+	).Scan(&v); err != nil {
+		return false, err
+	}
+	return v != 0, nil
+}
+
 // Clear empties the index in place — every entry, face, and face cluster is
 // deleted in a single transaction while the database file and connection stay
 // open. This is the "Rebuild index" primitive.

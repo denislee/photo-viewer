@@ -1002,18 +1002,80 @@ func (c *Controller) EmptyTrash(done func(count int, bytes int64, err error)) {
 	}()
 }
 
-// ToggleFavorite flips the favorite flag for path and refreshes the active
-// view so the change is visible immediately. Returns the new favorite state.
+// ToggleFavorite flips the favorite flag for path and reflects the change in
+// the grid + sidebar counts immediately. Returns the new favorite state.
+//
+// The DB flip is a single `UPDATE ... RETURNING` (one round-trip, atomic against
+// a concurrent scan) instead of the former IsFavorite (SELECT) + SetFavorite
+// (UPDATE) pair. The UI update is an in-memory patch (patchFavorite) rather than
+// a full refreshFromIndex: flipping one bit no longer re-runs ListDir over the
+// whole active directory plus the sidebar COUNT queries, so rating a 10k-photo
+// shoot with `f` stops re-querying and re-filtering 10k rows per keypress. The
+// full-refresh path is kept only for the favorites view, where un-favoriting
+// must actually remove the row from the grid.
 func (c *Controller) ToggleFavorite(path string) bool {
 	if path == "" {
 		return false
 	}
-	cur := c.index.IsFavorite(path)
-	if err := c.index.SetFavorite(path, !cur); err != nil {
-		return cur
+	newVal, err := c.index.ToggleFavorite(path)
+	if err != nil {
+		// No row for path (or a DB error): nothing flipped, nothing to patch.
+		return false
 	}
-	c.scheduleRefresh(c.activeDir())
-	return !cur
+	if c.activeDir() == FavoritesView {
+		// Un-favoriting here removes the row from the favorites listing, which
+		// only a full re-query can do — patch-in-place can't drop rows.
+		c.scheduleRefresh(FavoritesView)
+		return newVal
+	}
+	c.patchFavorite(path, newVal)
+	return newVal
+}
+
+// patchFavorite is the in-memory mirror of "path's favorite flag flipped to
+// newVal" — it flips Favorite on the matching c.entries element and adjusts the
+// cached FavoritesView count by ±1 without a full refresh. Mirrors
+// patchLocalDeletion's clone-swap discipline: c.entries gets a fresh backing
+// array (Snapshot hands the slice header out and other goroutines may still be
+// reading the old one) and dirCounts is clone-swapped (the sidebar reads the
+// published map lock-free every frame, so mutating it in place would race that
+// reader). Wakes the UI.
+func (c *Controller) patchFavorite(path string, newVal bool) {
+	c.mu.Lock()
+	// Flip Favorite on the matching displayed entry so its star repaints
+	// without a ListDir round-trip. New backing array — Snapshot returns
+	// c.entries directly and callers may still be reading the old slice header.
+	for idx := range c.entries {
+		if c.entries[idx].Path == path {
+			if c.entries[idx].Favorite != newVal {
+				next := make([]cache.Entry, len(c.entries))
+				copy(next, c.entries)
+				next[idx].Favorite = newVal
+				c.entries = next
+			}
+			break
+		}
+	}
+	// The DB flip changed the favorites total by exactly ±1; mirror that delta
+	// into the sidebar's cached count. Clone-swap rather than mutate in place —
+	// see the c.entries note above and bumpTrashCount.
+	if c.dirCounts != nil {
+		next := maps.Clone(c.dirCounts)
+		if newVal {
+			next[FavoritesView]++
+		} else {
+			next[FavoritesView]--
+			if next[FavoritesView] < 0 {
+				next[FavoritesView] = 0
+			}
+		}
+		c.dirCounts = next
+		c.dirCountsVer++
+	}
+	c.mu.Unlock()
+	if c.invalidate != nil {
+		c.invalidate()
+	}
 }
 
 // scheduleRefresh asks for a refreshFromIndex against dir, coalescing with any
