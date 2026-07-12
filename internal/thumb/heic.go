@@ -111,8 +111,11 @@ func decodeHEIC(ctx context.Context, src, tmpDir string) (string, error) {
 	if haveFfmpeg() {
 		out := filepath.Join(tmpDir, "ff-out.jpg")
 		var stderr bytes.Buffer
+		// -threads 1 (before -i) caps the HEVC-intra decoder — a single-frame
+		// HEIC decode needs no parallel threads, and this path runs under the
+		// store's oversized extSem (C-06).
 		cmd := exec.CommandContext(ctx, "ffmpeg", "-y", "-loglevel", "error",
-			"-i", src, "-frames:v", "1", "-update", "1", out)
+			"-threads", "1", "-i", src, "-frames:v", "1", "-update", "1", out)
 		cmd.Stderr = &stderr
 		if err := cmd.Run(); err == nil {
 			if _, statErr := os.Stat(out); statErr == nil {
