@@ -763,9 +763,20 @@ func (s *Server) handleAPIFavorite(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "unsupported media type", http.StatusUnsupportedMediaType)
 		return
 	}
-	origin := r.Header.Get("Origin")
+	// Browsers append Origin to every non-GET/HEAD request, including
+	// same-origin POSTs (per the Fetch standard). Rejecting any non-empty
+	// Origin would 403 every real-browser favorite toggle, so treat an
+	// Origin whose host matches the page host (r.Host) as same-origin and
+	// only reject a genuine cross-origin one.
+	if origin := r.Header.Get("Origin"); origin != "" {
+		u, err := url.Parse(origin)
+		if err != nil || u.Host != r.Host {
+			http.Error(w, "forbidden", http.StatusForbidden)
+			return
+		}
+	}
 	secFetch := r.Header.Get("Sec-Fetch-Site")
-	if origin != "" || (secFetch != "" && secFetch != "same-origin" && secFetch != "none") {
+	if secFetch != "" && secFetch != "same-origin" && secFetch != "none" {
 		http.Error(w, "forbidden", http.StatusForbidden)
 		return
 	}

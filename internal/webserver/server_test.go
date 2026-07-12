@@ -422,6 +422,70 @@ func TestAPIFavoriteRejectsCrossOrigin(t *testing.T) {
 	}
 }
 
+// TestAPIFavoriteAcceptsSameOrigin guards W-01: real browsers send an Origin
+// header matching the page host on same-origin POSTs, and the handler must
+// accept those (and actually flip the flag) rather than 403 them.
+func TestAPIFavoriteAcceptsSameOrigin(t *testing.T) {
+	tmp, err := os.MkdirTemp("", "pv-api-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(tmp)
+
+	idx, err := cache.Load(filepath.Join(tmp, "index.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer idx.Close()
+	store, err := cache.NewThumbStore(tmp)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	mediaPath := filepath.Join(tmp, "IMG_0001.jpg")
+	idx.ReconcileBatch([]scan.Result{{
+		Path:    mediaPath,
+		Type:    scan.TypePhoto,
+		Size:    3,
+		ModTime: time.Now(),
+	}})
+	id := cache.ThumbIDFor(mediaPath)
+
+	s := New(idx, store, tmp)
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/favorite", s.handleAPIFavorite)
+	ts := httptest.NewServer(mux)
+	defer ts.Close()
+
+	body := strings.NewReader(`{"id":"` + id + `","on":true}`)
+	req, _ := http.NewRequest(http.MethodPost, ts.URL+"/api/favorite", body)
+	req.Header.Set("Content-Type", "application/json")
+	// A browser fetch() to the same origin carries these headers.
+	req.Header.Set("Origin", ts.URL)
+	req.Header.Set("Sec-Fetch-Site", "same-origin")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (OK)", resp.StatusCode)
+	}
+	var got struct {
+		ID       string `json:"id"`
+		Favorite bool   `json:"favorite"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&got); err != nil {
+		t.Fatal(err)
+	}
+	if !got.Favorite {
+		t.Errorf("response favorite = false, want true")
+	}
+	if e, ok := idx.GetEntryByThumbID(id); !ok || !e.Favorite {
+		t.Errorf("favorite not persisted: ok=%v favorite=%v", ok, e.Favorite)
+	}
+}
+
 func TestContentDispositionEscapesQuote(t *testing.T) {
 	tmp, err := os.MkdirTemp("", "pv-media-")
 	if err != nil {
