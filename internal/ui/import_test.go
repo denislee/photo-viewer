@@ -67,3 +67,16 @@ func TestWriteFileDurableNoPartialOnError(t *testing.T) {
 		t.Errorf("partial .tmp left behind (stat err: %v)", statErr)
 	}
 }
+
+// TestSyncDir confirms the U-13 helper opens and fsyncs a real directory and
+// surfaces an error for a missing one (so a move never unlinks its source on a
+// silently-failed dir sync). The durability itself is a crash-consistency
+// property, verified by review against internal/export's moveFile.
+func TestSyncDir(t *testing.T) {
+	if err := syncDir(t.TempDir()); err != nil {
+		t.Errorf("syncDir on a real dir: %v", err)
+	}
+	if err := syncDir(filepath.Join(t.TempDir(), "does-not-exist")); err == nil {
+		t.Error("syncDir on a missing dir: want error, got nil")
+	}
+}

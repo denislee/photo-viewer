@@ -1135,7 +1135,15 @@ func (v *ImportView) runImport(ctx context.Context, cfg Config, importDirs, zipF
 				}
 				batch = append(batch, dest)
 				if deleteSrc {
-					if err := os.Remove(srcFile); err != nil {
+					// copyFile fsynced the Inbox copy's data; fsync the Inbox
+					// directory too so its entry is durable before we delete the
+					// source (the only other copy). On sync failure, keep the
+					// source rather than risk zero copies — the Inbox copy is
+					// already queued in batch, so no bytes are lost either way.
+					if err := syncDir(filepath.Dir(dest)); err != nil {
+						atomic.AddInt64(&v.statErrors, 1)
+						v.appendLog("[ERROR] Failed to fsync Inbox before deleting source " + srcFile + ": " + err.Error())
+					} else if err := os.Remove(srcFile); err != nil {
 						atomic.AddInt64(&v.statErrors, 1)
 						v.appendLog("[ERROR] Failed to delete source " + srcFile + ": " + err.Error())
 					}
@@ -1295,7 +1303,13 @@ func (v *ImportView) processBatch(ctx context.Context, outboxDir string, entries
 			// Gate strictly on EXDEV so genuine errors (permission denied,
 			// disk full) still surface as failures instead of silent copies.
 			if moveErr = copyFile(src, dest); moveErr == nil {
-				moveErr = os.Remove(src)
+				// Fsync the destination directory so the copy's directory entry
+				// is durable before we unlink the source — otherwise a power
+				// loss could lose the entry even though copyFile synced the
+				// data, leaving zero copies of the file.
+				if moveErr = syncDir(filepath.Dir(dest)); moveErr == nil {
+					moveErr = os.Remove(src)
+				}
 			}
 		}
 		if moveErr != nil {
@@ -1436,6 +1450,22 @@ func copyFile(src, dst string) error {
 	}
 	defer in.Close()
 	return writeFileDurable(dst, in)
+}
+
+// syncDir fsyncs a directory so a rename/create within it is itself durable.
+// copyFile/writeFileDurable fsync the file's *data* before the rename, but the
+// rename only adds a directory entry — on a crash that entry can still be lost
+// even though the bytes survived. When copyFile is used as a *move* (the source
+// is unlinked afterwards), that lost entry would leave zero copies, so callers
+// fsync the destination directory before dropping the source. Mirrors
+// internal/export/favorites.go's syncDir.
+func syncDir(dir string) error {
+	d, err := os.Open(dir)
+	if err != nil {
+		return err
+	}
+	defer d.Close()
+	return d.Sync()
 }
 
 // writeFileDurable streams r into dst crash-safely: it writes into a sibling
