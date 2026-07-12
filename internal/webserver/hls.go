@@ -297,19 +297,51 @@ func (s *Server) hlsInit() {
 	})
 }
 
+// probeDurationFn is the ffprobe indirection hlsDuration uses. It's a package
+// var only so tests can substitute a deterministic stub without an ffprobe
+// binary and count how often the probe actually forks; production never
+// reassigns it.
+var probeDurationFn = probeDuration
+
 // hlsDuration returns the source video's duration in seconds. It prefers the
 // DurationMs the scanner already recorded on the index row (no fork) and only
 // falls back to an ffprobe for entries indexed without one (e.g. via a walk
 // that skipped the duration probe). Returns 0 when the duration can't be found.
+//
+// On a successful fallback probe of an *indexed* entry it persists the result
+// via Index.SetDurationMs, so subsequent playlist and segment requests for the
+// same file read the duration off the row instead of re-forking ffprobe (and so
+// serveHLSSegment can bound out-of-range segments, which it skips while the
+// duration is unknown). Trash entries have no index row and stay probe-only, so
+// they're excluded from the write. The persistence is a pure side effect: the
+// return value is identical to what a probe-only implementation would yield.
 func (s *Server) hlsDuration(ctx context.Context, e cache.Entry) float64 {
 	if e.DurationMs > 0 {
 		return float64(e.DurationMs) / 1000.0
 	}
-	dur, err := probeDuration(ctx, e.Path)
+	dur, err := probeDurationFn(ctx, e.Path)
 	if err != nil {
 		return 0
 	}
+	// Persist only a real, positive duration for an indexed (non-trash) entry.
+	// A non-positive probe result is left unpersisted (SetDurationMs would
+	// ignore it anyway) so the "unknown" sentinel is never cemented.
+	if dur > 0 && !s.isTrashPath(e.Path) {
+		if perr := s.index.SetDurationMs(e.Path, int64(math.Round(dur*1000))); perr != nil {
+			log.Printf("webserver: HLS: persist probed duration for %s: %v", e.Path, perr)
+		}
+	}
 	return dur
+}
+
+// isTrashPath reports whether path lives inside the server's trash directory.
+// Trash entries are read straight from that directory and have no index row, so
+// their probed durations must not be persisted — there's nothing to UPDATE.
+func (s *Server) isTrashPath(path string) bool {
+	if s.trashDir == "" {
+		return false
+	}
+	return path == s.trashDir || strings.HasPrefix(path, s.trashDir+string(filepath.Separator))
 }
 
 // maybeSweepHLS launches an asynchronous HLS cache sweep at most once per

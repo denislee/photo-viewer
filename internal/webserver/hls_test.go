@@ -297,6 +297,100 @@ func TestHLSSegmentHonorsCancellation(t *testing.T) {
 	}
 }
 
+// TestHLSDurationPersistsProbe is the W-06 write-back guard. A duration-less
+// indexed entry falls back to ffprobe on its first playlist/segment request;
+// the probed result is persisted to the row so later requests read it off the
+// index instead of re-forking ffprobe. The probe is stubbed (no ffprobe binary
+// needed) and its forks counted.
+func TestHLSDurationPersistsProbe(t *testing.T) {
+	s, id, cleanup := indexedVideoServer(t, 0) // duration-less on purpose
+	defer cleanup()
+
+	e, ok := s.lookupEntry(id)
+	if !ok {
+		t.Fatal("video entry not found")
+	}
+	if e.DurationMs != 0 {
+		t.Fatalf("fixture DurationMs = %d, want 0", e.DurationMs)
+	}
+
+	var probes int
+	orig := probeDurationFn
+	probeDurationFn = func(_ context.Context, _ string) (float64, error) {
+		probes++
+		return 12.0, nil
+	}
+	defer func() { probeDurationFn = orig }()
+
+	// First call: falls back to the probe and persists the 12s result.
+	if got := s.hlsDuration(context.Background(), e); got != 12.0 {
+		t.Fatalf("first hlsDuration = %v, want 12", got)
+	}
+	if probes != 1 {
+		t.Fatalf("probe forks after first call = %d, want 1", probes)
+	}
+
+	// The index row now carries the probed duration (12s -> 12000ms).
+	persisted, ok := s.lookupEntry(id)
+	if !ok {
+		t.Fatal("entry vanished from index")
+	}
+	if persisted.DurationMs != 12000 {
+		t.Errorf("persisted DurationMs = %d, want 12000", persisted.DurationMs)
+	}
+
+	// Second call with the re-fetched entry: reads the fresh row (DurationMs >
+	// 0) and must NOT re-fork the probe — the whole point of W-06.
+	if got := s.hlsDuration(context.Background(), persisted); got != 12.0 {
+		t.Fatalf("second hlsDuration = %v, want 12", got)
+	}
+	if probes != 1 {
+		t.Errorf("probe forks after second call = %d, want 1 (index read must not re-fork)", probes)
+	}
+}
+
+// TestHLSDurationSkipsPersistForTrash guards the trash case: a trashed video
+// has no index row, so a probed duration must not be persisted (there's nothing
+// to UPDATE) and every request stays probe-only.
+func TestHLSDurationSkipsPersistForTrash(t *testing.T) {
+	s, _, cleanup := indexedVideoServer(t, 0)
+	defer cleanup()
+	if s.trashDir == "" {
+		t.Fatal("test server has no trash dir")
+	}
+
+	// A synthetic trash-dir entry, shaped like ListTrash's output: a path under
+	// the trash dir with no matching index row and no recorded duration.
+	trashEntry := cache.Entry{
+		Path:       filepath.Join(s.trashDir, "20260101T000000-deadbeef-clip.mkv"),
+		Type:       scan.TypeVideo,
+		DurationMs: 0,
+	}
+
+	var probes int
+	orig := probeDurationFn
+	probeDurationFn = func(_ context.Context, _ string) (float64, error) {
+		probes++
+		return 9.0, nil
+	}
+	defer func() { probeDurationFn = orig }()
+
+	if got := s.hlsDuration(context.Background(), trashEntry); got != 9.0 {
+		t.Fatalf("first hlsDuration = %v, want 9", got)
+	}
+	// Nothing must have been written to the index for the trash path.
+	if _, ok := s.index.GetEntryByThumbID(cache.ThumbIDFor(trashEntry.Path)); ok {
+		t.Error("trash entry unexpectedly written to the index")
+	}
+	// With nothing persisted to short-circuit it, a second call must re-probe.
+	if got := s.hlsDuration(context.Background(), trashEntry); got != 9.0 {
+		t.Fatalf("second hlsDuration = %v, want 9", got)
+	}
+	if probes != 2 {
+		t.Errorf("probe forks = %d, want 2 (trash entry must stay probe-only)", probes)
+	}
+}
+
 func TestSweepHLSDir(t *testing.T) {
 	root := t.TempDir()
 	now := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)

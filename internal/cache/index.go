@@ -948,6 +948,24 @@ func (i *Index) SetFavorite(path string, favorite bool) error {
 	return err
 }
 
+// SetDurationMs records a video's playback length (in milliseconds) on its
+// index row. The HLS handler calls this after an ffprobe fallback so later
+// playlist/segment requests read the duration straight off the row instead of
+// re-forking ffprobe — and so serveHLSSegment can bound out-of-range segment
+// requests, which it skips while the duration is unknown.
+//
+// A non-positive ms is ignored: 0 is the "duration unknown" sentinel the
+// reconcile upsert deliberately preserves, so a bogus probe must never
+// overwrite a real value (or a placeholder) with it. A path with no matching
+// row updates nothing (e.g. a trash entry), which is harmless.
+func (i *Index) SetDurationMs(path string, ms int64) error {
+	if ms <= 0 {
+		return nil
+	}
+	_, err := i.db.Exec("UPDATE entries SET duration_ms = ? WHERE path = ?", ms, path)
+	return err
+}
+
 // IsFavorite reports whether a path is flagged as a favorite.
 func (i *Index) IsFavorite(path string) bool {
 	var v int
