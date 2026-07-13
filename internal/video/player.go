@@ -125,10 +125,10 @@ type Player struct {
 	// that must NOT take mu is the render-update / wakeup callbacks: mpv can
 	// fire them synchronously from inside a command we're issuing under the
 	// lock, so they stay lock-free (they only touch atomics + invalidate).
-	mu       sync.Mutex
-	buf      *image.RGBA // reused across frames; reallocated on size change
-	closed   atomic.Bool
-	loaded   atomic.Bool
+	mu        sync.Mutex
+	buf       *image.RGBA // reused across frames; Pix capacity reused across size changes, freed on Stop
+	closed    atomic.Bool
+	loaded    atomic.Bool
 	drainDone chan struct{} // closed when drainEvents returns
 	// current holds the path of the file currently loaded. Read by the UI
 	// goroutine (Current) and written by Load/Stop on whichever goroutine
@@ -319,6 +319,10 @@ func (p *Player) Stop() {
 	C.command_str(p.h, cs)
 	p.loaded.Store(false)
 	p.current.Store(nil)
+	// Drop the frame buffer: after leaving a video we'd otherwise retain a
+	// window-sized RGBA (~33 MB for a 4K window) for the rest of the session
+	// while the user browses photos.
+	p.releaseBuf()
 }
 
 // TogglePause toggles the pause property.
@@ -400,26 +404,60 @@ func (p *Player) Render(w, h int) (*image.RGBA, bool) {
 		return nil, false
 	}
 
-	if p.buf == nil || p.buf.Rect.Dx() != w || p.buf.Rect.Dy() != h {
-		p.buf = image.NewRGBA(image.Rect(0, 0, w, h))
-		// mpv's rgb0 SW format writes R, G, B at byte offsets 0, 1, 2 and
-		// leaves the 4th byte untouched. Pre-fill the alpha column to 0xff
-		// once at allocation time so the per-frame loop that used to scan
-		// every pixel (~480 MB/s of writes at 1080p60) goes away entirely.
-		pix := p.buf.Pix
-		for i := 3; i < len(pix); i += 4 {
-			pix[i] = 0xff
-		}
-	}
+	p.ensureBuf(w, h)
 
+	// Clear the "new frame pending" flag before the blit, not after. A render
+	// update callback firing between render_sw returning and this store would
+	// be lost if we cleared afterwards; clearing first means such a callback
+	// re-arms updatePending and the next wakeup redraws. Otherwise a video
+	// paused in that window could sit on one stale frame until the next
+	// callback.
+	p.updatePending.Store(false)
 	stride := C.size_t(p.buf.Stride)
 	rc := C.render_sw(p.ctx, C.int(w), C.int(h),
 		stride, unsafe.Pointer(&p.buf.Pix[0]))
 	if rc < 0 {
 		return nil, false
 	}
-	p.updatePending.Store(false)
 	return p.buf, true
+}
+
+// ensureBuf makes p.buf a w×h RGBA, reusing the existing backing array when
+// it is large enough rather than allocating a fresh one on every size change
+// (an interactive resize would otherwise reallocate every frame and churn the
+// GC). A shrink keeps the larger capacity, so a later grow back within it
+// reuses the same array too. mpv's rgb0 SW format writes only R, G, B per
+// pixel and leaves the 4th byte untouched, so the alpha column is pre-filled
+// to 0xff once per (re)size — the per-frame loop that used to scan every pixel
+// (~480 MB/s of writes at 1080p60) is gone. Caller must hold p.mu.
+func (p *Player) ensureBuf(w, h int) {
+	if p.buf != nil && p.buf.Rect.Dx() == w && p.buf.Rect.Dy() == h {
+		return // already the right size; alpha column already 0xff
+	}
+	// RGBA with no row padding: stride is exactly 4*w and the buffer is
+	// 4*w*h bytes, matching image.NewRGBA's own layout.
+	need := 4 * w * h
+	if p.buf != nil && cap(p.buf.Pix) >= need {
+		// Reslice the existing backing array (valid since need <= cap) and
+		// rebuild the header for the new dimensions.
+		p.buf = &image.RGBA{
+			Pix:    p.buf.Pix[:need],
+			Stride: 4 * w,
+			Rect:   image.Rect(0, 0, w, h),
+		}
+	} else {
+		p.buf = image.NewRGBA(image.Rect(0, 0, w, h))
+	}
+	pix := p.buf.Pix
+	for i := 3; i < len(pix); i += 4 {
+		pix[i] = 0xff
+	}
+}
+
+// releaseBuf drops the frame buffer so a large RGBA is not retained after
+// playback stops. Caller must hold p.mu.
+func (p *Player) releaseBuf() {
+	p.buf = nil
 }
 
 // NeedsRedraw reports whether mpv has signalled a new frame since the
