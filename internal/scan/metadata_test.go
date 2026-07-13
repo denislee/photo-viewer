@@ -9,6 +9,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"testing"
+	"time"
 )
 
 // TestExifJSONString covers the number/string coercion the "-j" reader relies
@@ -107,5 +108,79 @@ func TestGetMediaInfoParsesCameraAndLens(t *testing.T) {
 	}
 	if got := info.Created.Format("2006-01-02 15:04:05"); got != "2024-05-04 12:34:56" {
 		t.Errorf("Created = %q, want %q", got, "2024-05-04 12:34:56")
+	}
+}
+
+// TestGetMediaDateReadsMetadata asserts GetMediaDate returns the creation date
+// exiftool writes into a JPEG, and that it returns exactly what readMetadataDate
+// returns — the delegation invariant introduced by S-07. The file mtime is
+// pushed far away so a metadata miss couldn't masquerade as a hit. Gated on
+// exiftool.
+func TestGetMediaDateReadsMetadata(t *testing.T) {
+	if _, err := exec.LookPath("exiftool"); err != nil {
+		t.Skip("exiftool not installed; skipping metadata read test")
+	}
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "fixture.jpg")
+
+	img := image.NewRGBA(image.Rect(0, 0, 8, 8))
+	f, err := os.Create(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := jpeg.Encode(f, img, nil); err != nil {
+		f.Close()
+		t.Fatal(err)
+	}
+	f.Close()
+
+	cmd := exec.Command("exiftool", "-overwrite_original",
+		"-DateTimeOriginal=2024:05:04 12:34:56",
+		"-CreateDate=2024:05:04 12:34:56",
+		path)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("exiftool write failed: %v: %s", err, out)
+	}
+
+	// Push the mtime far from the metadata date: if the metadata read silently
+	// failed, GetMediaDate would fall back to this mtime and the assert below
+	// would catch it.
+	other := time.Date(2000, 1, 1, 0, 0, 0, 0, time.Local)
+	if err := os.Chtimes(path, other, other); err != nil {
+		t.Fatal(err)
+	}
+
+	got := GetMediaDate(path)
+	if g := got.Format("2006-01-02 15:04:05"); g != "2024-05-04 12:34:56" {
+		t.Errorf("GetMediaDate = %q, want %q", g, "2024-05-04 12:34:56")
+	}
+
+	// Delegation invariant: GetMediaDate must return exactly readMetadataDate's date.
+	rd, ok := readMetadataDate(path)
+	if !ok || !rd.Equal(got) {
+		t.Errorf("GetMediaDate = %v, readMetadataDate = %v (ok=%v); want identical", got, rd, ok)
+	}
+}
+
+// TestGetMediaDateFallsBackToModTime verifies the mtime fallback S-07 preserves:
+// when no metadata date is present, GetMediaDate returns the file's modification
+// time. No exiftool needed — a non-media file has none of the requested date
+// tags, so readMetadataDate reports a miss whether or not exiftool is installed.
+func TestGetMediaDateFallsBackToModTime(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "notes.txt")
+	if err := os.WriteFile(path, []byte("no metadata here"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Whole-second time to avoid filesystem sub-second truncation surprises.
+	want := time.Date(2021, 3, 14, 9, 26, 53, 0, time.Local)
+	if err := os.Chtimes(path, want, want); err != nil {
+		t.Fatal(err)
+	}
+
+	if got := GetMediaDate(path); !got.Equal(want) {
+		t.Errorf("GetMediaDate = %v, want file mtime %v", got, want)
 	}
 }
