@@ -121,9 +121,7 @@ func TestTaskLogConcurrentAppendDrain(t *testing.T) {
 
 	done := make(chan struct{})
 	var drainWG sync.WaitGroup
-	drainWG.Add(1)
-	go func() {
-		defer drainWG.Done()
+	drainWG.Go(func() {
 		for {
 			select {
 			case <-done:
@@ -135,7 +133,7 @@ func TestTaskLogConcurrentAppendDrain(t *testing.T) {
 				_ = l.lines()
 			}
 		}
-	}()
+	})
 
 	wg.Wait()
 	close(done)
@@ -181,13 +179,11 @@ func TestProgressModelConcurrentBump(t *testing.T) {
 	const workers = 8
 	const perWorker = 1000
 	for range workers {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+		wg.Go(func() {
 			for range perWorker {
 				p.bump()
 			}
-		}()
+		})
 	}
 	wg.Wait()
 
@@ -295,9 +291,7 @@ func TestProcScopeConcurrent(t *testing.T) {
 	var wg sync.WaitGroup
 	const goroutines = 40
 	for range goroutines {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+		wg.Go(func() {
 			proc := s.begin(ProcImport, "t", nil)
 			mu.Lock()
 			s.attachLocked(proc, nil)
@@ -312,7 +306,7 @@ func TestProcScopeConcurrent(t *testing.T) {
 			s.detachLocked(nil)
 			mu.Unlock()
 			proc.End()
-		}()
+		})
 	}
 	wg.Wait()
 

@@ -11,8 +11,8 @@ import (
 // pixel-for-pixel against the expected remap.
 func makeImage(w, h int) *image.RGBA {
 	img := image.NewRGBA(image.Rect(0, 0, w, h))
-	for y := 0; y < h; y++ {
-		for x := 0; x < w; x++ {
+	for y := range h {
+		for x := range w {
 			img.Set(x, y, color.RGBA{R: uint8(x), G: uint8(y), B: 0, A: 255})
 		}
 	}
@@ -72,8 +72,8 @@ func TestApplyPixelRemap(t *testing.T) {
 	}
 	for _, c := range cases {
 		dst := Apply(src, c.orientation)
-		for y := 0; y < h; y++ {
-			for x := 0; x < w; x++ {
+		for y := range h {
+			for x := range w {
 				dx, dy := c.remap(x, y)
 				if got, want := dst.At(dx, dy), src.At(x, y); got != want {
 					t.Fatalf("orientation %d: src(%d,%d) expected at dst(%d,%d): got %v want %v",
@@ -100,8 +100,8 @@ func TestApplyFlipCorner(t *testing.T) {
 // path (PNG-decoded sources) is exercised.
 func makeNRGBA(w, h int) *image.NRGBA {
 	img := image.NewNRGBA(image.Rect(0, 0, w, h))
-	for y := 0; y < h; y++ {
-		for x := 0; x < w; x++ {
+	for y := range h {
+		for x := range w {
 			img.Set(x, y, color.NRGBA{R: uint8(x), G: uint8(y), B: 0, A: 255})
 		}
 	}

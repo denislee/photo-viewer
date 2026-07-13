@@ -92,8 +92,8 @@ func Apply(img image.Image, orientation int) image.Image {
 	// YCbCr JPEG handed over without a downscale): a plain per-pixel At/Set
 	// remap. Correct for every image type, just slower.
 	dst := image.NewRGBA(orientedRect(b, orientation))
-	for y := 0; y < h; y++ {
-		for x := 0; x < w; x++ {
+	for y := range h {
+		for x := range w {
 			dx, dy := destXY(orientation, x, y, w, h)
 			dst.Set(dx, dy, img.At(b.Min.X+x, b.Min.Y+y))
 		}
@@ -139,9 +139,9 @@ func destXY(orientation, x, y, w, h int) (int, int) {
 // RGBA and NRGBA cases identically because both share the same 4-byte layout;
 // copying raw bytes preserves the exact colour, so this is a pure spatial remap.
 func remapPix(spix []uint8, sstride int, dpix []uint8, dstride, w, h, orientation int) {
-	for y := 0; y < h; y++ {
+	for y := range h {
 		so := y * sstride
-		for x := 0; x < w; x++ {
+		for x := range w {
 			dx, dy := destXY(orientation, x, y, w, h)
 			di := dy*dstride + dx*4
 			copy(dpix[di:di+4], spix[so:so+4])

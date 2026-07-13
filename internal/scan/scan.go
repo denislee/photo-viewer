@@ -72,10 +72,7 @@ func WalkWith(ctx context.Context, root string, opts WalkOptions) <-chan Result 
 		r Result
 	}
 
-	metaWorkers := runtime.NumCPU()
-	if metaWorkers < 4 {
-		metaWorkers = 4
-	}
+	metaWorkers := max(runtime.NumCPU(), 4)
 	probeWorkers := metaWorkers
 
 	jobs := make(chan work, metaWorkers*256)
@@ -83,10 +80,8 @@ func WalkWith(ctx context.Context, root string, opts WalkOptions) <-chan Result 
 	out := make(chan Result, metaWorkers*256)
 
 	var metaWG sync.WaitGroup
-	for i := 0; i < metaWorkers; i++ {
-		metaWG.Add(1)
-		go func() {
-			defer metaWG.Done()
+	for range metaWorkers {
+		metaWG.Go(func() {
 			for w := range jobs {
 				info, err := w.d.Info()
 				if err != nil {
@@ -145,14 +140,12 @@ func WalkWith(ctx context.Context, root string, opts WalkOptions) <-chan Result 
 					return
 				}
 			}
-		}()
+		})
 	}
 
 	var probeWG sync.WaitGroup
-	for i := 0; i < probeWorkers; i++ {
-		probeWG.Add(1)
-		go func() {
-			defer probeWG.Done()
+	for range probeWorkers {
+		probeWG.Go(func() {
 			for vr := range probe {
 				vr.r.DurationMs = probeVideoDurationMs(ctx, vr.r.Path)
 				select {
@@ -161,7 +154,7 @@ func WalkWith(ctx context.Context, root string, opts WalkOptions) <-chan Result 
 					return
 				}
 			}
-		}()
+		})
 	}
 
 	go func() {

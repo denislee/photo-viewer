@@ -721,6 +721,11 @@ func backfillYear(db *sql.DB) {
 			pending = append(pending, upd{path: p, year: y})
 		}
 	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		log.Printf("cache: backfillYear: %v", err)
+		return
+	}
 	rows.Close()
 	if len(pending) == 0 {
 		return

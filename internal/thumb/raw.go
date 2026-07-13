@@ -161,7 +161,7 @@ func presentPreviewTags(src string, candidates []string) []string {
 		return nil
 	}
 	found := make(map[string]bool, len(candidates))
-	for _, line := range strings.Split(string(out), "\n") {
+	for line := range strings.SplitSeq(string(out), "\n") {
 		if tag, _, ok := strings.Cut(line, ":"); ok {
 			found[strings.TrimSpace(tag)] = true
 		}

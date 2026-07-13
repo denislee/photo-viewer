@@ -319,10 +319,7 @@ func (t *Toolbar) DrawTooltipOverlay(gtx layout.Context, th *Theme, anchorRight 
 
 	w := lblDims.Size.X + padH*2
 	h := lblDims.Size.Y + padV*2
-	x0 := anchorRight - w
-	if x0 < 0 {
-		x0 = 0
-	}
+	x0 := max(anchorRight-w, 0)
 
 	// Background.
 	rect := image.Rect(x0, 0, x0+w, h)

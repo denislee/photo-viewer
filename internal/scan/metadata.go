@@ -270,8 +270,8 @@ func readMetadataDate(path string) (time.Time, bool) {
 	// fallback (S-06).
 	out, err := runExiftool("-s", "-S", "-CreateDate", "-DateTimeOriginal", "-MediaCreateDate", path)
 	if err == nil {
-		lines := strings.Split(strings.TrimSpace(string(out)), "\n")
-		for _, line := range lines {
+		lines := strings.SplitSeq(strings.TrimSpace(string(out)), "\n")
+		for line := range lines {
 			line = strings.TrimSpace(line)
 			if line == "" {
 				continue

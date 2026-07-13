@@ -163,8 +163,8 @@ func mountDevice(ctx context.Context, devPath string) (string, error) {
 		return "", fmt.Errorf("udisksctl mount: %s", strings.TrimSpace(text))
 	}
 	// "Mounted /dev/sdb1 at /run/media/user/SDCARD" (with optional trailing dot).
-	if i := strings.Index(text, " at "); i >= 0 {
-		mount := strings.TrimSpace(text[i+4:])
+	if _, after, ok := strings.Cut(text, " at "); ok {
+		mount := strings.TrimSpace(after)
 		mount = strings.TrimRight(mount, ".\n\r ")
 		if mount != "" {
 			return mount, nil

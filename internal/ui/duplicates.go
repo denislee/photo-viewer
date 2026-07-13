@@ -679,10 +679,7 @@ func (d *DuplicatesView) layoutProgress(gtx layout.Context, th *Theme, done, tot
 				if total <= 0 {
 					msg = "Preparing…"
 				} else {
-					pct := int(float32(done) / float32(total) * 100)
-					if pct > 100 {
-						pct = 100
-					}
+					pct := min(int(float32(done)/float32(total)*100), 100)
 					msg = fmt.Sprintf("%d / %d  (%d%%)", done, total, pct)
 				}
 				lbl := material.Label(th.Theme, unit.Sp(13), msg)

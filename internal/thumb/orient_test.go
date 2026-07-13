@@ -41,8 +41,8 @@ func exifAPP1(orientation byte) []byte {
 func writeJPEGWithOrientation(t *testing.T, path string, w, h int, orientation byte) {
 	t.Helper()
 	img := image.NewRGBA(image.Rect(0, 0, w, h))
-	for y := 0; y < h; y++ {
-		for x := 0; x < w; x++ {
+	for y := range h {
+		for x := range w {
 			img.Set(x, y, color.RGBA{R: uint8(x), G: uint8(y), B: 0, A: 255})
 		}
 	}

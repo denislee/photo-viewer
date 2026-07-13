@@ -61,7 +61,7 @@ func probeVideoDurationMs(ctx context.Context, path string) int64 {
 	if err != nil {
 		return 0
 	}
-	for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
+	for line := range strings.SplitSeq(strings.TrimSpace(string(out)), "\n") {
 		line = strings.TrimSpace(line)
 		if line == "" || line == "N/A" {
 			continue

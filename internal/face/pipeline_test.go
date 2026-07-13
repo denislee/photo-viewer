@@ -138,13 +138,11 @@ func TestDisabledPipelineIsNoOpAndStopSafe(t *testing.T) {
 	p.Start(context.Background()) // no-op
 
 	var wg sync.WaitGroup
-	for i := 0; i < 50; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+	for range 50 {
+		wg.Go(func() {
 			p.Submit(photoJob())
 			p.SubmitBlocking(context.Background(), photoJob())
-		}()
+		})
 	}
 
 	done := make(chan struct{})
@@ -178,10 +176,8 @@ func TestConcurrentSubmitDuringStopNoPanic(t *testing.T) {
 	p.cancel = cancel
 	p.mu.Unlock()
 	p.liveWorkers.Store(n)
-	for i := 0; i < n; i++ {
-		p.wg.Add(1)
-		go func() {
-			defer p.wg.Done()
+	for range n {
+		p.wg.Go(func() {
 			defer p.liveWorkers.Add(-1)
 			for {
 				select {
@@ -192,19 +188,17 @@ func TestConcurrentSubmitDuringStopNoPanic(t *testing.T) {
 				case <-jobs:
 				}
 			}
-		}()
+		})
 	}
 
 	var wg sync.WaitGroup
-	for i := 0; i < 8; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			for j := 0; j < 300; j++ {
+	for range 8 {
+		wg.Go(func() {
+			for range 300 {
 				p.Submit(photoJob())
 				_ = p.SubmitBlocking(ctx, photoJob())
 			}
-		}()
+		})
 	}
 
 	done := make(chan struct{})

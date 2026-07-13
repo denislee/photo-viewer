@@ -22,7 +22,7 @@ import (
 func seedDupFiles(t *testing.T, dir string, n int) []scan.Result {
 	t.Helper()
 	out := make([]scan.Result, 0, n*2)
-	for i := 0; i < n; i++ {
+	for i := range n {
 		// Distinct bytes per pair → distinct quick hash across pairs; identical
 		// within a pair → they collide and reach the full-hash phase.
 		content := bytes.Repeat([]byte{byte(i), 0xab, 0xcd}, quickHashWindow) // ~192 KiB
@@ -47,7 +47,7 @@ func seedDupFiles(t *testing.T, dir string, n int) []scan.Result {
 // a baseline.
 func settleGoroutines() int {
 	min := 1 << 30
-	for i := 0; i < 10; i++ {
+	for range 10 {
 		runtime.GC()
 		time.Sleep(20 * time.Millisecond)
 		if n := runtime.NumGoroutine(); n < min {
@@ -61,7 +61,7 @@ func settleGoroutines() int {
 // count drops to <= target, returning the final count and whether it settled
 // within the timeout.
 func waitGoroutinesLE(target int) (int, bool) {
-	for i := 0; i < 200; i++ {
+	for range 200 {
 		runtime.GC()
 		if n := runtime.NumGoroutine(); n <= target {
 			return n, true

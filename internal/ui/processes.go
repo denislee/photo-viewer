@@ -90,8 +90,8 @@ type Process struct {
 
 	mu     sync.Mutex
 	status string
-	done   int64
-	total  int64
+	done   atomic.Int64
+	total  atomic.Int64
 
 	gate   *PauseGate
 	cancel func()
@@ -107,17 +107,17 @@ func (p *Process) SetStatus(s string) {
 }
 
 func (p *Process) SetTotal(t int64) {
-	atomic.StoreInt64(&p.total, t)
+	p.total.Store(t)
 	p.registry.notify()
 }
 
 func (p *Process) SetDone(d int64) {
-	atomic.StoreInt64(&p.done, d)
+	p.done.Store(d)
 	p.registry.notify()
 }
 
 func (p *Process) AddDone(delta int64) {
-	atomic.AddInt64(&p.done, delta)
+	p.done.Add(delta)
 	p.registry.notify()
 }
 
@@ -356,8 +356,8 @@ func (r *ProcessRegistry) Snapshot() []ProcessSnapshot {
 			Kind:    p.Kind,
 			Title:   p.Title,
 			Status:  status,
-			Done:    atomic.LoadInt64(&p.done),
-			Total:   atomic.LoadInt64(&p.total),
+			Done:    p.done.Load(),
+			Total:   p.total.Load(),
 			Paused:  p.IsPaused(),
 			Started: p.Started,
 		}
