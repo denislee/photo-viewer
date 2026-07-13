@@ -1025,6 +1025,20 @@ func (i *Index) Close() error {
 	}
 	i.stmtMu.Unlock()
 	if i.db != nil {
+		// PRAGMA optimize is SQLite's documented, cheap incremental pattern for
+		// keeping the query planner's statistics current: it inspects the schema
+		// and only runs ANALYZE on the tables/indexes whose row estimates have
+		// drifted far enough to matter, so on an unchanged database it does
+		// essentially no work. Running it on the still-open handle, after the
+		// prepared statements above are closed and just before the final Close,
+		// folds this session's insert/delete churn into the stats the next open
+		// starts from — the planner otherwise runs stat-less for the life of
+		// every DB (C-09). Best-effort: a failure must not stop Close from
+		// releasing the connection, so it is logged, not returned (matching the
+		// package's log-and-continue convention for read paths).
+		if _, err := i.db.Exec("PRAGMA optimize"); err != nil {
+			log.Printf("cache: Close: PRAGMA optimize: %v", err)
+		}
 		return i.db.Close()
 	}
 	return nil
