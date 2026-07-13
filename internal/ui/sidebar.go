@@ -104,6 +104,21 @@ func NewSidebar() *Sidebar {
 	return s
 }
 
+// visibleRange returns the [start, end) row window to drain pointer events
+// for, given a vertical layout.List's Position.First/Count and the total row
+// count n. Rows outside this window weren't laid out last frame and so can't
+// hold a pending press; polling only the window turns O(rows) event probes
+// into O(visible). The one-row margin on each side keeps a click registering
+// even right after a fast scroll nudges the pressed row a row out of view.
+func visibleRange(first, count, n int) (start, end int) {
+	start = max(first-1, 0)
+	end = min(first+count+1, n)
+	if start > end {
+		start = end
+	}
+	return start, end
+}
+
 type sidebarRow struct {
 	label string
 	path  string
@@ -161,7 +176,15 @@ func (s *Sidebar) Layout(gtx layout.Context, th *Theme, root, treeDir, highlight
 	if s.Selected < 0 {
 		s.Selected = 0
 	}
-	for _, t := range s.tags {
+	// Drain click events only for the rows laid out last frame. Rows outside
+	// the visible window can't have received new pointer events (they weren't
+	// laid out), so polling every tag is wasted work — and with year-grouping
+	// expanded the sidebar can reach thousands of rows. Mirrors the grid's
+	// I-19 fix; the ±1-row margin keeps clicks registering right after a fast
+	// scroll moves the pressed row a row out of the window.
+	start, end := visibleRange(s.list.Position.First, s.list.Position.Count, len(s.tags))
+	for i := start; i < end; i++ {
+		t := s.tags[i]
 		for {
 			// Press must be in Kinds for Gio to track the gesture so the
 			// matching Release fires on the same target.

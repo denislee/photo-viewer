@@ -517,7 +517,15 @@ func (v *FuzzySearchView) Layout(gtx layout.Context, th *Theme) layout.Dimension
 		}
 		v.rowTags[i].idx = i
 	}
-	for _, t := range v.rowTags {
+	// Drain click events only for the rows laid out last frame. Results
+	// outside the visible window can't have received new pointer events (they
+	// weren't laid out), so polling all 500 result tags every frame is wasted
+	// work — and it's paid continuously while the palette is open, exactly
+	// when frames are busiest. Mirrors the grid's I-19 fix; the ±1-row margin
+	// keeps clicks registering right after a fast scroll.
+	start, end := visibleRange(v.list.Position.First, v.list.Position.Count, len(v.rowTags))
+	for i := start; i < end; i++ {
+		t := v.rowTags[i]
 		for {
 			ev, ok := gtx.Event(pointer.Filter{Target: t, Kinds: pointer.Press | pointer.Release})
 			if !ok {
