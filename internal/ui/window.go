@@ -160,7 +160,7 @@ func Run(w *app.Window, ctrl *Controller) error {
 	toolbar.OnRebuild = func() {
 		go func() {
 			if err := ctrl.Rebuild(); err != nil {
-				return
+				ctrl.surfaceError("rebuild index", err)
 			}
 		}()
 	}

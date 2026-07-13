@@ -430,28 +430,50 @@ func (c *Controller) Rebuild() error {
 	}
 	// Forget every generated thumbnail so they regenerate from the rescanned
 	// originals. Thumbs live under cacheDir (always writable), so this works
-	// even when the library root itself is read-only.
+	// even when the library root itself is read-only. This is a hard failure:
+	// the grid renders straight from these thumbs, so pressing on with stale
+	// ones would show wrong images for re-derived originals — abort so the
+	// caller can surface it, with the index already cleared but no half-wiped
+	// thumb store served.
 	if err := os.RemoveAll(filepath.Join(c.cacheDir, "thumbs")); err != nil {
 		return err
 	}
-	// Drop the on-the-fly HLS transcode cache too. Segments there are keyed by
-	// thumb id + source mtime, so a rebuild that re-derives them from changed
-	// originals must not keep serving stale segments — and, unlike the
-	// per-request staleness check, this reclaims the whole tree (including any
+	// Drop the on-the-fly HLS transcode cache and the larger browser-viewer
+	// renditions (W-03) too. Both are keyed by thumb id + source mtime, so a
+	// rebuild that re-derives them from changed originals must not keep serving
+	// stale segments/images; this also reclaims the whole trees (including any
 	// crash-orphaned .tmp files) that would otherwise grow unbounded on the
-	// media drive. Best-effort: the dir may not exist if the webserver never ran.
-	if err := os.RemoveAll(filepath.Join(c.cacheDir, "hls")); err != nil {
-		return err
-	}
-	// Drop the larger browser-viewer renditions too (W-03). They're keyed on
-	// thumb id + source mtime like thumbs, so a rebuild that re-derives them
-	// from changed originals must not keep serving stale display images.
-	// Best-effort: the dir may not exist if the webserver never ran.
-	if err := os.RemoveAll(filepath.Join(c.cacheDir, "display")); err != nil {
-		return err
+	// media drive. Unlike the index and thumbs above, these are webserver-only
+	// caches whose per-request staleness check already guards correctness, so a
+	// wipe failure here is best-effort: log and press on to the rescan rather
+	// than aborting with a cleared index and no rebuild in flight. Each dir may
+	// also simply not exist if the webserver never ran (RemoveAll no-ops then).
+	for _, sub := range []string{"hls", "display"} {
+		if err := os.RemoveAll(filepath.Join(c.cacheDir, sub)); err != nil {
+			log.Printf("rebuild: clear %s cache: %v", sub, err)
+		}
 	}
 	go c.scanInto(ctx, c.libraryRoot)
 	return nil
+}
+
+// surfaceError records err as the controller's last error — the value the
+// index-info modal shows via IndexStatus.LastError — after logging it under
+// label, then requests a redraw so the message appears without waiting for the
+// next scan flush. Used by fire-and-forget goroutines (e.g. the Rebuild button
+// handler) whose failures would otherwise vanish. Safe to call from any
+// goroutine; scanLastErr is guarded by c.mu like the other status fields.
+func (c *Controller) surfaceError(label string, err error) {
+	if err == nil {
+		return
+	}
+	log.Printf("%s: %v", label, err)
+	c.mu.Lock()
+	c.scanLastErr = err.Error()
+	c.mu.Unlock()
+	if c.invalidate != nil {
+		c.invalidate()
+	}
 }
 
 // PreviewDir refreshes the grid with path's contents without changing the
