@@ -17,6 +17,7 @@ import (
 	_ "golang.org/x/image/tiff"
 	_ "golang.org/x/image/webp"
 
+	"github.com/dns/photo-viewer/internal/imgfit"
 	"github.com/dns/photo-viewer/internal/imgorient"
 	"github.com/dns/photo-viewer/internal/scan"
 )
@@ -85,11 +86,11 @@ func recompressImage(src, dst string, maxEdge, quality int) error {
 	// copy path keeps the original bytes incl. the EXIF tag, so it doesn't need
 	// this.) Orient *after* the downscale (S-04): rotation commutes with
 	// scaling, so the remap runs on the small output, not the full-res source.
-	// fitWithin is fed the stored dims; for the transpose orientations (5–8) the
+	// imgfit.Within is fed the stored dims; for the transpose orientations (5–8) the
 	// output's axes swap, both staying ≤ maxEdge.
 	orient := imgorient.ReadOrientation(src)
 	b := img.Bounds()
-	tw, th := fitWithin(b.Dx(), b.Dy(), maxEdge)
+	tw, th := imgfit.Within(b.Dx(), b.Dy(), maxEdge)
 	scaled := image.NewRGBA(image.Rect(0, 0, tw, th))
 	draw.ApproxBiLinear.Scale(scaled, scaled.Rect, img, b, draw.Src, nil)
 	dstImg := imgorient.Apply(scaled, orient)
@@ -168,14 +169,4 @@ func recompressVideo(ctx context.Context, src, dst string, maxEdge, crf int) err
 		return fmt.Errorf("ffmpeg: %v: %s", err, strings.TrimSpace(string(out)))
 	}
 	return os.Rename(tmp, dst)
-}
-
-func fitWithin(w, h, maxEdge int) (int, int) {
-	if maxEdge <= 0 || (w <= maxEdge && h <= maxEdge) {
-		return w, h
-	}
-	if w >= h {
-		return maxEdge, maxEdge * h / w
-	}
-	return maxEdge * w / h, maxEdge
 }

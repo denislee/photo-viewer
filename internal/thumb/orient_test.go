@@ -82,7 +82,7 @@ func thumbSize(t *testing.T, path string) (int, int) {
 // scale-then-orient reordering: a landscape-stored photo with Orientation=6
 // (rotate 90° CW) must thumbnail to a *portrait* (transposed) image, while an
 // upright control stays landscape. A regression that dropped the orientation,
-// or fed fitWithin the wrong axes, would flip one of these.
+// or fed imgfit.Within the wrong axes, would flip one of these.
 func TestImageAppliesOrientationAfterScale(t *testing.T) {
 	dir := t.TempDir()
 

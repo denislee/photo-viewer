@@ -11,6 +11,8 @@ import (
 	"path/filepath"
 
 	"golang.org/x/image/draw"
+
+	"github.com/dns/photo-viewer/internal/imgfit"
 )
 
 // FaceThumbSize is the longest edge of a cached face crop. 96px is large
@@ -61,7 +63,7 @@ func EnsureThumb(cacheDir, srcThumb string, faceID int64, bbox [4]int) (string, 
 	// Scale straight from the sub-rect of src into the final RGBA — the
 	// scaler accepts a source rectangle, so the intermediate "cropped"
 	// RGBA the older code allocated and copied into was unnecessary.
-	tw, th := fitWithin(rect.Dx(), rect.Dy(), FaceThumbSize)
+	tw, th := imgfit.Within(rect.Dx(), rect.Dy(), FaceThumbSize)
 	scaled := image.NewRGBA(image.Rect(0, 0, tw, th))
 	draw.ApproxBiLinear.Scale(scaled, scaled.Bounds(), src, rect, draw.Src, nil)
 
@@ -84,14 +86,4 @@ func EnsureThumb(cacheDir, srcThumb string, faceID int64, bbox [4]int) (string, 
 		return "", err
 	}
 	return dst, nil
-}
-
-func fitWithin(w, h, m int) (int, int) {
-	if w <= m && h <= m {
-		return w, h
-	}
-	if w >= h {
-		return m, m * h / w
-	}
-	return m * w / h, m
 }

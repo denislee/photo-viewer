@@ -19,6 +19,7 @@ import (
 	_ "golang.org/x/image/tiff"
 	_ "golang.org/x/image/webp"
 
+	"github.com/dns/photo-viewer/internal/imgfit"
 	"github.com/dns/photo-viewer/internal/imgorient"
 )
 
@@ -161,7 +162,7 @@ var rgbaPool = sync.Pool{
 func writeThumb(src image.Image, dst string, size, orientation int) error {
 	b := src.Bounds()
 	w, h := b.Dx(), b.Dy()
-	tw, th := fitWithin(w, h, size)
+	tw, th := imgfit.Within(w, h, size)
 	thumb := rgbaPool.Get().(*image.RGBA)
 	defer rgbaPool.Put(thumb)
 
@@ -182,7 +183,7 @@ func writeThumb(src image.Image, dst string, size, orientation int) error {
 
 	// Bake EXIF orientation in *after* the downscale (S-04): rotation commutes
 	// with scaling, so remapping the small thumbnail costs (src/dst)² less than
-	// orienting the full-resolution source. fitWithin was fed the stored dims,
+	// orienting the full-resolution source. imgfit.Within was fed the stored dims,
 	// so for the transpose orientations (5–8) the output's axes swap here —
 	// both edges stay ≤ size, so it still fits. orientation==1 returns thumb
 	// untouched (the common case), so the pooled buffer is reused as-is.
@@ -194,14 +195,4 @@ func writeThumb(src image.Image, dst string, size, orientation int) error {
 	}
 	defer out.Close()
 	return jpeg.Encode(out, oriented, &jpeg.Options{Quality: 82})
-}
-
-func fitWithin(w, h, max int) (int, int) {
-	if w <= max && h <= max {
-		return w, h
-	}
-	if w >= h {
-		return max, max * h / w
-	}
-	return max * w / h, max
 }
