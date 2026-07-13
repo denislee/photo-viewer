@@ -112,6 +112,21 @@ func (i *Index) Generation() uint64 {
 	return i.generation.Load()
 }
 
+// addColumn runs an "ALTER TABLE ... ADD COLUMN ..." migration idempotently.
+// SQLite has no "ADD COLUMN IF NOT EXISTS", so re-opening a database that was
+// already migrated raises a "duplicate column name" error — that one case is
+// the benign "already migrated" path and is swallowed. Any OTHER error (I/O
+// failure, malformed database) is genuine and returned: ignoring it would leave
+// the column missing, so every subsequent multi-column SELECT errors and the
+// scan helpers return empty, surfacing as a mysteriously-empty library with no
+// trail (C-08).
+func addColumn(db *sql.DB, alterSQL string) error {
+	if _, err := db.Exec(alterSQL); err != nil && !strings.Contains(err.Error(), "duplicate column name") {
+		return err
+	}
+	return nil
+}
+
 // Load opens the SQLite database index.
 func Load(dbPath string) (*Index, error) {
 	// Open through pvDriverName so the mmap_size/temp_store PRAGMAs (carried by
@@ -138,13 +153,17 @@ func Load(dbPath string) (*Index, error) {
 	if err != nil {
 		return nil, err
 	}
-	// Migrate older databases that pre-date the content_hash column. The
-	// "duplicate column name" error is ignored on purpose.
-	_, _ = db.Exec("ALTER TABLE entries ADD COLUMN content_hash TEXT")
+	// Migrate older databases that pre-date the content_hash column. addColumn
+	// tolerates the benign "already migrated" case but propagates real failures.
+	if err := addColumn(db, "ALTER TABLE entries ADD COLUMN content_hash TEXT"); err != nil {
+		return nil, err
+	}
 	if _, err := db.Exec("CREATE INDEX IF NOT EXISTS idx_entries_hash ON entries(content_hash)"); err != nil {
 		return nil, err
 	}
-	_, _ = db.Exec("ALTER TABLE entries ADD COLUMN favorite INTEGER NOT NULL DEFAULT 0")
+	if err := addColumn(db, "ALTER TABLE entries ADD COLUMN favorite INTEGER NOT NULL DEFAULT 0"); err != nil {
+		return nil, err
+	}
 	// idx_entries_favorite_path (v6) is composite (favorite, path): the leading
 	// column serves `WHERE favorite = 1` and the trailing path lets the
 	// favorites page and viewer prev/next neighbor probes stream in path order
@@ -155,9 +174,15 @@ func Load(dbPath string) (*Index, error) {
 	if _, err := db.Exec("CREATE INDEX IF NOT EXISTS idx_entries_favorite_path ON entries(favorite, path)"); err != nil {
 		return nil, err
 	}
-	_, _ = db.Exec("ALTER TABLE entries ADD COLUMN quick_hash TEXT")
-	_, _ = db.Exec("ALTER TABLE entries ADD COLUMN year INTEGER")
-	_, _ = db.Exec("ALTER TABLE entries ADD COLUMN duration_ms INTEGER NOT NULL DEFAULT 0")
+	if err := addColumn(db, "ALTER TABLE entries ADD COLUMN quick_hash TEXT"); err != nil {
+		return nil, err
+	}
+	if err := addColumn(db, "ALTER TABLE entries ADD COLUMN year INTEGER"); err != nil {
+		return nil, err
+	}
+	if err := addColumn(db, "ALTER TABLE entries ADD COLUMN duration_ms INTEGER NOT NULL DEFAULT 0"); err != nil {
+		return nil, err
+	}
 
 	// idx_entries_thumb backs GetEntryByThumbID, which fronts every /thumb/,
 	// /media/, /view/, /hls/ and /api/* request. Without it that lookup was a
