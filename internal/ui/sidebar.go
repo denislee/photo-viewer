@@ -4,6 +4,7 @@ import (
 	"image"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"sort"
 	"strconv"
 
@@ -73,9 +74,8 @@ type Sidebar struct {
 	expandedRev     int // bumped by toggleYear; invalidates the memo
 	memoRoot        string
 	memoTreeDir     string
-	memoSubLen      int
-	memoSubFirst    string
-	memoCountsVer   uint64 // DirCountsWithVersion() tag; bumped on every map swap
+	memoSubdirs     []string // exact copy of the subdirs that produced memoRows
+	memoCountsVer   uint64   // DirCountsWithVersion() tag; bumped on every map swap
 	memoGroupByYear bool
 	memoExpandedRev int
 	memoRows        []sidebarRow
@@ -231,22 +231,24 @@ func (s *Sidebar) Layout(gtx layout.Context, th *Theme, root, treeDir, highlight
 func (s *Sidebar) buildRows(root, treeDir string, subdirs []string, counts map[string]int, countsVer uint64, groupByYear bool) (rows []sidebarRow) {
 	// Fast path: return the cached rows when nothing has changed. countsVer is
 	// the monotonic version from DirCountsWithVersion — it increments on every
-	// clone-swap, so a changed map always yields a different version.
-	subFirst := ""
-	if len(subdirs) > 0 {
-		subFirst = subdirs[0]
-	}
+	// clone-swap, so a changed map always yields a different version. subdirs is
+	// compared element-by-element (slices.Equal) rather than by len+first: a
+	// mid-scan rename that swaps a non-first subdir for an equal-count set would
+	// otherwise keep both invariants and serve stale rows. The extra string
+	// compares are noise next to the regex + sorts + map builds the memo saves.
 	if root == s.memoRoot && treeDir == s.memoTreeDir &&
-		len(subdirs) == s.memoSubLen && subFirst == s.memoSubFirst &&
+		slices.Equal(subdirs, s.memoSubdirs) &&
 		countsVer == s.memoCountsVer && groupByYear == s.memoGroupByYear &&
 		s.expandedRev == s.memoExpandedRev {
 		return s.memoRows
 	}
 
 	// On return from the slow path, update the memo so the next frame is fast.
+	// Store a clone of subdirs (the caller may mutate/reuse its backing array)
+	// so the stored key reflects exactly the input that produced these rows.
 	defer func() {
 		s.memoRoot, s.memoTreeDir = root, treeDir
-		s.memoSubLen, s.memoSubFirst = len(subdirs), subFirst
+		s.memoSubdirs = slices.Clone(subdirs)
 		s.memoCountsVer = countsVer
 		s.memoGroupByYear = groupByYear
 		s.memoExpandedRev = s.expandedRev
