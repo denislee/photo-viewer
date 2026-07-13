@@ -28,6 +28,12 @@ type MismatchedVideo struct {
 	ExpectedDate time.Time
 }
 
+// mediaDateProber is the metadata-date lookup used by the Organize scan,
+// indirected through a package var so tests can substitute a counting stub and
+// assert the persisted media_date cache spares the second scan from re-probing
+// (U-14). Production always uses scan.GetMediaDate.
+var mediaDateProber = scan.GetMediaDate
+
 type OrganizeView struct {
 	Open    bool
 	OnClose func()
@@ -182,7 +188,17 @@ func (v *OrganizeView) scanForMismatched(ctx context.Context, idx *cache.Index, 
 				if ctx.Err() != nil {
 					return
 				}
-				date := scan.GetMediaDate(e.Path)
+				// Prefer the media date persisted on a previous open. It's keyed
+				// to the file's size/mtime (ReconcileBatch NULLs it on change), so
+				// a hit is always fresh for the current bytes and spares the
+				// ~50–200ms exiftool round-trip. On a miss (never probed, or an
+				// edited file whose cache was invalidated) probe once and persist
+				// so later opens skip it (U-14).
+				date, cached, err := idx.ProbedMediaDate(e.Path)
+				if err != nil || !cached {
+					date = mediaDateProber(e.Path)
+					_ = idx.SetProbedMediaDate(e.Path, date)
+				}
 				if !scan.SameDateFolder(e.Path, date) {
 					results <- MismatchedVideo{Entry: e, ExpectedDate: date}
 				}

@@ -4,6 +4,7 @@ import (
 	"crypto/sha1"
 	"database/sql"
 	"encoding/hex"
+	"errors"
 	"log"
 	"path/filepath"
 	"strconv"
@@ -193,6 +194,16 @@ func Load(dbPath string) (*Index, error) {
 	if err := addColumn(db, "ALTER TABLE entries ADD COLUMN duration_ms INTEGER NOT NULL DEFAULT 0"); err != nil {
 		return nil, err
 	}
+	// media_date (v7) caches the probed metadata creation date (unix seconds) so
+	// the Organize scan stops re-forking exiftool for every video on every modal
+	// open (U-14). Nullable with no default: NULL means "not yet probed" — the
+	// correct state for every legacy row and every fresh insert, so no backfill is
+	// needed. ReconcileBatch NULLs it whenever a file's size/mtime changes (see
+	// reconcileInsertSQL), keying the cached value to the current bytes so an
+	// edited file re-probes automatically.
+	if err := addColumn(db, "ALTER TABLE entries ADD COLUMN media_date INTEGER"); err != nil {
+		return nil, err
+	}
 
 	// idx_entries_thumb backs GetEntryByThumbID, which fronts every /thumb/,
 	// /media/, /view/, /hls/ and /api/* request. Without it that lookup was a
@@ -232,7 +243,12 @@ func Load(dbPath string) (*Index, error) {
 	// hash/value format changes so stale rows are invalidated. user_version is
 	// written once, after every migration below has run, so a crash mid-upgrade
 	// re-runs the migrations rather than skipping them.
-	const schemaVersion = 6
+	//
+	// v7 (U-14) adds the media_date column, applied unconditionally by the
+	// idempotent addColumn above (like every other column add) rather than a
+	// gated block — a new nullable column needs no backfill, so the version bump
+	// alone records that a v6 database has been brought forward.
+	const schemaVersion = 7
 	var userVersion int
 	_ = db.QueryRow("PRAGMA user_version").Scan(&userVersion)
 	if userVersion < 1 {
@@ -374,7 +390,10 @@ const reconcileInsertSQL = `INSERT INTO entries (path, type, size, mtime, thumb_
 			THEN NULL ELSE entries.quick_hash END,
 		content_hash = CASE
 			WHEN entries.size != excluded.size OR entries.mtime != excluded.mtime
-			THEN NULL ELSE entries.content_hash END`
+			THEN NULL ELSE entries.content_hash END,
+		media_date = CASE
+			WHEN entries.size != excluded.size OR entries.mtime != excluded.mtime
+			THEN NULL ELSE entries.media_date END`
 
 // ReconcileBatch inserts or updates a slice of scan results, chunking the
 // work into bounded transactions so readers aren't blocked for the whole
@@ -947,6 +966,49 @@ func (i *Index) SetDurationMs(path string, ms int64) error {
 		return nil
 	}
 	_, err := i.db.Exec("UPDATE entries SET duration_ms = ? WHERE path = ?", ms, path)
+	return err
+}
+
+// ProbedMediaDate returns the metadata creation date previously persisted for
+// path by the Organize scan (see SetProbedMediaDate). The bool is false when the
+// row has never been probed (media_date IS NULL) or the path isn't indexed; the
+// caller then probes via scan.GetMediaDate and persists the result. A non-NULL
+// value is always fresh for the file's current bytes: ReconcileBatch NULLs
+// media_date whenever the file's size or mtime changes, so a hit never needs a
+// staleness check here.
+//
+// media_date is deliberately kept out of entryCols/entrySelect: only Organize
+// reads it, and every listing/pagination scan runs the hot entrySelect — adding
+// an eighth column there would widen thousands of per-page Scans to serve one
+// rare modal. This dedicated point read keeps that cost where it belongs.
+//
+// The stored unix seconds are reconstructed in UTC. Video creation tags
+// (CreateDate/MediaCreateDate) are emitted by exiftool as naive timestamps, which
+// scan.GetMediaDate parses in UTC, so a UTC round-trip reproduces the same
+// calendar day the mismatch check compares against the YYYY-MM-DD folder.
+func (i *Index) ProbedMediaDate(path string) (time.Time, bool, error) {
+	var unixSecs sql.NullInt64
+	err := i.db.QueryRow("SELECT media_date FROM entries WHERE path = ?", path).Scan(&unixSecs)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return time.Time{}, false, nil
+		}
+		return time.Time{}, false, err
+	}
+	if !unixSecs.Valid {
+		return time.Time{}, false, nil
+	}
+	return time.Unix(unixSecs.Int64, 0).UTC(), true, nil
+}
+
+// SetProbedMediaDate persists the probed metadata creation date (unix seconds)
+// for path so a later Organize scan reads it straight off the row instead of
+// re-forking exiftool. A path with no matching row updates nothing (harmless,
+// e.g. a trash entry). The value is keyed to the file's current size/mtime by
+// ReconcileBatch, which NULLs it when either changes, so an edited file
+// re-probes automatically on the next scan.
+func (i *Index) SetProbedMediaDate(path string, t time.Time) error {
+	_, err := i.db.Exec("UPDATE entries SET media_date = ? WHERE path = ?", t.Unix(), path)
 	return err
 }
 

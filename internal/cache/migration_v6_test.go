@@ -100,8 +100,8 @@ func TestMigrationV6SweepsOrphanFaces(t *testing.T) {
 
 	var uv int
 	_ = idx2.db.QueryRow("PRAGMA user_version").Scan(&uv)
-	if uv != 6 {
-		t.Errorf("user_version = %d, want 6", uv)
+	if uv != 7 {
+		t.Errorf("user_version = %d, want 7", uv)
 	}
 }
 

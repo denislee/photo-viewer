@@ -1,10 +1,64 @@
 package ui
 
 import (
+	"context"
+	"path/filepath"
 	"strconv"
 	"sync/atomic"
 	"testing"
+	"time"
+
+	"github.com/dns/photo-viewer/internal/cache"
+	"github.com/dns/photo-viewer/internal/scan"
 )
+
+// TestOrganizeCachesMediaDate guards U-14: the Organize scan probes each video's
+// metadata date only once. The first scan persists it (SetProbedMediaDate); the
+// second scan reads it back from the index (ProbedMediaDate) without re-forking
+// the prober. We swap the package-level mediaDateProber for a counting stub and
+// assert the count is stable across the second pass.
+func TestOrganizeCachesMediaDate(t *testing.T) {
+	dir := t.TempDir()
+	idx, err := cache.Load(filepath.Join(dir, "index.db"))
+	if err != nil {
+		t.Fatalf("cache.Load: %v", err)
+	}
+	t.Cleanup(func() { idx.Close() })
+
+	const nVideos = 5
+	results := make([]scan.Result, 0, nVideos)
+	for i := range nVideos {
+		results = append(results, scan.Result{
+			Path:    filepath.Join(dir, "2024-03-15", "clip"+strconv.Itoa(i)+".mp4"),
+			Type:    scan.TypeVideo,
+			Size:    int64(1000 + i),
+			ModTime: time.Unix(1_600_000_000, 0),
+		})
+	}
+	idx.ReconcileBatch(results)
+
+	var probes atomic.Int64
+	orig := mediaDateProber
+	mediaDateProber = func(string) time.Time {
+		probes.Add(1)
+		return time.Date(2024, 3, 15, 0, 0, 0, 0, time.UTC)
+	}
+	t.Cleanup(func() { mediaDateProber = orig })
+
+	// No ProcessRegistry wired: scanForMismatched runs its worker pool and drains
+	// results synchronously, so calling it directly blocks until the pass ends.
+	v := NewOrganizeView(func() {})
+
+	v.scanForMismatched(context.Background(), idx, dir)
+	if got := probes.Load(); got != nVideos {
+		t.Fatalf("first pass probed %d videos, want %d (every row is a cache miss)", got, nVideos)
+	}
+
+	v.scanForMismatched(context.Background(), idx, dir)
+	if got := probes.Load(); got != nVideos {
+		t.Fatalf("second pass raised probe count to %d, want it stable at %d (all cache hits)", got, nVideos)
+	}
+}
 
 // TestOrganizeBumpProgressRoutesThroughCoalescer guards U-11: organize's
 // per-file wakeups (bumpProgress, appendLog) must route through the process
