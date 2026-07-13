@@ -1,9 +1,13 @@
 package webserver
 
 import (
+	"bytes"
 	"compress/gzip"
 	"encoding/json"
 	"fmt"
+	"image"
+	"image/color"
+	"image/jpeg"
 	"io"
 	"mime"
 	"net"
@@ -41,6 +45,10 @@ func fixture(t *testing.T, n int) (*Server, *httptest.Server, func()) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	display, err := cache.NewDisplayStore(tmp)
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	results := make([]scan.Result, 0, n)
 	for i := range n {
@@ -55,7 +63,7 @@ func fixture(t *testing.T, n int) (*Server, *httptest.Server, func()) {
 	}
 	idx.ReconcileBatch(results)
 
-	s := New(idx, store, libRoot)
+	s := New(idx, store, display, libRoot)
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", s.handleIndex)
 	mux.HandleFunc("/favorites", s.handleFavorites)
@@ -63,6 +71,7 @@ func fixture(t *testing.T, n int) (*Server, *httptest.Server, func()) {
 	mux.HandleFunc("/dir", s.handleDir)
 	mux.HandleFunc("/view/", s.handleView)
 	mux.HandleFunc("/thumb/", s.handleThumb)
+	mux.HandleFunc("/display/", s.handleDisplay)
 	mux.HandleFunc("/api/page", s.handleAPIPage)
 	ts := httptest.NewServer(mux)
 
@@ -417,7 +426,7 @@ func apiFixture(t *testing.T) (*httptest.Server, func()) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	s := New(idx, store, tmp)
+	s := New(idx, store, nil, tmp)
 	mux := http.NewServeMux()
 	mux.HandleFunc("/api/favorite", s.handleAPIFavorite)
 	ts := httptest.NewServer(mux)
@@ -492,7 +501,7 @@ func TestAPIFavoriteAcceptsSameOrigin(t *testing.T) {
 	}})
 	id := cache.ThumbIDFor(mediaPath)
 
-	s := New(idx, store, tmp)
+	s := New(idx, store, nil, tmp)
 	mux := http.NewServeMux()
 	mux.HandleFunc("/api/favorite", s.handleAPIFavorite)
 	ts := httptest.NewServer(mux)
@@ -579,7 +588,7 @@ func TestGalleryPageScansSubdirsOnce(t *testing.T) {
 	}
 	idx.ReconcileBatch(results)
 
-	s := New(idx, store, libRoot)
+	s := New(idx, store, nil, libRoot)
 	mux := http.NewServeMux()
 	mux.HandleFunc("/dir", s.handleDir)
 	ts := httptest.NewServer(mux)
@@ -763,7 +772,7 @@ func trashFixture(t *testing.T, n int) (*httptest.Server, func()) {
 	}
 	idx.ReconcileBatch(results)
 
-	s := New(idx, store, libRoot)
+	s := New(idx, store, nil, libRoot)
 	mux := http.NewServeMux()
 	mux.HandleFunc("/trash", s.handleTrash)
 	ts := httptest.NewServer(mux)
@@ -891,7 +900,7 @@ func TestContentDispositionEscapesQuote(t *testing.T) {
 		ModTime: time.Now(),
 	}})
 
-	s := New(idx, store, tmp)
+	s := New(idx, store, nil, tmp)
 	mux := http.NewServeMux()
 	mux.HandleFunc("/media/", s.handleMedia)
 	ts := httptest.NewServer(mux)
@@ -1109,7 +1118,7 @@ func TestVideoViewerPosterAndTranscodeFallback(t *testing.T) {
 		{Path: mp4Path, Type: scan.TypeVideo, Size: 10, ModTime: time.Now()},
 	})
 
-	s := New(idx, store, tmp)
+	s := New(idx, store, nil, tmp)
 	mux := http.NewServeMux()
 	mux.HandleFunc("/view/", s.handleView)
 	ts := httptest.NewServer(mux)
@@ -1163,5 +1172,191 @@ func TestVideoViewerPosterAndTranscodeFallback(t *testing.T) {
 	}
 	if strings.Contains(mp4Body, "Unsupported format") {
 		t.Errorf(".mp4 viewer should not render the transcode fallback note")
+	}
+}
+
+// makeDisplayJPEG returns the bytes of a valid w×h JPEG. jpeg.Encode is
+// deterministic, so a caller can regenerate the same bytes to byte-compare a
+// pass-through response.
+func makeDisplayJPEG(t *testing.T, w, h int) []byte {
+	t.Helper()
+	img := image.NewRGBA(image.Rect(0, 0, w, h))
+	for y := range h {
+		for x := range w {
+			img.Set(x, y, color.RGBA{uint8(x), uint8(y), 128, 255})
+		}
+	}
+	var buf bytes.Buffer
+	if err := jpeg.Encode(&buf, img, &jpeg.Options{Quality: 90}); err != nil {
+		t.Fatal(err)
+	}
+	return buf.Bytes()
+}
+
+// displayFixture wires an index + real on-disk files + a display store behind
+// just the /display route. Unlike fixture(), the media files actually exist on
+// disk so /display can serve/render them. It seeds two entries sharing one set
+// of JPEG bytes: small.jpg (a natively-renderable original, under the
+// pass-through threshold) and photo.dng (typed RAW; the JPEG magic makes
+// LoadRAWPreview return the bytes whole, so the rendition needs no exiftool).
+func displayFixture(t *testing.T) (ts *httptest.Server, ids map[string]string, jpegBytes []byte, mtime time.Time, cleanup func()) {
+	t.Helper()
+	tmp, err := os.MkdirTemp("", "pv-display-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	libRoot := filepath.Join(tmp, "lib")
+	if err := os.MkdirAll(libRoot, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	idx, err := cache.Load(filepath.Join(tmp, "index.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	store, err := cache.NewThumbStore(tmp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	display, err := cache.NewDisplayStore(tmp)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	jpegBytes = makeDisplayJPEG(t, 64, 48)
+	mtime = time.Date(2024, 6, 1, 0, 0, 0, 0, time.UTC)
+	files := []struct {
+		name string
+		typ  scan.MediaType
+	}{
+		{"small.jpg", scan.TypePhoto},
+		{"photo.dng", scan.TypeRAW},
+	}
+	var results []scan.Result
+	ids = make(map[string]string, len(files))
+	for _, f := range files {
+		p := filepath.Join(libRoot, f.name)
+		if err := os.WriteFile(p, jpegBytes, 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chtimes(p, mtime, mtime); err != nil {
+			t.Fatal(err)
+		}
+		results = append(results, scan.Result{
+			Path:    p,
+			Type:    f.typ,
+			Size:    int64(len(jpegBytes)),
+			ModTime: mtime,
+		})
+		ids[f.name] = cache.ThumbIDFor(p)
+	}
+	idx.ReconcileBatch(results)
+
+	s := New(idx, store, display, libRoot)
+	mux := http.NewServeMux()
+	mux.HandleFunc("/display/", s.handleDisplay)
+	ts = httptest.NewServer(mux)
+	return ts, ids, jpegBytes, mtime, func() {
+		ts.Close()
+		idx.Close()
+		os.RemoveAll(tmp)
+	}
+}
+
+// TestDisplayPassesThroughSmallJPEG verifies that a small, natively-renderable
+// original is served byte-for-byte (no rendition) with the original mime type.
+func TestDisplayPassesThroughSmallJPEG(t *testing.T) {
+	ts, ids, jpegBytes, _, cleanup := displayFixture(t)
+	defer cleanup()
+
+	resp, err := http.Get(ts.URL + "/display/" + ids["small.jpg"])
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+	if ct := resp.Header.Get("Content-Type"); ct != "image/jpeg" {
+		t.Errorf("Content-Type = %q, want image/jpeg", ct)
+	}
+	got, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, jpegBytes) {
+		t.Errorf("body = %d bytes, want the %d-byte original passed through unchanged", len(got), len(jpegBytes))
+	}
+}
+
+// TestDisplayRendersRAW verifies that a RAW entry (un-renderable in a browser)
+// is served as a JPEG rendition, not the original bytes. Uses the JPEG-preview
+// fast path so it needs no exiftool/ffmpeg; a genuinely-encoded RAW would.
+func TestDisplayRendersRAW(t *testing.T) {
+	ts, ids, jpegBytes, _, cleanup := displayFixture(t)
+	defer cleanup()
+
+	resp, err := http.Get(ts.URL + "/display/" + ids["photo.dng"])
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+	if ct := resp.Header.Get("Content-Type"); ct != "image/jpeg" {
+		t.Errorf("Content-Type = %q, want image/jpeg", ct)
+	}
+	got, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The rendition is a re-encoded JPEG, so it must decode as one and must not
+	// be the raw original bytes.
+	if _, _, err := image.DecodeConfig(bytes.NewReader(got)); err != nil {
+		t.Errorf("display rendition did not decode as an image: %v", err)
+	}
+	if bytes.Equal(got, jpegBytes) {
+		t.Errorf("RAW display served the original bytes; expected a re-encoded rendition")
+	}
+}
+
+// TestDisplayETag verifies the mtime-keyed validator: a stale bare-id ETag must
+// not 304 (an in-place edit has to invalidate), while the matching mtime-keyed
+// ETag short-circuits to 304.
+func TestDisplayETag(t *testing.T) {
+	ts, ids, _, mtime, cleanup := displayFixture(t)
+	defer cleanup()
+
+	id := ids["small.jpg"]
+	wantETag := `"` + id + "-" + itoa(int(mtime.Unix())) + `"`
+
+	// Stale bare-id ETag (the pre-fix validator) must NOT match.
+	staleReq, _ := http.NewRequest("GET", ts.URL+"/display/"+id, nil)
+	staleReq.Header.Set("If-None-Match", `"`+id+`"`)
+	staleResp, err := http.DefaultClient.Do(staleReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	staleResp.Body.Close()
+	if staleResp.StatusCode == http.StatusNotModified {
+		t.Errorf("bare-id ETag still 304'd — mtime is not part of the validator")
+	}
+
+	// Matching mtime-keyed ETag must short-circuit to 304.
+	req, _ := http.NewRequest("GET", ts.URL+"/display/"+id, nil)
+	req.Header.Set("If-None-Match", wantETag)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusNotModified {
+		t.Errorf("conditional GET status = %d, want 304", resp.StatusCode)
+	}
+	if etag := resp.Header.Get("ETag"); etag != wantETag {
+		t.Errorf("ETag = %q, want %q", etag, wantETag)
+	}
+	if cc := resp.Header.Get("Cache-Control"); strings.Contains(cc, "immutable") {
+		t.Errorf("Cache-Control = %q, must not be immutable", cc)
 	}
 }

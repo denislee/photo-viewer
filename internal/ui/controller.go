@@ -187,7 +187,13 @@ func (c *Controller) WebServer() *webserver.Server {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if c.webserver == nil {
-		c.webserver = webserver.New(c.index, c.store, c.libraryRoot)
+		// Second thumb store rooted at <cacheDir>/display for the larger
+		// browser-viewer renditions (W-03). Best-effort: cacheDir is the same
+		// always-writable root the primary thumb store already resolved, so this
+		// only fails in pathological cases; a nil store degrades /display to
+		// serving originals (fine for JPEG/PNG, no RAW/HEIC rendition).
+		display, _ := cache.NewDisplayStore(c.cacheDir)
+		c.webserver = webserver.New(c.index, c.store, display, c.libraryRoot)
 	}
 	return c.webserver
 }
@@ -429,6 +435,13 @@ func (c *Controller) Rebuild() error {
 	// crash-orphaned .tmp files) that would otherwise grow unbounded on the
 	// media drive. Best-effort: the dir may not exist if the webserver never ran.
 	if err := os.RemoveAll(filepath.Join(c.cacheDir, "hls")); err != nil {
+		return err
+	}
+	// Drop the larger browser-viewer renditions too (W-03). They're keyed on
+	// thumb id + source mtime like thumbs, so a rebuild that re-derives them
+	// from changed originals must not keep serving stale display images.
+	// Best-effort: the dir may not exist if the webserver never ran.
+	if err := os.RemoveAll(filepath.Join(c.cacheDir, "display")); err != nil {
 		return err
 	}
 	go c.scanInto(ctx, c.libraryRoot)

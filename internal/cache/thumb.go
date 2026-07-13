@@ -16,6 +16,14 @@ import (
 // ThumbSize is the target longest-edge of cached thumbnails.
 const ThumbSize = 256
 
+// DisplaySize is the target longest-edge of the larger "display" renditions
+// the webserver serves to the browser viewer (W-03). A file a browser can't
+// render (RAW/HEIC/TIFF) or a needlessly-large JPEG is downscaled to this size
+// instead of shipping the full-resolution original: ~2048 px is visually
+// indistinguishable on a phone/tablet screen while being an order of magnitude
+// smaller over the wire.
+const DisplaySize = 2048
+
 // thumbGenTimeout bounds a single thumbnail generation. Each of the four
 // thumbnailers shells out under exec.CommandContext, but nothing ever fed
 // them a deadline — so a hung ffmpeg/exiftool/heif-convert would block its
@@ -36,7 +44,8 @@ const thumbGenTimeout = 30 * time.Second
 // them at NumCPU under-utilises hardware; CPU-bound decoders, on the other
 // hand, must stay capped or the system bogs down under rapid scrolling.
 type ThumbStore struct {
-	dir    string // <cache>/thumbs
+	dir    string // <cache>/thumbs (or <cache>/display for a display store)
+	size   int    // target longest-edge for generated renditions
 	cpuSem chan struct{}
 	extSem chan struct{}
 
@@ -48,7 +57,25 @@ type ThumbStore struct {
 }
 
 func NewThumbStore(cacheDir string) (*ThumbStore, error) {
-	d := filepath.Join(cacheDir, "thumbs")
+	return newStore(cacheDir, "thumbs", ThumbSize)
+}
+
+// NewDisplayStore constructs a second store rooted at <cacheDir>/display that
+// generates larger (DisplaySize) JPEG renditions. It shares every bit of
+// ThumbStore's machinery — sharding, singleflight, mtime staleness, atomic
+// rename — differing only in the on-disk subdirectory and the target size, so
+// the webserver gets browser-renderable images for RAW/HEIC/TIFF and oversized
+// originals for free (W-03). Wipe <cacheDir>/display alongside thumbs/ and hls/
+// on a rebuild.
+func NewDisplayStore(cacheDir string) (*ThumbStore, error) {
+	return newStore(cacheDir, "display", DisplaySize)
+}
+
+// newStore builds a store rooted at <cacheDir>/<subdir> whose generated
+// renditions fit within size×size. NewThumbStore and NewDisplayStore differ
+// only in these two parameters.
+func newStore(cacheDir, subdir string, size int) (*ThumbStore, error) {
+	d := filepath.Join(cacheDir, subdir)
 	if err := os.MkdirAll(d, 0o755); err != nil {
 		return nil, err
 	}
@@ -56,6 +83,7 @@ func NewThumbStore(cacheDir string) (*ThumbStore, error) {
 	ext := max(cpu*3, 6)
 	return &ThumbStore{
 		dir:      d,
+		size:     size,
 		cpuSem:   make(chan struct{}, cpu),
 		extSem:   make(chan struct{}, ext),
 		inflight: make(map[string]chan struct{}),
@@ -219,13 +247,13 @@ func (s *ThumbStore) semFor(t scan.MediaType) chan struct{} {
 func (s *ThumbStore) generate(ctx context.Context, e Entry, dst string) error {
 	switch e.Type {
 	case scan.TypePhoto:
-		return thumb.Image(ctx, e.Path, dst, ThumbSize)
+		return thumb.Image(ctx, e.Path, dst, s.size)
 	case scan.TypeRAW:
-		return thumb.RAW(ctx, e.Path, dst, ThumbSize)
+		return thumb.RAW(ctx, e.Path, dst, s.size)
 	case scan.TypeHEIC:
-		return thumb.HEIC(ctx, e.Path, dst, ThumbSize)
+		return thumb.HEIC(ctx, e.Path, dst, s.size)
 	case scan.TypeVideo:
-		return thumb.Video(ctx, e.Path, dst, ThumbSize)
+		return thumb.Video(ctx, e.Path, dst, s.size)
 	}
 	return fmt.Errorf("unsupported media type: %s", e.Type)
 }

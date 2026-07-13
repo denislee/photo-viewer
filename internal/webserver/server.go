@@ -62,6 +62,7 @@ var dateFolderRe = regexp.MustCompile(`^(\d{4})-\d{2}-\d{2}$`)
 type Server struct {
 	index       *cache.Index
 	store       *cache.ThumbStore
+	display     *cache.ThumbStore // larger renditions for /display; may be nil
 	libraryRoot string
 	trashDir    string // resolved once at New; "" when no writable location
 
@@ -141,8 +142,12 @@ type viewCountEntry struct {
 
 // New constructs an idle server. libraryRoot is used to enumerate the
 // top-level directory categories and to confine /dir requests to paths
-// rooted at the library. Call Start to bind a port.
-func New(index *cache.Index, store *cache.ThumbStore, libraryRoot string) *Server {
+// rooted at the library. display is a second thumb store rooted at
+// <cacheDir>/display that produces the larger browser-viewer renditions the
+// /display route serves for RAW/HEIC/TIFF/oversized originals (W-03); it may be
+// nil, in which case /display serves every original untouched (correct for
+// JPEG/PNG, no rendition for RAW/HEIC). Call Start to bind a port.
+func New(index *cache.Index, store, display *cache.ThumbStore, libraryRoot string) *Server {
 	trashDir := ""
 	if libraryRoot != "" {
 		// Match cache.TrashDir's preferred location; if the dir doesn't
@@ -150,7 +155,7 @@ func New(index *cache.Index, store *cache.ThumbStore, libraryRoot string) *Serve
 		// renders with count 0.
 		trashDir = filepath.Join(libraryRoot, ".photo-viewer-trash")
 	}
-	return &Server{index: index, store: store, libraryRoot: libraryRoot, trashDir: trashDir}
+	return &Server{index: index, store: store, display: display, libraryRoot: libraryRoot, trashDir: trashDir}
 }
 
 // Running reports whether the server has an active listener.
@@ -197,6 +202,7 @@ func (s *Server) Start(host string, port int, password string) error {
 	mux.HandleFunc("/view/", gz(s.handleView))
 	mux.HandleFunc("/thumb/", s.handleThumb)
 	mux.HandleFunc("/media/", s.handleMedia)
+	mux.HandleFunc("/display/", s.handleDisplay)
 	mux.HandleFunc("/hls/", s.handleHLS)
 	mux.HandleFunc("/api/page", gz(s.handleAPIPage))
 	mux.HandleFunc("/api/favorite", gz(s.handleAPIFavorite))
@@ -1667,8 +1673,15 @@ func (s *Server) renderViewer(w http.ResponseWriter,
 			`if(needsHls&&!canHls){var n=document.getElementById('vnote');if(n)n.hidden=false;}})();</script>`,
 			needs, hlsURL, mediaURL)
 	} else {
+		// Point the <img> at /display, not /media: /display serves a
+		// browser-renderable image for every entry — the original bytes for a
+		// small JPEG/PNG/WebP/GIF, or a ~2048 px JPEG rendition for RAW/HEIC/TIFF
+		// and oversized originals — so RAW/HEIC render at all and plain photos
+		// ship a downscaled copy instead of tens of MB (W-03). /media stays the
+		// download-original route.
+		displayURL := "/display/" + cur.ThumbID
 		fmt.Fprintf(w, `<img class="vmedia" src="%s" alt="%s">`,
-			mediaURL, html.EscapeString(filepath.Base(cur.Path)))
+			displayURL, html.EscapeString(filepath.Base(cur.Path)))
 	}
 	// Tap zones — large invisible areas on the left/right so anywhere
 	// outside the controls advances. The visible arrow buttons are
@@ -1756,6 +1769,81 @@ func (s *Server) handleMedia(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Disposition",
 		mime.FormatMediaType("inline", map[string]string{"filename": filepath.Base(e.Path)}))
 	http.ServeFile(w, r, e.Path)
+}
+
+// displayPassThroughExts are the extensions a mainstream browser renders
+// natively in an <img>. A small original in one of these formats is served
+// as-is by /display; anything else (RAW/HEIC/TIFF) — and any oversized member
+// of this set — gets a JPEG rendition instead.
+var displayPassThroughExts = map[string]bool{
+	".jpg": true, ".jpeg": true, ".png": true, ".webp": true, ".gif": true,
+}
+
+// displayPassThroughMaxBytes is the size ceiling under which a natively-
+// renderable original is passed through untouched. Above it, even a plain
+// JPEG is downscaled to a ~2048 px rendition — a phone screen can't tell the
+// difference, and a multi-MB original is pure wasted bandwidth. 3 MiB keeps
+// ordinary web-sized photos direct while catching full-resolution camera
+// JPEGs.
+const displayPassThroughMaxBytes = 3 << 20
+
+// displayCacheControl matches handleThumb's: cacheable for a day but revalidated
+// against the mtime-keyed ETag, so an in-place source edit is picked up.
+const displayCacheControl = "private, max-age=86400"
+
+// handleDisplay serves a browser-renderable image for /display/<id>. For a
+// small original in a format browsers render natively (JPEG/PNG/WebP/GIF) it
+// passes the bytes straight through; otherwise — RAW, HEIC, TIFF, or an
+// oversized JPEG — it serves a cached ~2048 px JPEG rendition produced by the
+// display store (which reuses the thumb pipeline at DisplaySize). The viewer's
+// <img src> points here so RAW/HEIC render at all and plain photos ship a
+// downscaled copy instead of the full-resolution original (W-03); /media stays
+// the download-original / video route. The ETag folds in the source mtime
+// exactly like handleThumb, so editing the file in place invalidates any
+// cached response.
+func (s *Server) handleDisplay(w http.ResponseWriter, r *http.Request) {
+	id := strings.TrimPrefix(r.URL.Path, "/display/")
+	if !validID(id) {
+		http.NotFound(w, r)
+		return
+	}
+	e, ok := s.lookupEntry(id)
+	if !ok {
+		http.NotFound(w, r)
+		return
+	}
+	etag := fmt.Sprintf(`"%s-%d"`, id, e.ModTime.Unix())
+	if match := r.Header.Get("If-None-Match"); match != "" && strings.Contains(match, etag) {
+		w.Header().Set("ETag", etag)
+		w.Header().Set("Cache-Control", displayCacheControl)
+		w.WriteHeader(http.StatusNotModified)
+		return
+	}
+
+	// Pass through a small, natively-renderable original untouched — a browser
+	// renders it directly, so a rendition would only add a decode/encode round
+	// trip for no visual gain. Also the fallback when no display store is wired
+	// (a RAW would still be un-renderable, but there's nothing better to serve).
+	ext := strings.ToLower(filepath.Ext(e.Path))
+	if s.display == nil || (displayPassThroughExts[ext] && e.Size < displayPassThroughMaxBytes) {
+		if ct := mimeFor(e); ct != "" {
+			w.Header().Set("Content-Type", ct)
+		}
+		w.Header().Set("Cache-Control", displayCacheControl)
+		w.Header().Set("ETag", etag)
+		http.ServeFile(w, r, e.Path)
+		return
+	}
+
+	renditionPath, err := s.display.Path(e)
+	if err != nil {
+		http.Error(w, "display rendition unavailable", http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "image/jpeg")
+	w.Header().Set("Cache-Control", displayCacheControl)
+	w.Header().Set("ETag", etag)
+	http.ServeFile(w, r, renditionPath)
 }
 
 // validID returns true if id is a 40-char lowercase hex string — the shape
