@@ -964,3 +964,116 @@ func TestViewCountCacheSweepsPastCap(t *testing.T) {
 		t.Errorf("post-sweep size = %d, want 3 (two fresh + inserted)", after)
 	}
 }
+
+// TestSecureHeaders verifies the W-11 hardening headers: nosniff/CSP/
+// Referrer-Policy on the HTML gallery and, crucially, nosniff on the binary
+// /thumb route (the same guarantee protects /media, where a RAW original ships
+// without a Content-Type and would otherwise be MIME-sniffed).
+func TestSecureHeaders(t *testing.T) {
+	s, _, cleanup := fixture(t, 1)
+	defer cleanup()
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/", s.handleIndex)
+	mux.HandleFunc("/thumb/", s.handleThumb)
+	mux.HandleFunc("/api/page", s.handleAPIPage)
+	ts := httptest.NewServer(secureHeaders(mux))
+	defer ts.Close()
+
+	// HTML page carries nosniff + CSP + Referrer-Policy.
+	resp, err := http.Get(ts.URL + "/")
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if got := resp.Header.Get("X-Content-Type-Options"); got != "nosniff" {
+		t.Errorf("HTML X-Content-Type-Options = %q, want nosniff", got)
+	}
+	if got := resp.Header.Get("Content-Security-Policy"); got != contentSecurityPolicy {
+		t.Errorf("HTML Content-Security-Policy = %q, want %q", got, contentSecurityPolicy)
+	}
+	// The pages rely on inline <style> and <script>; the CSP must allow them or
+	// the gallery/viewer break.
+	if csp := resp.Header.Get("Content-Security-Policy"); !strings.Contains(csp, "script-src 'self' 'unsafe-inline'") ||
+		!strings.Contains(csp, "style-src 'self' 'unsafe-inline'") {
+		t.Errorf("CSP %q missing inline script/style allowance", csp)
+	}
+	if got := resp.Header.Get("Referrer-Policy"); got == "" {
+		t.Error("HTML Referrer-Policy header missing")
+	}
+
+	// Learn a real thumb id, then confirm the binary route also carries nosniff
+	// (set unconditionally by the middleware ahead of the handler).
+	apiResp, err := http.Get(ts.URL + "/api/page?from=all&p=1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var payload struct {
+		Items []struct {
+			ID string `json:"id"`
+		} `json:"items"`
+	}
+	json.NewDecoder(apiResp.Body).Decode(&payload)
+	apiResp.Body.Close()
+	if len(payload.Items) == 0 {
+		t.Fatal("no items returned")
+	}
+	tResp, err := http.Get(ts.URL + "/thumb/" + payload.Items[0].ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tResp.Body.Close()
+	if got := tResp.Header.Get("X-Content-Type-Options"); got != "nosniff" {
+		t.Errorf("/thumb X-Content-Type-Options = %q, want nosniff", got)
+	}
+}
+
+// TestAuthThrottle verifies the W-11 brute-force throttle: a correct password
+// always passes (even after the throttle trips), authFailBurst wrong attempts
+// answer 401, the next answers 429, and a subsequent success resets the budget.
+func TestAuthThrottle(t *testing.T) {
+	s, _, cleanup := fixture(t, 1)
+	defer cleanup()
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/", s.handleIndex)
+	ts := httptest.NewServer(secureHeaders(basicAuth(mux, "secret")))
+	defer ts.Close()
+
+	do := func(pass string) int {
+		req, _ := http.NewRequest("GET", ts.URL+"/", nil)
+		req.SetBasicAuth("viewer", pass)
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+		return resp.StatusCode
+	}
+
+	// Correct password passes.
+	if code := do("secret"); code != http.StatusOK {
+		t.Fatalf("correct password status = %d, want 200", code)
+	}
+
+	// authFailBurst wrong attempts are answered 401.
+	for i := range authFailBurst {
+		if code := do("wrong"); code != http.StatusUnauthorized {
+			t.Fatalf("wrong attempt %d status = %d, want 401", i+1, code)
+		}
+	}
+	// The next wrong attempt is throttled.
+	if code := do("wrong"); code != http.StatusTooManyRequests {
+		t.Fatalf("throttled attempt status = %d, want 429", code)
+	}
+
+	// A correct password bypasses the throttle (a legitimate user is never
+	// locked out) and clears the IP's failure budget.
+	if code := do("secret"); code != http.StatusOK {
+		t.Fatalf("correct password after throttle status = %d, want 200", code)
+	}
+	// Budget reset: a wrong attempt is a plain 401 again, not an immediate 429.
+	if code := do("wrong"); code != http.StatusUnauthorized {
+		t.Fatalf("post-reset wrong attempt status = %d, want 401", code)
+	}
+}
