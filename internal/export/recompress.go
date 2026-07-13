@@ -2,6 +2,7 @@ package export
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"image"
 	_ "image/gif"
@@ -10,7 +11,9 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"sync"
 
 	_ "golang.org/x/image/bmp"
 	"golang.org/x/image/draw"
@@ -20,6 +23,16 @@ import (
 	"github.com/dns/photo-viewer/internal/imgfit"
 	"github.com/dns/photo-viewer/internal/imgorient"
 	"github.com/dns/photo-viewer/internal/scan"
+)
+
+// External-tool availability is probed once via exec.LookPath and cached, the
+// same S-06 pattern the thumbnail pipeline uses (internal/thumb/image.go):
+// LookPath stats every $PATH entry, so probing per favorite in a large export
+// would waste thousands of stats. Tool presence can't change meaningfully
+// mid-run; a process restart re-probes.
+var (
+	haveFfmpeg      = sync.OnceValue(func() bool { _, err := exec.LookPath("ffmpeg"); return err == nil })
+	haveHeifConvert = sync.OnceValue(func() bool { _, err := exec.LookPath("heif-convert"); return err == nil })
 )
 
 // recompressOutputPath rewrites dst's extension when the encoder we're
@@ -51,12 +64,17 @@ func recompressFile(ctx context.Context, t scan.MediaType, src, dst string, maxE
 	case scan.TypePhoto:
 		return true, recompressImage(src, dst, maxEdge, jpegQuality)
 	case scan.TypeHEIC:
-		if _, err := exec.LookPath("heif-convert"); err != nil {
+		// Either decoder can satisfy HEIC: recompressHEIC prefers a single
+		// ffmpeg pass and falls back to heif-convert. Only plain-copy (return
+		// false) when NEITHER tool is present — silently copying the raw HEIC
+		// would hand the destination a file most browsers can't render, which
+		// defeats the recompress-to-JPEG intent.
+		if !haveFfmpeg() && !haveHeifConvert() {
 			return false, nil
 		}
 		return true, recompressHEIC(ctx, src, dst, maxEdge, jpegQuality)
 	case scan.TypeVideo:
-		if _, err := exec.LookPath("ffmpeg"); err != nil {
+		if !haveFfmpeg() {
 			return false, nil
 		}
 		return true, recompressVideo(ctx, src, dst, maxEdge, videoCRF)
@@ -140,18 +158,46 @@ func recompressImage(src, dst string, maxEdge, quality int) error {
 	return nil
 }
 
-// recompressHEIC converts the HEIF source to a temp JPEG via heif-convert
-// (the same tool used for thumbnails) and then resamples that with
-// recompressImage. The intermediate JPEG is heif-convert's max-quality
-// output, so quality loss is dominated by the final encode.
+// recompressHEIC re-encodes a HEIF source to a downscaled JPEG at dst.
+//
+// It prefers a SINGLE ffmpeg pass (decode HEIC → scale → JPEG-encode in one
+// invocation): one decode, one lossy generation. This mirrors the thumbnail
+// path (internal/thumb/heic.go), which learned the same trick. The previous
+// implementation always ran heif-convert → a q95 intermediate JPEG →
+// decode → scale → re-encode: two lossy generations and two codec passes.
+//
+// When ffmpeg is unavailable or refuses the file (HEIC support depends on how
+// ffmpeg was built), it falls back to the heif-convert → intermediate-JPEG →
+// recompressImage chain. Either way the source mtime is stamped onto dst so a
+// recompressed export sorts by capture time, not encode time.
 func recompressHEIC(ctx context.Context, src, dst string, maxEdge, quality int) error {
-	// Capture the original HEIC's mtime up front: recompressImage below runs on
-	// the intermediate temp JPEG and would otherwise stamp dst with that temp's
-	// (encode-time) mtime, so we re-stamp the source's mtime afterwards.
+	// Capture the original HEIC's mtime up front. The ffmpeg pass writes a fresh
+	// file (encode-time mtime) and the fallback's recompressImage stamps the
+	// intermediate temp's mtime, so both paths re-stamp the source's mtime after.
 	info, err := os.Stat(src)
 	if err != nil {
 		return err
 	}
+
+	var ffErr error
+	if haveFfmpeg() {
+		ffErr = recompressHEICViaFfmpeg(ctx, src, dst, maxEdge, quality)
+		if ffErr == nil {
+			// Preserve the source mtime (S-09). Best-effort, matching copyFile.
+			_ = os.Chtimes(dst, info.ModTime(), info.ModTime())
+			return nil
+		}
+		// fall through — ffmpeg either lacks a HEIC decoder or refused this
+		// file; the heif-convert chain below is the more permissive path.
+	}
+
+	if !haveHeifConvert() {
+		if ffErr != nil {
+			return fmt.Errorf("recompress HEIC: ffmpeg failed and heif-convert not installed: %w", ffErr)
+		}
+		return errors.New("recompress HEIC: no HEIC decoder available")
+	}
+
 	tmpFull, err := os.CreateTemp("", "pv-export-*.jpg")
 	if err != nil {
 		return err
@@ -170,6 +216,65 @@ func recompressHEIC(ctx context.Context, src, dst string, maxEdge, quality int) 
 	// original HEIC's mtime. Best-effort, matching copyFile's ignored error.
 	_ = os.Chtimes(dst, info.ModTime(), info.ModTime())
 	return nil
+}
+
+// recompressHEICViaFfmpeg does the whole HEIC → downscaled-JPEG job in one
+// ffmpeg invocation: ffmpeg decodes the HEIF (libheif/HEVC), its scaler fits
+// the long edge to maxEdge, and its mjpeg encoder writes the JPEG at the
+// mapped quality — one decode, one encode, no intermediate max-quality JPEG.
+// ffmpeg auto-applies the HEIF container rotation (the same autorotate the
+// thumb path relies on), so the output is upright with no orientation tag,
+// matching recompressImage's baked-in-orientation contract. The write is
+// atomic (temp + rename), like recompressVideo.
+func recompressHEICViaFfmpeg(ctx context.Context, src, dst string, maxEdge, quality int) error {
+	tmp := dst + ".tmp.jpg"
+	args := []string{
+		"-loglevel", "error",
+		"-y",
+		"-i", src,
+		"-frames:v", "1",
+		"-vf", heicScaleFilter(maxEdge),
+		"-c:v", "mjpeg",
+		"-q:v", strconv.Itoa(mjpegQScale(quality)),
+		"-f", "image2",
+		tmp,
+	}
+	cmd := exec.CommandContext(ctx, "ffmpeg", args...)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		os.Remove(tmp)
+		return fmt.Errorf("ffmpeg: %v: %s", err, strings.TrimSpace(string(out)))
+	}
+	if _, err := os.Stat(tmp); err != nil {
+		os.Remove(tmp)
+		return err
+	}
+	if err := os.Rename(tmp, dst); err != nil {
+		os.Remove(tmp)
+		return err
+	}
+	return nil
+}
+
+// heicScaleFilter builds the ffmpeg `-vf` scale expression that fits the long
+// edge to maxEdge WITHOUT upscaling (min(edge, maxEdge)), matching
+// imgfit.Within's contract. Both output dimensions are forced even
+// (trunc(.../2)*2 on the constrained edge, -2 on the auto edge) because the
+// mjpeg encoder's default 4:2:0 subsampling requires it. ffmpeg autorotate runs
+// before this filter, so iw/ih here are the already-upright display dimensions.
+func heicScaleFilter(maxEdge int) string {
+	return fmt.Sprintf("scale='if(gt(iw,ih),trunc(min(iw,%d)/2)*2,-2)':'if(gt(iw,ih),-2,trunc(min(ih,%d)/2)*2)'", maxEdge, maxEdge)
+}
+
+// mjpegQScale maps a libjpeg quality (1-100, higher = better — the scale the
+// export Options use) onto ffmpeg's mjpeg -q:v scale (2-31, LOWER = better).
+// The two encoders use different quantizer scales, so this is an approximate
+// remap, not an exact equivalence: q=100 → 2 (best), q=1 → 31 (worst), linear
+// in between. It keeps the export's "higher JpegQuality ⇒ higher-fidelity
+// output" intent without a second lossy generation.
+func mjpegQScale(quality int) int {
+	quality = max(min(quality, 100), 1)
+	qv := 31 - (quality*29)/100
+	return max(min(qv, 31), 2)
 }
 
 // recompressVideo invokes ffmpeg to transcode src into dst, fitting the

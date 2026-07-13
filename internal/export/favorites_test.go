@@ -1,13 +1,18 @@
 package export
 
 import (
+	"context"
 	"image"
 	"image/color"
+	_ "image/jpeg"
 	"image/png"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"testing"
 	"time"
+
+	"github.com/dns/photo-viewer/internal/scan"
 )
 
 func writeFile(t *testing.T, p, content string) {
@@ -250,4 +255,129 @@ func TestRecompressImagePreservesMtime(t *testing.T) {
 	if d := info.ModTime().Sub(want); d < -2*time.Second || d > 2*time.Second {
 		t.Fatalf("recompressed mtime = %v, want ~%v (delta %v)", info.ModTime(), want, d)
 	}
+}
+
+// TestMjpegQScaleMapping pins the S-19 libjpeg-quality → ffmpeg-mjpeg-qscale
+// remap: monotonically decreasing (higher fidelity ⇒ lower qscale), pinned
+// endpoints, and out-of-range inputs clamped into the valid [2, 31] range.
+func TestMjpegQScaleMapping(t *testing.T) {
+	if got := mjpegQScale(100); got != 2 {
+		t.Errorf("mjpegQScale(100) = %d, want 2 (best)", got)
+	}
+	if got := mjpegQScale(1); got != 31 {
+		t.Errorf("mjpegQScale(1) = %d, want 31 (worst)", got)
+	}
+	if got := mjpegQScale(0); got < 2 || got > 31 {
+		t.Errorf("mjpegQScale(0) = %d, want a value clamped into [2,31]", got)
+	}
+	if got := mjpegQScale(1000); got != 2 {
+		t.Errorf("mjpegQScale(1000) = %d, want 2 (clamped to best)", got)
+	}
+	prev := mjpegQScale(1)
+	for q := 2; q <= 100; q++ {
+		cur := mjpegQScale(q)
+		if cur > prev {
+			t.Fatalf("mjpegQScale not monotonic: q=%d gave %d > q=%d's %d", q, cur, q-1, prev)
+		}
+		prev = cur
+	}
+}
+
+// makeHEIC synthesizes a real HEIC fixture at path by encoding a Go-generated
+// PNG with heif-enc (libheif). The test that calls it is SKIPPED (not failed)
+// when heif-enc is missing or can't produce a file, so HEIC coverage degrades
+// cleanly in environments without the libheif encoder.
+func makeHEIC(t *testing.T, path string, w, h int) {
+	t.Helper()
+	if _, err := exec.LookPath("heif-enc"); err != nil {
+		t.Skipf("heif-enc not installed; cannot synthesize a HEIC fixture (%v)", err)
+	}
+	pngPath := path + ".src.png"
+	writePNG(t, pngPath, w, h)
+	defer os.Remove(pngPath)
+	if out, err := exec.Command("heif-enc", pngPath, "-o", path).CombinedOutput(); err != nil {
+		t.Skipf("heif-enc failed to build fixture: %v: %s", err, out)
+	}
+	if _, err := os.Stat(path); err != nil {
+		t.Skipf("heif-enc produced no output: %v", err)
+	}
+}
+
+// assertJPEGWithin fails unless path is a JPEG whose longest edge is ≤ maxEdge.
+// The format check is the load-bearing assertion for S-19's recompressFile fix:
+// a silently plain-copied HEIC would not decode as a JPEG at all.
+func assertJPEGWithin(t *testing.T, path string, maxEdge int) {
+	t.Helper()
+	f, err := os.Open(path)
+	if err != nil {
+		t.Fatalf("open %s: %v", path, err)
+	}
+	defer f.Close()
+	cfg, format, err := image.DecodeConfig(f)
+	if err != nil {
+		t.Fatalf("decode %s: %v (a plain HEIC copy would not decode as an image)", path, err)
+	}
+	if format != "jpeg" {
+		t.Fatalf("output format = %q, want jpeg", format)
+	}
+	if cfg.Width > maxEdge || cfg.Height > maxEdge {
+		t.Fatalf("output %dx%d exceeds maxEdge %d", cfg.Width, cfg.Height, maxEdge)
+	}
+}
+
+// TestRecompressHEICSinglePass exercises the S-19 ffmpeg single-pass HEIC
+// recompression: a real HEIC in, a size-bounded JPEG out, the source mtime
+// preserved (S-09), and no atomic-write temp left behind. Gated on ffmpeg (the
+// single-pass decoder) and heif-enc (fixture synthesis).
+func TestRecompressHEICSinglePass(t *testing.T) {
+	if !haveFfmpeg() {
+		t.Skip("ffmpeg not installed; HEIC single-pass path unavailable")
+	}
+	dir := t.TempDir()
+	src := filepath.Join(dir, "photo.heic")
+	makeHEIC(t, src, 640, 480)
+
+	want := time.Date(2020, 6, 1, 12, 0, 0, 0, time.UTC)
+	if err := os.Chtimes(src, want, want); err != nil {
+		t.Fatalf("chtimes src: %v", err)
+	}
+
+	dst := filepath.Join(dir, "out.jpg")
+	if err := recompressHEIC(context.Background(), src, dst, 256, 82); err != nil {
+		t.Fatalf("recompressHEIC: %v", err)
+	}
+	assertJPEGWithin(t, dst, 256)
+	if _, err := os.Stat(dst + ".tmp.jpg"); !os.IsNotExist(err) {
+		t.Fatalf("leftover ffmpeg temp after atomic write: %v", err)
+	}
+	info, err := os.Stat(dst)
+	if err != nil {
+		t.Fatalf("stat dst: %v", err)
+	}
+	if d := info.ModTime().Sub(want); d < -2*time.Second || d > 2*time.Second {
+		t.Fatalf("recompressed mtime = %v, want ~%v (delta %v)", info.ModTime(), want, d)
+	}
+}
+
+// TestRecompressFileHEICReencodesNotPlainCopy is the S-19 tool-selection
+// guarantee: with a HEIC decoder present (ffmpeg and/or heif-convert),
+// recompressFile must REPORT the HEIC handled and emit a real JPEG, never
+// silently fall back to plain-copying the unrenderable HEIC.
+func TestRecompressFileHEICReencodesNotPlainCopy(t *testing.T) {
+	if !haveFfmpeg() && !haveHeifConvert() {
+		t.Skip("no HEIC decoder installed; recompressFile would legitimately plain-copy")
+	}
+	dir := t.TempDir()
+	src := filepath.Join(dir, "photo.heic")
+	makeHEIC(t, src, 320, 240)
+
+	dst := filepath.Join(dir, "out.jpg")
+	handled, err := recompressFile(context.Background(), scan.TypeHEIC, src, dst, 256, 82, 26)
+	if err != nil {
+		t.Fatalf("recompressFile: %v", err)
+	}
+	if !handled {
+		t.Fatalf("recompressFile reported HEIC unhandled (plain-copy) despite a decoder being present")
+	}
+	assertJPEGWithin(t, dst, 256)
 }
