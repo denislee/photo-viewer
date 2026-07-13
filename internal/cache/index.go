@@ -1012,6 +1012,27 @@ func (i *Index) Clear() error {
 	return nil
 }
 
+// Vacuum rebuilds the database file, packing the live pages and handing the
+// freelist pages back to the filesystem so the file shrinks to fit its
+// contents. Clear() (the rebuild primitive) only DELETEs rows: that empties the
+// b-trees but leaves every page allocated to the file on the freelist, so a
+// rebuilt 200k-row library's `.photo-viewer.db` keeps its old multi-hundred-MB
+// high-water mark forever — sitting next to the user's media holding no data
+// (C-05). VACUUM is what reclaims that space.
+//
+// VACUUM is deliberately NOT run inside Clear (it rewrites the whole file, which
+// would add its cost to every rebuild's latency) and NOT after an incremental
+// SelectDir scan (nothing was purged there). It runs opportunistically once, off
+// the UI goroutine, after a full rebuild's rescan has drained — see
+// Controller.Rebuild. VACUUM needs no active transaction and takes a brief
+// exclusive lock while it rewrites, so the caller only invokes it when the
+// rebuild's scan writes are finished, never racing them. Best-effort at the call
+// site: the error is returned so the caller can log it, never fatal.
+func (i *Index) Vacuum() error {
+	_, err := i.db.Exec("VACUUM")
+	return err
+}
+
 // ThumbIDFor returns the deterministic thumbnail identifier for a media path.
 func ThumbIDFor(path string) string {
 	sum := sha1.Sum([]byte(path))

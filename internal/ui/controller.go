@@ -453,7 +453,28 @@ func (c *Controller) Rebuild() error {
 			log.Printf("rebuild: clear %s cache: %v", sub, err)
 		}
 	}
-	go c.scanInto(ctx, c.libraryRoot)
+	go func() {
+		// scanInto blocks until the rescan's result channel drains and its final
+		// ReconcileBatch has committed, so this returns with the index fully
+		// repopulated. Only then run the opportunistic VACUUM (C-05): Clear above
+		// moved the old library's pages to the freelist but never handed them back
+		// to the filesystem, so the `.photo-viewer.db` next to the media keeps its
+		// old high-water mark until something rewrites the file. VACUUM is done
+		// here — after a full rebuild, off the UI goroutine, once the scan writes
+		// are finished — rather than inside Clear (which would add its cost to
+		// rebuild latency) or after an incremental SelectDir scan (nothing was
+		// purged there). Skip it when this scan was cancelled: a newer scan/rebuild
+		// has taken over as the writer, so vacuuming now would only contend with
+		// it, and that newer run will do its own housekeeping if it's a rebuild.
+		// Best-effort: log on failure, never block or crash the app.
+		c.scanInto(ctx, c.libraryRoot)
+		if ctx.Err() != nil {
+			return
+		}
+		if err := c.index.Vacuum(); err != nil {
+			log.Printf("rebuild: vacuum: %v", err)
+		}
+	}()
 	return nil
 }
 
