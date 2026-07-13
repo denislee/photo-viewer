@@ -31,13 +31,42 @@ type exiftoolDaemon struct {
 // slot holds either a live daemon or nil (an empty slot spawned on demand): a
 // request checks a slot out, runs on it, and checks it back in, retiring just
 // that daemon (returning nil) on any error so only the failing instance is torn
-// down. exifFailed latches a spawn failure to the one-shot path for every
-// caller (see S-05 for un-latching it).
+// down.
+//
+// exifFailedAt records the unix-nano time of the most recent daemon spawn
+// failure, or 0 when the last spawn succeeded (or none has been attempted). A
+// recent failure routes callers to the one-shot exec, but only for
+// exifSpawnBackoff; once that window elapses a fresh spawn is retried. This is a
+// timed backoff rather than a permanent latch (S-05) so a transient fork
+// failure (memory pressure, FD exhaustion) doesn't degrade the whole process to
+// fork-per-file for its lifetime — mirroring face.Recheck's re-probe-after-
+// failure spirit.
 var (
-	exifPoolMu sync.Mutex
-	exifPool   chan *exiftoolDaemon
-	exifFailed atomic.Bool
+	exifPoolMu   sync.Mutex
+	exifPool     chan *exiftoolDaemon
+	exifFailedAt atomic.Int64
 )
+
+// exifSpawnBackoff is how long a failed daemon spawn suppresses further spawn
+// attempts, routing callers to the one-shot exec instead. After the window a
+// fresh spawn is retried. It is a var, not a const, only so tests can shrink or
+// age past it — production code never reassigns it.
+var exifSpawnBackoff = time.Minute
+
+// exifSpawnBackedOff reports whether a daemon spawn failed recently enough that
+// callers should skip the pool and go straight to the one-shot exec. Once the
+// backoff window has elapsed the pool path re-opens and the spawn is retried.
+func exifSpawnBackedOff() bool {
+	at := exifFailedAt.Load()
+	if at == 0 {
+		return false
+	}
+	return time.Since(time.Unix(0, at)) < exifSpawnBackoff
+}
+
+// spawnExiftool builds a daemon. It is a var only so tests can fault-inject a
+// transient spawn failure; production always uses spawnExiftoolDaemon.
+var spawnExiftool = spawnExiftoolDaemon
 
 // exiftoolPoolSize mirrors the face pipeline's worker sizing: at least 2 (so an
 // interactive read isn't stuck behind a single in-flight bulk request) and at
@@ -75,9 +104,11 @@ var exiftoolReqTimeout = 15 * time.Second
 // back to the one-shot exec, and the next caller transparently respawns it.
 var errExiftoolTimeout = errors.New("exiftool: request timed out")
 
-// haveExiftool caches whether exiftool is on PATH. SetMediaDate execs exiftool
-// directly (not through the pooled daemon), so it needs its own presence check;
-// a per-call exec.LookPath in the "fix dates" loop would re-walk $PATH per file.
+// haveExiftool caches whether exiftool is on PATH. runExiftool gates the daemon
+// pool on it so a never-installed tool short-circuits straight to the one-shot
+// path instead of retrying a doomed spawn every backoff window (S-05), and
+// SetMediaDate — which execs exiftool directly, not through the pooled daemon —
+// reuses it rather than re-walking $PATH per file in the "fix dates" loop.
 // Presence can't change meaningfully mid-run; a process restart re-probes.
 // Mirrors haveFFprobe in duration.go.
 var haveExiftool = sync.OnceValue(func() bool {
@@ -109,20 +140,32 @@ func runExiftool(args ...string) ([]byte, error) {
 	if argsUnsafeForDaemon(args) {
 		return runExiftoolOneShot(args...)
 	}
-	// A latched spawn failure sends every caller down the one-shot path.
-	if exifFailed.Load() {
+	// A truly-absent exiftool never reaches the daemon pool: haveExiftool (a
+	// cached PATH probe from S-06) short-circuits to the one-shot path, which
+	// reports "not installed" cleanly. That keeps us from retrying a doomed
+	// spawn every backoff window when the tool was simply never installed; the
+	// backoff below is only for a transient failure with the tool present.
+	if !haveExiftool() {
+		return runExiftoolOneShot(args...)
+	}
+	// A recent spawn failure sends callers down the one-shot path, but only for
+	// the backoff window — once it elapses the daemon spawn is retried, so a
+	// transient failure doesn't degrade to fork-per-file for the process life.
+	if exifSpawnBackedOff() {
 		return runExiftoolOneShot(args...)
 	}
 
 	pool := exifPoolChan()
 	d := <-pool // check out a slot; blocks only when all daemons are busy
 	if d == nil {
-		spawned, err := spawnExiftoolDaemon()
+		spawned, err := spawnExiftool()
 		if err != nil {
-			exifFailed.Store(true)
+			exifFailedAt.Store(time.Now().UnixNano())
 			pool <- nil // return the empty slot
 			return runExiftoolOneShot(args...)
 		}
+		// A successful spawn clears any prior backoff.
+		exifFailedAt.Store(0)
 		d = spawned
 	}
 	out, err := d.run(args)

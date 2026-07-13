@@ -1,11 +1,13 @@
 package scan
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -86,8 +88,8 @@ func TestRunExiftoolTimeoutRetiresAndFallsBack(t *testing.T) {
 	if live := livePoolDaemons(); live != 0 {
 		t.Errorf("expected 0 live daemons in the pool after a timeout, got %d", live)
 	}
-	if exifFailed.Load() {
-		t.Error("a timeout should be recoverable, but exifFailed was set")
+	if exifSpawnBackedOff() {
+		t.Error("a timeout should be recoverable, but the spawn backoff was armed")
 	}
 }
 
@@ -99,7 +101,7 @@ func resetExifPool() {
 	old := exifPool
 	exifPool = nil
 	exifPoolMu.Unlock()
-	exifFailed.Store(false)
+	exifFailedAt.Store(0)
 	if old != nil {
 		for {
 			select {
@@ -208,5 +210,85 @@ func TestRunExiftoolPoolConcurrent(t *testing.T) {
 	// The pool should never grow past its cap regardless of the request burst.
 	if live := livePoolDaemons(); live > exiftoolPoolSize() {
 		t.Errorf("pool holds %d live daemons, exceeds cap %d", live, exiftoolPoolSize())
+	}
+}
+
+// TestRunExiftoolSpawnFailureBacksOffThenRetries verifies S-05: a transient
+// daemon spawn failure routes callers to the one-shot exec only for the backoff
+// window, after which the daemon path is retried — rather than being latched to
+// fork-per-file for the process lifetime. It fault-injects a spawn that fails
+// once then succeeds (delegating to the working fake daemon on PATH).
+func TestRunExiftoolSpawnFailureBacksOffThenRetries(t *testing.T) {
+	dir := t.TempDir()
+	fake := filepath.Join(dir, "exiftool")
+	if err := os.WriteFile(fake, []byte(fakeExiftoolDaemonScript), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	resetExifPool()
+	t.Cleanup(resetExifPool)
+
+	// The first spawn attempt fails (a transient fork failure); every later one
+	// delegates to the real spawner, which starts the working fake daemon.
+	var spawns atomic.Int32
+	prevSpawn := spawnExiftool
+	spawnExiftool = func() (*exiftoolDaemon, error) {
+		if spawns.Add(1) == 1 {
+			return nil, errors.New("simulated transient spawn failure")
+		}
+		return prevSpawn()
+	}
+	t.Cleanup(func() { spawnExiftool = prevSpawn })
+
+	// First request: spawn fails, so it falls back to the one-shot exec and arms
+	// the backoff window.
+	out, err := runExiftool("-s", "-S", "-CreateDate", "/photos/first.jpg")
+	if err != nil {
+		t.Fatalf("first runExiftool errored: %v", err)
+	}
+	if !strings.Contains(string(out), "ONESHOT-OK") {
+		t.Errorf("first call: expected one-shot fallback, got %q", out)
+	}
+	if !exifSpawnBackedOff() {
+		t.Fatal("a spawn failure should arm the backoff window")
+	}
+
+	// While the window is open, callers stay on the one-shot path and no further
+	// spawn is attempted.
+	spawnsBefore := spawns.Load()
+	out, err = runExiftool("-s", "-S", "-CreateDate", "/photos/during.jpg")
+	if err != nil {
+		t.Fatalf("during-backoff runExiftool errored: %v", err)
+	}
+	if !strings.Contains(string(out), "ONESHOT-OK") {
+		t.Errorf("during backoff: expected one-shot fallback, got %q", out)
+	}
+	if got := spawns.Load(); got != spawnsBefore {
+		t.Errorf("during backoff: spawn should not be retried, but count went %d -> %d", spawnsBefore, got)
+	}
+
+	// Simulate the backoff window elapsing by ageing the failure timestamp past
+	// it (deterministic, no sleeping).
+	exifFailedAt.Store(time.Now().Add(-2 * exifSpawnBackoff).UnixNano())
+	if exifSpawnBackedOff() {
+		t.Fatal("backoff window should have re-opened once the timestamp aged out")
+	}
+
+	// Next request retries the daemon spawn (now succeeding) and rides the
+	// daemon path — the one-shot latch is gone.
+	out, err = runExiftool("-s", "-S", "-CreateDate", "/photos/after.jpg")
+	if err != nil {
+		t.Fatalf("post-backoff runExiftool errored: %v", err)
+	}
+	if strings.Contains(string(out), "ONESHOT-OK") {
+		t.Errorf("post-backoff: should no longer be on the one-shot path, got %q", out)
+	}
+	if want := "CreateDate: /photos/after.jpg"; !strings.Contains(string(out), want) {
+		t.Errorf("post-backoff: expected daemon output %q, got %q", want, out)
+	}
+	// A successful spawn clears the failure timestamp.
+	if got := exifFailedAt.Load(); got != 0 {
+		t.Errorf("a successful spawn should clear the failure timestamp, got %d", got)
 	}
 }
