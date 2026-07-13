@@ -188,12 +188,13 @@ func (v *OrganizeView) scanForMismatched(ctx context.Context, idx *cache.Index, 
 				}
 				v.progressDone.Add(1)
 				if proc != nil {
+					// proc.AddDone already coalesces the redraw through the
+					// registry's ~30Hz throttle (trailing flush included), so no
+					// modulo-10 direct v.invalidate() here — that per-item tick was
+					// exactly the storm import's coalescer removed (U-11).
 					proc.AddDone(1)
-				}
-				if v.progressDone.Load()%10 == 0 {
-					if v.invalidate != nil {
-						v.invalidate()
-					}
+				} else {
+					v.scheduleInvalidate()
 				}
 			}
 		})
@@ -372,13 +373,30 @@ func (v *OrganizeView) startOrganize(root string) {
 	}()
 }
 
+// scheduleInvalidate wakes the Gio frame loop through the process registry's
+// ~30Hz coalescer when one is wired up. Organize's per-file paths (appendLog,
+// bumpProgress, the scan-pass tick) fire once per file — thousands/sec during a
+// few-thousand-file move — so calling v.invalidate directly from them would peg
+// a core repainting a log that scrolls far faster than the eye can read. The
+// registry coalesces to ~30Hz with a guaranteed trailing flush, so the final
+// log line / progress value still lands. Falls back to the raw invalidate when
+// no registry is set (e.g. tests) — those paths aren't in a per-file storm.
+// Mirrors ImportView.scheduleInvalidate.
+func (v *OrganizeView) scheduleInvalidate() {
+	if v.processes != nil {
+		v.processes.notify()
+		return
+	}
+	if v.invalidate != nil {
+		v.invalidate()
+	}
+}
+
 func (v *OrganizeView) appendLog(msg string) {
 	v.mu.Lock()
 	v.logBuf = append(v.logBuf, msg)
 	v.mu.Unlock()
-	if v.invalidate != nil {
-		v.invalidate()
-	}
+	v.scheduleInvalidate()
 }
 
 func (v *OrganizeView) bumpProgress() {
@@ -387,11 +405,13 @@ func (v *OrganizeView) bumpProgress() {
 	proc := v.proc
 	v.mu.Unlock()
 	if proc != nil {
+		// proc.AddDone already coalesces the redraw through the registry; a
+		// direct v.invalidate() per file is exactly the storm we're killing
+		// (mirrors ImportView.bumpProgress, U-11).
 		proc.AddDone(1)
+		return
 	}
-	if v.invalidate != nil {
-		v.invalidate()
-	}
+	v.scheduleInvalidate()
 }
 
 func (v *OrganizeView) drainLog() {
