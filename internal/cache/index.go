@@ -84,6 +84,16 @@ type Entry struct {
 	Favorite   bool  `json:"favorite"`
 }
 
+// entryCols is the ordered column list backing every Entry read. It must stay
+// in lockstep with the rows.Scan(&e.Path, &e.Type, &e.Size, &mtimeUnix,
+// &e.ThumbID, &fav, &e.DurationMs) calls that consume it. entrySelect is the
+// bare "SELECT <cols> FROM entries" prefix that every entry query builds on by
+// appending its own WHERE/ORDER/LIMIT tail.
+const (
+	entryCols   = "path, type, size, mtime, thumb_id, favorite, duration_ms"
+	entrySelect = "SELECT " + entryCols + " FROM entries"
+)
+
 // Index is the SQLite database representation of the media cache.
 type Index struct {
 	db *sql.DB
@@ -484,14 +494,14 @@ func (i *Index) ListDir(dir string) []Entry {
 	// regrowth it would save.
 	var out []Entry
 	if e := i.queryOne(
-		"SELECT path, type, size, mtime, thumb_id, favorite, duration_ms FROM entries WHERE path = ? LIMIT 1",
+		entrySelect+" WHERE path = ? LIMIT 1",
 		dir,
 	); e != nil {
 		out = append(out, *e)
 	}
 
 	rows, err := i.db.Query(
-		"SELECT path, type, size, mtime, thumb_id, favorite, duration_ms FROM entries WHERE path >= ? AND path < ? ORDER BY path",
+		entrySelect+" WHERE path >= ? AND path < ? ORDER BY path",
 		lower, upper,
 	)
 	if err != nil {
@@ -635,7 +645,7 @@ func (i *Index) Years(filter string, showRAW bool) []YearStat {
 func (i *Index) ListByYear(year int, filter string, showRAW bool, dir string) []Entry {
 
 	where, args := typeFilterClause(filter, showRAW)
-	q := "SELECT path, type, size, mtime, thumb_id, favorite, duration_ms FROM entries WHERE " + yearExpr + " = ?"
+	q := entrySelect + " WHERE " + yearExpr + " = ?"
 	queryArgs := []any{year}
 	if dir != "" {
 		lower, upper := dirRange(dir)
@@ -740,7 +750,7 @@ func typeFilterClause(filter string, showRAW bool) (string, []any) {
 // All returns a snapshot of the entire index.
 func (i *Index) All() []Entry {
 
-	rows, err := i.db.Query("SELECT path, type, size, mtime, thumb_id, favorite, duration_ms FROM entries ORDER BY path")
+	rows, err := i.db.Query(entrySelect + " ORDER BY path")
 	if err != nil {
 		return nil
 	}
@@ -782,7 +792,7 @@ func (i *Index) ForEachEntry(visit func(Entry) bool) {
 	lastPath := ""
 	for {
 		rows, err := i.db.Query(
-			"SELECT path, type, size, mtime, thumb_id, favorite, duration_ms FROM entries WHERE path > ? ORDER BY path LIMIT ?",
+			entrySelect+" WHERE path > ? ORDER BY path LIMIT ?",
 			lastPath, pageSize)
 		if err != nil {
 			return
@@ -827,7 +837,7 @@ func (i *Index) ListByType(t scan.MediaType, visit func(Entry) bool) {
 	lastPath := ""
 	for {
 		rows, err := i.db.Query(
-			"SELECT path, type, size, mtime, thumb_id, favorite, duration_ms FROM entries WHERE type = ? AND path > ? ORDER BY path LIMIT ?",
+			entrySelect+" WHERE type = ? AND path > ? ORDER BY path LIMIT ?",
 			int(t), lastPath, pageSize)
 		if err != nil {
 			return
@@ -874,7 +884,7 @@ func (i *Index) CountByType(t scan.MediaType) int {
 // ListFavorites returns all entries flagged as favorites.
 func (i *Index) ListFavorites() []Entry {
 
-	rows, err := i.db.Query("SELECT path, type, size, mtime, thumb_id, favorite, duration_ms FROM entries WHERE favorite = 1 ORDER BY path")
+	rows, err := i.db.Query(entrySelect + " WHERE favorite = 1 ORDER BY path")
 	if err != nil {
 		return nil
 	}

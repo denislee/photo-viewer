@@ -364,7 +364,7 @@ func (i *Index) GetEntry(path string) (Entry, bool) {
 	var mtimeUnix int64
 	var fav int
 	err := i.db.QueryRow(
-		"SELECT path, type, size, mtime, thumb_id, favorite, duration_ms FROM entries WHERE path = ?",
+		entrySelect+" WHERE path = ?",
 		path,
 	).Scan(&e.Path, &e.Type, &e.Size, &mtimeUnix, &e.ThumbID, &fav, &e.DurationMs)
 	if err != nil {
@@ -383,7 +383,7 @@ func (i *Index) GetEntryByThumbID(id string) (Entry, bool) {
 	var mtimeUnix int64
 	var fav int
 	err := i.db.QueryRow(
-		"SELECT path, type, size, mtime, thumb_id, favorite, duration_ms FROM entries WHERE thumb_id = ? LIMIT 1",
+		entrySelect+" WHERE thumb_id = ? LIMIT 1",
 		id,
 	).Scan(&e.Path, &e.Type, &e.Size, &mtimeUnix, &e.ThumbID, &fav, &e.DurationMs)
 	if err != nil {

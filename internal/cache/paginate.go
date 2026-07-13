@@ -69,7 +69,7 @@ func (i *Index) dirExactEntry(v View) *Entry {
 	typeWhere, typeArgs := typeFilterClause(v.Filter, v.ShowRAW)
 	args := append([]any{v.Dir}, typeArgs...)
 	return i.queryOne(
-		"SELECT path, type, size, mtime, thumb_id, favorite, duration_ms FROM entries WHERE path = ?"+
+		entrySelect+" WHERE path = ?"+
 			typeWhere+" LIMIT 1",
 		args...)
 }
@@ -118,7 +118,7 @@ func (i *Index) ListPage(v View, offset, limit int) []Entry {
 		}
 	}
 
-	q := "SELECT path, type, size, mtime, thumb_id, favorite, duration_ms FROM entries WHERE " +
+	q := entrySelect + " WHERE " +
 		where + " ORDER BY path"
 	if limit > 0 {
 		q += " LIMIT ? OFFSET ?"
@@ -150,14 +150,14 @@ func (i *Index) Neighbors(v View, path string) (prev, next *Entry, pos, total in
 	prevArgs := append([]any{}, args...)
 	prevArgs = append(prevArgs, path)
 	prev = i.queryOne(
-		"SELECT path, type, size, mtime, thumb_id, favorite, duration_ms FROM entries WHERE "+
+		entrySelect+" WHERE "+
 			where+" AND path < ? ORDER BY path DESC LIMIT 1",
 		prevArgs...)
 
 	nextArgs := append([]any{}, args...)
 	nextArgs = append(nextArgs, path)
 	next = i.queryOne(
-		"SELECT path, type, size, mtime, thumb_id, favorite, duration_ms FROM entries WHERE "+
+		entrySelect+" WHERE "+
 			where+" AND path > ? ORDER BY path ASC LIMIT 1",
 		nextArgs...)
 
