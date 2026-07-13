@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strconv"
 	"sync/atomic"
 	"testing"
 )
@@ -107,6 +108,66 @@ func TestWriteFileDurableNoPartialOnError(t *testing.T) {
 	if _, statErr := os.Stat(dst + ".tmp"); !os.IsNotExist(statErr) {
 		t.Errorf("partial .tmp left behind (stat err: %v)", statErr)
 	}
+}
+
+// TestInboxHasFiles locks the U-10 cheap existence check: inboxHasFiles reports
+// true when the inbox holds at least one importable media file (only DetectType
+// != TypeUnknown counts), false for an empty inbox or one holding only
+// non-media/hidden leftovers. It replaces the full recursive inboxFileCount at
+// the Start-click decision sites, so it must agree with them on the ≥1-file
+// question.
+func TestInboxHasFiles(t *testing.T) {
+	write := func(t *testing.T, path string) {
+		t.Helper()
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			t.Fatalf("mkdir: %v", err)
+		}
+		if err := os.WriteFile(path, []byte("x"), 0o644); err != nil {
+			t.Fatalf("write %s: %v", path, err)
+		}
+	}
+
+	t.Run("empty dir", func(t *testing.T) {
+		if inboxHasFiles(t.TempDir()) {
+			t.Error("inboxHasFiles on an empty dir = true, want false")
+		}
+	})
+
+	t.Run("missing dir", func(t *testing.T) {
+		if inboxHasFiles(filepath.Join(t.TempDir(), "nope")) {
+			t.Error("inboxHasFiles on a missing dir = true, want false")
+		}
+	})
+
+	t.Run("only non-media and hidden files", func(t *testing.T) {
+		dir := t.TempDir()
+		write(t, filepath.Join(dir, ".DS_Store"))
+		write(t, filepath.Join(dir, "notes.txt"))
+		write(t, filepath.Join(dir, "sub", "readme.md"))
+		if inboxHasFiles(dir) {
+			t.Error("inboxHasFiles with only non-media files = true, want false")
+		}
+	})
+
+	t.Run("one media file at root", func(t *testing.T) {
+		dir := t.TempDir()
+		write(t, filepath.Join(dir, "IMG_0001.jpg"))
+		if !inboxHasFiles(dir) {
+			t.Error("inboxHasFiles with a media file = false, want true")
+		}
+	})
+
+	t.Run("media file nested among many non-media files", func(t *testing.T) {
+		dir := t.TempDir()
+		write(t, filepath.Join(dir, ".DS_Store"))
+		for i := range 50 {
+			write(t, filepath.Join(dir, "junk", "f"+strconv.Itoa(i)+".txt"))
+		}
+		write(t, filepath.Join(dir, "deep", "sub", "clip.mp4"))
+		if !inboxHasFiles(dir) {
+			t.Error("inboxHasFiles with a nested media file = false, want true")
+		}
+	})
 }
 
 // TestSyncDir confirms the U-13 helper opens and fsyncs a real directory and

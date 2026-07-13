@@ -393,10 +393,17 @@ func (v *ImportView) Layout(gtx layout.Context, th *Theme) layout.Dimensions {
 		v.Close()
 	}
 	if v.startBtn.Clicked(gtx) && !v.runningSnapshot() {
-		if v.haveSomethingToImport() {
+		// Probe the inbox once, cheaply: inboxHasFiles short-circuits on the
+		// first media file instead of counting every leftover (U-10 — this runs
+		// on the frame goroutine). Only meaningful once Inbox is configured; both
+		// callees gate on that first. Thread the result into both so a Start on
+		// an empty inbox doesn't walk it twice.
+		cfg := GetConfig()
+		inboxHas := cfg.InboxDir != "" && inboxHasFiles(cfg.InboxDir)
+		if v.haveSomethingToImport(cfg, inboxHas) {
 			v.startImport()
 		} else {
-			v.explainCantStart()
+			v.explainCantStart(cfg, inboxHas)
 		}
 	}
 	if v.cancelBtn.Clicked(gtx) {
@@ -890,8 +897,9 @@ func (v *ImportView) runningSnapshot() bool {
 // explainCantStart logs (and posts to the status line) why a Start Import
 // click had no effect — usually because inbox/outbox are not configured, or
 // no sources have been added. Without this feedback the button looks broken.
-func (v *ImportView) explainCantStart() {
-	cfg := GetConfig()
+// cfg and inboxHas are computed once by the Start-click handler and threaded in
+// so this never re-reads config or re-walks the inbox (U-10).
+func (v *ImportView) explainCantStart(cfg Config, inboxHas bool) {
 	if cfg.InboxDir == "" || cfg.OutboxDir == "" {
 		msg := "Set Inbox and Outbox directories in Settings first (config: " + configPath() + ")."
 		v.setStatus(msg)
@@ -902,33 +910,45 @@ func (v *ImportView) explainCantStart() {
 	hasDirs := len(v.importDirs) > 0
 	hasZips := len(v.zipFiles) > 0
 	v.mu.Unlock()
-	if !hasDirs && !hasZips && inboxFileCount(cfg.InboxDir) == 0 {
+	if !hasDirs && !hasZips && !inboxHas {
 		msg := "Nothing to import — add a folder, ZIP, or SD card and try again."
 		v.setStatus(msg)
 		v.appendLog("[ERROR] " + msg)
 	}
 }
 
-func (v *ImportView) haveSomethingToImport() bool {
-	cfg := GetConfig()
+// haveSomethingToImport reports whether a Start Import click has anything to
+// act on. cfg and inboxHas are supplied by the caller (which already probed the
+// inbox once via inboxHasFiles) so the ≥1-file decision costs no extra walk.
+func (v *ImportView) haveSomethingToImport(cfg Config, inboxHas bool) bool {
 	if cfg.InboxDir == "" || cfg.OutboxDir == "" {
 		return false
 	}
 	v.mu.Lock()
 	defer v.mu.Unlock()
-	return len(v.importDirs) > 0 || len(v.zipFiles) > 0 || inboxFileCount(cfg.InboxDir) > 0
+	return len(v.importDirs) > 0 || len(v.zipFiles) > 0 || inboxHas
 }
 
-func inboxFileCount(dir string) int {
-	n := 0
-	_ = filepath.WalkDir(dir, func(_ string, d fs.DirEntry, err error) error {
+// inboxHasFiles reports whether dir holds at least one importable media file.
+// It short-circuits: the WalkDir callback returns fs.SkipAll on the first hit,
+// so a huge inbox costs O(1) in the common "has files" case instead of a full
+// recursive count — this runs on the frame goroutine, so a stall here shows up
+// as a dropped frame per Start click (U-10). Only DetectType != TypeUnknown
+// files count, matching what phase-2 processing actually files, so a stray
+// .DS_Store in an otherwise-empty inbox doesn't claim "something to import".
+func inboxHasFiles(dir string) bool {
+	found := false
+	_ = filepath.WalkDir(dir, func(p string, d fs.DirEntry, err error) error {
 		if err != nil || d == nil || d.IsDir() {
 			return nil
 		}
-		n++
+		if scan.DetectType(p) != scan.TypeUnknown {
+			found = true
+			return fs.SkipAll
+		}
 		return nil
 	})
-	return n
+	return found
 }
 
 // startImport kicks off a background goroutine that runs the same three-phase
