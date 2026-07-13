@@ -1121,6 +1121,14 @@ func (v *ImportView) runImport(ctx context.Context, cfg Config, importDirs, zipF
 			}
 			v.setStatus(fmt.Sprintf("Copying %d files from %s…", len(files), sd))
 			v.appendLog(fmt.Sprintf("Copying %d files from %s to Inbox...", len(files), sd))
+			// This Inbox copy moves every byte off the card, so it's the longest
+			// phase on a slow SD reader. Own the progress bar across it — before
+			// U-09 the loop never touched progressDone/progressMax, so the bar
+			// held the previous batch's terminal value (a stale "100%") until
+			// processBatch reset it, reading as a multi-minute hang. bumpProgress
+			// runs once per file (success or copy error) so the bar climbs
+			// monotonically to len(files); processBatch re-owns the bar below.
+			v.setProgress(0, int64(len(files)))
 			var batch []string
 			for _, srcFile := range files {
 				v.waitIfPaused()
@@ -1131,6 +1139,7 @@ func (v *ImportView) runImport(ctx context.Context, cfg Config, importDirs, zipF
 				if err := copyFile(srcFile, dest); err != nil {
 					atomic.AddInt64(&v.statErrors, 1)
 					v.appendLog("[ERROR] Copy failed for " + srcFile + ": " + err.Error())
+					v.bumpProgress()
 					continue
 				}
 				batch = append(batch, dest)
@@ -1148,6 +1157,7 @@ func (v *ImportView) runImport(ctx context.Context, cfg Config, importDirs, zipF
 						v.appendLog("[ERROR] Failed to delete source " + srcFile + ": " + err.Error())
 					}
 				}
+				v.bumpProgress()
 			}
 			if len(batch) == 0 {
 				continue
