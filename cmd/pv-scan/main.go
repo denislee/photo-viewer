@@ -20,6 +20,7 @@ const batchSize = 256
 func main() {
 	root := flag.String("root", "", "library root to scan (required)")
 	noFaces := flag.Bool("no-faces", false, "skip face detection even if pv-face-detect is installed")
+	verbose := flag.Bool("v", false, "print one line per file (debug firehose) instead of periodic progress")
 	flag.Parse()
 
 	if *root == "" {
@@ -43,17 +44,43 @@ func main() {
 		log.Fatalf("pv-scan: thumb store: %v", err)
 	}
 
-	type detected struct {
-		entry cache.Entry
-		thumb string
-		mtime int64
+	// Start the face pipeline up front so face jobs stream as thumbnails are
+	// produced, rather than accumulating a library-sized backlog before any
+	// detection begins. Start and SubmitBlocking are both no-ops when the
+	// helper is unavailable, so this degrades gracefully.
+	pipe := face.NewPipeline(idx, nil)
+	faceCtx, faceCancel := context.WithCancel(context.Background())
+	defer faceCancel()
+	facesActive := !*noFaces && pipe.Enabled()
+	if facesActive {
+		pipe.Start(faceCtx)
 	}
 
-	// Collect entries in batches and fan out thumb generation.
-	var (
-		faceJobs []detected
-		batch    []scan.Result
-	)
+	prog := &progress{out: os.Stdout, verbose: *verbose, every: progressEvery}
+
+	// Thumb worker pool, hoisted out of the batch loop so it is created once
+	// for the whole run instead of per 256-file batch. Workers generate the
+	// thumbnail, record progress, and stream the face job for each entry.
+	workers := store.WarmUpConcurrency()
+	thumbJobs := make(chan cache.Entry, workers)
+	var wg sync.WaitGroup
+	for range workers {
+		wg.Go(func() {
+			for e := range thumbJobs {
+				p, perr := store.Path(e)
+				prog.record(e.Path, p, perr)
+				if facesActive && perr == nil && p != "" {
+					if info, statErr := os.Stat(p); statErr == nil {
+						pipe.SubmitBlocking(faceCtx, face.Job{
+							Entry:     e,
+							ThumbPath: p,
+							ThumbMod:  info.ModTime().Unix(),
+						})
+					}
+				}
+			}
+		})
+	}
 
 	opts := scan.WalkOptions{
 		OnError: func(path string, werr error) {
@@ -61,41 +88,15 @@ func main() {
 		},
 	}
 
+	var batch []scan.Result
 	flushBatch := func() {
 		if len(batch) == 0 {
 			return
 		}
-		entries := idx.ReconcileBatch(batch)
+		for _, e := range idx.ReconcileBatch(batch) {
+			thumbJobs <- e
+		}
 		batch = batch[:0]
-
-		// Fan out thumbnail generation across WarmUpConcurrency workers.
-		workers := store.WarmUpConcurrency()
-		type work struct {
-			e cache.Entry
-		}
-		jobs := make(chan work, workers)
-		var mu sync.Mutex
-		var wg sync.WaitGroup
-		for range workers {
-			wg.Go(func() {
-				for w := range jobs {
-					p, perr := store.Path(w.e)
-					fmt.Printf("  %s -> %s (err=%v)\n", w.e.Path, p, perr)
-					if perr == nil && p != "" {
-						if info, statErr := os.Stat(p); statErr == nil {
-							mu.Lock()
-							faceJobs = append(faceJobs, detected{entry: w.e, thumb: p, mtime: info.ModTime().Unix()})
-							mu.Unlock()
-						}
-					}
-				}
-			})
-		}
-		for _, e := range entries {
-			jobs <- work{e: e}
-		}
-		close(jobs)
-		wg.Wait()
 	}
 
 	for r := range scan.WalkWith(context.Background(), *root, opts) {
@@ -105,24 +106,23 @@ func main() {
 		}
 	}
 	flushBatch()
+
+	// No more entries: let the thumb workers drain, then finalise the index.
+	close(thumbJobs)
+	wg.Wait()
 	idx.Save()
+	fmt.Println(prog.line())
+
+	// Drain any face jobs still queued and wait for the workers to exit.
+	pipe.Stop()
 
 	if *noFaces {
 		return
 	}
-	pipe := face.NewPipeline(idx, nil)
 	if !pipe.Enabled() {
 		fmt.Println("face: pv-face-detect unavailable, skipping detection")
 		return
 	}
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	pipe.Start(ctx)
-	for _, j := range faceJobs {
-		pipe.SubmitBlocking(ctx, face.Job{Entry: j.entry, ThumbPath: j.thumb, ThumbMod: j.mtime})
-	}
-	pipe.Stop()
-
 	clusters := idx.AllClusters()
 	fmt.Printf("face: %d clusters\n", len(clusters))
 }
