@@ -1077,3 +1077,91 @@ func TestAuthThrottle(t *testing.T) {
 		t.Fatalf("post-reset wrong attempt status = %d, want 401", code)
 	}
 }
+
+// TestVideoViewerPosterAndTranscodeFallback guards W-13. Every video viewer
+// carries a poster frame pointing at the same /thumb/<id> the grid uses, so the
+// element shows the thumbnail instead of a black box before metadata loads. A
+// transcode-needed container (.mts) routes its src at the HLS URL even on
+// non-Safari browsers (canHls == false) and renders a download-original caption,
+// while a natively-playable container (.mp4) keeps the original-media path with
+// no fallback note.
+func TestVideoViewerPosterAndTranscodeFallback(t *testing.T) {
+	tmp, err := os.MkdirTemp("", "pv-vid-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(tmp)
+
+	idx, err := cache.Load(filepath.Join(tmp, "index.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer idx.Close()
+	store, err := cache.NewThumbStore(tmp)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	mtsPath := filepath.Join(tmp, "CLIP_0001.mts")
+	mp4Path := filepath.Join(tmp, "CLIP_0002.mp4")
+	idx.ReconcileBatch([]scan.Result{
+		{Path: mtsPath, Type: scan.TypeVideo, Size: 10, ModTime: time.Now()},
+		{Path: mp4Path, Type: scan.TypeVideo, Size: 10, ModTime: time.Now()},
+	})
+
+	s := New(idx, store, tmp)
+	mux := http.NewServeMux()
+	mux.HandleFunc("/view/", s.handleView)
+	ts := httptest.NewServer(mux)
+	defer ts.Close()
+
+	get := func(id string) string {
+		resp, err := http.Get(ts.URL + "/view/" + id)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("GET /view/%s status = %d, want 200", id, resp.StatusCode)
+		}
+		raw, err := io.ReadAll(resp.Body)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return string(raw)
+	}
+
+	// .mts needs transcoding: poster present, src routed to HLS, and the
+	// download-original fallback caption rendered.
+	mtsID := cache.ThumbIDFor(mtsPath)
+	mtsBody := get(mtsID)
+	if want := `poster="/thumb/` + mtsID + `"`; !strings.Contains(mtsBody, want) {
+		t.Errorf(".mts viewer missing poster frame: want %q", want)
+	}
+	if want := `v.src=needsHls?"/hls/` + mtsID + `/index.m3u8"`; !strings.Contains(mtsBody, want) {
+		t.Errorf(".mts viewer does not route src to HLS: want %q", want)
+	}
+	if !strings.Contains(mtsBody, `var needsHls=true`) {
+		t.Errorf(".mts viewer should mark needsHls=true")
+	}
+	if want := `href="/media/` + mtsID + `" download`; !strings.Contains(mtsBody, want) {
+		t.Errorf(".mts viewer missing download-original fallback link: want %q", want)
+	}
+	if !strings.Contains(mtsBody, "Unsupported format") {
+		t.Errorf(".mts viewer missing unsupported-format caption")
+	}
+
+	// .mp4 plays natively: poster present, but no transcode fallback note and
+	// needsHls=false so the picker keeps the original-media path unchanged.
+	mp4ID := cache.ThumbIDFor(mp4Path)
+	mp4Body := get(mp4ID)
+	if want := `poster="/thumb/` + mp4ID + `"`; !strings.Contains(mp4Body, want) {
+		t.Errorf(".mp4 viewer missing poster frame: want %q", want)
+	}
+	if !strings.Contains(mp4Body, `var needsHls=false`) {
+		t.Errorf(".mp4 viewer should mark needsHls=false")
+	}
+	if strings.Contains(mp4Body, "Unsupported format") {
+		t.Errorf(".mp4 viewer should not render the transcode fallback note")
+	}
+}

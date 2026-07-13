@@ -1641,12 +1641,31 @@ func (s *Server) renderViewer(w http.ResponseWriter,
 		// serve the original directly so we don't burn CPU transcoding a
 		// file the device can already play. The src is picked client-side
 		// because only the browser knows whether it has native HLS support.
+		//
+		// poster shows the cached thumbnail (the same /thumb/<id> URL the grid
+		// uses) until the first frame decodes, instead of a black box (W-13).
+		//
+		// Fallback (W-13): a container that needs transcoding (needsHls) points
+		// at hlsURL on every browser, including non-Safari ones (canHls ==
+		// false). They can't play HLS without MSE, but pointing at the working
+		// transcode URL is strictly better than handing them a raw original they
+		// definitely can't decode — and we reveal a caption with a direct
+		// download link client-side so the user isn't left with a silent black
+		// box. The natively-playable path (mp4/mov → original) is unchanged. The
+		// full hls.js/MSE embed is deliberately deferred as a separate decision.
 		hlsURL := "/hls/" + cur.ThumbID + "/index.m3u8"
-		fmt.Fprint(w, `<video class="vmedia" id="vmedia" controls preload="metadata" playsinline></video>`)
+		posterURL := "/thumb/" + cur.ThumbID
+		needs := needsHLS(cur.Path)
+		fmt.Fprintf(w, `<video class="vmedia" id="vmedia" controls preload="metadata" playsinline poster="%s"></video>`, posterURL)
+		if needs {
+			// Hidden until the picker confirms the browser lacks native HLS.
+			fmt.Fprintf(w, `<p class="vnote" id="vnote" hidden>Unsupported format — <a href="%s" download>download original</a></p>`, mediaURL)
+		}
 		fmt.Fprintf(w, `<script>(function(){var v=document.getElementById('vmedia');`+
 			`var canHls=!!v.canPlayType('application/vnd.apple.mpegurl');`+
-			`var needsHls=%t;v.src=(canHls&&needsHls)?%q:%q;})();</script>`,
-			needsHLS(cur.Path), hlsURL, mediaURL)
+			`var needsHls=%t;v.src=needsHls?%q:%q;`+
+			`if(needsHls&&!canHls){var n=document.getElementById('vnote');if(n)n.hidden=false;}})();</script>`,
+			needs, hlsURL, mediaURL)
 	} else {
 		fmt.Fprintf(w, `<img class="vmedia" src="%s" alt="%s">`,
 			mediaURL, html.EscapeString(filepath.Base(cur.Path)))
@@ -2241,6 +2260,12 @@ const pageHeader = `<!doctype html>
   .vnext { right: 0; justify-content: flex-end; padding-right: 16px;
            background: linear-gradient(to left, rgba(0,0,0,0.0), transparent); }
   .vnext:hover, .vnext:focus { background: linear-gradient(to left, rgba(0,0,0,0.4), transparent); }
+
+  .vnote { position: absolute; bottom: 14px; left: 50%; transform: translateX(-50%); z-index: 6;
+           background: rgba(20, 22, 26, 0.9); color: #ddd; padding: 6px 12px; border-radius: 6px;
+           font-size: 13px; border: 1px solid #2a2a2a; max-width: 90%; text-align: center; }
+  .vnote a { color: #6ea8fe; }
+  .vnote[hidden] { display: none; }
 
   .vinfo-panel { position: absolute; right: 0; top: 0; bottom: 0; width: 320px; max-width: 60vw;
                  background: rgba(20, 22, 26, 0.96); color: #eee; padding: 16px;
