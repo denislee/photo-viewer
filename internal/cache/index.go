@@ -426,57 +426,6 @@ func (i *Index) reconcileChunk(chunk []scan.Result, out *[]Entry) error {
 	return nil
 }
 
-// Prune drops index entries whose path is not in the given set. Returns the
-// list of removed paths so callers can delete their thumbnail files.
-func (i *Index) Prune(seen map[string]struct{}) []string {
-
-	tx, err := i.db.Begin()
-	if err != nil {
-		return nil
-	}
-	defer tx.Rollback()
-
-	if _, err := tx.Exec("CREATE TEMP TABLE IF NOT EXISTS prune_seen (path TEXT PRIMARY KEY)"); err != nil {
-		return nil
-	}
-	if _, err := tx.Exec("DELETE FROM prune_seen"); err != nil {
-		return nil
-	}
-
-	ins, err := tx.Prepare("INSERT OR IGNORE INTO prune_seen (path) VALUES (?)")
-	if err != nil {
-		return nil
-	}
-	for p := range seen {
-		_, _ = ins.Exec(p)
-	}
-	ins.Close()
-
-	rows, err := tx.Query("SELECT e.path FROM entries e LEFT JOIN prune_seen s ON s.path = e.path WHERE s.path IS NULL")
-	if err != nil {
-		return nil
-	}
-	var toDelete []string
-	for rows.Next() {
-		var p string
-		if err := rows.Scan(&p); err == nil {
-			toDelete = append(toDelete, p)
-		}
-	}
-	rows.Close()
-
-	if len(toDelete) > 0 {
-		if _, err := tx.Exec("DELETE FROM entries WHERE path NOT IN (SELECT path FROM prune_seen)"); err != nil {
-			return nil
-		}
-	}
-
-	if err := tx.Commit(); err != nil {
-		return nil
-	}
-	return toDelete
-}
-
 // dirRange returns the [lower, upper) string range that captures every path
 // strictly under dir. With dir="/foo" the bounds are "/foo/" and "/foo0",
 // which is index-friendly because the path column is the primary key.

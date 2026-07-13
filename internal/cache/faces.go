@@ -51,18 +51,6 @@ func DecodeEmbedding(b []byte) []float32 {
 	return out
 }
 
-// HasFreshFaces reports whether the index already holds face rows for path
-// matching the given thumb mtime. Callers use this to skip re-detection when
-// the thumbnail hasn't changed.
-func (i *Index) HasFreshFaces(path string, thumbMtime int64) bool {
-	var n int
-	err := i.db.QueryRow(
-		"SELECT COUNT(*) FROM faces WHERE path = ? AND thumb_mtime = ?",
-		path, thumbMtime,
-	).Scan(&n)
-	return err == nil && n > 0
-}
-
 // LoadFaceFreshness returns the maximum thumb_mtime stored against each path
 // that has any face rows. The face pipeline pre-loads this on start so its
 // per-job freshness checks can be answered from memory rather than firing a
@@ -261,6 +249,12 @@ func (i *Index) AllClusters() []Cluster {
 	return out
 }
 
+// The four cluster read/write APIs below (RenameCluster, PathsInCluster,
+// SampleFace, MergeClusters) back the not-yet-built People sidebar. No caller
+// exists yet, but the face detection + clustering pipeline is actively
+// maintained and these are its intended read surface, so they are retained
+// deliberately rather than deleted (see C-04).
+
 // RenameCluster updates the user-visible label for a cluster.
 func (i *Index) RenameCluster(clusterID int64, label string) error {
 	_, err := i.db.Exec("UPDATE face_clusters SET label = ? WHERE id = ?", label, clusterID)
@@ -398,13 +392,4 @@ func (i *Index) GetEntryByThumbID(id string) (Entry, bool) {
 	e.ModTime = time.Unix(mtimeUnix, 0)
 	e.Favorite = fav != 0
 	return e, true
-}
-
-// WipeFaces drops every face row and cluster. Used by the rebuild path.
-func (i *Index) WipeFaces() error {
-	if _, err := i.db.Exec("DELETE FROM faces"); err != nil {
-		return err
-	}
-	_, err := i.db.Exec("DELETE FROM face_clusters")
-	return err
 }
