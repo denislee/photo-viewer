@@ -152,3 +152,55 @@ func TestPathFailureLeavesNoTmp(t *testing.T) {
 		t.Fatalf("%d leftover .tmp files after failure", n)
 	}
 }
+
+// TestSweepStaleTmp seeds a shard directory with a crash-orphaned "*.tmp" older
+// than the reaper threshold, an in-flight "*.tmp" written moments ago, and a
+// real thumbnail, then sweeps. Only the stale temp is removed: the fresh temp
+// (a generation still in flight) and the finished .jpg both survive. This is
+// the startup reclaim NewThumbStore kicks off in the background (C-07); the
+// helper is driven synchronously here so the assertions don't race the
+// goroutine.
+func TestSweepStaleTmp(t *testing.T) {
+	root := t.TempDir()
+	now := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
+
+	// Place a file under a shard dir with a specific age relative to now.
+	place := func(rel string, age time.Duration) string {
+		p := filepath.Join(root, filepath.FromSlash(rel))
+		if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(p, []byte("x"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		mt := now.Add(-age)
+		if err := os.Chtimes(p, mt, mt); err != nil {
+			t.Fatal(err)
+		}
+		return p
+	}
+
+	oldTmp := place("aa/abcd-123.tmp", 2*time.Hour)   // crash-orphaned, stale
+	freshTmp := place("aa/abcd-456.tmp", time.Minute) // in-flight, keep
+	realThumb := place("aa/abcd.jpg", 3*time.Hour)    // finished thumb, never touched
+
+	sweepStaleTmp(root, staleTmpMaxAge, now)
+
+	exists := func(p string) bool { _, err := os.Stat(p); return err == nil }
+	if exists(oldTmp) {
+		t.Error("stale .tmp not swept")
+	}
+	if !exists(freshTmp) {
+		t.Error("fresh .tmp wrongly swept")
+	}
+	if !exists(realThumb) {
+		t.Error("finished .jpg wrongly swept")
+	}
+}
+
+// TestSweepStaleTmpMissingRoot verifies the sweep is a no-op (no panic) when the
+// store root doesn't exist yet — newStore MkdirAll's it first, but the helper
+// must tolerate a missing tree regardless.
+func TestSweepStaleTmpMissingRoot(t *testing.T) {
+	sweepStaleTmp(filepath.Join(t.TempDir(), "does-not-exist"), staleTmpMaxAge, time.Now())
+}

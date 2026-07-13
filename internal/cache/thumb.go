@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"sync"
 	"time"
 
@@ -34,6 +35,15 @@ const DisplaySize = 2048
 // actually fires the thumbnailers' kill paths; a timeout then unwinds
 // exactly like any other generation failure.
 const thumbGenTimeout = 30 * time.Second
+
+// staleTmpMaxAge bounds how long a half-written "*.tmp" rendition may linger in
+// a shard directory before a startup sweep reclaims it. Path() writes each
+// thumbnail to an os.CreateTemp file and atomically renames it into place; a
+// crash or SIGKILL in that window strands the temp, and without a sweep they
+// accumulate across runs forever (C-07). One hour is comfortably beyond
+// thumbGenTimeout (30 s), so an in-flight generation is never mistaken for an
+// orphan. Mirrors the webserver's hlsTmpMaxAge .tmp reaper.
+const staleTmpMaxAge = time.Hour
 
 // ThumbStore turns Entry → on-disk thumbnail JPEG path. It generates the
 // thumbnail on demand if the file does not yet exist.
@@ -81,6 +91,12 @@ func newStore(cacheDir, subdir string, size int) (*ThumbStore, error) {
 	}
 	cpu := max(runtime.NumCPU(), 2)
 	ext := max(cpu*3, 6)
+	// Reclaim any "*.tmp" renditions a previous run's crash stranded between
+	// os.CreateTemp and rename. Run in the background so the walk never blocks
+	// store construction (mirrors the webserver kicking its HLS sweep off a
+	// goroutine at init). Targets this store's own root, so a display store
+	// gets swept alongside the thumb store (W-03) for free.
+	go sweepStaleTmp(d, staleTmpMaxAge, time.Now())
 	return &ThumbStore{
 		dir:      d,
 		size:     size,
@@ -88,6 +104,33 @@ func newStore(cacheDir, subdir string, size int) (*ThumbStore, error) {
 		extSem:   make(chan struct{}, ext),
 		inflight: make(map[string]chan struct{}),
 	}, nil
+}
+
+// sweepStaleTmp walks root once, removing crash-orphaned "*.tmp" files older
+// than tmpMaxAge. Only files matching the ".tmp" suffix are ever removed — the
+// final ".jpg" renditions are never touched — and only when their mtime is
+// beyond the threshold, so an in-flight generation's fresh temp survives.
+// Best-effort throughout: an unreadable or vanished entry (including a missing
+// root) is skipped rather than aborting the walk. Split from newStore with
+// explicit age/now parameters so it's testable without racing wall-clock time.
+// Mirrors the webserver's sweepHLSDir .tmp reaper.
+func sweepStaleTmp(root string, tmpMaxAge time.Duration, now time.Time) {
+	_ = filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
+		if err != nil {
+			return nil // unreadable / vanished dir (or missing root): skip
+		}
+		if d.IsDir() || !strings.HasSuffix(path, ".tmp") {
+			return nil
+		}
+		info, ierr := d.Info()
+		if ierr != nil {
+			return nil
+		}
+		if now.Sub(info.ModTime()) > tmpMaxAge {
+			os.Remove(path)
+		}
+		return nil
+	})
 }
 
 // CacheDir returns the base cache directory the store lives under (the
