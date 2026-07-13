@@ -182,3 +182,121 @@ func TestSyncDir(t *testing.T) {
 		t.Error("syncDir on a missing dir: want error, got nil")
 	}
 }
+
+// TestSameContent locks the U-12 byte-compare contract: identical files are
+// equal, differing content of the same size is not, differing sizes are not,
+// and empty files are equal — the same true/false verdicts the old double-hash
+// produced, now via an early-exiting block compare.
+func TestSameContent(t *testing.T) {
+	dir := t.TempDir()
+	write := func(t *testing.T, name string, data []byte) string {
+		t.Helper()
+		p := filepath.Join(dir, name)
+		if err := os.WriteFile(p, data, 0o644); err != nil {
+			t.Fatalf("write %s: %v", name, err)
+		}
+		return p
+	}
+
+	// bytesRepeating builds an n-byte slice filled with b — handy for content
+	// spanning several 64 KiB blocks so the block-boundary logic is exercised.
+	bytesRepeating := func(b byte, n int) []byte {
+		s := make([]byte, n)
+		for i := range s {
+			s[i] = b
+		}
+		return s
+	}
+
+	t.Run("identical small files", func(t *testing.T) {
+		a := write(t, "a1.bin", []byte("the exact same media bytes"))
+		b := write(t, "b1.bin", []byte("the exact same media bytes"))
+		same, err := sameContent(a, b)
+		if err != nil {
+			t.Fatalf("sameContent: %v", err)
+		}
+		if !same {
+			t.Error("identical files reported as different")
+		}
+	})
+
+	t.Run("identical multi-block files", func(t *testing.T) {
+		// ~2.5 blocks so a short final block is compared too.
+		payload := bytesRepeating('Z', 64*1024*2+123)
+		a := write(t, "a2.bin", payload)
+		b := write(t, "b2.bin", payload)
+		same, err := sameContent(a, b)
+		if err != nil {
+			t.Fatalf("sameContent: %v", err)
+		}
+		if !same {
+			t.Error("identical multi-block files reported as different")
+		}
+	})
+
+	t.Run("same size, differ at byte 0", func(t *testing.T) {
+		// A large file differing in the very first byte must be reported
+		// different without depending on reading either file to EOF — the
+		// early-exit path the double-hash lacked.
+		n := 64 * 1024 * 4
+		pa := bytesRepeating('A', n)
+		pb := bytesRepeating('A', n)
+		pb[0] = 'B'
+		a := write(t, "a3.bin", pa)
+		b := write(t, "b3.bin", pb)
+		same, err := sameContent(a, b)
+		if err != nil {
+			t.Fatalf("sameContent: %v", err)
+		}
+		if same {
+			t.Error("files differing at byte 0 reported as identical")
+		}
+	})
+
+	t.Run("same size, differ in a later block", func(t *testing.T) {
+		n := 64*1024*3 + 7
+		pa := bytesRepeating('C', n)
+		pb := bytesRepeating('C', n)
+		pb[n-1] = 'D' // last byte, in the short final block
+		a := write(t, "a4.bin", pa)
+		b := write(t, "b4.bin", pb)
+		same, err := sameContent(a, b)
+		if err != nil {
+			t.Fatalf("sameContent: %v", err)
+		}
+		if same {
+			t.Error("files differing in the final block reported as identical")
+		}
+	})
+
+	t.Run("different sizes", func(t *testing.T) {
+		a := write(t, "a5.bin", []byte("short"))
+		b := write(t, "b5.bin", []byte("a longer set of bytes"))
+		same, err := sameContent(a, b)
+		if err != nil {
+			t.Fatalf("sameContent: %v", err)
+		}
+		if same {
+			t.Error("different-size files reported as identical")
+		}
+	})
+
+	t.Run("both empty", func(t *testing.T) {
+		a := write(t, "a6.bin", nil)
+		b := write(t, "b6.bin", nil)
+		same, err := sameContent(a, b)
+		if err != nil {
+			t.Fatalf("sameContent: %v", err)
+		}
+		if !same {
+			t.Error("two empty files reported as different")
+		}
+	})
+
+	t.Run("missing operand surfaces error", func(t *testing.T) {
+		a := write(t, "a7.bin", []byte("present"))
+		if _, err := sameContent(a, filepath.Join(dir, "nope.bin")); err == nil {
+			t.Error("sameContent with a missing file: want error, got nil")
+		}
+	})
+}

@@ -2,9 +2,8 @@ package ui
 
 import (
 	"archive/zip"
+	"bytes"
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"errors"
 	"fmt"
 	"image"
@@ -1537,6 +1536,13 @@ func writeFileDurable(dst string, r io.Reader) error {
 	return os.Rename(tmp, dst)
 }
 
+// sameContent reports whether two files hold identical bytes. It short-circuits
+// cheaply on a size mismatch, then compares the contents block-by-block and
+// early-exits on the first differing byte (U-12) — the previous implementation
+// SHA-256'd both files in full, always reading both to EOF even when they
+// differed in the first block, which made re-importing an already-filed card
+// pay two full-file reads per duplicate just to skip it. Any stat/open/read
+// error is surfaced to the caller unchanged.
 func sameContent(a, b string) (bool, error) {
 	ai, err := os.Stat(a)
 	if err != nil {
@@ -1549,26 +1555,42 @@ func sameContent(a, b string) (bool, error) {
 	if ai.Size() != bi.Size() {
 		return false, nil
 	}
-	ha, err := sha256File(a)
-	if err != nil {
-		return false, err
-	}
-	hb, err := sha256File(b)
-	if err != nil {
-		return false, err
-	}
-	return ha == hb, nil
-}
 
-func sha256File(path string) (string, error) {
-	f, err := os.Open(path)
+	fa, err := os.Open(a)
 	if err != nil {
-		return "", err
+		return false, err
 	}
-	defer f.Close()
-	h := sha256.New()
-	if _, err := io.Copy(h, f); err != nil {
-		return "", err
+	defer fa.Close()
+	fb, err := os.Open(b)
+	if err != nil {
+		return false, err
 	}
-	return hex.EncodeToString(h.Sum(nil)), nil
+	defer fb.Close()
+
+	// Read fixed-size blocks from both files in lockstep. io.ReadFull fills the
+	// whole buffer (so blocks stay aligned across the two files despite short OS
+	// reads) except at end-of-file, where it returns io.EOF (block boundary) or
+	// io.ErrUnexpectedEOF (short final block). Because the sizes already match,
+	// the two streams end together.
+	const block = 64 * 1024
+	bufA := make([]byte, block)
+	bufB := make([]byte, block)
+	for {
+		na, ea := io.ReadFull(fa, bufA)
+		nb, eb := io.ReadFull(fb, bufB)
+		if na != nb || !bytes.Equal(bufA[:na], bufB[:nb]) {
+			return false, nil
+		}
+		if ea != nil || eb != nil {
+			// End of at least one file, or a genuine read error. Surface any
+			// error that isn't an expected EOF; otherwise both files are
+			// exhausted with every block equal, so they're identical.
+			for _, e := range []error{ea, eb} {
+				if e != nil && e != io.EOF && e != io.ErrUnexpectedEOF {
+					return false, e
+				}
+			}
+			return true, nil
+		}
+	}
 }
