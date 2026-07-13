@@ -1,9 +1,13 @@
 package export
 
 import (
+	"image"
+	"image/color"
+	"image/png"
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 )
 
 func writeFile(t *testing.T, p, content string) {
@@ -189,5 +193,61 @@ func TestDryRunPlanMatchesRealCopy(t *testing.T) {
 	}
 	if b := mustRead(t, filepath.Join(dir, "a.jpg")); b != "OLD" {
 		t.Fatalf("pre-existing file clobbered: %q", b)
+	}
+}
+
+// writePNG writes a small solid-colour PNG to p, giving recompressImage a real
+// decodable source that needs no external tools.
+func writePNG(t *testing.T, p string, w, h int) {
+	t.Helper()
+	img := image.NewRGBA(image.Rect(0, 0, w, h))
+	for y := range h {
+		for x := range w {
+			img.Set(x, y, color.RGBA{R: uint8(x), G: uint8(y), B: 0x40, A: 0xff})
+		}
+	}
+	f, err := os.Create(p)
+	if err != nil {
+		t.Fatalf("create %s: %v", p, err)
+	}
+	if err := png.Encode(f, img); err != nil {
+		f.Close()
+		t.Fatalf("encode %s: %v", p, err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatalf("close %s: %v", p, err)
+	}
+}
+
+// TestRecompressImagePreservesMtime is the S-09 guarantee: a recompressed image
+// export carries the source's mtime (capture time), not the encode time, so it
+// sorts correctly in date-ordered browsers. Uses the pure-Go image path (PNG →
+// JPEG), so it needs no external tools and runs unconditionally.
+func TestRecompressImagePreservesMtime(t *testing.T) {
+	dir := t.TempDir()
+	src := filepath.Join(dir, "in.png")
+	writePNG(t, src, 64, 48)
+
+	// A distinctive, whole-second past mtime: whole seconds dodge sub-second
+	// truncation on coarser filesystems, and being years in the past makes the
+	// "stamped with now" regression impossible to pass the tolerance below.
+	want := time.Date(2019, 3, 14, 9, 26, 53, 0, time.UTC)
+	if err := os.Chtimes(src, want, want); err != nil {
+		t.Fatalf("chtimes src: %v", err)
+	}
+
+	dst := filepath.Join(dir, "out.jpg")
+	if err := recompressImage(src, dst, 32, 82); err != nil {
+		t.Fatalf("recompressImage: %v", err)
+	}
+
+	info, err := os.Stat(dst)
+	if err != nil {
+		t.Fatalf("stat dst: %v", err)
+	}
+	// Tolerance covers coarse mtime resolution (e.g. FAT's 2 s) without admitting
+	// an encode-time (~now) mtime, which would be years off.
+	if d := info.ModTime().Sub(want); d < -2*time.Second || d > 2*time.Second {
+		t.Fatalf("recompressed mtime = %v, want ~%v (delta %v)", info.ModTime(), want, d)
 	}
 }

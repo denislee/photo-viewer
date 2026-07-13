@@ -74,6 +74,12 @@ func recompressImage(src, dst string, maxEdge, quality int) error {
 		return err
 	}
 	defer in.Close()
+	// Capture the source mtime before decoding so we can stamp it onto the
+	// finalized output (see the Chtimes after rename below).
+	info, err := in.Stat()
+	if err != nil {
+		return err
+	}
 	img, _, err := image.Decode(in)
 	if err != nil {
 		return err
@@ -92,7 +98,12 @@ func recompressImage(src, dst string, maxEdge, quality int) error {
 	b := img.Bounds()
 	tw, th := imgfit.Within(b.Dx(), b.Dy(), maxEdge)
 	scaled := image.NewRGBA(image.Rect(0, 0, tw, th))
-	draw.ApproxBiLinear.Scale(scaled, scaled.Rect, img, b, draw.Src, nil)
+	// CatmullRom (a 4×4 cubic kernel), not ApproxBiLinear: a kept-forever export
+	// of a 24 MP source down to a 2048 px edge is exactly the large-downscale
+	// regime where bilinear aliases badly — the same reason the 256 px thumb path
+	// uses it (thumb/image.go). Exports aren't latency-critical (video is
+	// ffmpeg-bound anyway), so the extra CPU is fine.
+	draw.CatmullRom.Scale(scaled, scaled.Rect, img, b, draw.Src, nil)
 	dstImg := imgorient.Apply(scaled, orient)
 
 	tmp := dst + ".tmp"
@@ -117,7 +128,16 @@ func recompressImage(src, dst string, maxEdge, quality int) error {
 		os.Remove(tmp)
 		return err
 	}
-	return os.Rename(tmp, dst)
+	if err := os.Rename(tmp, dst); err != nil {
+		return err
+	}
+	// Preserve the source's mtime so a recompressed export sorts by capture time
+	// (source mtime), not encode time, in any date-ordered browser — mirroring
+	// copyFile's mode+mtime preservation in favorites.go. Best-effort, matching
+	// copyFile's ignored Chtimes error: a failed stamp doesn't invalidate an
+	// otherwise-good export.
+	_ = os.Chtimes(dst, info.ModTime(), info.ModTime())
+	return nil
 }
 
 // recompressHEIC converts the HEIF source to a temp JPEG via heif-convert
@@ -125,6 +145,13 @@ func recompressImage(src, dst string, maxEdge, quality int) error {
 // recompressImage. The intermediate JPEG is heif-convert's max-quality
 // output, so quality loss is dominated by the final encode.
 func recompressHEIC(ctx context.Context, src, dst string, maxEdge, quality int) error {
+	// Capture the original HEIC's mtime up front: recompressImage below runs on
+	// the intermediate temp JPEG and would otherwise stamp dst with that temp's
+	// (encode-time) mtime, so we re-stamp the source's mtime afterwards.
+	info, err := os.Stat(src)
+	if err != nil {
+		return err
+	}
 	tmpFull, err := os.CreateTemp("", "pv-export-*.jpg")
 	if err != nil {
 		return err
@@ -136,7 +163,13 @@ func recompressHEIC(ctx context.Context, src, dst string, maxEdge, quality int) 
 	if out, err := cmd.CombinedOutput(); err != nil {
 		return fmt.Errorf("heif-convert: %v: %s", err, strings.TrimSpace(string(out)))
 	}
-	return recompressImage(tmpFull.Name(), dst, maxEdge, quality)
+	if err := recompressImage(tmpFull.Name(), dst, maxEdge, quality); err != nil {
+		return err
+	}
+	// Override the intermediate-temp mtime recompressImage stamped with the
+	// original HEIC's mtime. Best-effort, matching copyFile's ignored error.
+	_ = os.Chtimes(dst, info.ModTime(), info.ModTime())
+	return nil
 }
 
 // recompressVideo invokes ffmpeg to transcode src into dst, fitting the
@@ -144,6 +177,12 @@ func recompressHEIC(ctx context.Context, src, dst string, maxEdge, quality int) 
 // using libx264 at the given CRF for the video stream. Audio is re-encoded
 // to AAC at 128 kbps so MOV/MTS sources still produce a portable MP4.
 func recompressVideo(ctx context.Context, src, dst string, maxEdge, crf int) error {
+	// Capture the source mtime up front so we can stamp it onto the ffmpeg output
+	// after the rename below.
+	info, err := os.Stat(src)
+	if err != nil {
+		return err
+	}
 	// force_original_aspect_ratio=decrease keeps the source dims when they
 	// already fit; otherwise scales down to fit inside maxEdge×maxEdge.
 	// The trailing -2 rounding ensures both axes stay even (required by
@@ -168,5 +207,11 @@ func recompressVideo(ctx context.Context, src, dst string, maxEdge, crf int) err
 		os.Remove(tmp)
 		return fmt.Errorf("ffmpeg: %v: %s", err, strings.TrimSpace(string(out)))
 	}
-	return os.Rename(tmp, dst)
+	if err := os.Rename(tmp, dst); err != nil {
+		return err
+	}
+	// Preserve the source's mtime so the transcoded clip sorts by capture time,
+	// not encode time. Best-effort, matching copyFile's ignored Chtimes error.
+	_ = os.Chtimes(dst, info.ModTime(), info.ModTime())
+	return nil
 }
