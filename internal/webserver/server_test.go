@@ -363,6 +363,44 @@ func TestDirOutsideRootRejected(t *testing.T) {
 	}
 }
 
+// TestAPIPageEmptyDirPathRejected guards W-09: an empty dir path must be
+// rejected before filepath.Abs turns "" into the process CWD, which would
+// otherwise silently serve the library root as a "dir" view. A valid path
+// under the root must still succeed.
+func TestAPIPageEmptyDirPathRejected(t *testing.T) {
+	s, ts, cleanup := fixture(t, 5)
+	defer cleanup()
+
+	// Empty path → 400 (viewFromQuery returns false, handleAPIPage 400s).
+	resp, err := http.Get(ts.URL + "/api/page?from=dir&path=&p=1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Errorf("empty path status = %d, want 400", resp.StatusCode)
+	}
+
+	// A real directory under the root still works.
+	valid, err := http.Get(ts.URL + "/api/page?from=dir&path=" + url.QueryEscape(s.libraryRoot) + "&p=1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer valid.Body.Close()
+	if valid.StatusCode != http.StatusOK {
+		t.Fatalf("valid path status = %d, want 200", valid.StatusCode)
+	}
+	var payload struct {
+		Items []struct{} `json:"items"`
+	}
+	if err := json.NewDecoder(valid.Body).Decode(&payload); err != nil {
+		t.Fatal(err)
+	}
+	if len(payload.Items) != 5 {
+		t.Errorf("valid dir items = %d, want 5", len(payload.Items))
+	}
+}
+
 // apiFixture creates a minimal test server with only /api/favorite registered
 // — enough for CSRF boundary tests that need no actual index data.
 func apiFixture(t *testing.T) (*httptest.Server, func()) {

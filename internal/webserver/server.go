@@ -490,6 +490,13 @@ func (s *Server) viewFromQuery(q url.Values) (viewInfo, bool) {
 		}, true
 	case "dir":
 		path := q.Get("path")
+		// Reject empty paths before Abs: filepath.Abs("") resolves to the
+		// process CWD with no error, which would silently serve the library
+		// root as a "dir" view (the GUI defaults -root to CWD). handleDir
+		// rejects empty paths the same way.
+		if path == "" {
+			return viewInfo{}, false
+		}
 		abs, err := filepath.Abs(path)
 		if err != nil || !s.withinRoot(abs) {
 			return viewInfo{}, false
