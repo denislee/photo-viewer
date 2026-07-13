@@ -78,7 +78,6 @@ type Server struct {
 	srv      *http.Server
 	listener net.Listener
 	addr     string // resolved listen address (host:port) once running
-	password string
 	running  bool
 
 	// HLS on-the-fly transcode state (see hls.go). Lazily initialised by
@@ -225,7 +224,6 @@ func (s *Server) Start(host string, port int, password string) error {
 	s.srv = srv
 	s.listener = ln
 	s.addr = ln.Addr().String()
-	s.password = password
 	s.running = true
 	s.mu.Unlock()
 
@@ -261,7 +259,6 @@ func (s *Server) Stop() error {
 	s.listener = nil
 	s.running = false
 	s.addr = ""
-	s.password = ""
 	s.mu.Unlock()
 	if srv == nil {
 		return nil
