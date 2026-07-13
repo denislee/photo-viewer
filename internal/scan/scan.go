@@ -77,9 +77,6 @@ func WalkWith(ctx context.Context, root string, opts WalkOptions) <-chan Result 
 		metaWorkers = 4
 	}
 	probeWorkers := metaWorkers
-	if probeWorkers < 4 {
-		probeWorkers = 4
-	}
 
 	jobs := make(chan work, metaWorkers*256)
 	probe := make(chan vidResult, probeWorkers*16)
