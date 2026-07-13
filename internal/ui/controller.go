@@ -56,8 +56,13 @@ type Controller struct {
 	libraryRoot string
 	cacheDir    string
 	trashDir    string
-	index       *cache.Index
-	store       *cache.ThumbStore
+	// indexPath is the real on-disk SQLite path, resolved once at construction
+	// via cache.IndexPath (which may fall back to cacheDir on a read-only
+	// library root). Stored so IndexStatus reports the true path without
+	// re-deriving or re-statting the filesystem on every modal poll.
+	indexPath string
+	index     *cache.Index
+	store     *cache.ThumbStore
 
 	mu          sync.Mutex
 	treeDir     string // anchor for the sidebar tree (parent + subdirs)
@@ -154,6 +159,7 @@ func NewController(root string, idx *cache.Index, store *cache.ThumbStore, cache
 		libraryRoot:   root,
 		cacheDir:      cacheDir,
 		trashDir:      trashDir,
+		indexPath:     cache.IndexPath(root, cacheDir),
 		index:         idx,
 		store:         store,
 		treeDir:       root,
@@ -353,7 +359,7 @@ func (c *Controller) IndexStatus() IndexStatus {
 	st := IndexStatus{
 		LibraryRoot: c.libraryRoot,
 		CacheDir:    c.cacheDir,
-		DBPath:      filepath.Join(c.libraryRoot, ".photo-viewer.db"),
+		DBPath:      c.indexPath,
 		Active:      c.scanning > 0,
 		Target:      c.scanTarget,
 		StartedAt:   c.scanStartedAt,
