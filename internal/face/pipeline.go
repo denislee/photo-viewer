@@ -377,7 +377,29 @@ func (p *Pipeline) process(ctx context.Context, d *daemon, j Job) (daemonOK bool
 		return errors.As(err, &pie)
 	}
 
+	// The assignment step + DB write happen under clusterMu, released via defer
+	// inside the helper so a panic there (WriteFacesForPath, or a fix-up index
+	// bug) can't escape holding the lock and wedge every other worker at Lock().
+	// onChange must stay OUTSIDE the lock, so the helper only reports whether a
+	// new cluster was created and the caller fires the callback unlocked.
+	changed := p.assignAndPersist(j, dets)
+	if changed && p.onChange != nil {
+		p.onChange()
+	}
+	return true
+}
+
+// assignAndPersist greedily assigns the detected faces to clusters, persists
+// them with WriteFacesForPath, and fixes up the in-memory cache with the new
+// cluster IDs — all under clusterMu, which is released via defer so any panic
+// in the DB write or the fix-up loop still frees the lock (otherwise every
+// other worker would block forever at clusterMu.Lock and face processing would
+// silently stop). It returns whether a new cluster was created, so the caller
+// can fire onChange outside the lock.
+func (p *Pipeline) assignAndPersist(j Job, dets []Detection) (changed bool) {
 	p.clusterMu.Lock()
+	defer p.clusterMu.Unlock()
+
 	if !p.clusterCacheOK {
 		p.cachedClusters = p.idx.AllClusters()
 		p.clusterCacheOK = true
@@ -444,24 +466,17 @@ func (p *Pipeline) process(ctx context.Context, d *daemon, j Job) (daemonOK bool
 		// not a helper transport error, so the daemon stays healthy.
 		p.cachedClusters = nil
 		p.clusterCacheOK = false
-		p.clusterMu.Unlock()
-		return true
+		return false
 	}
 	p.markFresh(j.Entry.Path, j.ThumbMod)
 
-	changed := false
 	for i, op := range ops {
 		if op.ExistingClusterID == 0 {
 			p.cachedClusters[cacheSlots[i]].ID = results[i].ClusterID
 			changed = true
 		}
 	}
-	p.clusterMu.Unlock()
-
-	if changed && p.onChange != nil {
-		p.onChange()
-	}
-	return true
+	return changed
 }
 
 // InvalidateClusters drops the in-memory cluster cache. UI paths that mutate
