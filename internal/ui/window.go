@@ -242,19 +242,22 @@ func Run(w *app.Window, ctrl *Controller) error {
 	}
 }
 
-func handleKeys(gtx layout.Context, ctrl *Controller, grid *Grid, sidebar *Sidebar, viewer *Viewer, dups *DuplicatesView, imports *ImportView, organize *OrganizeView, settings *SettingsView, indexInfo *IndexInfoView, search *FuzzySearchView, sdPrompt *SDPromptView, webView *WebServerView, sidebarFocus *bool, focusSearch *bool, w *app.Window) {
-	_, _, entries, _ := ctrl.Snapshot()
-	total := len(entries)
-
-	// Filters without a Focus field deliver events globally — independent of
-	// which widget currently holds keyboard focus. This is the right shape
-	// for app-wide hotkeys (viewer Esc/Q, grid hjkl) since otherwise any
-	// click on a widget that grabs focus would silently swallow our keys.
-	//
-	// When the fuzzy-search palette is open the editor needs printable keys,
-	// so we register a narrow filter set: navigation + the close shortcut.
-	// Letters/space fall through to the focused editor.
-	filters := []event.Filter{
+// Key-event filters are static sets, so they are built once at package init
+// rather than being reconstructed on every frame (handleKeys runs each frame,
+// including idle invalidations from video playback and the process bar).
+//
+// Filters without a Focus field deliver events globally — independent of which
+// widget currently holds keyboard focus. This is the right shape for app-wide
+// hotkeys (viewer Esc/Q, grid hjkl) since otherwise any click on a widget that
+// grabs focus would silently swallow our keys.
+//
+// Both slices are read-only: gtx.Event only reads them and they are shared
+// across every frame, so they must never be mutated.
+var (
+	// baseKeyFilters is the narrow set registered while the fuzzy-search
+	// palette is open: navigation + the close shortcut. Printable keys
+	// (letters/space) fall through to the focused editor.
+	baseKeyFilters = []event.Filter{
 		key.Filter{Name: key.NameEscape},
 		key.Filter{Name: key.NameUpArrow},
 		key.Filter{Name: key.NameDownArrow},
@@ -264,38 +267,54 @@ func handleKeys(gtx layout.Context, ctrl *Controller, grid *Grid, sidebar *Sideb
 		key.Filter{Name: "K", Required: key.ModCtrl},
 		key.Filter{Name: "[", Required: key.ModCtrl},
 	}
-	if !search.Open {
-		filters = append(filters,
-			key.Filter{Name: key.NameLeftArrow},
-			key.Filter{Name: key.NameRightArrow},
-			key.Filter{Name: key.NameSpace},
-			key.Filter{Name: "D"},
-			key.Filter{Name: "E"},
-			key.Filter{Name: "F"},
-			key.Filter{Name: "G"},
-			key.Filter{Name: "G", Required: key.ModShift},
-			key.Filter{Name: "H"},
-			key.Filter{Name: "I"},
-			key.Filter{Name: "J"},
-			key.Filter{Name: "K"},
-			key.Filter{Name: "L"},
-			key.Filter{Name: "M"},
-			key.Filter{Name: "O"},
-			key.Filter{Name: "o"},
-			key.Filter{Name: "Q"},
-			key.Filter{Name: "V"},
-			key.Filter{Name: "["},
-			key.Filter{Name: "]"},
-			key.Filter{Name: "F", Required: key.ModCtrl},
-			key.Filter{Name: "B", Required: key.ModCtrl},
-			key.Filter{Name: "I", Required: key.ModCtrl},
-			key.Filter{Name: "D", Required: key.ModCtrl},
-			key.Filter{Name: "E", Required: key.ModCtrl},
-			key.Filter{Name: "+", Required: key.ModCtrl},
-			key.Filter{Name: "=", Required: key.ModCtrl},
-			key.Filter{Name: "-", Required: key.ModCtrl},
-			key.Filter{Name: ","},
-		)
+
+	// fullKeyFilters is baseKeyFilters plus every app-wide hotkey, registered
+	// when no modal editor needs printable keys. Built by copying the base set
+	// into a fresh backing array (append to a nil slice) so appending the
+	// extras can never mutate baseKeyFilters.
+	fullKeyFilters = append(append([]event.Filter(nil), baseKeyFilters...),
+		key.Filter{Name: key.NameLeftArrow},
+		key.Filter{Name: key.NameRightArrow},
+		key.Filter{Name: key.NameSpace},
+		key.Filter{Name: "D"},
+		key.Filter{Name: "E"},
+		key.Filter{Name: "F"},
+		key.Filter{Name: "G"},
+		key.Filter{Name: "G", Required: key.ModShift},
+		key.Filter{Name: "H"},
+		key.Filter{Name: "I"},
+		key.Filter{Name: "J"},
+		key.Filter{Name: "K"},
+		key.Filter{Name: "L"},
+		key.Filter{Name: "M"},
+		key.Filter{Name: "O"},
+		key.Filter{Name: "o"},
+		key.Filter{Name: "Q"},
+		key.Filter{Name: "V"},
+		key.Filter{Name: "["},
+		key.Filter{Name: "]"},
+		key.Filter{Name: "F", Required: key.ModCtrl},
+		key.Filter{Name: "B", Required: key.ModCtrl},
+		key.Filter{Name: "I", Required: key.ModCtrl},
+		key.Filter{Name: "D", Required: key.ModCtrl},
+		key.Filter{Name: "E", Required: key.ModCtrl},
+		key.Filter{Name: "+", Required: key.ModCtrl},
+		key.Filter{Name: "=", Required: key.ModCtrl},
+		key.Filter{Name: "-", Required: key.ModCtrl},
+		key.Filter{Name: ","},
+	)
+)
+
+func handleKeys(gtx layout.Context, ctrl *Controller, grid *Grid, sidebar *Sidebar, viewer *Viewer, dups *DuplicatesView, imports *ImportView, organize *OrganizeView, settings *SettingsView, indexInfo *IndexInfoView, search *FuzzySearchView, sdPrompt *SDPromptView, webView *WebServerView, sidebarFocus *bool, focusSearch *bool, w *app.Window) {
+	_, _, entries, _ := ctrl.Snapshot()
+	total := len(entries)
+
+	// Select the pre-built static filter set (see baseKeyFilters /
+	// fullKeyFilters). The palette needs printable keys, so it uses the base
+	// set only.
+	filters := fullKeyFilters
+	if search.Open {
+		filters = baseKeyFilters
 	}
 	for {
 		ev, ok := gtx.Event(filters...)
