@@ -815,7 +815,7 @@ func (v *Viewer) prefetchAt(idx int) {
 	switch e.Type {
 	case scan.TypePhoto, scan.TypeRAW, scan.TypeHEIC:
 	case scan.TypeVideo:
-		v.prefetchVideo(e)
+		v.prefetchVideo(e, idx)
 		return
 	default:
 		return
@@ -880,7 +880,12 @@ const videoPrefetchBytes = 16 << 20
 // its first videoPrefetchBytes. Doesn't touch the player — mpv only loads
 // one file at a time — but on a cold cache this is the difference between
 // mpv blocking on disk seeks and the first frame appearing instantly.
-func (v *Viewer) prefetchVideo(e cache.Entry) {
+//
+// Like the photo prefetch path it is bounded by the 2-slot prefetchSem
+// (acquired non-blocking, so rapid paging can't stack N concurrent 16 MB
+// reads into a seek storm) and short-circuits via the ±2 stale check when
+// the user has already paged away from idx.
+func (v *Viewer) prefetchVideo(e cache.Entry, idx int) {
 	v.recentMu.Lock()
 	if v.prefetching == nil {
 		v.prefetching = map[string]bool{}
@@ -892,19 +897,39 @@ func (v *Viewer) prefetchVideo(e cache.Entry) {
 	v.prefetching[e.Path] = true
 	v.recentMu.Unlock()
 
-	go func(path string) {
+	if v.prefetchSem == nil {
+		v.prefetchSem = make(chan struct{}, 2)
+	}
+	go func(path string, idx int) {
 		defer func() {
 			v.recentMu.Lock()
 			delete(v.prefetching, path)
 			v.recentMu.Unlock()
 		}()
+		// Non-blocking acquire: if both slots are taken, skip this prefetch
+		// rather than spawning an unbounded read.
+		select {
+		case v.prefetchSem <- struct{}{}:
+		default:
+			return
+		}
+		defer func() { <-v.prefetchSem }()
+
+		// Stale check: abort if we've navigated far away. curIdx is the
+		// atomic mirror of Index; reading it here avoids racing the
+		// UI-goroutine writers of Index.
+		dist := int(v.curIdx.Load()) - idx
+		if dist < -2 || dist > 2 {
+			return
+		}
+
 		f, err := os.Open(path)
 		if err != nil {
 			return
 		}
 		defer f.Close()
 		_, _ = io.CopyN(io.Discard, f, videoPrefetchBytes)
-	}(e.Path)
+	}(e.Path, idx)
 }
 
 // decodeOriginal decodes an entry's full-resolution image into a paint.ImageOp,
@@ -985,4 +1010,3 @@ func downscalePreview(img image.Image, maxSide int) image.Image {
 	draw.ApproxBiLinear.Scale(dst, dst.Bounds(), img, b, draw.Over, nil)
 	return dst
 }
-

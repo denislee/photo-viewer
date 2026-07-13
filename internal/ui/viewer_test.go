@@ -9,6 +9,7 @@ import (
 	"image/jpeg"
 	"os"
 	"path/filepath"
+	"syscall"
 	"testing"
 	"time"
 
@@ -153,5 +154,91 @@ func TestDecodeDimensionsSwapsForTranspose(t *testing.T) {
 	writeJPEGWithOrientation(t, rotated, 40, 20, 6)
 	if got := decodeDimensions(rotated); got != "20 × 40" {
 		t.Fatalf("rotated dimensions = %q, want %q", got, "20 × 40")
+	}
+}
+
+// mkfifo creates a named pipe under dir. Reading it blocks in os.Open until a
+// writer opens the other end, so a prefetch goroutine that reaches the read
+// stays parked — letting these tests observe how many run concurrently.
+func mkfifo(t *testing.T, dir string, i int) string {
+	t.Helper()
+	p := filepath.Join(dir, fmt.Sprintf("clip-%d.mp4", i))
+	if err := syscall.Mkfifo(p, 0o600); err != nil {
+		t.Fatalf("mkfifo: %v", err)
+	}
+	return p
+}
+
+func prefetchingLen(v *Viewer) int {
+	v.recentMu.Lock()
+	defer v.recentMu.Unlock()
+	return len(v.prefetching)
+}
+
+// TestPrefetchVideoBoundedConcurrency is the G-10 guard: neighbour-video
+// prefetch must respect the 2-slot prefetchSem instead of spawning one 16 MB
+// read per neighbour. Each entry is a FIFO whose reader blocks in os.Open
+// until a writer appears, so a goroutine that acquires a slot stays parked
+// (its prefetching entry lingers) while goroutines that can't acquire return
+// immediately and clear theirs. At steady state exactly two entries remain —
+// the semaphore's capacity. Without the bound all five would block.
+func TestPrefetchVideoBoundedConcurrency(t *testing.T) {
+	dir := t.TempDir()
+	const n = 5
+	var v Viewer
+	v.curIdx.Store(2) // keep every idx below within the ±2 stale window
+	fifos := make([]string, n)
+	for i := range fifos {
+		fifos[i] = mkfifo(t, dir, i)
+		v.prefetchVideo(cache.Entry{Path: fifos[i], Type: scan.TypeVideo}, i)
+	}
+
+	// Unblock parked readers on the way out so no goroutine leaks past the test.
+	t.Cleanup(func() {
+		deadline := time.Now().Add(2 * time.Second)
+		for prefetchingLen(&v) > 0 && time.Now().Before(deadline) {
+			for _, p := range fifos {
+				if w, err := os.OpenFile(p, os.O_WRONLY|syscall.O_NONBLOCK, 0); err == nil {
+					_, _ = w.Write([]byte{0})
+					_ = w.Close()
+				}
+			}
+			time.Sleep(2 * time.Millisecond)
+		}
+	})
+
+	// Wait for the three losers to clear; the two slot-holders stay parked.
+	deadline := time.Now().Add(2 * time.Second)
+	for prefetchingLen(&v) > 2 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if got := prefetchingLen(&v); got != 2 {
+		t.Fatalf("parked video prefetches = %d, want 2 (prefetchSem cap)", got)
+	}
+	// Confirm the bound is stable rather than still draining toward 0.
+	time.Sleep(30 * time.Millisecond)
+	if got := prefetchingLen(&v); got != 2 {
+		t.Fatalf("parked video prefetches = %d after settle, want a stable 2", got)
+	}
+}
+
+// TestPrefetchVideoStaleAborts is the other half of G-10: a prefetch whose
+// target index has fallen outside the ±2 window must abort before touching the
+// file. The entry is a FIFO with no writer, so an os.Open would block forever —
+// the goroutine can only clear its prefetching entry if the stale check
+// short-circuits ahead of the read.
+func TestPrefetchVideoStaleAborts(t *testing.T) {
+	dir := t.TempDir()
+	fifo := mkfifo(t, dir, 0)
+	var v Viewer
+	v.curIdx.Store(100) // far from idx 0 → outside ±2
+	v.prefetchVideo(cache.Entry{Path: fifo, Type: scan.TypeVideo}, 0)
+
+	deadline := time.Now().Add(2 * time.Second)
+	for prefetchingLen(&v) > 0 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if got := prefetchingLen(&v); got != 0 {
+		t.Fatalf("prefetching not drained (%d) — stale prefetch blocked on os.Open instead of aborting", got)
 	}
 }
