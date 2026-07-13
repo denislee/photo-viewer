@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"image"
 	_ "image/jpeg"
 	"os"
@@ -176,10 +177,24 @@ func presentPreviewTags(src string, candidates []string) []string {
 
 func extractEmbedded(ctx context.Context, src, tag string) ([]byte, error) {
 	cmd := exec.CommandContext(ctx, "exiftool", "-b", tag, src)
-	var buf bytes.Buffer
+	var buf, stderr bytes.Buffer
 	cmd.Stdout = &buf
+	cmd.Stderr = &stderr
 	if err := cmd.Run(); err != nil {
-		return nil, err
+		return nil, exiftoolError(err, &stderr)
 	}
 	return buf.Bytes(), nil
+}
+
+// exiftoolError folds the first line of exiftool's stderr into the returned
+// error so a failure reports *why* instead of a bare "exit status 1". Only the
+// first line is kept — a failing exiftool often emits several warning lines
+// (unknown makernotes, minor tag complaints) that would otherwise spam logs.
+// Mirrors ffmpegError in image.go.
+func exiftoolError(err error, stderr *bytes.Buffer) error {
+	if msg := strings.TrimSpace(stderr.String()); msg != "" {
+		first, _, _ := strings.Cut(msg, "\n")
+		return fmt.Errorf("exiftool: %s: %w", first, err)
+	}
+	return err
 }

@@ -1,6 +1,7 @@
 package thumb
 
 import (
+	"context"
 	"image"
 	"image/color"
 	"image/jpeg"
@@ -8,6 +9,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"testing"
 )
 
@@ -61,5 +63,28 @@ func TestPresentPreviewTags(t *testing.T) {
 	writeJPEG(t, plain, color.RGBA{5, 5, 5, 255})
 	if got := presentPreviewTags(plain, tags); len(got) != 0 {
 		t.Errorf("presentPreviewTags(plain) = %v, want empty", got)
+	}
+}
+
+// TestExtractEmbeddedCapturesStderr checks that a failed embedded-preview
+// extraction (S-17) surfaces exiftool's stderr detail instead of a bare
+// "exit status 1".
+func TestExtractEmbeddedCapturesStderr(t *testing.T) {
+	if _, err := exec.LookPath("exiftool"); err != nil {
+		t.Skip("exiftool not installed; skipping stderr-capture test")
+	}
+
+	missing := filepath.Join(t.TempDir(), "nope.cr2")
+	_, err := extractEmbedded(context.Background(), missing, "-PreviewImage")
+	if err == nil {
+		t.Fatal("expected an error for a nonexistent RAW file")
+	}
+	if !strings.Contains(err.Error(), "exiftool:") {
+		t.Errorf("error should carry the exiftool prefix, got: %v", err)
+	}
+	// The stderr detail must survive into the error, not be dropped for a bare
+	// "exit status 1".
+	if !strings.Contains(err.Error(), "File not found") {
+		t.Errorf("error should carry exiftool's stderr detail, got: %v", err)
 	}
 }

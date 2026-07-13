@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -11,6 +12,27 @@ import (
 	"testing"
 	"time"
 )
+
+// TestRunExiftoolOneShotCapturesStderr checks that the one-shot fallback (S-17)
+// folds exiftool's stderr detail into the returned error instead of dropping it
+// for a bare "exit status 1".
+func TestRunExiftoolOneShotCapturesStderr(t *testing.T) {
+	if _, err := exec.LookPath("exiftool"); err != nil {
+		t.Skip("exiftool not installed; skipping stderr-capture test")
+	}
+
+	missing := filepath.Join(t.TempDir(), "nope.jpg")
+	_, err := runExiftoolOneShot("-b", "-PreviewImage", missing)
+	if err == nil {
+		t.Fatal("expected an error for a nonexistent file")
+	}
+	if !strings.Contains(err.Error(), "exiftool:") {
+		t.Errorf("error should carry the exiftool prefix, got: %v", err)
+	}
+	if !strings.Contains(err.Error(), "File not found") {
+		t.Errorf("error should carry exiftool's stderr detail, got: %v", err)
+	}
+}
 
 func TestArgsUnsafeForDaemon(t *testing.T) {
 	cases := []struct {
