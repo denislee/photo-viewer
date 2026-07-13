@@ -1,6 +1,7 @@
 package ui
 
 import (
+	"strconv"
 	"sync/atomic"
 	"testing"
 )
@@ -49,4 +50,31 @@ func TestOrganizeBumpProgressRoutesThroughCoalescer(t *testing.T) {
 	}
 
 	proc.End()
+}
+
+// TestOrganizeAppendLogCapsBuffer guards U-16.5: organize's appendLog must cap
+// the pending logBuf at 500 lines (like import's), so a huge move pass whose
+// modal is never laid out — drainLog never runs to flush logBuf into
+// logVisible — can't grow logBuf without bound. It keeps the most recent 500
+// lines and drops the oldest.
+func TestOrganizeAppendLogCapsBuffer(t *testing.T) {
+	v := NewOrganizeView(func() {})
+
+	const n = 700
+	for i := range n {
+		v.appendLog("line " + strconv.Itoa(i))
+	}
+
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	if len(v.logBuf) != 500 {
+		t.Fatalf("logBuf grew to %d lines, want it capped at 500", len(v.logBuf))
+	}
+	// The cap keeps the tail (newest lines), dropping the oldest.
+	if first, want := v.logBuf[0], "line "+strconv.Itoa(n-500); first != want {
+		t.Errorf("oldest retained line = %q, want %q", first, want)
+	}
+	if last, want := v.logBuf[len(v.logBuf)-1], "line "+strconv.Itoa(n-1); last != want {
+		t.Errorf("newest line = %q, want %q", last, want)
+	}
 }

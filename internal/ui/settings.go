@@ -21,12 +21,12 @@ type SettingsView struct {
 	Open    bool
 	OnClose func()
 
-	inboxEditor     widget.Editor
-	outboxEditor    widget.Editor
-	inboxBrowseBtn  widget.Clickable
-	outboxBrowseBtn widget.Clickable
-	saveBtn         widget.Clickable
-	closeBtn        widget.Clickable
+	inboxEditor        widget.Editor
+	outboxEditor       widget.Editor
+	inboxBrowseBtn     widget.Clickable
+	outboxBrowseBtn    widget.Clickable
+	saveBtn            widget.Clickable
+	closeBtn           widget.Clickable
 	emptyTrashBtn      widget.Clickable
 	exportFavBtn       widget.Clickable
 	exportFavFlat      widget.Bool
@@ -41,9 +41,9 @@ type SettingsView struct {
 	// hidden.
 	ctrl *Controller
 
-	mu          sync.Mutex
-	statusMsg   string
-	trashMsg    string
+	mu           sync.Mutex
+	statusMsg    string
+	trashMsg     string
 	exportFavMsg string
 
 	// pendingInbox / pendingOutbox hold a directory the background zenity
@@ -123,20 +123,7 @@ func (v *SettingsView) trashStatus() string {
 	if count == 0 {
 		return "Trash is empty"
 	}
-	return fmt.Sprintf("Trash: %d item(s), %s", count, humanBytes(bytes))
-}
-
-func humanBytes(n int64) string {
-	const unit = 1024
-	if n < unit {
-		return fmt.Sprintf("%d B", n)
-	}
-	div, exp := int64(unit), 0
-	for x := n / unit; x >= unit; x /= unit {
-		div *= unit
-		exp++
-	}
-	return fmt.Sprintf("%.1f %ciB", float64(n)/float64(div), "KMGTPE"[exp])
+	return fmt.Sprintf("Trash: %d item(s), %s", count, formatBytesGio(bytes))
 }
 
 // Close hides the modal.
@@ -218,7 +205,7 @@ func (v *SettingsView) Layout(gtx layout.Context, th *Theme) layout.Dimensions {
 			} else if count == 0 {
 				v.trashMsg = "Trash is empty"
 			} else {
-				v.trashMsg = fmt.Sprintf("Wiped %d item(s), freed %s", count, humanBytes(bytes))
+				v.trashMsg = fmt.Sprintf("Wiped %d item(s), freed %s", count, formatBytesGio(bytes))
 			}
 			v.mu.Unlock()
 			if v.invalidate != nil {

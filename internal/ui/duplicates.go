@@ -962,8 +962,9 @@ func shortPath(p string) string {
 	return "…" + p[len(p)-47:]
 }
 
-// formatBytesGio is the shared byte-size formatter for the duplicates and
-// import overlays.
+// formatBytesGio is the shared byte-size formatter for the UI overlays
+// (duplicates, viewer, settings). Units are binary (1024-based), so the
+// suffix is the accurate "KiB"/"MiB"/… rather than the decimal "KB"/"MB".
 func formatBytesGio(b int64) string {
 	const u = 1024
 	if b < u {
@@ -974,5 +975,5 @@ func formatBytesGio(b int64) string {
 		div *= u
 		exp++
 	}
-	return fmt.Sprintf("%.1f %cB", float64(b)/float64(div), "KMGTPE"[exp])
+	return fmt.Sprintf("%.1f %ciB", float64(b)/float64(div), "KMGTPE"[exp])
 }

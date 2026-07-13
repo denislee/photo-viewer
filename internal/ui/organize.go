@@ -395,6 +395,12 @@ func (v *OrganizeView) scheduleInvalidate() {
 func (v *OrganizeView) appendLog(msg string) {
 	v.mu.Lock()
 	v.logBuf = append(v.logBuf, msg)
+	// Cap the pending buffer like import's appendLog does, so a huge move pass
+	// whose modal is never laid out (drainLog never runs) can't grow logBuf
+	// without bound.
+	if len(v.logBuf) > 500 {
+		v.logBuf = v.logBuf[len(v.logBuf)-500:]
+	}
 	v.mu.Unlock()
 	v.scheduleInvalidate()
 }

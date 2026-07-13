@@ -157,9 +157,9 @@ func (v *ImportView) Show() {
 	v.sdBusyDev = ""
 	v.sdMounts = nil
 	v.sdBtns = nil
-	v.deleteCheck.Value = GetConfig().ImportDeleteSource
-	v.deleteSource = v.deleteCheck.Value
 	cfg := GetConfig()
+	v.deleteCheck.Value = cfg.ImportDeleteSource
+	v.deleteSource = v.deleteCheck.Value
 	if cfg.InboxDir == "" || cfg.OutboxDir == "" {
 		v.statusMsg = "Set InboxDir and OutboxDir in " + configPath() + " before importing."
 	} else {
@@ -499,14 +499,9 @@ func (v *ImportView) Layout(gtx layout.Context, th *Theme) layout.Dimensions {
 	running := v.running
 	finished := v.finished
 	sdShown := v.sdShown
-	sdDevices := append([]removableDevice(nil), v.sdDevices...)
 	sdError := v.sdError
 	sdScanning := v.sdScanning
 	sdBusyDev := v.sdBusyDev
-	// Resize the per-row clickables to match the device count.
-	if len(v.sdBtns) < len(v.sdDevices) {
-		v.sdBtns = append(v.sdBtns, make([]widget.Clickable, len(v.sdDevices)-len(v.sdBtns))...)
-	}
 	v.mu.Unlock()
 
 	pad := layout.Inset{Top: unit.Dp(12), Bottom: unit.Dp(12), Left: unit.Dp(12), Right: unit.Dp(12)}
@@ -530,7 +525,7 @@ func (v *ImportView) Layout(gtx layout.Context, th *Theme) layout.Dimensions {
 					return layout.Dimensions{}
 				}
 				return layout.Inset{Top: unit.Dp(8)}.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
-					return v.layoutSDPicker(gtx, th, sdDevices, sdError, sdScanning, sdBusyDev)
+					return v.layoutSDPicker(gtx, th, devSnapshot, sdError, sdScanning, sdBusyDev)
 				})
 			}),
 			layout.Rigid(layout.Spacer{Height: unit.Dp(8)}.Layout),
@@ -972,15 +967,11 @@ func (v *ImportView) startImport() {
 	importDirs := append([]string(nil), v.importDirs...)
 	zipFiles := append([]string(nil), v.zipFiles...)
 	deleteSrc := v.deleteSource
-	v.mu.Unlock()
-	atomic.StoreInt64(&v.statMoved, 0)
-	atomic.StoreInt64(&v.statSkipped, 0)
-	atomic.StoreInt64(&v.statErrors, 0)
-	atomic.StoreInt64(&v.progressDone, 0)
-	atomic.StoreInt64(&v.progressMax, 0)
-
-	// Register with the process bar so the user can pause / cancel
-	// the import even when the modal is closed.
+	// Register with the process bar so the user can pause / cancel the import
+	// even when the modal is closed. Begin only touches the registry's own
+	// locks (the cancel callback runs later, on user click), so it is safe to
+	// call while holding v.mu — and this keeps the one v.proc write guarded
+	// like every other access.
 	if v.processes != nil {
 		v.proc = v.processes.Begin(ProcImport, "Import", func() {
 			v.mu.Lock()
@@ -991,6 +982,12 @@ func (v *ImportView) startImport() {
 			}
 		}, true)
 	}
+	v.mu.Unlock()
+	atomic.StoreInt64(&v.statMoved, 0)
+	atomic.StoreInt64(&v.statSkipped, 0)
+	atomic.StoreInt64(&v.statErrors, 0)
+	atomic.StoreInt64(&v.progressDone, 0)
+	atomic.StoreInt64(&v.progressMax, 0)
 
 	go func() {
 		defer cancel()
