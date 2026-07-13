@@ -120,6 +120,95 @@ func TestNeighbors(t *testing.T) {
 	}
 }
 
+// entryPath returns e.Path or "<nil>" so equivalence failures print a stable
+// label instead of a pointer address.
+func entryPath(e *Entry) string {
+	if e == nil {
+		return "<nil>"
+	}
+	return e.Path
+}
+
+// assertNeighborsEquiv proves NeighborsWithTotal(v, probe, CountView(v)) returns
+// the identical prev/next/pos/total tuple as the self-counting Neighbors(v,
+// probe). This is the W-10 equivalence guarantee: threading the cached total
+// into the bounded-position variant must not change any observable result.
+func assertNeighborsEquiv(t *testing.T, idx *Index, label string, v View, probe string) {
+	t.Helper()
+	wantPrev, wantNext, wantPos, wantTotal := idx.Neighbors(v, probe)
+	gotPrev, gotNext, gotPos, gotTotal := idx.NeighborsWithTotal(v, probe, idx.CountView(v))
+
+	if entryPath(gotPrev) != entryPath(wantPrev) {
+		t.Errorf("%s: prev = %s, want %s", label, entryPath(gotPrev), entryPath(wantPrev))
+	}
+	if entryPath(gotNext) != entryPath(wantNext) {
+		t.Errorf("%s: next = %s, want %s", label, entryPath(gotNext), entryPath(wantNext))
+	}
+	if gotPos != wantPos {
+		t.Errorf("%s: pos = %d, want %d", label, gotPos, wantPos)
+	}
+	if gotTotal != wantTotal {
+		t.Errorf("%s: total = %d, want %d", label, gotTotal, wantTotal)
+	}
+}
+
+// TestNeighborsWithTotalEquivalence exercises the W-10 split: NeighborsWithTotal
+// fed CountView(v) must match Neighbors across every view kind (all, favorites,
+// year, dir) and every probe position (first, middle, last), including the
+// tricky dir-exact fold cases (file-as-dir and a synthetic exact-prepend row).
+func TestNeighborsWithTotalEquivalence(t *testing.T) {
+	idx, cleanup := loadEmpty(t)
+	defer cleanup()
+	root := "/lib"
+	entries := seed(t, idx, root, 20) // all mtime year 2024
+
+	// Favorite a scattered subset so the favorites view has interior + edge rows.
+	for _, k := range []int{0, 3, 4, 9, 19} {
+		if err := idx.SetFavorite(entries[k].Path, true); err != nil {
+			t.Fatalf("SetFavorite: %v", err)
+		}
+	}
+	// A synthetic row whose path == a subdirectory string, to drive the
+	// dir-exact fold (can't occur on a real fs, but the index is path-keyed).
+	seed(t, idx, "/lib/sub", 5)
+	if _, err := idx.db.Exec(
+		"INSERT INTO entries (path, type, size, mtime, thumb_id, favorite, duration_ms) VALUES (?,?,?,?,?,0,0)",
+		"/lib/sub", 1, 1, 0, ThumbIDFor("/lib/sub"),
+	); err != nil {
+		t.Fatalf("insert exact-dir row: %v", err)
+	}
+
+	first, mid, last := entries[0].Path, entries[10].Path, entries[19].Path
+	cases := []struct {
+		label string
+		v     View
+		probe string
+	}{
+		{"all/first", View{Kind: "all"}, first},
+		{"all/mid", View{Kind: "all"}, mid},
+		{"all/last", View{Kind: "all"}, last},
+		{"favorites/first", View{Kind: "favorites"}, entries[0].Path},
+		{"favorites/mid", View{Kind: "favorites"}, entries[4].Path},
+		{"favorites/last", View{Kind: "favorites"}, entries[19].Path},
+		{"year/first", View{Kind: "year", Year: 2024}, first},
+		{"year/mid", View{Kind: "year", Year: 2024}, mid},
+		{"year/last", View{Kind: "year", Year: 2024}, last},
+		{"dir/first", View{Kind: "dir", Dir: root}, first},
+		{"dir/mid", View{Kind: "dir", Dir: root}, mid},
+		{"dir/last", View{Kind: "dir", Dir: root}, last},
+		// file-as-dir: probe is the file itself (sole member via dirExactEntry).
+		{"dir/file-as-dir", View{Kind: "dir", Dir: entries[3].Path}, entries[3].Path},
+		// exact-prepend: probe the exact-dir row and its first child.
+		{"dir/exact-row", View{Kind: "dir", Dir: "/lib/sub"}, "/lib/sub"},
+		{"dir/exact-firstchild", View{Kind: "dir", Dir: "/lib/sub"}, filepath.Join("/lib/sub", "000000.jpg")},
+		// A probe outside the view (pos == 0) must agree too.
+		{"all/absent", View{Kind: "all"}, filepath.Join(root, "999999.jpg")},
+	}
+	for _, c := range cases {
+		assertNeighborsEquiv(t, idx, c.label, c.v, c.probe)
+	}
+}
+
 func TestNeighborsDirView(t *testing.T) {
 	idx, cleanup := loadEmpty(t)
 	defer cleanup()

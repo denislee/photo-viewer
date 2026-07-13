@@ -1552,7 +1552,11 @@ func (s *Server) handleView(w http.ResponseWriter, r *http.Request) {
 		case "trash":
 			prev, next, pos, total = s.trashNeighbors(cur.Path)
 		default:
-			prev, next, pos, total = s.index.Neighbors(vi.v, cur.Path)
+			// Reuse the generation-checked, TTL-cached view total (same value the
+			// gallery page renders) so a navigation burst amortizes the O(view)
+			// count; each keystroke then only pays the bounded position probe.
+			total = s.cachedCountView(vi.v)
+			prev, next, pos, total = s.index.NeighborsWithTotal(vi.v, cur.Path, total)
 		}
 		ctxQ = vi.ctxQuery
 		backHref = vi.backHref

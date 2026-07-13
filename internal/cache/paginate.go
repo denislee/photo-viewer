@@ -140,37 +140,57 @@ func (i *Index) ListPage(v View, offset, limit int) []Entry {
 // 1-based position and total. prev or next are nil at the list edges; pos is
 // 0 when path isn't part of v.
 //
-// The lookups use the path index directly — "biggest path strictly less than X
-// within the view" for prev, "smallest path strictly greater" for next — so
-// they cost O(log N) regardless of view size. The position requires a COUNT
-// over the WHERE clause but still uses the existing indexes.
+// It self-counts the view total via CountView, then defers to
+// NeighborsWithTotal. Callers that already hold the view total (e.g. the web
+// server's cachedCountView, generation-checked with a short TTL) should call
+// NeighborsWithTotal directly so a navigation burst amortizes the O(view) count
+// and each keystroke only pays the bounded position probe.
 func (i *Index) Neighbors(v View, path string) (prev, next *Entry, pos, total int) {
+	return i.NeighborsWithTotal(v, path, i.CountView(v))
+}
+
+// NeighborsWithTotal is Neighbors with the view total supplied by the caller
+// (it is returned verbatim, never recomputed). Only the bounded work runs here:
+//
+//   - prev/next use the path index directly — "biggest path strictly less than
+//     X within the view" for prev, "smallest strictly greater" for next — so
+//     they cost O(log N) regardless of view size.
+//   - pos is `COUNT(*) WHERE <where> AND path <= probe`. SQLite bounds the scan
+//     at the probe path (SEARCH ... path<=?), so the position costs O(pos)
+//     instead of the O(view) COUNT+SUM aggregate the old combined query paid.
+//
+// For the same inputs the returned prev/next/pos are identical to Neighbors;
+// total is identical when the caller passes CountView(v) (as Neighbors does).
+// The where-clause here is the exact one CountView totals over, so pos and
+// total can never disagree about which rows belong to the view.
+func (i *Index) NeighborsWithTotal(v View, path string, total int) (prev, next *Entry, pos, _ int) {
 	where, args := v.whereClause()
 
-	prevArgs := append([]any{}, args...)
-	prevArgs = append(prevArgs, path)
+	prevArgs := append(append([]any{}, args...), path)
 	prev = i.queryOne(
 		entrySelect+" WHERE "+
 			where+" AND path < ? ORDER BY path DESC LIMIT 1",
 		prevArgs...)
 
-	nextArgs := append([]any{}, args...)
-	nextArgs = append(nextArgs, path)
+	nextArgs := append(append([]any{}, args...), path)
 	next = i.queryOne(
 		entrySelect+" WHERE "+
 			where+" AND path > ? ORDER BY path ASC LIMIT 1",
 		nextArgs...)
 
-	// Single pass: COUNT(*) = total rows, SUM(path<=?) = rows at or before path = pos.
-	countArgs := append([]any{path}, args...)
+	// Bounded position: rows at or before path within the view. The trailing
+	// `AND path <= ?` lets SQLite stop the index walk at the probe path, so this
+	// equals the old query's SUM(path<=?) without scanning the whole view range.
+	posArgs := append(append([]any{}, args...), path)
 	_ = i.db.QueryRow(
-		"SELECT COUNT(*), COALESCE(SUM(path <= ?), 0) FROM entries WHERE "+where,
-		countArgs...).Scan(&total, &pos)
+		"SELECT COUNT(*) FROM entries WHERE "+where+" AND path <= ?",
+		posArgs...).Scan(&pos)
 
 	// Fold in the dir view's exact-path row (see dirExactEntry). Its path
 	// (== Dir) sorts strictly before every range row, so relative to the probe
 	// `path` it can only ever be the smallest element. Therefore:
-	//   - it bumps total, and bumps pos when it is <= path;
+	//   - it bumps pos when it is <= path (total already counts it — CountView
+	//     folds the same row in, so we must NOT bump total again here);
 	//   - it becomes `prev` only when no range row precedes path (it's the sole
 	//     predecessor);
 	//   - it becomes `next` only when it itself follows path (then it's smaller
@@ -178,7 +198,6 @@ func (i *Index) Neighbors(v View, path string) (prev, next *Entry, pos, total in
 	// nil in every non-dir view and the common dir case, leaving the range-only
 	// results untouched.
 	if exact := i.dirExactEntry(v); exact != nil {
-		total++
 		if exact.Path <= path {
 			pos++
 		}

@@ -146,6 +146,39 @@ func TestPlanListDirAndListPage(t *testing.T) {
 	mustNotContain(t, "listpage", plan, "TEMP B-TREE")
 }
 
+// TestPlanNeighborsPosBounded proves the W-10 position probe
+// (`COUNT(*) WHERE <where> AND path <= ?`) is a bounded index SEARCH stopping at
+// the probe path (`path<?`), not the O(view) full COUNT+SUM scan the old
+// combined query paid. Every view kind must bound the scan so nav cost is
+// O(pos), not O(view).
+func TestPlanNeighborsPosBounded(t *testing.T) {
+	idx, cleanup := loadEmpty(t)
+	defer cleanup()
+	seed(t, idx, "/lib", 200)
+
+	probe := filepath.Join("/lib", "000100.jpg")
+	for _, tc := range []struct {
+		label string
+		v     View
+	}{
+		{"all", View{Kind: "all"}},
+		{"favorites", View{Kind: "favorites"}},
+		{"year", View{Kind: "year", Year: 2024}},
+		{"dir", View{Kind: "dir", Dir: "/lib"}},
+	} {
+		where, args := tc.v.whereClause()
+		// The exact position statement issued by NeighborsWithTotal (paginate.go).
+		q := "SELECT COUNT(*) FROM entries WHERE " + where + " AND path <= ?"
+		args = append(args, probe)
+		plan := explainPlan(t, idx, q, args...)
+
+		mustContain(t, "pos-"+tc.label, plan, "SEARCH entries USING")
+		mustContain(t, "pos-"+tc.label, plan, "path<?") // scan bounded at the probe
+		mustNotContain(t, "pos-"+tc.label, plan, "SCAN entries")
+		mustNotContain(t, "pos-"+tc.label, plan, "TEMP B-TREE")
+	}
+}
+
 // TestDeadIndexesDropped proves the migrations removed the write-only/superseded
 // indexes and created the functional ones: v5 dropped idx_entries_year and
 // idx_entries_duration; v6 replaced the single-column idx_entries_favorite with
