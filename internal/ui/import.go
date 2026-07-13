@@ -47,9 +47,6 @@ type ImportView struct {
 	importDirs   []string
 	zipFiles     []string
 	statusMsg    string
-	logVisible   []string
-	progressDone int64
-	progressMax  int64
 	statMoved    int64
 	statSkipped  int64
 	statErrors   int64
@@ -57,6 +54,11 @@ type ImportView struct {
 	finished     bool // at least one import has completed since the overlay opened
 	deleteSource bool
 	cancelImport context.CancelFunc
+
+	// Shared modal plumbing (see taskui.go): the bounded worker→UI log buffer
+	// and the done/max progress state that used to be hand-rolled fields here.
+	log      taskLog
+	progress progressModel
 
 	// SD-card picker state. sdShown toggles the inline device list under the
 	// add row; sdDevices is the last lsblk snapshot; sdError surfaces a
@@ -70,10 +72,6 @@ type ImportView struct {
 	sdBusyDev  string // device path currently being mounted, "" otherwise
 	sdMounts   []sdMount
 	sdBtns     []widget.Clickable
-
-	// Buffered log lines from worker goroutines, drained into logVisible by
-	// the UI thread once per frame to avoid mutex thrash.
-	logBuf []string
 
 	// UI state.
 	closeBtn      widget.Clickable
@@ -90,16 +88,11 @@ type ImportView struct {
 
 	invalidate func()
 
-	// processes lets the import publish progress to the main-screen
-	// process bar so the user can pause / resume / cancel without
-	// opening the modal.
-	processes *ProcessRegistry
-	proc      *Process
+	// scope lets the import publish progress to the main-screen process bar so
+	// the user can pause / resume / cancel without opening the modal. It owns the
+	// registry pointer and the live-Process slot (see taskui.go).
+	scope procScope
 }
-
-const (
-	importLogVisibleLines = 1000
-)
 
 // sdMount tracks a removable device that the import view mounted itself.
 // After the import completes (or the user closes the overlay) the mount is
@@ -112,7 +105,7 @@ type sdMount struct {
 // SetProcessRegistry wires the import view to the main-screen process
 // bar so each Start Import publishes progress, pause, and cancel
 // controls outside the modal.
-func (v *ImportView) SetProcessRegistry(r *ProcessRegistry) { v.processes = r }
+func (v *ImportView) SetProcessRegistry(r *ProcessRegistry) { v.scope.reg = r }
 
 // NewImportView wires the import overlay.
 func NewImportView(invalidate func()) *ImportView {
@@ -141,10 +134,8 @@ func (v *ImportView) Show() {
 	v.Open = true
 	v.importDirs = nil
 	v.zipFiles = nil
-	v.logVisible = nil
-	v.logBuf = nil
-	v.progressDone = 0
-	v.progressMax = 0
+	v.log.reset()
+	v.progress.reset()
 	v.statMoved = 0
 	v.statSkipped = 0
 	v.statErrors = 0
@@ -318,7 +309,7 @@ func (v *ImportView) handleSDDeviceClick(dev removableDevice) {
 func (v *ImportView) setStatus(msg string) {
 	v.mu.Lock()
 	v.statusMsg = msg
-	proc := v.proc
+	proc := v.scope.currentLocked()
 	v.mu.Unlock()
 	if proc != nil {
 		// SetStatus notifies through the registry coalescer; skip the direct
@@ -334,7 +325,7 @@ func (v *ImportView) setStatus(msg string) {
 // (e.g. tests) it's a no-op.
 func (v *ImportView) waitIfPaused() {
 	v.mu.Lock()
-	proc := v.proc
+	proc := v.scope.currentLocked()
 	v.mu.Unlock()
 	if proc != nil {
 		proc.Wait()
@@ -351,8 +342,8 @@ func (v *ImportView) waitIfPaused() {
 // no registry is set (e.g. tests, or one-shot messages before an import
 // starts) — those paths aren't in a per-file storm.
 func (v *ImportView) scheduleInvalidate() {
-	if v.processes != nil {
-		v.processes.notify()
+	if v.scope.reg != nil {
+		v.scope.reg.notify()
 		return
 	}
 	if v.invalidate != nil {
@@ -361,32 +352,13 @@ func (v *ImportView) scheduleInvalidate() {
 }
 
 func (v *ImportView) appendLog(msg string) {
-	v.mu.Lock()
-	v.logBuf = append(v.logBuf, msg)
-	if len(v.logBuf) > 500 {
-		v.logBuf = v.logBuf[len(v.logBuf)-500:]
-	}
-	v.mu.Unlock()
+	v.log.append(msg)
 	v.scheduleInvalidate()
-}
-
-// drainLog moves buffered lines into logVisible (capped). Called from the UI
-// goroutine so logVisible can be read without locking during render.
-func (v *ImportView) drainLog() {
-	v.mu.Lock()
-	if len(v.logBuf) > 0 {
-		v.logVisible = append(v.logVisible, v.logBuf...)
-		v.logBuf = v.logBuf[:0]
-		if len(v.logVisible) > importLogVisibleLines {
-			v.logVisible = v.logVisible[len(v.logVisible)-importLogVisibleLines:]
-		}
-	}
-	v.mu.Unlock()
 }
 
 // Layout draws the overlay.
 func (v *ImportView) Layout(gtx layout.Context, th *Theme) layout.Dimensions {
-	v.drainLog()
+	v.log.drain()
 
 	if v.closeBtn.Clicked(gtx) {
 		v.Close()
@@ -486,13 +458,12 @@ func (v *ImportView) Layout(gtx layout.Context, th *Theme) layout.Dimensions {
 	paint.PaintOp{}.Add(gtx.Ops)
 	clipArea.Pop()
 
+	logVisible := v.log.lines()
+	progressDone, progressMax := v.progress.load()
 	v.mu.Lock()
 	statusMsg := v.statusMsg
 	importDirs := append([]string(nil), v.importDirs...)
 	zipFiles := append([]string(nil), v.zipFiles...)
-	logVisible := v.logVisible
-	progressDone := atomic.LoadInt64(&v.progressDone)
-	progressMax := atomic.LoadInt64(&v.progressMax)
 	moved := atomic.LoadInt64(&v.statMoved)
 	skipped := atomic.LoadInt64(&v.statSkipped)
 	errs := atomic.LoadInt64(&v.statErrors)
@@ -540,7 +511,7 @@ func (v *ImportView) Layout(gtx layout.Context, th *Theme) layout.Dimensions {
 			}),
 			layout.Rigid(layout.Spacer{Height: unit.Dp(8)}.Layout),
 			layout.Rigid(func(gtx layout.Context) layout.Dimensions {
-				return v.layoutProgress(gtx, th, progressDone, progressMax)
+				return layoutProgressBar(gtx, th, progressDone, progressMax, true)
 			}),
 			layout.Rigid(layout.Spacer{Height: unit.Dp(4)}.Layout),
 			layout.Rigid(func(gtx layout.Context) layout.Dimensions {
@@ -656,28 +627,6 @@ func (v *ImportView) layoutSources(gtx layout.Context, th *Theme, dirs, zips []s
 		}))
 	}
 	return layout.Flex{Axis: layout.Vertical}.Layout(gtx, rows...)
-}
-
-func (v *ImportView) layoutProgress(gtx layout.Context, th *Theme, done, max int64) layout.Dimensions {
-	w := gtx.Constraints.Max.X
-	barH := gtx.Dp(unit.Dp(6))
-	bg := image.Rect(0, 0, w, barH)
-	clipBg := clip.Rect(bg).Push(gtx.Ops)
-	paint.ColorOp{Color: th.CellBG}.Add(gtx.Ops)
-	paint.PaintOp{}.Add(gtx.Ops)
-	clipBg.Pop()
-	if max > 0 {
-		frac := float32(done) / float32(max)
-		if frac > 1 {
-			frac = 1
-		}
-		fg := image.Rect(0, 0, int(float32(w)*frac), barH)
-		clipFg := clip.Rect(fg).Push(gtx.Ops)
-		paint.ColorOp{Color: th.Accent}.Add(gtx.Ops)
-		paint.PaintOp{}.Add(gtx.Ops)
-		clipFg.Pop()
-	}
-	return layout.Dimensions{Size: image.Pt(w, barH)}
 }
 
 func (v *ImportView) layoutButtons(gtx layout.Context, th *Theme, running bool) layout.Dimensions {
@@ -970,24 +919,23 @@ func (v *ImportView) startImport() {
 	// Register with the process bar so the user can pause / cancel the import
 	// even when the modal is closed. Begin only touches the registry's own
 	// locks (the cancel callback runs later, on user click), so it is safe to
-	// call while holding v.mu — and this keeps the one v.proc write guarded
-	// like every other access.
-	if v.processes != nil {
-		v.proc = v.processes.Begin(ProcImport, "Import", func() {
-			v.mu.Lock()
-			c := v.cancelImport
-			v.mu.Unlock()
-			if c != nil {
-				c()
-			}
-		}, true)
+	// call while holding v.mu — and attachLocked keeps the one proc-slot write
+	// guarded like every other access.
+	if proc := v.scope.begin(ProcImport, "Import", func() {
+		v.mu.Lock()
+		c := v.cancelImport
+		v.mu.Unlock()
+		if c != nil {
+			c()
+		}
+	}); proc != nil {
+		v.scope.attachLocked(proc, nil)
 	}
 	v.mu.Unlock()
 	atomic.StoreInt64(&v.statMoved, 0)
 	atomic.StoreInt64(&v.statSkipped, 0)
 	atomic.StoreInt64(&v.statErrors, 0)
-	atomic.StoreInt64(&v.progressDone, 0)
-	atomic.StoreInt64(&v.progressMax, 0)
+	v.progress.reset()
 
 	go func() {
 		defer cancel()
@@ -1000,8 +948,8 @@ func (v *ImportView) startImport() {
 			// reading from them. The user can then safely pull the card.
 			mounts := v.sdMounts
 			v.sdMounts = nil
-			proc := v.proc
-			v.proc = nil
+			proc := v.scope.currentLocked()
+			v.scope.detachLocked(nil)
 			v.mu.Unlock()
 			if proc != nil {
 				proc.End()
@@ -1397,10 +1345,9 @@ func (v *ImportView) extractZipToInbox(ctx context.Context, zipPath, inboxDir st
 }
 
 func (v *ImportView) setProgress(done, max int64) {
-	atomic.StoreInt64(&v.progressDone, done)
-	atomic.StoreInt64(&v.progressMax, max)
+	v.progress.set(done, max)
 	v.mu.Lock()
-	proc := v.proc
+	proc := v.scope.currentLocked()
 	v.mu.Unlock()
 	if proc != nil {
 		// proc.SetDone/SetTotal already route through the registry's ~30Hz
@@ -1414,9 +1361,9 @@ func (v *ImportView) setProgress(done, max int64) {
 }
 
 func (v *ImportView) bumpProgress() {
-	atomic.AddInt64(&v.progressDone, 1)
+	v.progress.bump()
 	v.mu.Lock()
-	proc := v.proc
+	proc := v.scope.currentLocked()
 	v.mu.Unlock()
 	if proc != nil {
 		// proc.AddDone already coalesces the redraw through the registry; a

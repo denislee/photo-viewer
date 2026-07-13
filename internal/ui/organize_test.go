@@ -75,7 +75,7 @@ func TestOrganizeBumpProgressRoutesThroughCoalescer(t *testing.T) {
 
 	proc := r.Begin(ProcOrganize, "test", nil, true)
 	v.mu.Lock()
-	v.proc = proc
+	v.scope.attachLocked(proc, nil)
 	v.mu.Unlock()
 
 	// Baseline: Begin's structural forceNotify already fired one registry
@@ -119,16 +119,16 @@ func TestOrganizeAppendLogCapsBuffer(t *testing.T) {
 		v.appendLog("line " + strconv.Itoa(i))
 	}
 
-	v.mu.Lock()
-	defer v.mu.Unlock()
-	if len(v.logBuf) != 500 {
-		t.Fatalf("logBuf grew to %d lines, want it capped at 500", len(v.logBuf))
+	v.log.mu.Lock()
+	defer v.log.mu.Unlock()
+	if len(v.log.pending) != 500 {
+		t.Fatalf("logBuf grew to %d lines, want it capped at 500", len(v.log.pending))
 	}
 	// The cap keeps the tail (newest lines), dropping the oldest.
-	if first, want := v.logBuf[0], "line "+strconv.Itoa(n-500); first != want {
+	if first, want := v.log.pending[0], "line "+strconv.Itoa(n-500); first != want {
 		t.Errorf("oldest retained line = %q, want %q", first, want)
 	}
-	if last, want := v.logBuf[len(v.logBuf)-1], "line "+strconv.Itoa(n-1); last != want {
+	if last, want := v.log.pending[len(v.log.pending)-1], "line "+strconv.Itoa(n-1); last != want {
 		t.Errorf("newest line = %q, want %q", last, want)
 	}
 }

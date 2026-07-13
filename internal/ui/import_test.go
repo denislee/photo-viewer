@@ -6,7 +6,6 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
-	"sync/atomic"
 	"testing"
 )
 
@@ -25,11 +24,10 @@ func TestImportCopyProgressInstrumentation(t *testing.T) {
 	v := &ImportView{invalidate: func() { invalidations++ }}
 
 	v.setProgress(0, int64(nFiles))
-	if got := atomic.LoadInt64(&v.progressMax); got != nFiles {
-		t.Fatalf("progressMax after setProgress = %d, want %d", got, nFiles)
-	}
-	if got := atomic.LoadInt64(&v.progressDone); got != 0 {
-		t.Fatalf("progressDone after setProgress = %d, want 0", got)
+	if done, max := v.progress.load(); max != nFiles {
+		t.Fatalf("progressMax after setProgress = %d, want %d", max, nFiles)
+	} else if done != 0 {
+		t.Fatalf("progressDone after setProgress = %d, want 0", done)
 	}
 
 	// One bump per file, mirroring the loop's success and copy-error paths.
@@ -37,11 +35,10 @@ func TestImportCopyProgressInstrumentation(t *testing.T) {
 		v.bumpProgress()
 	}
 
-	if got := atomic.LoadInt64(&v.progressDone); got != nFiles {
-		t.Errorf("progressDone after %d bumps = %d, want %d", nFiles, got, nFiles)
-	}
-	if got := atomic.LoadInt64(&v.progressMax); got != nFiles {
-		t.Errorf("progressMax drifted to %d, want %d", got, nFiles)
+	if done, max := v.progress.load(); done != nFiles {
+		t.Errorf("progressDone after %d bumps = %d, want %d", nFiles, done, nFiles)
+	} else if max != nFiles {
+		t.Errorf("progressMax drifted to %d, want %d", max, nFiles)
 	}
 	// Each helper wakes the frame loop (no registry wired ⇒ direct invalidate);
 	// the bar can't visibly advance without at least one redraw per update.

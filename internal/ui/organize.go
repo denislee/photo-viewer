@@ -9,7 +9,6 @@ import (
 	"runtime"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"gioui.org/layout"
@@ -38,15 +37,15 @@ type OrganizeView struct {
 	Open    bool
 	OnClose func()
 
-	mu           sync.Mutex
-	mismatched   []MismatchedVideo
-	scanning     bool
-	running      bool
-	progressDone atomic.Int64
-	progressMax  atomic.Int64
-	statusMsg    string
-	logVisible   []string
-	logBuf       []string
+	mu         sync.Mutex
+	mismatched []MismatchedVideo
+	scanning   bool
+	running    bool
+	statusMsg  string
+	// Shared modal plumbing (see taskui.go): the bounded worker→UI log buffer
+	// and the done/max progress state that used to be hand-rolled fields here.
+	log      taskLog
+	progress progressModel
 	// Separate cancel funcs for the two passes: the metadata scan and the move.
 	// Keeping them apart guarantees the Cancel button (and the process bar)
 	// aborts the pass that is actually running — a re-entrant scan can never
@@ -68,8 +67,9 @@ type OrganizeView struct {
 	applyMove     func(old, new string) error
 	refreshActive func()
 
-	processes *ProcessRegistry
-	proc      *Process
+	// scope owns the registry pointer and the live-Process slot published to the
+	// main-screen process bar for the scan and move passes (see taskui.go).
+	scope procScope
 }
 
 func NewOrganizeView(invalidate func()) *OrganizeView {
@@ -81,7 +81,7 @@ func NewOrganizeView(invalidate func()) *OrganizeView {
 
 // SetProcessRegistry wires the organize view to the main-screen process
 // bar so the scan + move passes show up with pause / cancel controls.
-func (v *OrganizeView) SetProcessRegistry(r *ProcessRegistry) { v.processes = r }
+func (v *OrganizeView) SetProcessRegistry(r *ProcessRegistry) { v.scope.reg = r }
 
 // SetMover wires the per-rename index/thumbnail bookkeeping callback. Without
 // it the move pass would still rename files, but the grid would show broken
@@ -111,8 +111,7 @@ func (v *OrganizeView) Show(idx *cache.Index, root string) {
 	v.scanning = true
 	v.running = false
 	v.statusMsg = "Preparing library scan..."
-	v.logVisible = nil
-	v.logBuf = nil
+	v.log.reset()
 
 	ctx, cancel := context.WithCancel(context.Background())
 	v.scanCancel = cancel
@@ -136,31 +135,29 @@ func (v *OrganizeView) Close() {
 }
 
 func (v *OrganizeView) scanForMismatched(ctx context.Context, idx *cache.Index, _ string) {
-	var proc *Process
-	if v.processes != nil {
-		proc = v.processes.Begin(ProcOrganize, "Organize: scan", func() {
-			v.mu.Lock()
-			c := v.scanCancel
-			v.mu.Unlock()
-			if c != nil {
-				c()
-			}
-		}, true)
+	proc := v.scope.begin(ProcOrganize, "Organize: scan", func() {
+		v.mu.Lock()
+		c := v.scanCancel
+		v.mu.Unlock()
+		if c != nil {
+			c()
+		}
+	})
+	if proc != nil {
 		proc.SetStatus("Scanning videos…")
 		v.mu.Lock()
-		v.proc = proc
+		v.scope.attachLocked(proc, nil)
 		v.mu.Unlock()
 		defer func() {
 			v.mu.Lock()
-			v.proc = nil
+			v.scope.detachLocked(nil)
 			v.mu.Unlock()
 			proc.End()
 		}()
 	}
 
 	total := idx.CountByType(scan.TypeVideo)
-	v.progressMax.Store(int64(total))
-	v.progressDone.Store(0)
+	v.progress.set(0, int64(total))
 	if proc != nil {
 		proc.SetTotal(int64(total))
 	}
@@ -202,7 +199,7 @@ func (v *OrganizeView) scanForMismatched(ctx context.Context, idx *cache.Index, 
 				if !scan.SameDateFolder(e.Path, date) {
 					results <- MismatchedVideo{Entry: e, ExpectedDate: date}
 				}
-				v.progressDone.Add(1)
+				v.progress.bump()
 				if proc != nil {
 					// proc.AddDone already coalesces the redraw through the
 					// registry's ~30Hz throttle (trailing flush included), so no
@@ -263,7 +260,7 @@ func (v *OrganizeView) scanForMismatched(ctx context.Context, idx *cache.Index, 
 func (v *OrganizeView) setStatus(msg string) {
 	v.mu.Lock()
 	v.statusMsg = msg
-	proc := v.proc
+	proc := v.scope.currentLocked()
 	v.mu.Unlock()
 	if proc != nil {
 		proc.SetStatus(msg)
@@ -285,25 +282,23 @@ func (v *OrganizeView) startOrganize(root string) {
 	v.moveCancel = cancel
 	v.mu.Unlock()
 
-	v.progressDone.Store(0)
-	v.progressMax.Store(int64(len(mismatched)))
+	v.progress.set(0, int64(len(mismatched)))
 
 	go func() {
 		defer cancel()
-		var proc *Process
-		if v.processes != nil {
-			proc = v.processes.Begin(ProcOrganize, "Organize: move", func() {
-				v.mu.Lock()
-				c := v.moveCancel
-				v.mu.Unlock()
-				if c != nil {
-					c()
-				}
-			}, true)
+		proc := v.scope.begin(ProcOrganize, "Organize: move", func() {
+			v.mu.Lock()
+			c := v.moveCancel
+			v.mu.Unlock()
+			if c != nil {
+				c()
+			}
+		})
+		if proc != nil {
 			proc.SetStatus(fmt.Sprintf("Moving %d videos…", len(mismatched)))
 			proc.SetTotal(int64(len(mismatched)))
 			v.mu.Lock()
-			v.proc = proc
+			v.scope.attachLocked(proc, nil)
 			v.mu.Unlock()
 		}
 		movedAny := false
@@ -311,7 +306,7 @@ func (v *OrganizeView) startOrganize(root string) {
 			v.mu.Lock()
 			v.running = false
 			v.moveCancel = nil
-			v.proc = nil
+			v.scope.detachLocked(nil)
 			v.mu.Unlock()
 			if proc != nil {
 				proc.End()
@@ -399,8 +394,8 @@ func (v *OrganizeView) startOrganize(root string) {
 // no registry is set (e.g. tests) — those paths aren't in a per-file storm.
 // Mirrors ImportView.scheduleInvalidate.
 func (v *OrganizeView) scheduleInvalidate() {
-	if v.processes != nil {
-		v.processes.notify()
+	if v.scope.reg != nil {
+		v.scope.reg.notify()
 		return
 	}
 	if v.invalidate != nil {
@@ -409,22 +404,14 @@ func (v *OrganizeView) scheduleInvalidate() {
 }
 
 func (v *OrganizeView) appendLog(msg string) {
-	v.mu.Lock()
-	v.logBuf = append(v.logBuf, msg)
-	// Cap the pending buffer like import's appendLog does, so a huge move pass
-	// whose modal is never laid out (drainLog never runs) can't grow logBuf
-	// without bound.
-	if len(v.logBuf) > 500 {
-		v.logBuf = v.logBuf[len(v.logBuf)-500:]
-	}
-	v.mu.Unlock()
+	v.log.append(msg)
 	v.scheduleInvalidate()
 }
 
 func (v *OrganizeView) bumpProgress() {
-	v.progressDone.Add(1)
+	v.progress.bump()
 	v.mu.Lock()
-	proc := v.proc
+	proc := v.scope.currentLocked()
 	v.mu.Unlock()
 	if proc != nil {
 		// proc.AddDone already coalesces the redraw through the registry; a
@@ -436,20 +423,8 @@ func (v *OrganizeView) bumpProgress() {
 	v.scheduleInvalidate()
 }
 
-func (v *OrganizeView) drainLog() {
-	v.mu.Lock()
-	if len(v.logBuf) > 0 {
-		v.logVisible = append(v.logVisible, v.logBuf...)
-		v.logBuf = v.logBuf[:0]
-		if len(v.logVisible) > 1000 {
-			v.logVisible = v.logVisible[len(v.logVisible)-1000:]
-		}
-	}
-	v.mu.Unlock()
-}
-
 func (v *OrganizeView) Layout(gtx layout.Context, th *Theme, root string) layout.Dimensions {
-	v.drainLog()
+	v.log.drain()
 
 	if v.closeBtn.Clicked(gtx) {
 		v.Close()
@@ -469,14 +444,13 @@ func (v *OrganizeView) Layout(gtx layout.Context, th *Theme, root string) layout
 		v.startOrganize(root)
 	}
 
+	progressDone, progressMax := v.progress.load()
+	logVisible := v.log.lines()
 	v.mu.Lock()
 	statusMsg := v.statusMsg
 	scanning := v.scanning
 	running := v.running
 	mismatchedCount := len(v.mismatched)
-	progressDone := v.progressDone.Load()
-	progressMax := v.progressMax.Load()
-	logVisible := v.logVisible
 	v.mu.Unlock()
 
 	// Background.
@@ -505,7 +479,9 @@ func (v *OrganizeView) Layout(gtx layout.Context, th *Theme, root string) layout
 			layout.Rigid(layout.Spacer{Height: unit.Dp(16)}.Layout),
 			layout.Rigid(func(gtx layout.Context) layout.Dimensions {
 				if scanning || running {
-					return v.layoutProgress(gtx, th, progressDone, progressMax)
+					// clamp=false preserves organize's original bar rendering,
+					// which never clamped frac (its done never exceeds max).
+					return layoutProgressBar(gtx, th, progressDone, progressMax, false)
 				}
 				return layout.Dimensions{}
 			}),
@@ -533,25 +509,6 @@ func (v *OrganizeView) Layout(gtx layout.Context, th *Theme, root string) layout
 			}),
 		)
 	})
-}
-
-func (v *OrganizeView) layoutProgress(gtx layout.Context, th *Theme, done, max int64) layout.Dimensions {
-	w := gtx.Constraints.Max.X
-	barH := gtx.Dp(unit.Dp(6))
-	bg := image.Rect(0, 0, w, barH)
-	clipBg := clip.Rect(bg).Push(gtx.Ops)
-	paint.ColorOp{Color: th.CellBG}.Add(gtx.Ops)
-	paint.PaintOp{}.Add(gtx.Ops)
-	clipBg.Pop()
-	if max > 0 {
-		frac := float32(done) / float32(max)
-		fg := image.Rect(0, 0, int(float32(w)*frac), barH)
-		clipFg := clip.Rect(fg).Push(gtx.Ops)
-		paint.ColorOp{Color: th.Accent}.Add(gtx.Ops)
-		paint.PaintOp{}.Add(gtx.Ops)
-		clipFg.Pop()
-	}
-	return layout.Dimensions{Size: image.Pt(w, barH)}
 }
 
 func (v *OrganizeView) layoutLog(gtx layout.Context, th *Theme, lines []string) layout.Dimensions {

@@ -72,8 +72,10 @@ type DuplicatesView struct {
 
 	invalidate func()
 
-	processes *ProcessRegistry
-	proc      *Process
+	// scope owns the registry pointer and the live-Process slot published to the
+	// process bar for the hashing pass; the gen guard below feeds its keep()
+	// check so a Rescan-superseded pass can't claim or clear it (see taskui.go).
+	scope procScope
 }
 
 // NewDuplicatesView wires the view to the index/store/thumb cache and an
@@ -89,7 +91,7 @@ func NewDuplicatesView(idx *cache.Index, store *cache.ThumbStore, thumbs *thumbC
 // SetProcessRegistry wires the hashing pass into the main-screen
 // process bar so the user can pause / resume / cancel without keeping
 // the modal open.
-func (d *DuplicatesView) SetProcessRegistry(r *ProcessRegistry) { d.processes = r }
+func (d *DuplicatesView) SetProcessRegistry(r *ProcessRegistry) { d.scope.reg = r }
 
 // SetDeleter wires the soft-delete callback so duplicate-removal goes
 // through the same trash flow as keyboard delete (rename → trash dir,
@@ -191,30 +193,26 @@ func (d *DuplicatesView) Close() {
 func (d *DuplicatesView) hashAndScan(ctx context.Context, gen int) {
 	// Publish to the main-screen process bar so the user can pause /
 	// resume / cancel without keeping the modal open.
-	var proc *Process
-	if d.processes != nil {
-		proc = d.processes.Begin(ProcDuplicates, "Duplicates", func() {
-			d.mu.Lock()
-			c := d.cancel
-			d.mu.Unlock()
-			if c != nil {
-				c()
-			}
-		}, true)
-		proc.SetStatus("Hashing files…")
+	proc := d.scope.begin(ProcDuplicates, "Duplicates", func() {
 		d.mu.Lock()
-		// Only claim the shared d.proc slot if we're still the current pass —
-		// a superseded goroutine must not overwrite the live pass's proc, nor
-		// nil it out on the way down (that's why the defer is gen-gated too).
-		if d.gen == gen {
-			d.proc = proc
+		c := d.cancel
+		d.mu.Unlock()
+		if c != nil {
+			c()
 		}
+	})
+	if proc != nil {
+		proc.SetStatus("Hashing files…")
+		// Only claim the shared proc slot if we're still the current pass — a
+		// superseded goroutine must not overwrite the live pass's proc, nor nil
+		// it out on the way down (that's why the defer's keep is gen-gated too).
+		keep := func() bool { return d.gen == gen }
+		d.mu.Lock()
+		d.scope.attachLocked(proc, keep)
 		d.mu.Unlock()
 		defer func() {
 			d.mu.Lock()
-			if d.gen == gen {
-				d.proc = nil
-			}
+			d.scope.detachLocked(keep)
 			d.mu.Unlock()
 			proc.End()
 		}()
