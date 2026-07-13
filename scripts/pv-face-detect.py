@@ -13,14 +13,86 @@
 # Exit 0 (one-shot mode) even when no faces are found. Non-zero only on error.
 import json
 import os
+import subprocess
 import sys
+
+# Upper bound on how long a single `python -c "import face_recognition"` probe
+# may run before we treat that interpreter as unusable and move on. Kept well
+# under the Go side's 15s `--check` window (see internal/face/detector.go) so a
+# probe can't eat the whole budget, yet generous enough for a real (cold) dlib
+# import, which is a few seconds. A wedged interpreter is skipped, not hung on.
+_PROBE_IMPORT_TIMEOUT = 12.0
+
+
+def _normalize_venv_name(name: str) -> str:
+    """Collapse a pipx venv directory name to a comparison key so that
+    `face-recognition`, `face_recognition`, `Face_Recognition`, ... all match.
+    """
+    return name.lower().replace("-", "").replace("_", "")
+
+
+def _pipx_venv_pythons(bases: "list[str]") -> "list[str]":
+    """Return candidate pipx-venv python interpreter paths, ordered so the
+    venv whose name looks like `face_recognition`/`face-recognition` comes
+    first, with every other discovered venv following in sorted order.
+
+    Pure aside from filesystem reads (`isdir`/`listdir`/`exists`), which makes
+    it straightforward to exercise against a temp fake pipx tree in a test.
+    """
+    named: "list[str]" = []
+    others: "list[str]" = []
+    for base in bases:
+        if not os.path.isdir(base):
+            continue
+        for name in sorted(os.listdir(base)):
+            py = os.path.join(base, name, "bin", "python")
+            if not os.path.exists(py):
+                continue
+            if _normalize_venv_name(name) == "facerecognition":
+                named.append(py)
+            else:
+                others.append(py)
+    return named + others
+
+
+def _can_import_face_recognition(py: str) -> bool:
+    """True iff interpreter `py` can `import face_recognition` without raising
+    ImportError. Runs the import in a throwaway child so we never mutate — or
+    hang — this process. A crash, non-zero exit, or timeout counts as "no".
+
+    Note: face_recognition's __init__ may `sys.exit(0)` when its model data is
+    missing, so a returncode of 0 means "the package is importable", not "the
+    install is healthy". The full model self-test lives in `--check`, which
+    runs after we re-exec into the interpreter this selects.
+    """
+    try:
+        proc = subprocess.run(
+            [py, "-c", "import face_recognition"],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=_PROBE_IMPORT_TIMEOUT,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return proc.returncode == 0
 
 
 def _try_reexec_with_pipx() -> None:
     """If face_recognition isn't importable here, look for it inside common
-    pipx venvs and re-exec the script under that interpreter. This lets
-    `pipx install face_recognition` work without forcing the user to
-    duplicate the package into the system Python.
+    pipx venvs and re-exec the script under an interpreter that actually has
+    it. This lets `pipx install face_recognition` work without forcing the
+    user to duplicate the package into the system Python.
+
+    Selection is deliberately careful: `os.execve` *replaces* this process, so
+    execing into the wrong venv (e.g. an alphabetically-earlier `ansible` or
+    `black`) would strand us in an interpreter where the import fails and the
+    whole helper reports "broken" even though a working venv exists. We first
+    prefer a venv literally named face_recognition, then fall back to any other
+    venv, and — crucially — PROBE each candidate with a throwaway
+    `import face_recognition` before committing to it, only re-exec'ing into
+    one whose probe succeeds. If none qualifies we return and let the normal
+    import path below degrade to "unavailable".
     """
     if os.environ.get("PV_FACE_REEXECED") == "1":
         return
@@ -34,15 +106,9 @@ def _try_reexec_with_pipx() -> None:
         os.path.join(home, ".local", "pipx", "venvs"),
         os.path.join(home, ".local", "share", "pipx", "venvs"),
     ]
-    candidates: list[str] = []
-    for base in bases:
-        if not os.path.isdir(base):
+    for py in _pipx_venv_pythons(bases):
+        if not _can_import_face_recognition(py):
             continue
-        for name in sorted(os.listdir(base)):
-            py = os.path.join(base, name, "bin", "python")
-            if os.path.exists(py):
-                candidates.append(py)
-    for py in candidates:
         env = os.environ.copy()
         env["PV_FACE_REEXECED"] = "1"
         try:
