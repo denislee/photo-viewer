@@ -740,7 +740,13 @@ func (c *Controller) performDeletion(paths []string) {
 			log.Printf("trash: rename failed for %s (%v); falling back to remove", p, err)
 			failed = append(failed, p)
 		}
-		_ = c.index.RemoveEntries(paths)
+		if err := c.index.RemoveEntries(paths); err != nil {
+			// Files are already in the trash but their rows survive; log it and
+			// force a refresh so the next paint resurfaces the index's truth
+			// instead of phantom rows with broken cells.
+			log.Printf("trash: index cleanup failed for %d path(s): %v", len(paths), err)
+			c.scheduleRefresh(c.activeDir())
+		}
 		for _, p := range failed {
 			if c.store != nil {
 				c.store.Forget(cache.ThumbIDFor(p))
@@ -765,7 +771,13 @@ func (c *Controller) performDeletion(paths []string) {
 			log.Printf("delete: remove failed for %s: %v", p, rmErr)
 		}
 	}
-	_ = c.index.RemoveEntries(paths)
+	if err := c.index.RemoveEntries(paths); err != nil {
+		// Files are already unlinked but their rows survive; log it and force a
+		// refresh so the next paint resurfaces the index's truth instead of
+		// phantom rows with broken cells.
+		log.Printf("delete: index cleanup failed for %d path(s): %v", len(paths), err)
+		c.scheduleRefresh(c.activeDir())
+	}
 }
 
 // ApplyMove keeps the index and thumbnail store consistent after the organize
