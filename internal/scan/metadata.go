@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"math/big"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 	"time"
@@ -212,7 +211,16 @@ func SetMediaDate(path string, t time.Time) error {
 		return errors.New("exiftool not available")
 	}
 	stamp := t.Format("2006:01:02 15:04:05")
-	cmd := exec.Command("exiftool",
+	// Route the write through the pooled -stay_open daemon (runExiftool) rather
+	// than a fresh exec per file (S-14): a "fix dates" pass over hundreds of
+	// files otherwise pays exiftool's ~50–150 ms fork+Perl startup each time,
+	// while every metadata READ already rides the daemon. Writes are safe on the
+	// daemon protocol — the update summary is plain text on stdout (only "-b"
+	// binary reads are excluded). runExiftool applies the argsUnsafeForDaemon
+	// gate, so a path carrying a newline (which would corrupt the newline-framed
+	// argfile stream) transparently falls back to a one-shot exec; it also
+	// short-circuits to one-shot when the daemon spawn is backing off.
+	out, err := runExiftool(
 		"-overwrite_original",
 		"-P",
 		"-DateTimeOriginal="+stamp,
@@ -223,11 +231,34 @@ func SetMediaDate(path string, t time.Time) error {
 		"-TrackCreateDate="+stamp,
 		"-TrackModifyDate="+stamp,
 		path)
-	if out, err := cmd.CombinedOutput(); err != nil {
+	if err != nil {
+		// One-shot fallbacks surface a non-zero exit via err (and carry stderr
+		// in the returned bytes); daemon I/O errors and "exiftool not installed"
+		// also arrive here.
 		return fmt.Errorf("exiftool: %w: %s", err, strings.TrimSpace(string(out)))
+	}
+	// The daemon reports write success/failure only through its stdout summary:
+	// the "{ready}" sentinel that frames the response fires whether the write
+	// succeeded or not, and exiftool's human-readable "Error:" line goes to the
+	// daemon's discarded stderr. Detect a failed write from the stdout summary
+	// (this is what catches the daemon path — the one-shot path already failed
+	// the err check above).
+	if exiftoolWriteFailed(out) {
+		return fmt.Errorf("exiftool: write failed: %s", strings.TrimSpace(string(out)))
 	}
 	_ = os.Chtimes(path, t, t)
 	return nil
+}
+
+// exiftoolWriteFailed reports whether exiftool's stdout write summary indicates
+// the update did not complete. On success exiftool prints "N image files
+// updated"; on failure it prints "0 image files updated" plus "M files weren't
+// updated due to errors" — both on stdout, which the -stay_open daemon
+// captures. The absence of any "files updated" acknowledgement is treated as a
+// failure too, guarding against an empty or unexpected response.
+func exiftoolWriteFailed(out []byte) bool {
+	s := string(out)
+	return strings.Contains(s, "weren't updated") || !strings.Contains(s, "files updated")
 }
 
 // readMetadataDate is the shared implementation used by GetMediaDate and
