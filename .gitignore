@@ -47,3 +47,6 @@ GEMINI.md
 
 # Session handoff / audit notes (kept local, not part of the repo)
 OPTIMIZATION_*.md
+
+# graft's local graph cache — regenerable, not committed (run `graft build`).
+/graft/
