@@ -207,6 +207,16 @@ func New(invalidate func()) (*Player, error) {
 		// above only removes a *different* source of frame/params disagreement —
 		// half-initialised hwdec frames — and does not cover this SW-decode path.)
 		{"vd-apply-cropping", "no"},
+		// Never hand the VO a rotated frame. vo_libmpv advertises
+		// VO_CAP_ROTATE90 (true for its GPU backend), so mpv skips its own
+		// autorotate filter and computes the src rect in *rotated*
+		// coordinates. The SW backend we use ignores rotation, though, and
+		// crops the unrotated frame with that rect: a 1920×1080 phone clip
+		// tagged rotate=90 gets src y1=1920 against h=1080 and libmpv aborts
+		// on mp_image_crop's `y1 <= img->h` assertion. We zero the rotation
+		// here and instead bake it into the pixels with a lavfi transpose
+		// filter per file (applyRotation, on MPV_EVENT_FILE_LOADED).
+		{"video-rotate", "no"},
 		{"loop-file", "inf"},
 		{"keep-open", "always"},
 		{"audio-display", "no"},
@@ -523,6 +533,40 @@ func (p *Player) drainEvents() {
 		if p.closed.Load() {
 			return
 		}
+		if ev.event_id == C.MPV_EVENT_FILE_LOADED {
+			p.applyRotation()
+		}
+	}
+}
+
+// rotationFilters maps a container rotation (degrees clockwise) to the
+// lavfi chain that bakes it into the pixels. Anything else — 0, or a
+// non-right angle — gets no filter.
+var rotationFilters = map[string]string{
+	"90":  "lavfi=[transpose=clock]",
+	"180": "lavfi=[hflip,vflip]",
+	"270": "lavfi=[transpose=cclock]",
+}
+
+// applyRotation replaces the vf chain with the transpose matching the
+// current video track's rotation metadata (see the video-rotate=no comment
+// in New for why mpv can't do this itself). Always sets vf, so a rotated
+// file's filter doesn't leak into the next, unrotated one. Runs on the
+// drainEvents goroutine, which keeps p.h valid until it exits.
+func (p *Player) applyRotation() {
+	name := C.CString("current-tracks/video/demux-rotation")
+	defer C.free(unsafe.Pointer(name))
+	var rot string
+	if s := C.mpv_get_property_string(p.h, name); s != nil {
+		rot = C.GoString(s)
+		C.mpv_free(unsafe.Pointer(s))
+	}
+	vfName := C.CString("vf")
+	defer C.free(unsafe.Pointer(vfName))
+	vf := C.CString(rotationFilters[rot])
+	defer C.free(unsafe.Pointer(vf))
+	if rc := C.mpv_set_property_string(p.h, vfName, vf); rc < 0 {
+		log.Printf("video: set vf for rotation %q: %s", rot, C.GoString(C.mpv_error_string(rc)))
 	}
 }
 
