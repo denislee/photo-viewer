@@ -967,6 +967,11 @@ type favoriteRequest struct {
 	Toggle bool   `json:"toggle,omitempty"`
 }
 
+// favoriteMaxBody caps the POST /api/favorite body. A real request is under
+// 100 bytes; the cap stops a client from making the JSON decoder buffer an
+// arbitrarily large body (e.g. one giant string field) into memory.
+const favoriteMaxBody = 4 << 10
+
 // handleAPIFavorite toggles or sets the favorite flag for a given thumb id.
 // Returns the new state so the client can update the UI deterministically.
 func (s *Server) handleAPIFavorite(w http.ResponseWriter, r *http.Request) {
@@ -997,7 +1002,13 @@ func (s *Server) handleAPIFavorite(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req favoriteRequest
+	r.Body = http.MaxBytesReader(w, r.Body, favoriteMaxBody)
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		var tooBig *http.MaxBytesError
+		if errors.As(err, &tooBig) {
+			http.Error(w, "request body too large", http.StatusRequestEntityTooLarge)
+			return
+		}
 		http.Error(w, "bad request", http.StatusBadRequest)
 		return
 	}

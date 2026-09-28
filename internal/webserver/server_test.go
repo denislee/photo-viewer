@@ -472,6 +472,25 @@ func TestAPIFavoriteRejectsCrossOrigin(t *testing.T) {
 	}
 }
 
+// TestAPIFavoriteRejectsOversizedBody guards W-15: the body is capped, so a
+// huge JSON value gets 413 instead of being buffered into memory.
+func TestAPIFavoriteRejectsOversizedBody(t *testing.T) {
+	ts, cleanup := apiFixture(t)
+	defer cleanup()
+
+	body := strings.NewReader(`{"id":"` + strings.Repeat("a", 1<<20) + `","toggle":true}`)
+	req, _ := http.NewRequest(http.MethodPost, ts.URL+"/api/favorite", body)
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusRequestEntityTooLarge {
+		t.Errorf("status = %d, want 413 (Request Entity Too Large)", resp.StatusCode)
+	}
+}
+
 // TestAPIFavoriteAcceptsSameOrigin guards W-01: real browsers send an Origin
 // header matching the page host on same-origin POSTs, and the handler must
 // accept those (and actually flip the flag) rather than 403 them.
