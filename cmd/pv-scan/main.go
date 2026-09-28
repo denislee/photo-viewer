@@ -8,7 +8,9 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"os/signal"
 	"sync"
+	"syscall"
 
 	"github.com/dns/photo-viewer/internal/cache"
 	"github.com/dns/photo-viewer/internal/face"
@@ -48,8 +50,17 @@ func main() {
 	// produced, rather than accumulating a library-sized backlog before any
 	// detection begins. Start and SubmitBlocking are both no-ops when the
 	// helper is unavailable, so this degrades gracefully.
+	// The first SIGINT/SIGTERM cancels ctx: the walk stops, queued thumbnails
+	// and face jobs are skipped, and the batch already walked is still
+	// reconciled and the index saved (S-23). A second Ctrl-C force-quits.
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	go func() {
+		<-ctx.Done()
+		stop()
+	}()
+
 	pipe := face.NewPipeline(idx, nil)
-	faceCtx, faceCancel := context.WithCancel(context.Background())
+	faceCtx, faceCancel := context.WithCancel(ctx)
 	defer faceCancel()
 	facesActive := !*noFaces && pipe.Enabled()
 	if facesActive {
@@ -67,6 +78,9 @@ func main() {
 	for range workers {
 		wg.Go(func() {
 			for e := range thumbJobs {
+				if ctx.Err() != nil {
+					continue // interrupted: drain without generating
+				}
 				p, perr := store.Path(e)
 				prog.record(e.Path, p, perr)
 				if facesActive && perr == nil && p != "" {
@@ -99,7 +113,7 @@ func main() {
 		batch = batch[:0]
 	}
 
-	for r := range scan.WalkWith(context.Background(), *root, opts) {
+	for r := range scan.WalkWith(ctx, *root, opts) {
 		batch = append(batch, r)
 		if len(batch) >= batchSize {
 			flushBatch()
@@ -115,6 +129,11 @@ func main() {
 
 	// Drain any face jobs still queued and wait for the workers to exit.
 	pipe.Stop()
+
+	if ctx.Err() != nil {
+		fmt.Println("interrupted: index saved; rerun to pick up where the scan stopped")
+		os.Exit(130)
+	}
 
 	if *noFaces {
 		return

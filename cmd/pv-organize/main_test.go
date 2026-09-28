@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"os"
 	"path/filepath"
@@ -42,7 +43,7 @@ func TestMoveFileCollisionSuffixesWithoutOverwrite(t *testing.T) {
 	src := filepath.Join(dir, "photo.jpg")
 	writeFile(t, src, "NEW")
 
-	got, err := moveFile(src, destDir, "photo.jpg")
+	got, err := moveFile(context.Background(), src, destDir, "photo.jpg")
 	if err != nil {
 		t.Fatalf("moveFile: %v", err)
 	}
@@ -75,7 +76,7 @@ func TestMoveFileNoCollision(t *testing.T) {
 	src := filepath.Join(dir, "clip.mp4")
 	writeFile(t, src, "BYTES")
 
-	got, err := moveFile(src, destDir, "clip.mp4")
+	got, err := moveFile(context.Background(), src, destDir, "clip.mp4")
 	if err != nil {
 		t.Fatalf("moveFile: %v", err)
 	}
@@ -105,7 +106,7 @@ func TestCrossDeviceMoveCopiesAndRemovesSource(t *testing.T) {
 	writeFile(t, src, "CONTENT-1234")
 	dst := filepath.Join(destDir, "movie.mov")
 
-	got, err := crossDeviceMove(src, destDir, dst)
+	got, err := crossDeviceMove(context.Background(), src, destDir, dst)
 	if err != nil {
 		t.Fatalf("crossDeviceMove: %v", err)
 	}
@@ -141,7 +142,7 @@ func TestCrossDeviceMoveRefusesOverwrite(t *testing.T) {
 	src := filepath.Join(dir, "keep.jpg")
 	writeFile(t, src, "INCOMING")
 
-	_, err := crossDeviceMove(src, destDir, dst)
+	_, err := crossDeviceMove(context.Background(), src, destDir, dst)
 	if !errors.Is(err, os.ErrExist) {
 		t.Fatalf("expected file-exists error, got %v", err)
 	}
@@ -176,7 +177,7 @@ func TestDryRunPlanMatchesRealRun(t *testing.T) {
 	// Real move of a same-named source.
 	src := filepath.Join(dir, "a.jpg")
 	writeFile(t, src, "NEW")
-	real, err := moveFile(src, destDir, "a.jpg")
+	real, err := moveFile(context.Background(), src, destDir, "a.jpg")
 	if err != nil {
 		t.Fatalf("moveFile: %v", err)
 	}
@@ -234,5 +235,29 @@ func TestStatTaken(t *testing.T) {
 	writeFile(t, present, "x")
 	if !statTaken(present) {
 		t.Fatalf("existing path reported as free")
+	}
+}
+
+// TestCrossDeviceMoveCancelled is the S-23 guard: an interrupt mid-copy must
+// abort the copy, leave no .pv-organize-*.tmp in the destination, create no
+// destination file, and keep the source intact.
+func TestCrossDeviceMoveCancelled(t *testing.T) {
+	srcDir, destDir := t.TempDir(), t.TempDir()
+	src := filepath.Join(srcDir, "clip.mp4")
+	if err := os.WriteFile(src, []byte("video bytes"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	dst := filepath.Join(destDir, "clip.mp4")
+	if _, err := crossDeviceMove(ctx, src, destDir, dst); !errors.Is(err, context.Canceled) {
+		t.Fatalf("err = %v, want context.Canceled", err)
+	}
+	if entries, _ := os.ReadDir(destDir); len(entries) != 0 {
+		t.Errorf("destination not empty after cancelled copy: %v", entries)
+	}
+	if got, err := os.ReadFile(src); err != nil || string(got) != "video bytes" {
+		t.Errorf("source damaged: %q, %v", got, err)
 	}
 }

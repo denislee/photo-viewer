@@ -9,6 +9,7 @@ import (
 	"log"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
 	"strings"
 	"syscall"
@@ -56,7 +57,11 @@ func main() {
 	// SkipDurationProbe: pv-organize only needs each file's path and date, never
 	// a video's duration, so suppress the per-video ffprobe fork that a plain
 	// Walk would pay for every clip.
-	for res := range scan.WalkWith(context.Background(), *srcDir, scan.WalkOptions{SkipDurationProbe: true}) {
+	ctx := interruptContext()
+	for res := range scan.WalkWith(ctx, *srcDir, scan.WalkOptions{SkipDurationProbe: true}) {
+		if ctx.Err() != nil {
+			break
+		}
 		if res.Type == scan.TypeUnknown {
 			continue
 		}
@@ -104,8 +109,11 @@ func main() {
 			continue
 		}
 
-		finalDest, err := moveFile(absSrc, destSubDir, baseName)
+		finalDest, err := moveFile(ctx, absSrc, destSubDir, baseName)
 		if err != nil {
+			if ctx.Err() != nil {
+				break // interrupted mid-copy: the move was rolled back, not a failure
+			}
 			log.Printf("Error moving %s: %v", res.Path, err)
 			failures++
 			continue
@@ -114,6 +122,10 @@ func main() {
 		count++
 	}
 
+	if ctx.Err() != nil {
+		fmt.Printf("\nInterrupted. Moved %d files (%d error(s)); nothing was left half-moved.\n", count, failures)
+		os.Exit(130)
+	}
 	if *dryRun {
 		fmt.Printf("\nDry run finished. Would have moved %d files (%d planning error(s)).\n", count, failures)
 	} else {
@@ -134,7 +146,7 @@ func main() {
 // silently destroyed, and (2) os.Rename returns EXDEV across filesystems — the
 // tool's primary use case (SD card to library disk on a different mount) — so
 // every move failed and the files stayed stuck at the source.
-func moveFile(src, destDir, baseName string) (string, error) {
+func moveFile(ctx context.Context, src, destDir, baseName string) (string, error) {
 	for attempt := 0; attempt <= maxCollisionSuffix; attempt++ {
 		dst := candidatePath(destDir, baseName, attempt)
 		// os.Link is the atomic no-overwrite claim: it creates a second name
@@ -158,7 +170,7 @@ func moveFile(src, destDir, baseName string) (string, error) {
 			// primary use (SD card to library disk). EPERM/ENOSYS/…: a source
 			// filesystem without hardlink support (FAT). Either way fall back
 			// to a crash-safe copy that still refuses to overwrite.
-			finalDest, cerr := crossDeviceMove(src, destDir, dst)
+			finalDest, cerr := crossDeviceMove(ctx, src, destDir, dst)
 			if errors.Is(cerr, os.ErrExist) {
 				continue // dst appeared between our attempt and the copy — advance the suffix
 			}
@@ -199,7 +211,7 @@ func isCrossDeviceOrUnsupported(err error) bool {
 // file at dst, and src is unlinked ONLY after its bytes are durably in place.
 // Returns fs.ErrExist (via syscall.EEXIST) when dst is already taken so the
 // caller can advance to the next suffix.
-func crossDeviceMove(src, destDir, dst string) (string, error) {
+func crossDeviceMove(ctx context.Context, src, destDir, dst string) (string, error) {
 	in, err := os.Open(src)
 	if err != nil {
 		return "", err
@@ -207,16 +219,20 @@ func crossDeviceMove(src, destDir, dst string) (string, error) {
 	defer in.Close()
 
 	// Unique temp in the destination dir (same filesystem as dst) so two
-	// concurrent runs can't clobber each other's partial copy.
+	// concurrent runs can't clobber each other's partial copy. The deferred
+	// remove is the single cleanup for every failure path — including a Ctrl-C
+	// mid-copy (S-23) — and a no-op once placeNoClobber has consumed the temp.
 	tmp, err := os.CreateTemp(destDir, ".pv-organize-*.tmp")
 	if err != nil {
 		return "", err
 	}
 	tmpName := tmp.Name()
+	defer os.Remove(tmpName)
 
-	if _, err := io.Copy(tmp, in); err != nil {
+	// ctxReader makes the copy stop at the next read after an interrupt, so a
+	// multi-GB video doesn't finish copying before the run can exit.
+	if _, err := io.Copy(tmp, ctxReader{ctx, in}); err != nil {
 		tmp.Close()
-		os.Remove(tmpName) // best-effort: never leave a partial temp behind
 		return "", err
 	}
 	// fsync before the placement + source unlink: a failed Sync is exactly the
@@ -225,16 +241,13 @@ func crossDeviceMove(src, destDir, dst string) (string, error) {
 	// destroy the sole copy.
 	if err := tmp.Sync(); err != nil {
 		tmp.Close()
-		os.Remove(tmpName)
 		return "", err
 	}
 	if err := tmp.Close(); err != nil {
-		os.Remove(tmpName)
 		return "", err
 	}
 
 	if err := placeNoClobber(tmpName, dst); err != nil {
-		os.Remove(tmpName)
 		return "", err // may be fs.ErrExist → caller advances the suffix
 	}
 	// Destination is durably in place under its final name; only now is it safe
@@ -244,6 +257,34 @@ func crossDeviceMove(src, destDir, dst string) (string, error) {
 		return "", fmt.Errorf("copied to %s but could not remove source %s: %w", dst, src, err)
 	}
 	return dst, nil
+}
+
+// ctxReader fails reads once ctx is cancelled.
+type ctxReader struct {
+	ctx context.Context
+	r   io.Reader
+}
+
+func (c ctxReader) Read(p []byte) (int, error) {
+	if err := c.ctx.Err(); err != nil {
+		return 0, err
+	}
+	return c.r.Read(p)
+}
+
+// interruptContext returns a context cancelled by the first SIGINT/SIGTERM, so
+// the run stops between (or mid-copy within) files and cleans up its temp
+// instead of dying with a partial .pv-organize-*.tmp in the destination (S-23).
+// After that first signal the default handling is restored: a second Ctrl-C
+// kills the process immediately.
+func interruptContext() context.Context {
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	go func() {
+		<-ctx.Done()
+		stop()
+		fmt.Fprintln(os.Stderr, "\nInterrupted — finishing up (press Ctrl-C again to force quit)…")
+	}()
+	return ctx
 }
 
 // placeNoClobber moves the fully-written temp file to its final name dst on the
