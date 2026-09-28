@@ -1265,6 +1265,7 @@ func (v *ImportView) processBatch(ctx context.Context, outboxDir string, entries
 		if err := os.MkdirAll(destDir, 0o755); err != nil {
 			atomic.AddInt64(&v.statErrors, 1)
 			v.appendLog(fmt.Sprintf("[ERROR] mkdir %s: %v", destDir, err))
+			v.bumpProgress()
 			continue
 		}
 		dest := filepath.Join(destDir, baseName)

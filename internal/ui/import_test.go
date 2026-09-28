@@ -460,6 +460,36 @@ func TestProcessBatchCollisionNeverOverwrites(t *testing.T) {
 	}
 }
 
+// TestProcessBatchProgressReachesMaxOnMkdirError is the U-19 regression:
+// every file bumps the bar twice (date pass + move pass). The mkdir-failure
+// branch skipped its bump, so a batch with such failures stalled below 100%.
+func TestProcessBatchProgressReachesMaxOnMkdirError(t *testing.T) {
+	dir := t.TempDir()
+	// A regular file as the Outbox makes every date-folder MkdirAll fail.
+	outbox := filepath.Join(dir, "outbox")
+	if err := os.WriteFile(outbox, nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	var entries []string
+	for _, name := range []string{"a.jpg", "b.jpg", "c.jpg"} {
+		p := filepath.Join(dir, name)
+		if err := os.WriteFile(p, []byte(name), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		entries = append(entries, p)
+	}
+
+	v := &ImportView{}
+	v.processBatch(context.Background(), outbox, entries)
+
+	if e := atomic.LoadInt64(&v.statErrors); e != int64(len(entries)) {
+		t.Fatalf("statErrors = %d, want %d", e, len(entries))
+	}
+	if done, max := v.progress.load(); done != max || max != int64(2*len(entries)) {
+		t.Errorf("progress = %d/%d, want %d/%d", done, max, 2*len(entries), 2*len(entries))
+	}
+}
+
 // TestCopyFileNoReplace: the durable copy used for cross-device filing must
 // refuse to publish over an existing file and must not leave its temp behind.
 func TestCopyFileNoReplace(t *testing.T) {
