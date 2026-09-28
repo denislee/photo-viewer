@@ -449,7 +449,7 @@ func gzipMiddleware(next http.Handler) http.Handler {
 			return
 		}
 		gw := &gzipResponseWriter{ResponseWriter: w}
-		defer gw.Close()
+		defer gw.Close() //nolint:errcheck // the response is already committed; nothing to report to
 		next.ServeHTTP(gw, r)
 	})
 }

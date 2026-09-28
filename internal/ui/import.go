@@ -1313,7 +1313,7 @@ func (v *ImportView) extractZipToInbox(ctx context.Context, zipPath, inboxDir st
 		v.appendLog("[ERROR] Failed to open ZIP: " + err.Error())
 		return nil
 	}
-	defer r.Close()
+	defer r.Close() //nolint:errcheck // read-only archive
 	var extracted []string
 	for _, f := range r.File {
 		// Honour Pause / Cancel between archive entries so a multi-GB ZIP

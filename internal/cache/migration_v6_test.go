@@ -120,6 +120,9 @@ func indexNames(t *testing.T, idx *Index) map[string]bool {
 			have[n] = true
 		}
 	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
 	return have
 }
 

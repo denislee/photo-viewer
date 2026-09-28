@@ -28,6 +28,9 @@ func explainPlan(t *testing.T, idx *Index, query string, args ...any) string {
 		b.WriteString(detail)
 		b.WriteByte('\n')
 	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("plan rows: %v", err)
+	}
 	return b.String()
 }
 
@@ -188,18 +191,7 @@ func TestDeadIndexesDropped(t *testing.T) {
 	idx, cleanup := loadEmpty(t)
 	defer cleanup()
 
-	have := map[string]bool{}
-	rows, err := idx.db.Query("SELECT name FROM sqlite_master WHERE type='index'")
-	if err != nil {
-		t.Fatal(err)
-	}
-	for rows.Next() {
-		var n string
-		if err := rows.Scan(&n); err == nil {
-			have[n] = true
-		}
-	}
-	rows.Close()
+	have := indexNames(t, idx)
 
 	for _, dead := range []string{"idx_entries_year", "idx_entries_duration", "idx_entries_favorite"} {
 		if have[dead] {

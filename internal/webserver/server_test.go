@@ -708,7 +708,7 @@ func TestStopForceClosesActiveConnections(t *testing.T) {
 	}
 	reqDone := make(chan getResult, 1)
 	go func() {
-		resp, err := http.Get("http://" + ln.Addr().String() + "/stream")
+		resp, err := http.Get("http://" + ln.Addr().String() + "/stream") //nolint:bodyclose // closed by the receiver of reqDone
 		reqDone <- getResult{resp, err}
 	}()
 

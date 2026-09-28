@@ -167,7 +167,7 @@ func exifJSONString(rec map[string]json.RawMessage, key string) string {
 
 func safeRat(tag *tiff.Tag) (rat *big.Rat) {
 	defer func() {
-		recover()
+		_ = recover()
 	}()
 	if r, err := tag.Rat(0); err == nil {
 		return r

@@ -146,9 +146,11 @@ func TestHLSSegmentCached(t *testing.T) {
 	defer cleanup()
 
 	url := ts.URL + "/hls/" + id + "/seg0.ts"
-	if _, err := http.Get(url); err != nil {
+	first, err := http.Get(url)
+	if err != nil {
 		t.Fatal(err)
 	}
+	first.Body.Close()
 	// Second request should be served from the on-disk cache and return
 	// quickly (no second transcode). We assert correctness, not timing:
 	// the response must still be a valid segment.

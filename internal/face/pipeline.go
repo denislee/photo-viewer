@@ -254,7 +254,6 @@ func (p *Pipeline) hasFreshCached(path string, thumbMod int64) bool {
 		if p.freshness == nil {
 			p.freshness = p.idx.LoadFaceFreshness()
 		}
-		m = p.freshness
 		p.freshnessMu.Unlock()
 	}
 	p.freshnessMu.RLock()
