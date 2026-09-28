@@ -2,6 +2,7 @@ package ui
 
 import (
 	"image"
+	"log"
 	"sync"
 	"time"
 
@@ -13,20 +14,32 @@ import (
 	"gioui.org/widget/material"
 )
 
-// SDCardWatcher polls lsblk on a fixed interval when auto-detect is enabled
-// and reports newly-attached removable devices via a queue of pending prompts.
-// Devices present at the time the watcher starts (or the toggle is first
-// enabled) are seeded into `known` so the user isn't pestered about drives
-// already plugged in. A device the user dismisses is suppressed until it is
-// physically unplugged.
+// SDCardWatcher reports newly-attached removable devices via a queue of
+// pending prompts while auto-detect is enabled. Devices present at the time the
+// watcher starts (or the toggle is first enabled) are seeded into `known` so
+// the user isn't pestered about drives already plugged in. A device the user
+// dismisses is suppressed until it is physically unplugged.
 //
-// While auto-detect is off, no lsblk forks are issued. On the first tick
-// after auto-detect is enabled, the watcher re-seeds `known` from the current
-// device list (no prompts) so that already-present drives don't immediately
-// enqueue. From the following tick onward, newly-inserted drives surface normally.
+// On Linux it listens for block-device uevents (see blockEvents) and runs
+// lsblk only when one arrives, so an idle session forks nothing. The ticker
+// then just watches the auto-detect toggle: the first tick after it is enabled
+// re-seeds `known` from the current device list (no prompts), and insertions
+// after that surface normally. Where uevents are unavailable (other platforms,
+// a sandbox without netlink) the ticker falls back to running lsblk itself,
+// as the watcher always did before. While auto-detect is off, no lsblk forks
+// are issued either way.
 type SDCardWatcher struct {
 	invalidate func()
 	interval   time.Duration
+	// settle delays the rescan after a uevent so a burst (disk, then each
+	// partition, then udev's copies of each) costs one lsblk, run after udev
+	// has recorded the filesystem type.
+	settle time.Duration
+
+	// Seams for tests; NewSDCardWatcher wires the real implementations.
+	list    func() ([]removableDevice, error)
+	events  func(stop <-chan struct{}) (<-chan struct{}, error)
+	enabled func() bool
 
 	mu          sync.Mutex
 	running     bool
@@ -34,7 +47,7 @@ type SDCardWatcher struct {
 	known       map[string]bool
 	dismissed   map[string]bool
 	pending     []removableDevice
-	prevEnabled bool // whether auto-detect was on during the previous tick
+	prevEnabled bool // whether auto-detect was on during the previous check
 }
 
 // NewSDCardWatcher constructs a watcher. invalidate is called whenever a new
@@ -43,12 +56,16 @@ func NewSDCardWatcher(invalidate func()) *SDCardWatcher {
 	return &SDCardWatcher{
 		invalidate: invalidate,
 		interval:   3 * time.Second,
+		settle:     500 * time.Millisecond,
+		list:       listRemovableDevices,
+		events:     blockEvents,
+		enabled:    func() bool { return GetConfig().SDCardAutoDetect },
 		known:      make(map[string]bool),
 		dismissed:  make(map[string]bool),
 	}
 }
 
-// Start kicks off the polling goroutine. Seeds `known` with devices currently
+// Start kicks off the watcher goroutine. Seeds `known` with devices currently
 // attached so the watcher only fires on subsequent insertions. Safe to call
 // more than once — extra calls are no-ops.
 func (w *SDCardWatcher) Start() {
@@ -62,30 +79,49 @@ func (w *SDCardWatcher) Start() {
 	stop := w.stopCh
 	w.mu.Unlock()
 
-	if devs, err := listRemovableDevices(); err == nil {
+	if devs, err := w.list(); err == nil {
 		w.mu.Lock()
 		for _, d := range devs {
 			w.known[d.Path] = true
 		}
-		w.prevEnabled = true // seeding done; first real tick may enqueue
+		w.prevEnabled = true // seeding done; the next scan may enqueue
 		w.mu.Unlock()
+	}
+
+	events, err := w.events(stop)
+	poll := err != nil
+	if poll {
+		log.Printf("sd-card watcher: no block-device events (%v); polling lsblk every %s", err, w.interval)
 	}
 
 	go func() {
 		t := time.NewTicker(w.interval)
 		defer t.Stop()
+		var settled <-chan time.Time
 		for {
 			select {
 			case <-stop:
 				return
 			case <-t.C:
-				w.tick()
+				w.tick(poll)
+			case _, ok := <-events:
+				if !ok {
+					log.Printf("sd-card watcher: block-device events stopped; polling lsblk every %s", w.interval)
+					events, poll = nil, true
+					continue
+				}
+				if settled == nil {
+					settled = time.After(w.settle)
+				}
+			case <-settled:
+				settled = nil
+				w.onEvent()
 			}
 		}
 	}()
 }
 
-// Stop terminates the polling goroutine.
+// Stop terminates the watcher goroutine and its event source.
 func (w *SDCardWatcher) Stop() {
 	w.mu.Lock()
 	defer w.mu.Unlock()
@@ -97,19 +133,39 @@ func (w *SDCardWatcher) Stop() {
 	w.running = false
 }
 
-func (w *SDCardWatcher) tick() {
-	enabled := GetConfig().SDCardAutoDetect
+// tick runs every interval. It tracks the auto-detect toggle, re-seeding when
+// it has just been turned on, and in polling mode also rescans.
+func (w *SDCardWatcher) tick(poll bool) {
+	enabled := w.enabled()
 
 	w.mu.Lock()
 	prev := w.prevEnabled
 	w.prevEnabled = enabled
 	w.mu.Unlock()
 
-	if !enabled {
-		return // skip lsblk entirely when auto-detect is off
+	if enabled && (poll || !prev) {
+		w.scan(prev)
 	}
+}
 
-	devs, err := listRemovableDevices()
+// onEvent rescans after a burst of block-device uevents has settled.
+func (w *SDCardWatcher) onEvent() {
+	if !w.enabled() {
+		return
+	}
+	w.mu.Lock()
+	prev := w.prevEnabled
+	w.prevEnabled = true
+	w.mu.Unlock()
+	w.scan(prev)
+}
+
+// scan lists devices and diffs them against `known`. With prev false (the
+// first scan after auto-detect was enabled) it only re-seeds; otherwise every
+// new, non-dismissed device is queued as a prompt. Unplugged devices are
+// forgotten, which also lifts their dismissal.
+func (w *SDCardWatcher) scan(prev bool) {
+	devs, err := w.list()
 	if err != nil {
 		return
 	}
@@ -135,9 +191,6 @@ func (w *SDCardWatcher) tick() {
 	for _, d := range newDevs {
 		w.known[d.Path] = true
 		if prev {
-			// Only enqueue on subsequent ticks (prev==true), not on the first
-			// tick after auto-detect is enabled (re-seed pass). This ensures
-			// drives already connected at toggle-on time don't flood the prompt.
 			w.pending = append(w.pending, d)
 		}
 	}
