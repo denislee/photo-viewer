@@ -122,7 +122,7 @@ When a location isn't writable, the data moves:
 | `make test-video` | the libmpv Close/Render race tests against an ffmpeg-generated clip |
 | `make lint` | `golangci-lint` with `.golangci.yml` (pinned, via `go run`) |
 | `make vuln` | `govulncheck` (pinned, via `go run`) |
-| `make check` | everything CI runs: fmt-check, vet, lint, race, test-video, vuln |
+| `make check` | everything to run before pushing: fmt-check, vet, lint, race, test-video, vuln |
 
 The libmpv race tests skip unless `PV_CROP_VIDEO` points at a video file, which is why
 `make test-video` exists. `PV_CROP_VIDEO=/path/to/clip go test -run TestRenderCropAssertion

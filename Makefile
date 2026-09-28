@@ -39,7 +39,7 @@ lint:
 vuln:
 	$(GOVULNCHECK) ./...
 
-# Everything CI runs.
+# Everything to run before pushing.
 check: fmt-check vet lint race test-video vuln
 
 clean:
