@@ -4,6 +4,7 @@ import (
 	"os"
 	"sync"
 	"testing"
+	"time"
 )
 
 // TestCloseRenderRace verifies that concurrent Close and Render calls do not
@@ -41,4 +42,28 @@ func TestCloseRenderRace(t *testing.T) {
 		p.Close()
 	}()
 	wg.Wait()
+}
+
+// TestCloseDuringFileLoaded closes the player at staggered delays after Load
+// so Close races the FILE_LOADED event (drainEvents → applyRotation, which
+// calls into p.h). Before the fix Close destroyed the handle without first
+// waiting for drainEvents, so applyRotation could run on a handle being
+// torn down. Run with -race and PV_CROP_VIDEO set to a real video file.
+func TestCloseDuringFileLoaded(t *testing.T) {
+	path := os.Getenv("PV_CROP_VIDEO")
+	if path == "" {
+		t.Skip("set PV_CROP_VIDEO to a video file to run the Close/FILE_LOADED race test")
+	}
+
+	for i := range 30 {
+		p, err := New(func() {})
+		if err != nil {
+			t.Fatalf("New: %v", err)
+		}
+		if err := p.Load(path); err != nil {
+			t.Fatalf("Load: %v", err)
+		}
+		time.Sleep(time.Duration(i) * time.Millisecond)
+		p.Close()
+	}
 }

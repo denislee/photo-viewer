@@ -482,6 +482,13 @@ func (p *Player) NeedsRedraw() bool {
 
 // Close tears down the render context and the mpv handle.  After Close
 // the Player must not be used again.
+//
+// Teardown order matters: the drainEvents goroutine calls into p.h (it
+// blocks in mpv_wait_event and runs applyRotation on FILE_LOADED), so it
+// must be gone before the handle is destroyed. closed is set first, then
+// mpv_wakeup (thread-safe) makes a pending or the next mpv_wait_event
+// return MPV_EVENT_NONE; drainEvents sees closed and exits. Only then are
+// the render context and the handle freed.
 func (p *Player) Close() {
 	if p == nil {
 		return
@@ -489,10 +496,19 @@ func (p *Player) Close() {
 	if !p.closed.CompareAndSwap(false, true) {
 		return
 	}
+	if p.h != nil {
+		C.mpv_wakeup(p.h)
+		if p.drainDone != nil {
+			<-p.drainDone
+		}
+	}
 	// Swap p.ctx out under mu so any in-progress Render either completes
 	// before we free the render context, or sees closed=true when it
 	// re-checks under mu. Render never touches p.ctx after seeing
-	// closed=true, so no call reaches a freed pointer.
+	// closed=true, so no call reaches a freed pointer. Taking mu also
+	// waits out any Load/Stop/command already inside libmpv, so nothing
+	// is using p.h when it is destroyed below. libmpv requires the render
+	// context to be freed before the handle.
 	p.mu.Lock()
 	ctx := p.ctx
 	p.ctx = nil
@@ -501,39 +517,29 @@ func (p *Player) Close() {
 		C.mpv_render_context_free(ctx)
 	}
 	if p.h != nil {
-		// mpv_terminate_destroy posts MPV_EVENT_SHUTDOWN to the event
-		// queue, which makes drainEvents fall out of mpv_wait_event.
-		// Wait for that to happen before zeroing p.h so the goroutine
-		// can't be observed passing a nil handle to mpv.
 		C.mpv_terminate_destroy(p.h)
-		if p.drainDone != nil {
-			<-p.drainDone
-		}
 		p.h = nil
 	}
 	p.handle.Delete()
 }
 
 // drainEvents pumps mpv's event queue so it never blocks waiting for the
-// host to consume events. The loop exits when mpv signals shutdown (which
-// happens during Close via mpv_terminate_destroy).
+// host to consume events. The loop exits once Close has set closed (Close
+// wakes mpv_wait_event with mpv_wakeup and waits for drainDone before
+// destroying the handle), or if mpv shuts down on its own.
 func (p *Player) drainEvents() {
 	defer close(p.drainDone)
 	for {
 		ev := C.mpv_wait_event(p.h, -1)
-		if ev == nil {
+		if ev == nil || p.closed.Load() {
 			return
 		}
-		if ev.event_id == C.MPV_EVENT_SHUTDOWN {
+		switch ev.event_id {
+		case C.MPV_EVENT_SHUTDOWN:
 			return
-		}
-		if ev.event_id == C.MPV_EVENT_LOG_MESSAGE {
+		case C.MPV_EVENT_LOG_MESSAGE:
 			logMpvMessage((*C.mpv_event_log_message)(ev.data))
-		}
-		if p.closed.Load() {
-			return
-		}
-		if ev.event_id == C.MPV_EVENT_FILE_LOADED {
+		case C.MPV_EVENT_FILE_LOADED:
 			p.applyRotation()
 		}
 	}
@@ -548,11 +554,19 @@ var rotationFilters = map[string]string{
 	"270": "lavfi=[transpose=cclock]",
 }
 
+// rotationVF returns the vf value applyRotation sets for a demux-rotation
+// property value: the transpose chain for a right angle, "" (clear the
+// chain) for everything else.
+func rotationVF(rot string) string {
+	return rotationFilters[rot]
+}
+
 // applyRotation replaces the vf chain with the transpose matching the
 // current video track's rotation metadata (see the video-rotate=no comment
 // in New for why mpv can't do this itself). Always sets vf, so a rotated
 // file's filter doesn't leak into the next, unrotated one. Runs on the
-// drainEvents goroutine, which keeps p.h valid until it exits.
+// drainEvents goroutine; Close waits for that goroutine to exit before it
+// destroys p.h.
 func (p *Player) applyRotation() {
 	name := C.CString("current-tracks/video/demux-rotation")
 	defer C.free(unsafe.Pointer(name))
@@ -563,7 +577,7 @@ func (p *Player) applyRotation() {
 	}
 	vfName := C.CString("vf")
 	defer C.free(unsafe.Pointer(vfName))
-	vf := C.CString(rotationFilters[rot])
+	vf := C.CString(rotationVF(rot))
 	defer C.free(unsafe.Pointer(vf))
 	if rc := C.mpv_set_property_string(p.h, vfName, vf); rc < 0 {
 		log.Printf("video: set vf for rotation %q: %s", rot, C.GoString(C.mpv_error_string(rc)))
