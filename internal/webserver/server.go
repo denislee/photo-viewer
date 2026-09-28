@@ -1757,7 +1757,7 @@ func (s *Server) handleThumb(w http.ResponseWriter, r *http.Request) {
 	// static ETag — is what pinned stale thumbs. Dropping it lets a reload
 	// revalidate against the mtime-keyed ETag and pick up edits.
 	const thumbCacheControl = "public, max-age=86400"
-	if match := r.Header.Get("If-None-Match"); match != "" && strings.Contains(match, etag) {
+	if etagMatches(r.Header.Get("If-None-Match"), etag) {
 		w.Header().Set("ETag", etag)
 		w.Header().Set("Cache-Control", thumbCacheControl)
 		w.WriteHeader(http.StatusNotModified)
@@ -1817,6 +1817,20 @@ const displayPassThroughMaxBytes = 3 << 20
 // against the mtime-keyed ETag, so an in-place source edit is picked up.
 const displayCacheControl = "private, max-age=86400"
 
+// etagMatches reports whether an If-None-Match header value matches etag,
+// per RFC 7232 §3.2: a comma-separated list of entity tags compared weakly
+// (a W/ prefix is ignored), or "*" for any current representation.
+func etagMatches(ifNoneMatch, etag string) bool {
+	etag = strings.TrimPrefix(etag, "W/")
+	for tag := range strings.SplitSeq(ifNoneMatch, ",") {
+		tag = strings.TrimSpace(tag)
+		if tag == "*" || strings.TrimPrefix(tag, "W/") == etag {
+			return true
+		}
+	}
+	return false
+}
+
 // handleDisplay serves a browser-renderable image for /display/<id>. For a
 // small original in a format browsers render natively (JPEG/PNG/WebP/GIF) it
 // passes the bytes straight through; otherwise — RAW, HEIC, TIFF, or an
@@ -1839,7 +1853,7 @@ func (s *Server) handleDisplay(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	etag := fmt.Sprintf(`"%s-%d"`, id, e.ModTime.Unix())
-	if match := r.Header.Get("If-None-Match"); match != "" && strings.Contains(match, etag) {
+	if etagMatches(r.Header.Get("If-None-Match"), etag) {
 		w.Header().Set("ETag", etag)
 		w.Header().Set("Cache-Control", displayCacheControl)
 		w.WriteHeader(http.StatusNotModified)

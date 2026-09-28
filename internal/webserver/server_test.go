@@ -1386,3 +1386,28 @@ func TestDisplayETag(t *testing.T) {
 		t.Errorf("Cache-Control = %q, must not be immutable", cc)
 	}
 }
+
+// TestETagMatches pins W-18's If-None-Match parsing: exact comparison of each
+// listed tag (not a substring search), weak prefixes ignored, "*" matches.
+func TestETagMatches(t *testing.T) {
+	const etag = `"abc-100"`
+	for _, tc := range []struct {
+		header string
+		want   bool
+	}{
+		{"", false},
+		{`"abc-100"`, true},
+		{`W/"abc-100"`, true},
+		{`"x", "abc-100"`, true},
+		{` "x" ,W/"abc-100" `, true},
+		{"*", true},
+		{`"abc-1000"`, false},
+		{`"xabc-100"`, false},
+		{`"abc-100`, false},
+		{`abc-100`, false},
+	} {
+		if got := etagMatches(tc.header, etag); got != tc.want {
+			t.Errorf("etagMatches(%q) = %v, want %v", tc.header, got, tc.want)
+		}
+	}
+}
