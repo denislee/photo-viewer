@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 )
 
@@ -73,6 +74,38 @@ func GetConfig() Config {
 	cfgMu.Lock()
 	defer cfgMu.Unlock()
 	return cfg
+}
+
+// importDirsProblem reports why an Inbox/Outbox pair is unsafe to import
+// with, or "" when it's fine (an unset dir is left to the callers' own "not
+// configured" message). Import walks the whole Inbox and files every media
+// file under Outbox/YYYY-MM-DD, so an Inbox that is — or contains — the
+// Outbox would re-file the library into itself (U-17). An Inbox inside the
+// Outbox is fine: source and destination paths never coincide.
+func importDirsProblem(inbox, outbox string) string {
+	if inbox == "" || outbox == "" {
+		return ""
+	}
+	in, out := resolveDir(inbox), resolveDir(outbox)
+	if in == out {
+		return "Inbox and Outbox must be different directories."
+	}
+	if rel, err := filepath.Rel(in, out); err == nil && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return "Outbox must not be inside the Inbox."
+	}
+	return ""
+}
+
+// resolveDir canonicalises p for comparison: absolute, symlinks resolved when
+// the path exists, cleaned.
+func resolveDir(p string) string {
+	if abs, err := filepath.Abs(p); err == nil {
+		p = abs
+	}
+	if r, err := filepath.EvalSymlinks(p); err == nil {
+		p = r
+	}
+	return filepath.Clean(p)
 }
 
 // SaveConfig writes the supplied config to disk and updates the in-memory

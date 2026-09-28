@@ -153,6 +153,8 @@ func (v *ImportView) Show() {
 	v.deleteSource = v.deleteCheck.Value
 	if cfg.InboxDir == "" || cfg.OutboxDir == "" {
 		v.statusMsg = "Set InboxDir and OutboxDir in " + configPath() + " before importing."
+	} else if p := importDirsProblem(cfg.InboxDir, cfg.OutboxDir); p != "" {
+		v.statusMsg = p + " Fix it in Settings before importing."
 	} else {
 		v.statusMsg = fmt.Sprintf("Inbox: %s   Outbox: %s", cfg.InboxDir, cfg.OutboxDir)
 	}
@@ -849,6 +851,12 @@ func (v *ImportView) explainCantStart(cfg Config, inboxHas bool) {
 		v.appendLog("[ERROR] " + msg)
 		return
 	}
+	if p := importDirsProblem(cfg.InboxDir, cfg.OutboxDir); p != "" {
+		msg := p + " Fix it in Settings before importing."
+		v.setStatus(msg)
+		v.appendLog("[ERROR] " + msg)
+		return
+	}
 	v.mu.Lock()
 	hasDirs := len(v.importDirs) > 0
 	hasZips := len(v.zipFiles) > 0
@@ -865,6 +873,9 @@ func (v *ImportView) explainCantStart(cfg Config, inboxHas bool) {
 // inbox once via inboxHasFiles) so the ≥1-file decision costs no extra walk.
 func (v *ImportView) haveSomethingToImport(cfg Config, inboxHas bool) bool {
 	if cfg.InboxDir == "" || cfg.OutboxDir == "" {
+		return false
+	}
+	if importDirsProblem(cfg.InboxDir, cfg.OutboxDir) != "" {
 		return false
 	}
 	v.mu.Lock()
@@ -901,6 +912,10 @@ func (v *ImportView) startImport() {
 	cfg := GetConfig()
 	if cfg.InboxDir == "" || cfg.OutboxDir == "" {
 		v.appendLog("[ERROR] InboxDir/OutboxDir not configured.")
+		return
+	}
+	if p := importDirsProblem(cfg.InboxDir, cfg.OutboxDir); p != "" {
+		v.appendLog("[ERROR] " + p)
 		return
 	}
 
@@ -1252,7 +1267,19 @@ func (v *ImportView) processBatch(ctx context.Context, outboxDir string, entries
 			continue
 		}
 		dest := filepath.Join(destDir, baseName)
-		if _, err := os.Stat(dest); err == nil {
+		if destInfo, err := os.Stat(dest); err == nil {
+			// The source already IS the destination — an Inbox that is (or
+			// contains) the Outbox, or an import folder inside the library.
+			// sameContent would compare the file with itself and the duplicate
+			// removal below would delete the only copy (U-17). SameFile also
+			// matches hardlinks and symlinked dirs; skipping those just leaves
+			// the source in place, which is always safe.
+			if srcInfo, err := os.Stat(src); err == nil && os.SameFile(srcInfo, destInfo) {
+				atomic.AddInt64(&v.statSkipped, 1)
+				v.appendLog(fmt.Sprintf("[SKIP] %s is already filed in %s", baseName, dateFolder))
+				v.bumpProgress()
+				continue
+			}
 			same, _ := sameContent(src, dest)
 			if same {
 				if err := os.Remove(src); err != nil {

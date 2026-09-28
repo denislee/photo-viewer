@@ -2,11 +2,14 @@ package ui
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"os"
 	"path/filepath"
 	"strconv"
+	"sync/atomic"
 	"testing"
+	"time"
 )
 
 // TestImportCopyProgressInstrumentation locks the U-09 contract for the
@@ -294,6 +297,121 @@ func TestSameContent(t *testing.T) {
 		a := write(t, "a7.bin", []byte("present"))
 		if _, err := sameContent(a, filepath.Join(dir, "nope.bin")); err == nil {
 			t.Error("sameContent with a missing file: want error, got nil")
+		}
+	})
+}
+
+// TestImportDirsProblem pins the U-17 config guard: an Inbox that is, or
+// contains, the Outbox is rejected (import would re-file the library into
+// itself); an Inbox inside the Outbox, siblings, and name-prefix siblings are
+// all fine.
+func TestImportDirsProblem(t *testing.T) {
+	root := t.TempDir()
+	lib := filepath.Join(root, "photos")
+	if err := os.MkdirAll(filepath.Join(lib, "inbox"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(root, "photos-link")
+	if err := os.Symlink(lib, link); err != nil {
+		t.Fatal(err)
+	}
+
+	cases := []struct {
+		name          string
+		inbox, outbox string
+		wantProblem   bool
+	}{
+		{"unset", "", lib, false},
+		{"same dir", lib, lib, true},
+		{"same dir, trailing slash", lib + "/", lib, true},
+		{"same dir via symlink", link, lib, true},
+		{"outbox inside inbox", root, lib, true},
+		{"inbox inside outbox", filepath.Join(lib, "inbox"), lib, false},
+		{"siblings", filepath.Join(root, "in"), filepath.Join(root, "out"), false},
+		{"name-prefix sibling", filepath.Join(root, "photos-in"), lib, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := importDirsProblem(tc.inbox, tc.outbox)
+			if (got != "") != tc.wantProblem {
+				t.Errorf("importDirsProblem(%q, %q) = %q, wantProblem %v", tc.inbox, tc.outbox, got, tc.wantProblem)
+			}
+		})
+	}
+}
+
+// TestProcessBatchNeverDeletesAlreadyFiled is the U-17 regression: a file that
+// already sits at its Outbox/YYYY-MM-DD destination (inbox == outbox, or
+// reached through a symlinked inbox) used to be compared with itself, judged a
+// duplicate, and removed — deleting the only copy. It must be skipped instead,
+// while a genuinely separate identical copy is still de-duplicated.
+func TestProcessBatchNeverDeletesAlreadyFiled(t *testing.T) {
+	when := time.Date(2024, 3, 5, 12, 0, 0, 0, time.Local)
+	content := []byte("already-filed media bytes")
+
+	setup := func(t *testing.T) (outbox, filed string) {
+		t.Helper()
+		outbox = t.TempDir()
+		dateDir := filepath.Join(outbox, when.Format("2006-01-02"))
+		if err := os.MkdirAll(dateDir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		filed = filepath.Join(dateDir, "IMG_0001.jpg")
+		if err := os.WriteFile(filed, content, 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chtimes(filed, when, when); err != nil {
+			t.Fatal(err)
+		}
+		return outbox, filed
+	}
+	assertIntact := func(t *testing.T, v *ImportView, filed string) {
+		t.Helper()
+		got, err := os.ReadFile(filed)
+		if err != nil {
+			t.Fatalf("filed copy is gone: %v", err)
+		}
+		if !bytes.Equal(got, content) {
+			t.Fatalf("filed copy changed: %q", got)
+		}
+		if s, m := atomic.LoadInt64(&v.statSkipped), atomic.LoadInt64(&v.statMoved); s != 1 || m != 0 {
+			t.Errorf("skipped=%d moved=%d, want skipped=1 moved=0", s, m)
+		}
+	}
+
+	t.Run("inbox is outbox", func(t *testing.T) {
+		outbox, filed := setup(t)
+		v := &ImportView{}
+		v.processBatch(context.Background(), outbox, []string{filed})
+		assertIntact(t, v, filed)
+	})
+
+	t.Run("inbox symlinked to outbox", func(t *testing.T) {
+		outbox, filed := setup(t)
+		link := filepath.Join(t.TempDir(), "inbox")
+		if err := os.Symlink(outbox, link); err != nil {
+			t.Fatal(err)
+		}
+		viaLink := filepath.Join(link, when.Format("2006-01-02"), "IMG_0001.jpg")
+		v := &ImportView{}
+		v.processBatch(context.Background(), outbox, []string{viaLink})
+		assertIntact(t, v, filed)
+	})
+
+	t.Run("separate identical copy is still de-duplicated", func(t *testing.T) {
+		outbox, filed := setup(t)
+		dup := filepath.Join(t.TempDir(), "IMG_0001.jpg")
+		if err := os.WriteFile(dup, content, 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chtimes(dup, when, when); err != nil {
+			t.Fatal(err)
+		}
+		v := &ImportView{}
+		v.processBatch(context.Background(), outbox, []string{dup})
+		assertIntact(t, v, filed)
+		if _, err := os.Stat(dup); !os.IsNotExist(err) {
+			t.Errorf("inbox duplicate should have been removed, stat err = %v", err)
 		}
 	})
 }

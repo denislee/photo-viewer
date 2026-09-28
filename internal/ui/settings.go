@@ -165,7 +165,9 @@ func (v *SettingsView) Layout(gtx layout.Context, th *Theme) layout.Dimensions {
 		c.SDCardAutoDetect = v.sdAutoDetect.Value
 		c.ShowShortcutHints = v.showShortcuts.Value
 		msg := "Saved to " + configPath()
-		if err := SaveConfig(c); err != nil {
+		if p := importDirsProblem(c.InboxDir, c.OutboxDir); p != "" {
+			msg = "Not saved: " + p
+		} else if err := SaveConfig(c); err != nil {
 			msg = "Save failed: " + err.Error()
 		}
 		v.mu.Lock()
