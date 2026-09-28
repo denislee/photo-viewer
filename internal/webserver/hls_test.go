@@ -3,6 +3,7 @@ package webserver
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -243,6 +244,56 @@ func TestHLSSegmentRejectsOutOfRange(t *testing.T) {
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusNotFound {
 		t.Errorf("out-of-range segment status = %d, want 404", resp.StatusCode)
+	}
+}
+
+// TestHLSSegmentBoundsUnknownDuration is the W-14 guard. A duration-less
+// entry used to skip the range check entirely, so any seg<k>.ts forked an
+// ffmpeg seek past EOF. Now k past hlsMaxSegments is rejected before any
+// probe, and a smaller out-of-range k is rejected against the probed
+// duration (which is persisted, so the probe runs once).
+func TestHLSSegmentBoundsUnknownDuration(t *testing.T) {
+	s, id, cleanup := indexedVideoServer(t, 0) // duration-less on purpose
+	defer cleanup()
+	ts := httptest.NewServer(http.HandlerFunc(s.handleHLS))
+	defer ts.Close()
+
+	var probes int
+	orig := probeDurationFn
+	probeDurationFn = func(_ context.Context, _ string) (float64, error) {
+		probes++
+		return 8.0, nil // ceil(8/6) = 2 segments
+	}
+	defer func() { probeDurationFn = orig }()
+
+	get := func(seg string) int {
+		t.Helper()
+		resp, err := http.Get(ts.URL + "/hls/" + id + "/" + seg)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+		return resp.StatusCode
+	}
+
+	if code := get(fmt.Sprintf("seg%d.ts", hlsMaxSegments)); code != http.StatusNotFound {
+		t.Errorf("seg%d status = %d, want 404", hlsMaxSegments, code)
+	}
+	if code := get("seg999999999.ts"); code != http.StatusNotFound {
+		t.Errorf("huge segment status = %d, want 404", code)
+	}
+	if probes != 0 {
+		t.Errorf("probe forks for capped indices = %d, want 0", probes)
+	}
+
+	if code := get("seg5.ts"); code != http.StatusNotFound {
+		t.Errorf("seg5 on an 8s video status = %d, want 404", code)
+	}
+	if code := get("seg2.ts"); code != http.StatusNotFound {
+		t.Errorf("seg2 on an 8s video status = %d, want 404", code)
+	}
+	if probes != 1 {
+		t.Errorf("probe forks = %d, want 1 (probed duration must be persisted)", probes)
 	}
 }
 

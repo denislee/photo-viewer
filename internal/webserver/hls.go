@@ -61,7 +61,18 @@ const (
 	hlsCacheMaxBytes = 4 << 30 // 4 GiB
 	hlsTmpMaxAge     = time.Hour
 	hlsSweepInterval = 5 * time.Minute
+
+	// hlsMaxSegments hard-caps the segment index (~16.7 h of 6 s segments).
+	// It bounds seg<k>.ts before any duration lookup, so a flood of distinct
+	// huge k values can't each claim a singleflight key and an hlsSem slot.
+	hlsMaxSegments = 10000
 )
+
+// hlsSegCount is the number of segments the playlist lists for a video of
+// dur seconds; serveHLSSegment rejects any index at or past it.
+func hlsSegCount(dur float64) int {
+	return int(math.Ceil(dur / hlsSegDur))
+}
 
 // handleHLS routes /hls/<id>/index.m3u8 (playlist) and /hls/<id>/seg<k>.ts
 // (segments). Both resolve <id> to a video entry via the shared lookup so
@@ -104,7 +115,7 @@ func (s *Server) serveHLSPlaylist(w http.ResponseWriter, r *http.Request, _ stri
 		http.Error(w, "cannot probe video duration", http.StatusInternalServerError)
 		return
 	}
-	n := int(math.Ceil(dur / hlsSegDur))
+	n := hlsSegCount(dur)
 
 	var b strings.Builder
 	b.WriteString("#EXTM3U\n")
@@ -131,10 +142,17 @@ func (s *Server) serveHLSPlaylist(w http.ResponseWriter, r *http.Request, _ stri
 func (s *Server) serveHLSSegment(w http.ResponseWriter, r *http.Request, id string, e cache.Entry, k int) {
 	// Reject segment indices past the end of the video. The playlist only ever
 	// references seg0…seg(n-1); an out-of-range k (a stale player, a manual
-	// probe) would otherwise spawn an ffmpeg seek past EOF and cache a junk
-	// segment. Bound only when the duration is known for free (index row) — a
-	// duration-less entry skips the check rather than paying a probe fork here.
-	if e.DurationMs > 0 && k >= int(math.Ceil(float64(e.DurationMs)/1000.0/hlsSegDur)) {
+	// probe, a client flooding distinct indices) would otherwise spawn an
+	// ffmpeg seek past EOF, hold an hlsSem slot and cache a junk segment.
+	// hlsMaxSegments bounds k for free; a duration-less entry then pays one
+	// ffprobe (persisted for indexed entries, so normally only until the
+	// playlist or first segment has been served) to get the real bound. If
+	// even the probe can't tell, only the hard cap applies.
+	if k >= hlsMaxSegments {
+		http.NotFound(w, r)
+		return
+	}
+	if dur := s.hlsDuration(r.Context(), e); dur > 0 && k >= hlsSegCount(dur) {
 		http.NotFound(w, r)
 		return
 	}
@@ -310,9 +328,8 @@ var probeDurationFn = probeDuration
 //
 // On a successful fallback probe of an *indexed* entry it persists the result
 // via Index.SetDurationMs, so subsequent playlist and segment requests for the
-// same file read the duration off the row instead of re-forking ffprobe (and so
-// serveHLSSegment can bound out-of-range segments, which it skips while the
-// duration is unknown). Trash entries have no index row and stay probe-only, so
+// same file read the duration off the row instead of re-forking ffprobe.
+// Trash entries have no index row and stay probe-only, so
 // they're excluded from the write. The persistence is a pure side effect: the
 // return value is identical to what a probe-only implementation would yield.
 func (s *Server) hlsDuration(ctx context.Context, e cache.Entry) float64 {
