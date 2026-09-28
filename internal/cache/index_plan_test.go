@@ -1,6 +1,7 @@
 package cache
 
 import (
+	"fmt"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -372,4 +373,59 @@ func pathsOf(es []Entry) []string {
 		out[i] = e.Path
 	}
 	return out
+}
+
+// TestPlanCountDirFiltered guards C-14: the sidebar's per-directory count
+// (CountDirFiltered → CountView) must be a PK range SEARCH, not the old
+// "(range) OR path = ?" MULTI-INDEX OR, under every filter combination.
+func TestPlanCountDirFiltered(t *testing.T) {
+	idx, cleanup := loadEmpty(t)
+	defer cleanup()
+	seed(t, idx, "/lib", 200)
+
+	for _, filter := range []string{"All", "Photos", "Videos"} {
+		for _, showRAW := range []bool{true, false} {
+			v := View{Kind: "dir", Dir: "/lib", Filter: filter, ShowRAW: showRAW}
+			where, args := v.whereClause()
+			plan := explainPlan(t, idx, "SELECT COUNT(*) FROM entries WHERE "+where, args...)
+			label := fmt.Sprintf("count %s raw=%v", filter, showRAW)
+			mustContain(t, label, plan, "SEARCH entries USING")
+			mustNotContain(t, label, plan, "SCAN entries")
+			mustNotContain(t, label, plan, "MULTI-INDEX OR")
+		}
+	}
+}
+
+// TestCountDirFiltered pins CountDirFiltered's results now that it shares
+// CountView: the type filters, a sibling directory sharing the name prefix
+// ("/lib2") staying out of "/lib", and a file path passed as dir counting as 1.
+func TestCountDirFiltered(t *testing.T) {
+	idx, cleanup := loadEmpty(t)
+	defer cleanup()
+	seedMixed(t, idx, "/lib/sub") // 2 photos, 2 videos, 1 RAW
+	seedMixed(t, idx, "/lib2")
+
+	for _, tc := range []struct {
+		dir     string
+		filter  string
+		showRAW bool
+		want    int
+	}{
+		{"/lib", "All", true, 5},
+		{"/lib", "All", false, 4},
+		{"/lib", "Photos", true, 3},
+		{"/lib", "Photos", false, 2},
+		{"/lib", "Videos", true, 2},
+		{"/lib/sub", "All", true, 5},
+		{"/lib/sub/b_video.mp4", "All", true, 1},
+		{"/lib/sub/b_video.mp4", "Photos", true, 0},
+		{"/nope", "All", true, 0},
+	} {
+		if got := idx.CountDirFiltered(tc.dir, tc.filter, tc.showRAW); got != tc.want {
+			t.Errorf("CountDirFiltered(%q, %q, %v) = %d, want %d", tc.dir, tc.filter, tc.showRAW, got, tc.want)
+		}
+	}
+	if got := idx.CountDir("/lib"); got != 5 {
+		t.Errorf("CountDir(/lib) = %d, want 5", got)
+	}
 }

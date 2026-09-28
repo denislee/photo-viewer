@@ -551,19 +551,11 @@ func (i *Index) CountDir(dir string) int {
 
 // CountDirFiltered returns the number of entries under dir that match the
 // given media-type filter ("All" / "Photos" / "Videos") and showRAW toggle —
-// the same semantics as ui.passesFilter.
+// the same semantics as ui.passesFilter. It is the dir-view count, so it
+// shares CountView's range + exact-path point lookup instead of the old
+// "(range) OR path = ?" query, which forced a MULTI-INDEX OR plan.
 func (i *Index) CountDirFiltered(dir, filter string, showRAW bool) int {
-
-	lower, upper := dirRange(dir)
-	where, args := typeFilterClause(filter, showRAW)
-	q := "SELECT COUNT(*) FROM entries WHERE ((path >= ? AND path < ?) OR path = ?)" + where
-	queryArgs := append([]any{lower, upper, dir}, args...)
-
-	var count int
-	if err := i.db.QueryRow(q, queryArgs...).Scan(&count); err != nil {
-		return 0
-	}
-	return count
+	return i.CountView(View{Kind: "dir", Dir: dir, Filter: filter, ShowRAW: showRAW})
 }
 
 // YearStat is a (year, count) pair for the year-grouped sidebar.

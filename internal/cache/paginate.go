@@ -79,6 +79,7 @@ func (i *Index) CountView(v View) int {
 	where, args := v.whereClause()
 	var n int
 	if err := i.db.QueryRow("SELECT COUNT(*) FROM entries WHERE "+where, args...).Scan(&n); err != nil {
+		log.Printf("cache: CountView: %v", err)
 		return 0
 	}
 	// The dir range excludes the exact-dir row (see dirExactEntry); count it
