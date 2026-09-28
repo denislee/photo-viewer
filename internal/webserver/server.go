@@ -646,33 +646,25 @@ func (s *Server) viewFromQuery(q url.Values) (viewInfo, bool) {
 			contextURL: withExtra("/year/" + url.PathEscape(ys)),
 		}, true
 	case "dir":
-		path := q.Get("path")
-		// Reject empty paths before Abs: filepath.Abs("") resolves to the
-		// process CWD with no error, which would silently serve the library
-		// root as a "dir" view (the GUI defaults -root to CWD). handleDir
-		// rejects empty paths the same way.
-		if path == "" {
-			return viewInfo{}, false
-		}
-		abs, err := filepath.Abs(path)
-		if err != nil || !s.withinRoot(abs) {
+		abs, ok := s.resolveDirParam(q.Get("path"))
+		if !ok {
 			return viewInfo{}, false
 		}
 		return viewInfo{
 			v:          cache.View{Kind: "dir", Dir: abs, Filter: filter, ShowRAW: showRAW},
 			kind:       "dir",
 			title:      filepath.Base(abs),
-			backHref:   withExtra("/dir?path=" + url.QueryEscape(abs)),
+			backHref:   withExtra(s.dirHref(abs)),
 			backLabel:  filepath.Base(abs),
-			ctxQuery:   buildCtxQuery("dir", "", abs, filter, showRAW),
-			contextURL: withExtra("/dir?path=" + url.QueryEscape(abs)),
+			ctxQuery:   buildCtxQuery("dir", "", s.relPath(abs), filter, showRAW),
+			contextURL: withExtra(s.dirHref(abs)),
 		}, true
 	}
 	return viewInfo{}, false
 }
 
 // buildCtxQuery assembles the `from=...&...` fragment used to thread context
-// through viewer + api links.
+// through viewer + api links. dir is library-relative (see relPath).
 func buildCtxQuery(from, year, dir, filter string, showRAW bool) string {
 	parts := []string{"from=" + url.QueryEscape(from)}
 	if year != "" {
@@ -774,21 +766,17 @@ func (s *Server) handleYear(w http.ResponseWriter, r *http.Request) {
 	s.renderGalleryPage(w, r, vi)
 }
 
-// handleDir serves the entries under /dir?path=<abs-path>. The requested
-// path must resolve to a directory inside the library root — anything
-// outside is rejected so a URL can't escape the configured tree.
+// handleDir serves the entries under /dir?path=<library-relative path>. The
+// requested path must resolve to a directory inside the library root —
+// anything outside is rejected so a URL can't escape the configured tree.
 func (s *Server) handleDir(w http.ResponseWriter, r *http.Request) {
 	raw := r.URL.Query().Get("path")
 	if raw == "" {
 		http.Error(w, "missing path", http.StatusBadRequest)
 		return
 	}
-	abs, err := filepath.Abs(raw)
-	if err != nil {
-		http.NotFound(w, r)
-		return
-	}
-	if !s.withinRoot(abs) {
+	abs, ok := s.resolveDirParam(raw)
+	if !ok {
 		http.Error(w, "forbidden", http.StatusForbidden)
 		return
 	}
@@ -800,10 +788,10 @@ func (s *Server) handleDir(w http.ResponseWriter, r *http.Request) {
 		v:          cache.View{Kind: "dir", Dir: abs, Filter: filter, ShowRAW: showRAW},
 		kind:       "dir",
 		title:      filepath.Base(abs),
-		backHref:   appendQuery("/dir?path="+url.QueryEscape(abs), extra),
+		backHref:   appendQuery(s.dirHref(abs), extra),
 		backLabel:  filepath.Base(abs),
-		ctxQuery:   buildCtxQuery("dir", "", abs, filter, showRAW),
-		contextURL: appendQuery("/dir?path="+url.QueryEscape(abs), extra),
+		ctxQuery:   buildCtxQuery("dir", "", s.relPath(abs), filter, showRAW),
+		contextURL: appendQuery(s.dirHref(abs), extra),
 	}
 	s.renderGalleryPage(w, r, vi)
 }
@@ -818,6 +806,45 @@ func (s *Server) withinRoot(abs string) bool {
 		return true
 	}
 	return strings.HasPrefix(abs, s.libraryRoot+string(filepath.Separator))
+}
+
+// relPath returns abs relative to the library root, which is what the server
+// puts in URLs and API responses so LAN clients never see the absolute
+// location (home directory, username) of the library (W-19). A path outside
+// the root — which callers never pass — falls back to its base name.
+func (s *Server) relPath(abs string) string {
+	if !s.withinRoot(abs) {
+		return filepath.Base(abs)
+	}
+	rel, err := filepath.Rel(s.libraryRoot, abs)
+	if err != nil {
+		return filepath.Base(abs)
+	}
+	return rel
+}
+
+// dirHref is the /dir link for the directory abs.
+func (s *Server) dirHref(abs string) string {
+	return "/dir?path=" + url.QueryEscape(s.relPath(abs))
+}
+
+// resolveDirParam turns a /dir or from=dir `path` parameter into an absolute
+// directory inside the library root. The server emits library-relative paths;
+// absolute ones are still accepted so links bookmarked before W-19 keep
+// working. Empty is rejected explicitly: joined onto the root it would
+// silently serve the whole library as a "dir" view.
+func (s *Server) resolveDirParam(raw string) (string, bool) {
+	if raw == "" || s.libraryRoot == "" {
+		return "", false
+	}
+	abs := filepath.Clean(raw)
+	if !filepath.IsAbs(raw) {
+		abs = filepath.Join(s.libraryRoot, raw)
+	}
+	if !s.withinRoot(abs) {
+		return "", false
+	}
+	return abs, true
 }
 
 // renderGalleryPage writes the first page of the gallery (sidebar, header,
@@ -1093,7 +1120,7 @@ func (s *Server) handleAPIInfo(w http.ResponseWriter, r *http.Request) {
 	info := infoJSON{
 		ID:           e.ThumbID,
 		Name:         filepath.Base(e.Path),
-		Path:         e.Path,
+		Path:         s.relPath(e.Path),
 		Type:         titleCase(e.Type.String()),
 		Size:         formatBytes(e.Size),
 		Modified:     e.ModTime.Local().Format("2006-01-02 15:04:05"),
@@ -1230,7 +1257,7 @@ func (s *Server) basePathFor(vi viewInfo) string {
 	case "year":
 		return "/year/" + strconv.Itoa(vi.v.Year)
 	case "dir":
-		return "/dir?path=" + url.QueryEscape(vi.v.Dir)
+		return s.dirHref(vi.v.Dir)
 	default:
 		return "/"
 	}
@@ -1392,8 +1419,7 @@ func (s *Server) renderSubdirsGrouped(w http.ResponseWriter, subdirs []string, c
 	}
 
 	for _, d := range nonDate {
-		q := url.Values{"path": []string{d}}.Encode()
-		href := withExtra("/dir?" + q)
+		href := withExtra(s.dirHref(d))
 		active := vi.kind == "dir" && vi.v.Dir == d
 		s.sidebarRow(w, href, filepath.Base(d), "", counts[d], active)
 	}
@@ -1419,8 +1445,7 @@ func (s *Server) renderSubdirsGrouped(w http.ResponseWriter, subdirs []string, c
 			html.EscapeString(y), openAttr, html.EscapeString(y), b.total)
 		sort.Strings(b.dirs)
 		for _, d := range b.dirs {
-			q := url.Values{"path": []string{d}}.Encode()
-			href := withExtra("/dir?" + q)
+			href := withExtra(s.dirHref(d))
 			active := vi.kind == "dir" && vi.v.Dir == d
 			s.sidebarRow(w, href, filepath.Base(d), "", counts[d], active)
 		}
@@ -1458,8 +1483,7 @@ func (s *Server) renderSubdirChips(w http.ResponseWriter, vi viewInfo, children 
 	})
 	fmt.Fprint(w, `<div class="chips">`)
 	for _, c := range chips {
-		q := url.Values{"path": []string{c.path}}.Encode()
-		href := appendQuery("/dir?"+q, extra)
+		href := appendQuery(s.dirHref(c.path), extra)
 		fmt.Fprintf(w,
 			`<a class="chip" href="%s"><span>%s</span><span class="chip-count">%d</span></a>`,
 			html.EscapeString(href), html.EscapeString(c.name), c.count)

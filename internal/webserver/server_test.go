@@ -1411,3 +1411,89 @@ func TestETagMatches(t *testing.T) {
 		}
 	}
 }
+
+// TestNoAbsolutePathsExposed is the W-19 guard: gallery pages, dir views, the
+// viewer and /api/info must never show LAN clients the library's absolute
+// location (home directory, username). Dir links carry library-relative
+// paths; old absolute /dir bookmarks still resolve, and nothing escapes the
+// root.
+func TestNoAbsolutePathsExposed(t *testing.T) {
+	tmp := t.TempDir()
+	libRoot := filepath.Join(tmp, "secret-home", "lib")
+	idx, err := cache.Load(filepath.Join(tmp, "index.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer idx.Close()
+	store, err := cache.NewThumbStore(tmp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var results []scan.Result
+	for _, rel := range []string{"2024-01-01/a.jpg", "Trips/Rome/b.jpg"} {
+		p := filepath.Join(libRoot, rel)
+		if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(p, []byte("x"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		results = append(results, scan.Result{Path: p, Type: scan.TypePhoto, Size: 1, ModTime: time.Now()})
+	}
+	idx.ReconcileBatch(results)
+
+	s := New(idx, store, nil, libRoot)
+	mux := http.NewServeMux()
+	mux.HandleFunc("/", s.handleIndex)
+	mux.HandleFunc("/dir", s.handleDir)
+	mux.HandleFunc("/view/", s.handleView)
+	mux.HandleFunc("/api/info", s.handleAPIInfo)
+	ts := httptest.NewServer(mux)
+	defer ts.Close()
+
+	get := func(path string) (int, string) {
+		t.Helper()
+		resp, err := http.Get(ts.URL + path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer resp.Body.Close()
+		body, _ := io.ReadAll(resp.Body)
+		return resp.StatusCode, string(body)
+	}
+	b := cache.ThumbIDFor(results[1].Path)
+	for _, path := range []string{
+		"/",
+		"/dir?path=Trips",
+		"/dir?path=Trips%2FRome",
+		"/view/" + b + "?from=dir&path=Trips%2FRome",
+		"/api/info?id=" + b,
+	} {
+		code, body := get(path)
+		if code != http.StatusOK {
+			t.Errorf("GET %s = %d, want 200", path, code)
+		}
+		if strings.Contains(body, tmp) || strings.Contains(body, url.QueryEscape(tmp)) {
+			t.Errorf("GET %s leaks the absolute library location", path)
+		}
+	}
+	if _, body := get("/"); !strings.Contains(body, `/dir?path=Trips"`) {
+		t.Error("sidebar has no library-relative link to Trips")
+	}
+	if _, body := get("/api/info?id=" + b); !strings.Contains(body, `"path":"Trips/Rome/b.jpg"`) {
+		t.Errorf("info path is not library-relative: %s", body)
+	}
+
+	// An absolute path from an old bookmark still works; escapes don't.
+	if code, _ := get("/dir?path=" + url.QueryEscape(filepath.Join(libRoot, "Trips"))); code != http.StatusOK {
+		t.Errorf("absolute /dir bookmark = %d, want 200", code)
+	}
+	for _, bad := range []string{"..", "../..", "Trips/../../x", url.QueryEscape(tmp)} {
+		if code, _ := get("/dir?path=" + bad); code != http.StatusForbidden {
+			t.Errorf("/dir?path=%s = %d, want 403", bad, code)
+		}
+	}
+	if code, _ := get("/dir?path="); code != http.StatusBadRequest {
+		t.Errorf("empty /dir path = %d, want 400", code)
+	}
+}
