@@ -143,9 +143,10 @@ type Controller struct {
 	trashCount      int
 	trashCountValid bool
 
-	// Selection state
-	SelectionMode bool
-	SelectedPaths map[string]bool
+	// Selection state. Guarded by mu; read through SelectionMode /
+	// IsSelected / SnapshotSelected.
+	selectionMode bool
+	selectedPaths map[string]bool
 
 	invalidate func()
 
@@ -174,7 +175,7 @@ func NewController(root string, idx *cache.Index, store *cache.ThumbStore, cache
 		mediaFilter:   "All",
 		showRAW:       true,
 		sortMode:      normalizeSort(GetConfig().SortMode),
-		SelectedPaths: make(map[string]bool),
+		selectedPaths: make(map[string]bool),
 	}
 	c.thumbs = newThumbCache(store, func() {
 		if c.invalidate != nil {
@@ -1410,10 +1411,10 @@ func (c *Controller) scanInto(ctx context.Context, dir string) {
 func (c *Controller) ToggleSelection(path string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if c.SelectedPaths[path] {
-		delete(c.SelectedPaths, path)
+	if c.selectedPaths[path] {
+		delete(c.selectedPaths, path)
 	} else {
-		c.SelectedPaths[path] = true
+		c.selectedPaths[path] = true
 	}
 }
 
@@ -1421,22 +1422,37 @@ func (c *Controller) ToggleSelection(path string) {
 func (c *Controller) Select(path string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	c.SelectedPaths[path] = true
+	c.selectedPaths[path] = true
+}
+
+// SelectionMode reports whether multi-select mode is on.
+func (c *Controller) SelectionMode() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.selectionMode
+}
+
+// SetSelectionMode turns multi-select mode on or off. Turning it off does not
+// clear the selected set; ClearSelection does both.
+func (c *Controller) SetSelectionMode(on bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.selectionMode = on
 }
 
 // ClearSelection empties the selected set and exits selection mode.
 func (c *Controller) ClearSelection() {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	c.SelectionMode = false
-	c.SelectedPaths = make(map[string]bool)
+	c.selectionMode = false
+	c.selectedPaths = make(map[string]bool)
 }
 
 // IsSelected returns whether path is in the selected set.
 func (c *Controller) IsSelected(path string) bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	return c.SelectedPaths[path]
+	return c.selectedPaths[path]
 }
 
 // SnapshotSelected returns a copy of the current selected-path set. Callers
@@ -1446,8 +1462,8 @@ func (c *Controller) IsSelected(path string) bool {
 func (c *Controller) SnapshotSelected() map[string]bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	snap := make(map[string]bool, len(c.SelectedPaths))
-	maps.Copy(snap, c.SelectedPaths)
+	snap := make(map[string]bool, len(c.selectedPaths))
+	maps.Copy(snap, c.selectedPaths)
 	return snap
 }
 

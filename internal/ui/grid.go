@@ -314,7 +314,7 @@ func (g *Grid) Layout(gtx layout.Context, th *Theme, entries []cache.Entry, ctrl
 		}
 		if g.cells[i].Clicked(gtx) {
 			g.Selected = i
-			if ctrl.SelectionMode {
+			if ctrl.SelectionMode() {
 				ctrl.ToggleSelection(entries[i].Path)
 			} else if g.OnOpen != nil {
 				g.OnOpen(i)
@@ -339,7 +339,7 @@ func (g *Grid) Layout(gtx layout.Context, th *Theme, entries []cache.Entry, ctrl
 	// Snapshot the selected-path set once per frame rather than acquiring
 	// Controller.mu per visible cell. Only meaningful in selection mode.
 	var selectedSnap map[string]bool
-	if ctrl.SelectionMode {
+	if ctrl.SelectionMode() {
 		selectedSnap = ctrl.SnapshotSelected()
 	}
 	rowCount := (len(entries) + cols - 1) / cols
@@ -386,7 +386,7 @@ func (g *Grid) layoutRow(gtx layout.Context, th *Theme, entries []cache.Entry, c
 	cellGtx.Constraints.Max = cellSize
 	cellGtx.Constraints.Min = cellSize
 	thumbs := ctrl.Thumbs()
-	selectionMode := ctrl.SelectionMode
+	selectionMode := ctrl.SelectionMode()
 	selected := g.Selected
 	for i := start; i < end; i++ {
 		x := (i - start) * stride

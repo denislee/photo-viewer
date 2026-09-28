@@ -671,10 +671,10 @@ func handleGridKey(ke key.Event, grid *Grid, _ *Sidebar, sidebarFocus *bool, vie
 	}
 	switch ke.Name {
 	case "V":
-		if ctrl.SelectionMode {
+		if ctrl.SelectionMode() {
 			ctrl.ClearSelection()
 		} else {
-			ctrl.SelectionMode = true
+			ctrl.SetSelectionMode(true)
 			if total > 0 {
 				_, _, entries, _ := ctrl.Snapshot()
 				idx := grid.SelectedIndex(len(entries))
@@ -705,7 +705,7 @@ func handleGridKey(ke key.Event, grid *Grid, _ *Sidebar, sidebarFocus *bool, vie
 	case key.NamePageUp:
 		moved = grid.PageMove(-1, total)
 	case key.NameReturn, key.NameSpace:
-		if ctrl.SelectionMode {
+		if ctrl.SelectionMode() {
 			_, _, entries, _ := ctrl.Snapshot()
 			var selected []cache.Entry
 			for _, e := range entries {
@@ -728,7 +728,7 @@ func handleGridKey(ke key.Event, grid *Grid, _ *Sidebar, sidebarFocus *bool, vie
 			go exportFavoritesViaPicker(ctrl, w.Invalidate)
 			return
 		}
-		if ctrl.SelectionMode {
+		if ctrl.SelectionMode() {
 			_, _, entries, _ := ctrl.Snapshot()
 			var selected []string
 			for _, e := range entries {
@@ -780,7 +780,7 @@ func handleGridKey(ke key.Event, grid *Grid, _ *Sidebar, sidebarFocus *bool, vie
 		if total > 0 {
 			_, _, entries, _ := ctrl.Snapshot()
 			var selected []cache.Entry
-			if ctrl.SelectionMode {
+			if ctrl.SelectionMode() {
 				for _, e := range entries {
 					if ctrl.IsSelected(e.Path) {
 						selected = append(selected, e)
@@ -796,7 +796,7 @@ func handleGridKey(ke key.Event, grid *Grid, _ *Sidebar, sidebarFocus *bool, vie
 
 			if len(selected) > 0 {
 				openExternally(selected)
-				if ctrl.SelectionMode {
+				if ctrl.SelectionMode() {
 					ctrl.ClearSelection()
 					w.Invalidate()
 				}
@@ -806,7 +806,7 @@ func handleGridKey(ke key.Event, grid *Grid, _ *Sidebar, sidebarFocus *bool, vie
 		w.Perform(system.ActionClose)
 	}
 	if moved {
-		if ctrl.SelectionMode {
+		if ctrl.SelectionMode() {
 			_, _, entries, _ := ctrl.Snapshot()
 			idx := grid.SelectedIndex(total)
 			if idx >= 0 && idx < len(entries) {
@@ -929,7 +929,7 @@ func drawRoot(gtx layout.Context, th *Theme, ctrl *Controller, tb *Toolbar, sb *
 		gtx2.Constraints.Max = image.Pt(totalW, sbH)
 		gtx2.Constraints.Min = image.Pt(totalW, sbH)
 		stack := op.Offset(image.Pt(0, totalH-sbH)).Push(gtx.Ops)
-		drawShortcutBar(gtx2, th, v.Open, sidebarFocus, ctrl.SelectionMode)
+		drawShortcutBar(gtx2, th, v.Open, sidebarFocus, ctrl.SelectionMode())
 		stack.Pop()
 	}
 	drawProcBar := func() {
