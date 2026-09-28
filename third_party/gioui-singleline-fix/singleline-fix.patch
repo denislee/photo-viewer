@@ -1,0 +1,18 @@
+--- a/widget/text.go
++++ b/widget/text.go
+@@ -245,7 +245,14 @@
+ 	}
+ 	maxWidth := gtx.Constraints.Max.X
+ 	if e.SingleLine {
+-		maxWidth = math.MaxInt
++		// Upstream sets math.MaxInt here, but go-text/typesetting's
++		// LineWrapper.WrapParagraph immediately calls fixed.I(maxWidth) which
++		// shifts the value left by 6 bits. With int64 math.MaxInt that
++		// overflows int32 (fixed.Int26_6) into a small negative value, and
++		// the wrapper wraps every glyph onto its own line. 1<<24 (≈16M px)
++		// stays well below the int32 ceiling and still acts as "infinite"
++		// for any plausible text.
++		maxWidth = 1 << 24
+ 	}
+ 	minWidth := gtx.Constraints.Min.X
+ 	if maxWidth != e.params.MaxWidth {

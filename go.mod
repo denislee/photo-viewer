@@ -21,4 +21,6 @@ require (
 // widget/text.go's SingleLine handling, which made every single-line
 // editor wrap its glyphs onto a vertical column. See
 // third_party/gioui-singleline-fix/widget/text.go around line 247.
+// Based on gioui.org v0.9.0 (3f4f8ba); base, patch and removal check are in
+// third_party/gioui-singleline-fix/FORK.md.
 replace gioui.org => ./third_party/gioui-singleline-fix
