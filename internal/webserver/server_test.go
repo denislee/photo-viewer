@@ -1029,6 +1029,13 @@ func TestSecureHeaders(t *testing.T) {
 	if got := resp.Header.Get("Referrer-Policy"); got == "" {
 		t.Error("HTML Referrer-Policy header missing")
 	}
+	// W-17: the gallery must not be frameable (clickjacking on favorite/delete).
+	if csp := resp.Header.Get("Content-Security-Policy"); !strings.Contains(csp, "frame-ancestors 'none'") {
+		t.Errorf("CSP %q missing frame-ancestors 'none'", csp)
+	}
+	if got := resp.Header.Get("X-Frame-Options"); got != "DENY" {
+		t.Errorf("X-Frame-Options = %q, want DENY", got)
+	}
 
 	// Learn a real thumb id, then confirm the binary route also carries nosniff
 	// (set unconditionally by the middleware ahead of the handler).

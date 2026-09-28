@@ -288,11 +288,13 @@ func (s *Server) Stop() error {
 // <img>/<video> sources that are all same-origin /thumb, /media and /hls URLs.
 // No external host, font, or XHR target is ever loaded, so pinning every fetch
 // directive to 'self' costs the pages nothing while blocking any injected
-// off-origin resource. object-src 'none' and base-uri 'self' close the two
-// directives that don't fall back to default-src.
+// off-origin resource. object-src 'none', base-uri 'self', form-action 'self'
+// and frame-ancestors 'none' cover the directives that don't fall back to
+// default-src; the last stops another page framing the gallery to clickjack
+// the favorite/delete controls (W-17).
 const contentSecurityPolicy = "default-src 'self'; script-src 'self' 'unsafe-inline'; " +
 	"style-src 'self' 'unsafe-inline'; img-src 'self'; media-src 'self'; " +
-	"object-src 'none'; base-uri 'self'"
+	"object-src 'none'; base-uri 'self'; form-action 'self'; frame-ancestors 'none'"
 
 // secureHeaders wraps next so every response carries hardening headers (W-11).
 // X-Content-Type-Options: nosniff matters most on /media, where a RAW original
@@ -307,6 +309,8 @@ func secureHeaders(next http.Handler) http.Handler {
 		h := w.Header()
 		h.Set("X-Content-Type-Options", "nosniff")
 		h.Set("Content-Security-Policy", contentSecurityPolicy)
+		// frame-ancestors 'none' above, for browsers that predate it.
+		h.Set("X-Frame-Options", "DENY")
 		h.Set("Referrer-Policy", "no-referrer")
 		next.ServeHTTP(w, r)
 	})
