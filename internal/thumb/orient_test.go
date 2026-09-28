@@ -3,6 +3,7 @@ package thumb
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"image"
 	"image/color"
 	"image/jpeg"
@@ -107,5 +108,32 @@ func TestImageAppliesOrientationAfterScale(t *testing.T) {
 	}
 	if w, h := thumbSize(t, dstR); h <= w {
 		t.Fatalf("rotated thumbnail = %dx%d, want portrait (h>w); orientation not applied", w, h)
+	}
+}
+
+// TestLoadRAWImageReportsPreviewOrientation is the S-21 guard: an embedded RAW
+// preview is stored in sensor orientation, so LoadRAWImage must hand back the
+// RAW's Orientation tag for the viewer to apply after its downscale. A
+// JPEG-bodied ".cr2" takes LoadRAWPreview's whole-file fast path, so no
+// exiftool or ffmpeg is needed.
+func TestLoadRAWImageReportsPreviewOrientation(t *testing.T) {
+	dir := t.TempDir()
+	for _, tc := range []struct {
+		orientation byte
+		want        int
+	}{{1, 1}, {6, 6}, {8, 8}} {
+		p := filepath.Join(dir, fmt.Sprintf("o%d.cr2", tc.orientation))
+		writeJPEGWithOrientation(t, p, 40, 20, tc.orientation)
+		img, got, err := LoadRAWImage(context.Background(), p)
+		if err != nil {
+			t.Fatalf("orientation %d: LoadRAWImage: %v", tc.orientation, err)
+		}
+		if got != tc.want {
+			t.Errorf("orientation %d: reported %d, want %d", tc.orientation, got, tc.want)
+		}
+		// Pixels come back as stored; applying is the caller's job.
+		if b := img.Bounds(); b.Dx() != 40 || b.Dy() != 20 {
+			t.Errorf("orientation %d: bounds %v, want stored 40x20", tc.orientation, b)
+		}
 	}
 }

@@ -938,6 +938,7 @@ func (v *Viewer) prefetchVideo(e cache.Entry, idx int) {
 func decodeOriginal(ctx context.Context, e cache.Entry) (paint.ImageOp, image.Point, bool) {
 	var img image.Image
 	var err error
+	orientation := 1
 	switch e.Type {
 	case scan.TypeHEIC:
 		tmpDir, err2 := os.MkdirTemp("", "photo-viewer-heicview-")
@@ -956,12 +957,13 @@ func decodeOriginal(ctx context.Context, e cache.Entry) (paint.ImageOp, image.Po
 		img, _, err = image.Decode(f)
 		f.Close()
 	case scan.TypeRAW:
-		img, err = thumb.LoadRAWImage(ctx, e.Path)
+		img, orientation, err = thumb.LoadRAWImage(ctx, e.Path)
 	case scan.TypePhoto:
 		f, err2 := os.Open(e.Path)
 		if err2 == nil {
 			img, _, err = image.Decode(f)
 			f.Close()
+			orientation = imgorient.ReadOrientation(e.Path)
 		}
 	}
 	if err != nil || img == nil {
@@ -971,17 +973,15 @@ func decodeOriginal(ctx context.Context, e cache.Entry) (paint.ImageOp, image.Po
 		return paint.ImageOp{}, image.Point{}, false
 	}
 	img = downscalePreview(img, viewerMaxPreviewSide)
-	// The RAW and HEIC branches already deliver an upright image (LoadRAWImage
-	// applies the RAW Orientation tag; heif-convert/ffmpeg bake in the HEIF
-	// rotation), but Go's JPEG/TIFF/PNG decoders ignore EXIF Orientation, so a
-	// portrait photo shot on a phone/DSLR would render sideways here — the same
+	// The HEIC branch already delivers an upright image (heif-convert/ffmpeg
+	// bake in the HEIF rotation), but Go's JPEG/TIFF/PNG decoders ignore EXIF
+	// Orientation, so a portrait photo — or a RAW's embedded preview, which is
+	// stored in sensor orientation (S-21) — would render sideways here; the same
 	// fix thumb.Image and export/recompress already carry. Apply it *after* the
 	// downscale: rotation is a lossless remap that commutes with scaling, and
 	// imgorient.Apply is per-pixel At/Set, so orienting the small preview costs
 	// ~1 ms where full-res would cost seconds on a 24 MP source.
-	if e.Type == scan.TypePhoto {
-		img = imgorient.Apply(img, imgorient.ReadOrientation(e.Path))
-	}
+	img = imgorient.Apply(img, orientation)
 	op := paint.NewImageOp(img)
 	op.Filter = paint.FilterLinear
 	return op, img.Bounds().Size(), true

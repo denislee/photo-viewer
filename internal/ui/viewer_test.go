@@ -97,6 +97,22 @@ func TestDecodeOriginalAppliesOrientation(t *testing.T) {
 	}
 }
 
+// TestDecodeOriginalOrientsRAWPreview is the S-21 regression guard: a portrait
+// RAW whose embedded preview is stored landscape must display transposed, like
+// its grid thumbnail. The JPEG-bodied ".nef" fixture takes LoadRAWPreview's
+// whole-file fast path, so no exiftool is needed.
+func TestDecodeOriginalOrientsRAWPreview(t *testing.T) {
+	raw := filepath.Join(t.TempDir(), "portrait.nef")
+	writeJPEGWithOrientation(t, raw, 40, 20, 6)
+	_, size, ok := decodeOriginal(context.Background(), cache.Entry{Path: raw, Type: scan.TypeRAW})
+	if !ok {
+		t.Fatal("decodeOriginal failed on RAW fixture")
+	}
+	if size.X != 20 || size.Y != 40 {
+		t.Fatalf("RAW size = %dx%d, want 20x40 (orientation not applied)", size.X, size.Y)
+	}
+}
+
 // TestPrefetchIndexNoRace is the -race regression guard for G-03: background
 // prefetch goroutines stale-check their target against curIdx (an atomic mirror
 // of Index) while the UI goroutine writes Index through Show/Next/Prev. Before

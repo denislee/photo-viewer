@@ -58,23 +58,29 @@ func RAW(ctx context.Context, src, dst string, size int) error {
 // embedded previews first (via exiftool) and falls back to decoding the
 // full RAW via ffmpeg. Used by the full-resolution viewer path; the thumbnail
 // path (RAW) has its own ffmpeg fast/orientation handling.
-func LoadRAWImage(ctx context.Context, src string) (image.Image, error) {
+//
+// The returned orientation is the EXIF Orientation still to be applied with
+// imgorient.Apply: the embedded preview is stored in sensor orientation, so it
+// carries the RAW's tag, while the ffmpeg fallback autorotates and reports 1.
+// Orientation is returned rather than applied so the caller can rotate after
+// downscaling — previews are often full-resolution (S-21).
+func LoadRAWImage(ctx context.Context, src string) (img image.Image, orientation int, err error) {
 	data, err := LoadRAWPreview(ctx, src)
 	if err == nil {
 		img, _, derr := image.Decode(bytes.NewReader(data))
 		if derr == nil {
-			return img, nil
+			return img, imgorient.ReadOrientation(src), nil
 		}
 	}
 
 	img, ferr := decodeRAWViaFfmpeg(ctx, src)
 	if ferr == nil {
-		return img, nil
+		return img, 1, nil
 	}
 	if err != nil {
-		return nil, err
+		return nil, 1, err
 	}
-	return nil, errors.New("could not decode RAW file")
+	return nil, 1, errors.New("could not decode RAW file")
 }
 
 // decodeRAWViaFfmpeg decodes the full RAW via ffmpeg (which handles DNG, CR2,
