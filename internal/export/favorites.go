@@ -13,15 +13,9 @@ import (
 	"syscall"
 
 	"github.com/dns/photo-viewer/internal/cache"
+	"github.com/dns/photo-viewer/internal/fsutil"
 	"github.com/dns/photo-viewer/internal/scan"
 )
-
-// maxCollisionSuffix caps how many "_1", "_2", … variants avoidCollision will
-// try before giving up on a single file. It's a backstop: the old loop only
-// exited on os.IsNotExist, so a persistent stat error on the destination
-// directory (e.g. EACCES) looked like a permanent collision and spun forever.
-// With the cap the worst case is a single per-file failure, never a hung run.
-const maxCollisionSuffix = 10000
 
 // Options controls how Favorites lays out and writes the exported files.
 type Options struct {
@@ -108,14 +102,14 @@ func Favorites(ctx context.Context, idx *cache.Index, opts Options, progress Pro
 	// printed paths match a real run file-for-file: two favorites that map to
 	// the same name resolve to distinct destinations (base, then _1), exactly
 	// as a real run's on-disk collision check would. A real run consults only
-	// the filesystem (statTaken); the dry-run also consults claimed because it
+	// the filesystem (fsutil.Taken); the dry-run also consults claimed because it
 	// never actually creates the files, so the disk alone can't tell it a name
 	// is spoken for. Without this the old dry-run printed the same destination
 	// twice and lied about the outcome.
 	claimed := map[string]bool{}
-	taken := func(p string) bool { return statTaken(p) }
+	taken := fsutil.Taken
 	if opts.DryRun {
-		taken = func(p string) bool { return claimed[p] || statTaken(p) }
+		taken = func(p string) bool { return claimed[p] || fsutil.Taken(p) }
 	}
 
 	for i, e := range favs {
@@ -226,39 +220,13 @@ func destinationPath(root, dst, src string, flatten bool) string {
 	return filepath.Join(dst, rel)
 }
 
-// avoidCollision returns a path that is free according to taken(), appending
-// _1, _2, … before the extension. It is capped at maxCollisionSuffix so a
-// pathological or unreadable destination directory produces a clean per-file
-// failure instead of the old infinite loop, which only stopped on
-// os.IsNotExist and therefore spun forever on any other stat error (e.g. an
-// EACCES on the destination dir). taken lets the dry-run planner also treat
-// already-planned names as occupied so its output matches a real run.
+// avoidCollision returns p, or the first free p_1, p_2, … according to taken
+// (fsutil.FreeName over fsutil.SuffixName, so it gives up cleanly instead of
+// spinning on an unreadable directory). taken lets the dry-run planner also
+// treat already-planned names as occupied so its output matches a real run.
 func avoidCollision(p string, taken func(string) bool) (string, error) {
-	if !taken(p) {
-		return p, nil
-	}
-	ext := filepath.Ext(p)
-	base := strings.TrimSuffix(p, ext)
-	for i := 1; i <= maxCollisionSuffix; i++ {
-		cand := fmt.Sprintf("%s_%d%s", base, i, ext)
-		if !taken(cand) {
-			return cand, nil
-		}
-	}
-	return "", fmt.Errorf("gave up after %d collisions finding a free name for %s", maxCollisionSuffix, p)
-}
-
-// statTaken reports whether p is unavailable as a destination: either a file
-// really exists there, or it can't be stat'd for a reason OTHER than "not
-// found" (e.g. EACCES). Treating the latter as taken is what lets
-// avoidCollision advance and eventually fail cleanly instead of hanging on an
-// unreadable destination directory.
-func statTaken(p string) bool {
-	_, err := os.Stat(p)
-	if err == nil {
-		return true
-	}
-	return !os.IsNotExist(err)
+	dir, base := filepath.Dir(p), filepath.Base(p)
+	return fsutil.FreeName(func(n int) string { return fsutil.SuffixName(dir, base, n) }, taken)
 }
 
 // copyFile copies src to dst crash-safely: it streams into a sibling dst+".tmp",
@@ -335,7 +303,7 @@ func moveFile(src, dst string) error {
 	if err := copyFile(src, dst); err != nil {
 		return err
 	}
-	if err := syncDir(filepath.Dir(dst)); err != nil {
+	if err := fsutil.SyncDir(filepath.Dir(dst)); err != nil {
 		return err
 	}
 	// Count the move as a success only after the source unlink succeeds; a
@@ -345,16 +313,4 @@ func moveFile(src, dst string) error {
 		return fmt.Errorf("copied to %s but could not remove source %s: %w", dst, src, err)
 	}
 	return nil
-}
-
-// syncDir fsyncs a directory so a rename/create within it is durable. Opening
-// the directory read-only and calling Sync is the portable way on Linux to
-// flush the directory entry to stable storage.
-func syncDir(dir string) error {
-	d, err := os.Open(dir)
-	if err != nil {
-		return err
-	}
-	defer d.Close()
-	return d.Sync()
 }

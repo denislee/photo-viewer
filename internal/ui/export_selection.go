@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"path/filepath"
 	"strings"
+
+	"github.com/dns/photo-viewer/internal/fsutil"
 )
 
 // ExportSelection copies paths into target on a background goroutine, shown
@@ -48,9 +50,7 @@ func exportSelection(ctx context.Context, paths []string, target string, step fu
 			errs = append(errs, fmt.Errorf("cancelled: %d file(s) not exported", len(paths)-i))
 			break
 		}
-		if _, err := claimName(target, filepath.Base(src), func(dest string) error {
-			return copyFileNoReplace(src, dest)
-		}); err != nil {
+		if _, err := fsutil.CopyUnique(ctx, src, target, filepath.Base(src)); err != nil {
 			errs = append(errs, fmt.Errorf("%s: %w", filepath.Base(src), err))
 		} else {
 			copied++

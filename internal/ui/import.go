@@ -2,12 +2,9 @@ package ui
 
 import (
 	"archive/zip"
-	"bytes"
 	"context"
-	"errors"
 	"fmt"
 	"image"
-	"io"
 	"io/fs"
 	"os"
 	"os/exec"
@@ -17,7 +14,6 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
-	"syscall"
 	"time"
 
 	"gioui.org/layout"
@@ -1091,7 +1087,7 @@ func (v *ImportView) runImport(ctx context.Context, cfg Config, importDirs, zipF
 			// the Inbox copy entirely — processBatch will os.Rename each
 			// source straight into Outbox/YYYY-MM-DD/, which is atomic and
 			// free on the same device.
-			if deleteSrc && sameDevice(sd, cfg.OutboxDir) {
+			if deleteSrc && fsutil.SameDevice(sd, cfg.OutboxDir) {
 				v.setStatus(fmt.Sprintf("Filing %d files from %s directly into %s…", len(files), sd, filepath.Base(cfg.OutboxDir)))
 				v.appendLog(fmt.Sprintf("Same-device shortcut: moving %d files from %s straight to Outbox (no Inbox copy).", len(files), sd))
 				// processBatch owns the progress bar (it spans a date-read pass
@@ -1115,8 +1111,8 @@ func (v *ImportView) runImport(ctx context.Context, cfg Config, importDirs, zipF
 				if ctx.Err() != nil {
 					break
 				}
-				dest := uniqueInboxPath(cfg.InboxDir, filepath.Base(srcFile))
-				if err := copyFile(srcFile, dest); err != nil {
+				dest, err := fsutil.CopyUnique(ctx, srcFile, cfg.InboxDir, filepath.Base(srcFile))
+				if err != nil {
 					atomic.AddInt64(&v.statErrors, 1)
 					v.appendLog("[ERROR] Copy failed for " + srcFile + ": " + err.Error())
 					v.bumpProgress()
@@ -1124,12 +1120,12 @@ func (v *ImportView) runImport(ctx context.Context, cfg Config, importDirs, zipF
 				}
 				batch = append(batch, dest)
 				if deleteSrc {
-					// copyFile fsynced the Inbox copy's data; fsync the Inbox
+					// CopyUnique fsynced the Inbox copy's data; fsync the Inbox
 					// directory too so its entry is durable before we delete the
 					// source (the only other copy). On sync failure, keep the
 					// source rather than risk zero copies — the Inbox copy is
 					// already queued in batch, so no bytes are lost either way.
-					if err := syncDir(filepath.Dir(dest)); err != nil {
+					if err := fsutil.SyncDir(filepath.Dir(dest)); err != nil {
 						atomic.AddInt64(&v.statErrors, 1)
 						v.appendLog("[ERROR] Failed to fsync Inbox before deleting source " + srcFile + ": " + err.Error())
 					} else if err := os.Remove(srcFile); err != nil {
@@ -1272,7 +1268,7 @@ func (v *ImportView) processBatch(ctx context.Context, outboxDir string, entries
 		if destInfo, err := os.Stat(dest); err == nil {
 			// The source already IS the destination — an Inbox that is (or
 			// contains) the Outbox, or an import folder inside the library.
-			// sameContent would compare the file with itself and the duplicate
+			// SameContent would compare the file with itself and the duplicate
 			// removal below would delete the only copy (U-17). SameFile also
 			// matches hardlinks and symlinked dirs; skipping those just leaves
 			// the source in place, which is always safe.
@@ -1282,7 +1278,7 @@ func (v *ImportView) processBatch(ctx context.Context, outboxDir string, entries
 				v.bumpProgress()
 				continue
 			}
-			same, _ := sameContent(src, dest)
+			same, _ := fsutil.SameContent(src, dest)
 			if same {
 				if err := os.Remove(src); err != nil {
 					atomic.AddInt64(&v.statErrors, 1)
@@ -1295,7 +1291,7 @@ func (v *ImportView) processBatch(ctx context.Context, outboxDir string, entries
 				continue
 			}
 		}
-		dest, moveErr := fileInto(src, destDir, baseName)
+		dest, moveErr := fsutil.MoveUnique(ctx, src, destDir, baseName)
 		if moveErr != nil {
 			atomic.AddInt64(&v.statErrors, 1)
 			v.appendLog("[ERROR] Could not move " + baseName + ": " + moveErr.Error())
@@ -1318,7 +1314,7 @@ func (v *ImportView) extractZipToInbox(ctx context.Context, zipPath, inboxDir st
 	for _, f := range r.File {
 		// Honour Pause / Cancel between archive entries so a multi-GB ZIP
 		// stops promptly instead of extracting to completion after the user
-		// hit Cancel. (writeFileDurable below only publishes an entry via an
+		// hit Cancel. (WriteUnique below only publishes an entry via an
 		// atomic rename after fsync, so an interrupted io.Copy leaves at most a
 		// .tmp — never a truncated file at the final name — and an early return
 		// here leaves nothing behind.)
@@ -1337,13 +1333,11 @@ func (v *ImportView) extractZipToInbox(ctx context.Context, zipPath, inboxDir st
 			v.appendLog("[ERROR] Failed to open file in ZIP: " + err.Error())
 			continue
 		}
-		dest := uniqueInboxPath(inboxDir, filepath.Base(f.Name))
-		// Crash-safe extract: writeFileDurable streams into dest+".tmp",
-		// fsyncs, and atomically renames — so an interrupted extraction (cancel,
-		// full disk, power loss) leaves at most the .tmp, never a truncated file
-		// at dest that the next import's inbox walk would file into the library
-		// as valid media.
-		err = writeFileDurable(dest, rc)
+		// Crash-safe extract: WriteUnique streams into a temp, fsyncs, and
+		// renames it onto a free name — so an interrupted extraction (cancel,
+		// full disk, power loss) never leaves a truncated file that the next
+		// import's inbox walk would file into the library as valid media.
+		dest, err := fsutil.WriteUnique(ctx, inboxDir, filepath.Base(f.Name), rc)
 		rc.Close()
 		if err != nil {
 			v.appendLog("[ERROR] Failed to extract file: " + err.Error())
@@ -1382,241 +1376,4 @@ func (v *ImportView) bumpProgress() {
 		return
 	}
 	v.scheduleInvalidate()
-}
-
-// File helpers (mirrored from internal/ui/import.go).
-
-// fileInto moves src into destDir as baseName, or baseName_N when that name is
-// taken, never replacing an existing file (U-18): the old collision fallback
-// picked a UnixNano-suffixed name and os.Rename'd onto it unchecked. Returns the
-// path the file now lives at.
-//
-// os.Rename can't cross filesystems (EXDEV): when the inbox and outbox live on
-// different mounts, every move would otherwise fail and the files would stay
-// stuck in the inbox. Fall back to a crash-safe copy that claims its name the
-// same no-replace way, then remove the source. Gate strictly on EXDEV so genuine
-// errors (permission denied, disk full) still surface as failures instead of
-// silent copies.
-func fileInto(src, destDir, baseName string) (string, error) {
-	return claimName(destDir, baseName, func(dest string) error {
-		err := fsutil.RenameNoReplace(src, dest)
-		if !errors.Is(err, syscall.EXDEV) {
-			return err
-		}
-		if err := copyFileNoReplace(src, dest); err != nil {
-			return err
-		}
-		// Fsync the destination directory so the copy's directory entry is
-		// durable before we unlink the source — otherwise a power loss could
-		// lose the entry even though the copy synced the data, leaving zero
-		// copies of the file.
-		if err := syncDir(destDir); err != nil {
-			return err
-		}
-		return os.Remove(src)
-	})
-}
-
-// claimName calls place with destDir/baseName, then baseName_1, baseName_2, …
-// until place stops failing with fs.ErrExist, and returns the name it settled
-// on. place must never replace an existing file (use fsutil.RenameNoReplace or
-// copyFileNoReplace) — that is what makes the claim safe; the Lstat below only
-// skips names that are visibly taken, so a collision on a cross-device copy
-// doesn't copy the whole file just to be refused at the final rename.
-func claimName(destDir, baseName string, place func(dest string) error) (string, error) {
-	for n := 0; n <= fsutil.MaxCollisionSuffix; n++ {
-		dest := fsutil.SuffixName(destDir, baseName, n)
-		if _, err := os.Lstat(dest); err == nil {
-			continue
-		}
-		if err := place(dest); !errors.Is(err, fs.ErrExist) {
-			return dest, err
-		}
-	}
-	return "", fmt.Errorf("no free name for %s in %s after %d attempts", baseName, destDir, fsutil.MaxCollisionSuffix)
-}
-
-func uniqueInboxPath(dir, base string) string {
-	p := filepath.Join(dir, base)
-	if _, err := os.Stat(p); os.IsNotExist(err) {
-		return p
-	}
-	ext := filepath.Ext(base)
-	name := strings.TrimSuffix(base, ext)
-	for i := 1; ; i++ {
-		c := filepath.Join(dir, fmt.Sprintf("%s_%d%s", name, i, ext))
-		if _, err := os.Stat(c); os.IsNotExist(err) {
-			return c
-		}
-	}
-}
-
-// sameDevice reports whether two paths live on the same filesystem. Used to
-// decide whether os.Rename can move a file between them atomically. Any stat
-// failure returns false so callers fall back to the safe copy path.
-func sameDevice(a, b string) bool {
-	var sa, sb syscall.Stat_t
-	if err := syscall.Stat(a, &sa); err != nil {
-		return false
-	}
-	if err := syscall.Stat(b, &sb); err != nil {
-		return false
-	}
-	return sa.Dev == sb.Dev
-}
-
-// copyFile copies src to dst crash-safely: it streams into a sibling
-// dst+".tmp", fsyncs it to stable storage, and only then renames it into
-// place. This closes two data-safety holes. First, a yanked SD card or full
-// disk mid-copy leaves at most the .tmp (removed here on any error), never a
-// truncated file at dst — otherwise the next import's inbox walk would file
-// that partial file into the library as if it were valid. Second, the Sync
-// before the rename backstops "Delete source after import": the caller's
-// os.Remove(src) must not run while dst's bytes are still only in the page
-// cache, or a power loss would destroy the sole copy. (dst's .tmp is a real
-// *os.File, so plain io.Copy still gets the kernel copy_file_range/sendfile
-// fast path — no pooled buffer needed.)
-func copyFile(src, dst string) error {
-	in, err := os.Open(src)
-	if err != nil {
-		return err
-	}
-	defer in.Close()
-	return writeFileDurable(dst, in)
-}
-
-// copyFileNoReplace is copyFile, except the final publish fails with
-// fs.ErrExist instead of replacing a file already at dst.
-func copyFileNoReplace(src, dst string) error {
-	in, err := os.Open(src)
-	if err != nil {
-		return err
-	}
-	defer in.Close()
-	return writeDurable(dst, in, fsutil.RenameNoReplace)
-}
-
-// syncDir fsyncs a directory so a rename/create within it is itself durable.
-// copyFile/writeFileDurable fsync the file's *data* before the rename, but the
-// rename only adds a directory entry — on a crash that entry can still be lost
-// even though the bytes survived. When copyFile is used as a *move* (the source
-// is unlinked afterwards), that lost entry would leave zero copies, so callers
-// fsync the destination directory before dropping the source. Mirrors
-// internal/export/favorites.go's syncDir.
-func syncDir(dir string) error {
-	d, err := os.Open(dir)
-	if err != nil {
-		return err
-	}
-	defer d.Close()
-	return d.Sync()
-}
-
-// writeFileDurable streams r into dst crash-safely: it writes into a sibling
-// dst+".tmp", fsyncs it to stable storage, and only then atomically renames it
-// into place. It is the writer half of copyFile, shared so any producer of new
-// inbox bytes (a plain file copy, a ZIP entry) gets the same guarantee: an
-// interrupted write — yanked card, full disk, power loss, cancel — leaves at
-// most the .tmp (removed here on any error), never a truncated file at the final
-// name that the next import's inbox walk would file into the library as valid
-// media. The Sync before the rename also backstops "Delete source after
-// import": a caller must not os.Remove the source while dst's bytes are still
-// only in the page cache. (dst's .tmp is a real *os.File, so plain io.Copy keeps
-// the kernel copy_file_range/sendfile fast path — no pooled buffer needed.)
-func writeFileDurable(dst string, r io.Reader) error {
-	return writeDurable(dst, r, os.Rename)
-}
-
-// writeDurable is writeFileDurable with the final publish step (tmp → dst)
-// supplied by the caller: os.Rename, or fsutil.RenameNoReplace when an
-// existing dst must never be replaced.
-func writeDurable(dst string, r io.Reader, publish func(tmp, dst string) error) error {
-	tmp := dst + ".tmp"
-	out, err := os.Create(tmp)
-	if err != nil {
-		return err
-	}
-	if _, err := io.Copy(out, r); err != nil {
-		out.Close()
-		os.Remove(tmp) // best-effort: never leave a partial temp behind
-		return err
-	}
-	// A failed Sync is exactly the "bytes still only in the page cache" case,
-	// so treat it as a copy failure: drop the temp and report the error so no
-	// caller deletes the source believing the copy is durable.
-	if err := out.Sync(); err != nil {
-		out.Close()
-		os.Remove(tmp)
-		return err
-	}
-	if err := out.Close(); err != nil {
-		os.Remove(tmp)
-		return err
-	}
-	// Rename is atomic within a filesystem: dst either doesn't exist or is the
-	// fully-written, fsynced file — never a half-copy.
-	if err := publish(tmp, dst); err != nil {
-		os.Remove(tmp)
-		return err
-	}
-	return nil
-}
-
-// sameContent reports whether two files hold identical bytes. It short-circuits
-// cheaply on a size mismatch, then compares the contents block-by-block and
-// early-exits on the first differing byte (U-12) — the previous implementation
-// SHA-256'd both files in full, always reading both to EOF even when they
-// differed in the first block, which made re-importing an already-filed card
-// pay two full-file reads per duplicate just to skip it. Any stat/open/read
-// error is surfaced to the caller unchanged.
-func sameContent(a, b string) (bool, error) {
-	ai, err := os.Stat(a)
-	if err != nil {
-		return false, err
-	}
-	bi, err := os.Stat(b)
-	if err != nil {
-		return false, err
-	}
-	if ai.Size() != bi.Size() {
-		return false, nil
-	}
-
-	fa, err := os.Open(a)
-	if err != nil {
-		return false, err
-	}
-	defer fa.Close()
-	fb, err := os.Open(b)
-	if err != nil {
-		return false, err
-	}
-	defer fb.Close()
-
-	// Read fixed-size blocks from both files in lockstep. io.ReadFull fills the
-	// whole buffer (so blocks stay aligned across the two files despite short OS
-	// reads) except at end-of-file, where it returns io.EOF (block boundary) or
-	// io.ErrUnexpectedEOF (short final block). Because the sizes already match,
-	// the two streams end together.
-	const block = 64 * 1024
-	bufA := make([]byte, block)
-	bufB := make([]byte, block)
-	for {
-		na, ea := io.ReadFull(fa, bufA)
-		nb, eb := io.ReadFull(fb, bufB)
-		if na != nb || !bytes.Equal(bufA[:na], bufB[:nb]) {
-			return false, nil
-		}
-		if ea != nil || eb != nil {
-			// End of at least one file, or a genuine read error. Surface any
-			// error that isn't an expected EOF; otherwise both files are
-			// exhausted with every block equal, so they're identical.
-			for _, e := range []error{ea, eb} {
-				if e != nil && e != io.EOF && e != io.ErrUnexpectedEOF {
-					return false, e
-				}
-			}
-			return true, nil
-		}
-	}
 }

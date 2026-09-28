@@ -13,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/dns/photo-viewer/internal/fsutil"
 	"github.com/dns/photo-viewer/internal/scan"
 )
 
@@ -80,20 +81,6 @@ func TestMoveFileSameFilesystem(t *testing.T) {
 	}
 }
 
-// TestStatTaken documents the non-hang guarantee: a missing path is free, an
-// existing one is taken.
-func TestStatTaken(t *testing.T) {
-	dir := t.TempDir()
-	if statTaken(filepath.Join(dir, "nope.jpg")) {
-		t.Fatalf("missing path reported as taken")
-	}
-	present := filepath.Join(dir, "yes.jpg")
-	writeFile(t, present, "x")
-	if !statTaken(present) {
-		t.Fatalf("existing path reported as free")
-	}
-}
-
 // TestAvoidCollisionSuffixes: an occupied base name must resolve to the "_1"
 // variant, and a free name must be returned unchanged.
 func TestAvoidCollisionSuffixes(t *testing.T) {
@@ -101,7 +88,7 @@ func TestAvoidCollisionSuffixes(t *testing.T) {
 	base := filepath.Join(dir, "a.jpg")
 	writeFile(t, base, "OLD")
 
-	got, err := avoidCollision(base, statTaken)
+	got, err := avoidCollision(base, fsutil.Taken)
 	if err != nil {
 		t.Fatalf("avoidCollision: %v", err)
 	}
@@ -110,7 +97,7 @@ func TestAvoidCollisionSuffixes(t *testing.T) {
 	}
 
 	free := filepath.Join(dir, "b.jpg")
-	got, err = avoidCollision(free, statTaken)
+	got, err = avoidCollision(free, fsutil.Taken)
 	if err != nil {
 		t.Fatalf("avoidCollision(free): %v", err)
 	}
@@ -138,7 +125,7 @@ func TestAvoidCollisionTerminates(t *testing.T) {
 func TestDryRunPlanDistinctForSameNamedSources(t *testing.T) {
 	dir := t.TempDir()
 	claimed := map[string]bool{}
-	taken := func(p string) bool { return claimed[p] || statTaken(p) }
+	taken := func(p string) bool { return claimed[p] || fsutil.Taken(p) }
 
 	first, err := avoidCollision(filepath.Join(dir, "img.jpg"), taken)
 	if err != nil {
@@ -171,7 +158,7 @@ func TestDryRunPlanMatchesRealCopy(t *testing.T) {
 
 	// Dry-run planning path.
 	claimed := map[string]bool{}
-	taken := func(p string) bool { return claimed[p] || statTaken(p) }
+	taken := func(p string) bool { return claimed[p] || fsutil.Taken(p) }
 	planned, err := avoidCollision(filepath.Join(dir, "a.jpg"), taken)
 	if err != nil {
 		t.Fatalf("plan: %v", err)
@@ -181,7 +168,7 @@ func TestDryRunPlanMatchesRealCopy(t *testing.T) {
 	// Real run: collision-resolve against the disk, then copy there.
 	src := filepath.Join(dir, "src.jpg")
 	writeFile(t, src, "NEW")
-	real, err := avoidCollision(filepath.Join(dir, "a.jpg"), statTaken)
+	real, err := avoidCollision(filepath.Join(dir, "a.jpg"), fsutil.Taken)
 	if err != nil {
 		t.Fatalf("resolve: %v", err)
 	}

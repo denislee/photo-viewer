@@ -1,5 +1,7 @@
-// Package fsutil holds small filesystem primitives shared by the flows that
-// move the user's files around (import, organize, trash restore).
+// Package fsutil holds the filesystem primitives shared by every flow that
+// moves or copies the user's files (import, organize, pv-organize, trash
+// restore, selection and favorites export): no-replace renames, collision
+// suffixes, and crash-safe copies.
 package fsutil
 
 import (
@@ -14,7 +16,7 @@ import (
 
 // MaxCollisionSuffix caps how many candidate names RenameUnique tries before
 // giving up, so an unwritable or pathological directory fails one file instead
-// of spinning forever. Matches pv-organize's cap.
+// of spinning forever.
 const MaxCollisionSuffix = 10000
 
 // RenameNoReplace renames src to dst but never replaces an existing dst: if
