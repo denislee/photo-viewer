@@ -89,3 +89,24 @@ func TestMoveFacesRelocatesRows(t *testing.T) {
 		t.Errorf("relocated face thumb_mtime = %d, want 1 (preserved)", mtime)
 	}
 }
+
+// TestWriteFacesForPathRejectsMismatchedPath is the C-15 guard: the rewrite
+// wipes by path, so a face carrying another Path would orphan. It must be
+// rejected without writing anything or touching the path's existing faces.
+func TestWriteFacesForPathRejectsMismatchedPath(t *testing.T) {
+	idx, cleanup := loadEmpty(t)
+	defer cleanup()
+	writeFace(t, idx, "/lib/a.jpg")
+
+	_, err := idx.WriteFacesForPath("/lib/a.jpg", []FaceOp{{
+		Face:               Face{Path: "/lib/b.jpg", ThumbMtime: 2, Embedding: []float32{0.3}},
+		NewClusterCentroid: []float32{0.3},
+	}})
+	if err == nil {
+		t.Fatal("mismatched Face.Path accepted")
+	}
+	fresh := idx.LoadFaceFreshness()
+	if len(fresh) != 1 || fresh["/lib/a.jpg"] != 1 {
+		t.Errorf("faces after rejected write = %v, want only a.jpg's original row", fresh)
+	}
+}

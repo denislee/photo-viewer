@@ -3,6 +3,7 @@ package cache
 import (
 	"database/sql"
 	"encoding/binary"
+	"fmt"
 	"log"
 	"math"
 	"time"
@@ -135,7 +136,17 @@ func (i *Index) faceStatements() (ins, updCluster, newCluster, setCluster *sql.S
 // ops in a single transaction (1 fsync per image instead of ~3 per face).
 // Callers (the face pipeline) are expected to have already chosen
 // existing-cluster vs. new-cluster against an in-memory cache.
+//
+// Every op's Face.Path must equal path: the wipe is keyed on path, so a face
+// inserted under any other path would survive the next rewrite of path and
+// orphan (or clobber another file's faces). A mismatch is rejected up front,
+// before anything is written.
 func (i *Index) WriteFacesForPath(path string, ops []FaceOp) ([]FaceOpResult, error) {
+	for k, op := range ops {
+		if op.Face.Path != path {
+			return nil, fmt.Errorf("WriteFacesForPath(%q): op %d has Face.Path %q", path, k, op.Face.Path)
+		}
+	}
 	insStmt, updClusterStmt, newClusterStmt, setClusterStmt, err := i.faceStatements()
 	if err != nil {
 		return nil, err
