@@ -6,6 +6,7 @@ import (
 	"encoding/binary"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"io"
 	"log"
 	"os"
@@ -129,15 +130,30 @@ func (i *Index) EnsureHashes(ctx context.Context, progress func(done, total int)
 	if err != nil {
 		return err
 	}
+	// A cursor error mid-iteration would leave todo partial and duplicate
+	// detection silently incomplete, so it fails the pass. A row that won't
+	// scan is skipped (it just isn't hashed this run) but counted and logged.
 	var todo []cand
+	var badRows int
 	for rows.Next() {
 		var c cand
 		if err := rows.Scan(&c.path, &c.size, &c.quick, &c.full); err != nil {
+			if badRows == 0 {
+				log.Printf("cache: EnsureHashes: skip unreadable row: %v", err)
+			}
+			badRows++
 			continue
 		}
 		todo = append(todo, c)
 	}
+	err = rows.Err()
 	rows.Close()
+	if err != nil {
+		return fmt.Errorf("list hash candidates: %w", err)
+	}
+	if badRows > 1 {
+		log.Printf("cache: EnsureHashes: skipped %d unreadable rows", badRows)
+	}
 
 	if len(todo) == 0 {
 		if progress != nil {

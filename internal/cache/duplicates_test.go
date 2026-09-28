@@ -172,3 +172,25 @@ func TestEnsureHashesFindsDuplicates(t *testing.T) {
 		}
 	}
 }
+
+// TestEnsureHashesSkipsUnreadableRow guards C-13: a candidate row that won't
+// scan (here a NULL path sharing a size with real files) is skipped and
+// logged, not allowed to abort the pass or hide the real duplicates.
+func TestEnsureHashesSkipsUnreadableRow(t *testing.T) {
+	idx, cleanup := loadEmpty(t)
+	defer cleanup()
+
+	dir := t.TempDir()
+	results := seedDupFiles(t, dir, 1)
+	idx.ReconcileBatch(results)
+	if _, err := idx.db.Exec(`INSERT INTO entries (path, type, size, mtime, thumb_id) VALUES (NULL, 0, ?, 0, '')`, results[0].Size); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := idx.EnsureHashes(context.Background(), nil, nil); err != nil {
+		t.Fatalf("EnsureHashes: %v", err)
+	}
+	if groups := idx.FindDuplicates(); len(groups) != 1 || len(groups[0].Entries) != 2 {
+		t.Fatalf("FindDuplicates = %+v, want one group of 2", groups)
+	}
+}
