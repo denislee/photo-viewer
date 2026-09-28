@@ -106,6 +106,10 @@ type Server struct {
 	// gallery page loads at the same view avoid repeated O(N) index scans.
 	viewCountMu    sync.Mutex
 	viewCountCache map[cache.View]viewCountEntry
+
+	// infoCache holds /api/info's exiftool metadata + dimensions per file
+	// version, so reopening the info panel doesn't fork exiftool again.
+	infoCache infoCache
 }
 
 // sidebarKey identifies a cached sidebar aggregate: the two toolbar toggles
@@ -1071,7 +1075,16 @@ func (s *Server) handleAPIInfo(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
-	mi := scan.GetMediaInfo(e.Path)
+	key := infoKey{id: e.ThumbID, mtime: e.ModTime.UnixNano(), size: e.Size}
+	cached, ok := s.infoCache.get(key)
+	if !ok {
+		// Dimensions are best-effort: a fast image.DecodeConfig works on
+		// regular photos; RAW/HEIC/video would need exiftool again and
+		// aren't worth the extra fork for an info-panel value.
+		cached = infoVal{mi: mediaInfoFn(e.Path), dims: decodeDimensions(e)}
+		s.infoCache.put(key, cached)
+	}
+	mi := cached.mi
 
 	info := infoJSON{
 		ID:           e.ThumbID,
@@ -1093,10 +1106,7 @@ func (s *Server) handleAPIInfo(w http.ResponseWriter, r *http.Request) {
 	} else {
 		info.Created = "—"
 	}
-	// Dimensions are best-effort: a fast image.DecodeConfig works on
-	// regular photos; RAW/HEIC/video would need exiftool again and aren't
-	// worth the extra fork for an info-panel value.
-	info.Dimensions = decodeDimensions(e)
+	info.Dimensions = cached.dims
 
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	_ = json.NewEncoder(w).Encode(info)
