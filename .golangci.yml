@@ -1,0 +1,48 @@
+version: "2"
+
+linters:
+  # standard = errcheck, govet, ineffassign, staticcheck, unused.
+  default: standard
+  enable:
+    - bodyclose
+    # rowserrcheck would have caught C-13 (a cursor error dropped silently).
+    # sqlclosecheck is deliberately off: its remaining reports are all "Close
+    # should use defer" on cursors closed early on purpose, e.g. before a long
+    # hashing pass so the read isn't held open across it.
+    - rowserrcheck
+  settings:
+    errcheck:
+      # Best-effort cleanup on paths that already return or log the error
+      # that matters. Checking these everywhere is noise, not signal.
+      exclude-functions:
+        - (io.Closer).Close
+        - (*os.File).Close
+        - (*database/sql.Rows).Close
+        - (*database/sql.Stmt).Close
+        - (*database/sql.Tx).Rollback
+        - os.Remove
+        - os.RemoveAll
+        - fmt.Fprint
+        - fmt.Fprintf
+        - fmt.Fprintln
+    staticcheck:
+      checks:
+        - all
+        # golangci-lint's default opt-outs (package/naming style) ...
+        - -ST1000
+        - -ST1003
+        - -ST1016
+        - -ST1020
+        - -ST1021
+        - -ST1022
+        # ... plus the De Morgan rewrite suggestion, which is a style call.
+        - -QF1001
+  exclusions:
+    paths:
+      - third_party/
+    rules:
+      # Test setup (MkdirAll, WriteFile, Close on fixtures) fails loudly on
+      # its own; only lint tests for the resource leaks below.
+      - path: _test\.go
+        linters:
+          - errcheck

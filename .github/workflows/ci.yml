@@ -1,0 +1,47 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  check:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+          check-latest: true
+
+      # cgo: libmpv (internal/video) and Gio's X11/Wayland/EGL backends.
+      # Runtime tools the tests exercise: ffmpeg/ffprobe (video thumbs, HLS,
+      # export), exiftool (RAW previews, metadata), heif-convert (HEIC).
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            pkg-config libmpv-dev \
+            libwayland-dev libx11-dev libx11-xcb-dev libxkbcommon-dev libxkbcommon-x11-dev \
+            libxcursor-dev libxfixes-dev libgles2-mesa-dev libegl1-mesa-dev libffi-dev libvulkan-dev \
+            ffmpeg libimage-exiftool-perl libheif-examples
+
+      - name: gofmt
+        run: make fmt-check
+
+      - name: go vet
+        run: make vet
+
+      - name: golangci-lint
+        run: make lint
+
+      - name: Tests (race)
+        run: make race
+
+      - name: libmpv race tests
+        run: make test-video
+
+      - name: govulncheck
+        run: make vuln
