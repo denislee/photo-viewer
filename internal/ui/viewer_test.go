@@ -258,3 +258,45 @@ func TestPrefetchVideoStaleAborts(t *testing.T) {
 		t.Fatalf("prefetching not drained (%d) — stale prefetch blocked on os.Open instead of aborting", got)
 	}
 }
+
+// TestConfirmDeletePrefetchesNeighbours is the G-15 regression: after a
+// delete the viewer lands on a new entry whose neighbours were never
+// prefetched (Show only warmed the old ±1), so the next step fell back to the
+// blurry thumbnail. ConfirmDelete now prefetches ±1 like Show.
+func TestConfirmDeletePrefetchesNeighbours(t *testing.T) {
+	dir := t.TempDir()
+	var entries []cache.Entry
+	for _, name := range []string{"a.jpg", "b.jpg", "c.jpg", "d.jpg"} {
+		p := filepath.Join(dir, name)
+		writeJPEGWithOrientation(t, p, 8, 8, 1)
+		entries = append(entries, cache.Entry{Path: p, Type: scan.TypePhoto})
+	}
+	v := &Viewer{}
+	waitCached := func(path string) bool {
+		t.Helper()
+		for deadline := time.Now().Add(5 * time.Second); time.Now().Before(deadline); {
+			if v.cacheHas(path) {
+				return true
+			}
+			time.Sleep(2 * time.Millisecond)
+		}
+		return false
+	}
+
+	v.Show(entries, 1) // on b: prefetches a and c
+	if !waitCached(entries[0].Path) || !waitCached(entries[2].Path) {
+		t.Fatal("Show did not prefetch its neighbours")
+	}
+	if v.cacheHas(entries[3].Path) {
+		t.Fatal("d prefetched before the delete")
+	}
+
+	v.Confirming = true
+	v.ConfirmDelete(func(string) error { return nil }) // now on c: next is d
+	if v.Index != 1 || v.entries[v.Index].Path != entries[2].Path {
+		t.Fatalf("after delete on %d (%s), want c", v.Index, v.entries[v.Index].Path)
+	}
+	if !waitCached(entries[3].Path) {
+		t.Error("ConfirmDelete did not prefetch the new next neighbour")
+	}
+}

@@ -324,6 +324,15 @@ func (v *Viewer) ConfirmDelete(deleter func(path string) error) {
 	v.loadedPath = ""
 	v.loadingPath = ""
 	v.loadedOp = paint.ImageOp{}
+	// Same hand-off as Next/Prev: stop a video that is no longer current
+	// (Layout only drives the player for a video entry, so a deleted clip
+	// followed by a photo would keep playing), preload the new current
+	// video, and warm both neighbours so the next step isn't a blurry
+	// thumbnail fallback.
+	v.stopVideoIfRunning()
+	v.preloadVideoIfNeeded()
+	v.prefetchAt(v.Index + 1)
+	v.prefetchAt(v.Index - 1)
 }
 
 func (v *Viewer) cancelLoading() {
