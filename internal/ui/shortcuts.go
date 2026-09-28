@@ -24,7 +24,7 @@ var (
 		"space: play/pause",
 		"[/]: seek 5s",
 		"m: mute",
-		"o: open mpv",
+		"o: open externally",
 		"esc/q/ctrl+[: close",
 	}, "   ·   ")
 	shortcutTextSidebar = strings.Join([]string{
@@ -40,7 +40,7 @@ var (
 		"v: exit selection",
 		"enter: open selected",
 		"e: export selected",
-		"o: open mpv",
+		"o: open externally",
 		"q: quit",
 	}, "   ·   ")
 	shortcutTextDefault = strings.Join([]string{
@@ -49,7 +49,7 @@ var (
 		"enter: open",
 		"f: favorite",
 		"d: delete",
-		"o: open mpv",
+		"o: open externally",
 		"h at left: focus tree",
 		"ctrl k: search",
 		"ctrl +/-: zoom",

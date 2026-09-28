@@ -556,10 +556,7 @@ func handleViewerKey(ke key.Event, viewer *Viewer, grid *Grid, ctrl *Controller,
 		w.Invalidate()
 	case "O", "o":
 		if viewer.Index >= 0 && viewer.Index < len(viewer.entries) {
-			e := viewer.entries[viewer.Index]
-			if e.Type == scan.TypeVideo {
-				go runDetached(exec.Command("mpv", "--loop", e.Path))
-			}
+			openExternally(viewer.entries[viewer.Index : viewer.Index+1])
 		}
 	case "F":
 		if viewer.Index >= 0 && viewer.Index < len(viewer.entries) {
@@ -716,30 +713,7 @@ func handleGridKey(ke key.Event, grid *Grid, _ *Sidebar, sidebarFocus *bool, vie
 					selected = append(selected, e)
 				}
 			}
-			if len(selected) > 0 {
-				allVideos := true
-				var paths []string
-				for _, e := range selected {
-					paths = append(paths, e.Path)
-					if e.Type != scan.TypeVideo {
-						allVideos = false
-					}
-				}
-
-				if allVideos {
-					var args []string
-					if len(paths) > 1 {
-						args = append([]string{"--loop-playlist=inf"}, paths...)
-					} else {
-						args = []string{"--loop", paths[0]}
-					}
-					go runDetached(exec.Command("mpv", args...))
-				} else {
-					for _, p := range paths {
-						go runDetached(exec.Command("xdg-open", p))
-					}
-				}
-			}
+			openExternally(selected)
 			ctrl.ClearSelection()
 			w.Invalidate()
 			return
@@ -821,27 +795,10 @@ func handleGridKey(ke key.Event, grid *Grid, _ *Sidebar, sidebarFocus *bool, vie
 			}
 
 			if len(selected) > 0 {
-				allVideos := true
-				var paths []string
-				for _, e := range selected {
-					paths = append(paths, e.Path)
-					if e.Type != scan.TypeVideo {
-						allVideos = false
-					}
-				}
-
-				if allVideos {
-					var args []string
-					if len(paths) > 1 {
-						args = append([]string{"--loop-playlist=inf"}, paths...)
-					} else {
-						args = []string{"--loop", paths[0]}
-					}
-					go runDetached(exec.Command("mpv", args...))
-					if ctrl.SelectionMode {
-						ctrl.ClearSelection()
-						w.Invalidate()
-					}
+				openExternally(selected)
+				if ctrl.SelectionMode {
+					ctrl.ClearSelection()
+					w.Invalidate()
 				}
 			}
 		}
@@ -1257,6 +1214,42 @@ func exportFavoritesViaPicker(ctrl *Controller, invalidate func()) {
 	ctrl.ExportFavorites(ExportFavoritesOptions{Dst: dst}, nil)
 	if invalidate != nil {
 		invalidate()
+	}
+}
+
+// externalOpenCmds builds the external-viewer commands for entries: one mpv
+// looping over them when they are all videos, otherwise one xdg-open per file
+// (the desktop's default app, which also handles mixed selections).
+func externalOpenCmds(entries []cache.Entry) []*exec.Cmd {
+	if len(entries) == 0 {
+		return nil
+	}
+	paths := make([]string, len(entries))
+	allVideos := true
+	for i, e := range entries {
+		paths[i] = e.Path
+		if e.Type != scan.TypeVideo {
+			allVideos = false
+		}
+	}
+	if allVideos {
+		args := []string{"--loop", paths[0]}
+		if len(paths) > 1 {
+			args = append([]string{"--loop-playlist=inf"}, paths...)
+		}
+		return []*exec.Cmd{exec.Command("mpv", args...)}
+	}
+	cmds := make([]*exec.Cmd, len(paths))
+	for i, p := range paths {
+		cmds[i] = exec.Command("xdg-open", p)
+	}
+	return cmds
+}
+
+// openExternally launches externalOpenCmds(entries) in the background.
+func openExternally(entries []cache.Entry) {
+	for _, cmd := range externalOpenCmds(entries) {
+		go runDetached(cmd)
 	}
 }
 
