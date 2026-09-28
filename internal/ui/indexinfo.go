@@ -72,6 +72,7 @@ func (v *IndexInfoView) Layout(gtx layout.Context, th *Theme) layout.Dimensions 
 			v.row(th, "Ended", fmtTime(st.EndedAt)),
 			v.row(th, "Elapsed", elapsedString(st)),
 			v.row(th, "Reconciled this run", fmt.Sprintf("%d", st.Batched)),
+			v.row(th, "Thumbnail warm-up", warmUpString(st.WarmUp)),
 			v.row(th, "Last error", fallback(st.LastError, "—")),
 			layout.Rigid(layout.Spacer{Height: unit.Dp(16)}.Layout),
 			layout.Rigid(material.Button(th.Theme, &v.closeBtn, "Close (esc)").Layout),
@@ -120,6 +121,19 @@ func elapsedString(s IndexStatus) string {
 	}
 	d := end.Sub(s.StartedAt).Round(time.Millisecond)
 	return d.String()
+}
+
+// warmUpString summarises the thumbnail warm-up pass on one line, e.g.
+// "Running — 150 / 4000 (since 10:02:11)".
+func warmUpString(w WarmUpStatus) string {
+	switch {
+	case w.Active:
+		return fmt.Sprintf("Running — %d / %d (since %s)", w.Done, w.Total, fmtTime(w.StartedAt))
+	case !w.EndedAt.IsZero():
+		return fmt.Sprintf("Last run ended %s — %d / %d", fmtTime(w.EndedAt), w.Done, w.Total)
+	default:
+		return "—"
+	}
 }
 
 func fmtTime(t time.Time) string {

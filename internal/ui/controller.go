@@ -84,6 +84,13 @@ type Controller struct {
 	// background goroutine can tell whether warmUpCancel still references
 	// its own context when it exits.
 	warmUpGen int
+	// Warm-up progress, exposed via IndexStatus.WarmUp. Kept apart from the
+	// scan* fields below: a warm-up usually runs alongside directory scans,
+	// and sharing the fields made each overwrite the other's status.
+	warmUpStartedAt time.Time
+	warmUpEndedAt   time.Time
+	warmUpDone      int
+	warmUpTotal     int
 
 	// Indexing status, exposed via IndexStatus for the info modal.
 	scanTarget    string
@@ -339,6 +346,8 @@ func (c *Controller) CancelScan() {
 }
 
 // IndexStatus is a snapshot of the indexing pipeline state for the info modal.
+// Active/Target/StartedAt/EndedAt/Batched describe directory scans only; the
+// thumbnail warm-up, which runs independently, is reported in WarmUp.
 type IndexStatus struct {
 	LibraryRoot string
 	CacheDir    string
@@ -350,6 +359,16 @@ type IndexStatus struct {
 	Batched     int
 	TotalRows   int
 	LastError   string
+	WarmUp      WarmUpStatus
+}
+
+// WarmUpStatus is the current/last thumbnail warm-up pass.
+type WarmUpStatus struct {
+	Active    bool
+	StartedAt time.Time
+	EndedAt   time.Time
+	Done      int // entries checked so far
+	Total     int // entries in the index when the pass started
 }
 
 // IndexStatus returns a snapshot of the current/last indexing run plus
@@ -366,6 +385,13 @@ func (c *Controller) IndexStatus() IndexStatus {
 		EndedAt:     c.scanEndedAt,
 		Batched:     c.scanBatched,
 		LastError:   c.scanLastErr,
+		WarmUp: WarmUpStatus{
+			Active:    c.warmUpRunning,
+			StartedAt: c.warmUpStartedAt,
+			EndedAt:   c.warmUpEndedAt,
+			Done:      c.warmUpDone,
+			Total:     c.warmUpTotal,
+		},
 	}
 	idx := c.index
 	c.mu.Unlock()
@@ -1446,11 +1472,10 @@ func (c *Controller) WarmUp() {
 	c.warmUpGen++
 	myGen := c.warmUpGen
 	c.warmUpRunning = true
-	c.scanning++
-	c.scanTarget = "Thumbnail Warm-up"
-	c.scanStartedAt = time.Now()
-	c.scanEndedAt = time.Time{}
-	c.scanBatched = 0
+	c.warmUpStartedAt = time.Now()
+	c.warmUpEndedAt = time.Time{}
+	c.warmUpDone = 0
+	c.warmUpTotal = 0
 	c.mu.Unlock()
 	if c.invalidate != nil {
 		c.invalidate()
@@ -1464,12 +1489,13 @@ func (c *Controller) WarmUp() {
 			proc.SetStatus("Generating thumbnails…")
 		}
 		defer func() {
+			// A superseded pass (another WarmUp started since) leaves the
+			// status alone: it now belongs to the newer pass.
 			c.mu.Lock()
-			c.scanning--
-			c.scanEndedAt = time.Now()
 			if c.warmUpGen == myGen {
 				c.warmUpRunning = false
 				c.warmUpCancel = nil
+				c.warmUpEndedAt = time.Now()
 			}
 			c.mu.Unlock()
 			if proc != nil {
@@ -1484,6 +1510,11 @@ func (c *Controller) WarmUp() {
 		if proc != nil {
 			proc.SetTotal(int64(total))
 		}
+		c.mu.Lock()
+		if c.warmUpGen == myGen {
+			c.warmUpTotal = total
+		}
+		c.mu.Unlock()
 
 		// Fan out across a worker pool. store.Path is internally bounded by
 		// the CPU/external decode semaphores, but driving it from a single
@@ -1506,7 +1537,9 @@ func (c *Controller) WarmUp() {
 			}
 			if n%50 == 0 || n == int64(total) {
 				c.mu.Lock()
-				c.scanBatched = int(n)
+				if c.warmUpGen == myGen {
+					c.warmUpDone = int(n)
+				}
 				c.mu.Unlock()
 			}
 			if c.invalidate != nil {
