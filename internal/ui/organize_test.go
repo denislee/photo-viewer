@@ -2,6 +2,7 @@ package ui
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -189,5 +190,52 @@ func TestOrganizeCollisionNeverOverwrites(t *testing.T) {
 	}
 	if got, _ := os.ReadFile(occupant); string(got) != "occupant" {
 		t.Errorf("occupant clobbered: %q", got)
+	}
+}
+
+// TestOrganizeReportsFailures is the U-20 regression: a pass with failed moves
+// or index updates used to end on a plain "Organization complete.", hiding the
+// failures in the log. The final status now counts them.
+func TestOrganizeReportsFailures(t *testing.T) {
+	root := t.TempDir()
+	want := time.Date(2024, 3, 5, 0, 0, 0, 0, time.Local)
+	wrongDir := filepath.Join(root, "2023-01-01")
+	if err := os.MkdirAll(wrongDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	ok := filepath.Join(wrongDir, "ok.mov")
+	if err := os.WriteFile(ok, []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gone := filepath.Join(wrongDir, "gone.mov") // never created: the move fails
+
+	v := &OrganizeView{
+		mismatched: []MismatchedVideo{
+			{Entry: cache.Entry{Path: gone, Type: scan.TypeVideo}, ExpectedDate: want},
+			{Entry: cache.Entry{Path: ok, Type: scan.TypeVideo}, ExpectedDate: want},
+		},
+		applyMove: func(oldPath, newPath string) error { return errors.New("index busy") },
+	}
+	v.startOrganize(root)
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		v.mu.Lock()
+		running, status := v.running, v.statusMsg
+		v.mu.Unlock()
+		if !running {
+			const wantStatus = "Organization finished. Moved 1 • 1 error(s) • 1 warning(s) — see log."
+			if status != wantStatus {
+				t.Errorf("status = %q, want %q", status, wantStatus)
+			}
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("organize did not finish")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	if got := organizeSummary(3, 0, 0); got != "Organization complete. Moved 3." {
+		t.Errorf("clean summary = %q", got)
 	}
 }

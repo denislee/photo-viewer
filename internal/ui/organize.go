@@ -302,6 +302,7 @@ func (v *OrganizeView) startOrganize(root string) {
 			v.mu.Unlock()
 		}
 		movedAny := false
+		var moved, errs, warns int
 		defer func() {
 			v.mu.Lock()
 			v.running = false
@@ -339,6 +340,7 @@ func (v *OrganizeView) startOrganize(root string) {
 
 			if err := os.MkdirAll(destDir, 0755); err != nil {
 				v.appendLog(fmt.Sprintf("[ERROR] mkdir %s: %v", destDir, err))
+				errs++
 				v.bumpProgress()
 				continue
 			}
@@ -355,6 +357,7 @@ func (v *OrganizeView) startOrganize(root string) {
 			})
 			if err != nil {
 				v.appendLog(fmt.Sprintf("[ERROR] Move %s: %v", baseName, err))
+				errs++
 			} else {
 				// Relocate the index row + thumbnail so the grid resolves the
 				// entry at its new path instead of showing a broken row and
@@ -362,8 +365,10 @@ func (v *OrganizeView) startOrganize(root string) {
 				if v.applyMove != nil {
 					if err := v.applyMove(m.Entry.Path, dest); err != nil {
 						v.appendLog(fmt.Sprintf("[WARN] Index update after moving %s: %v", baseName, err))
+						warns++
 					}
 				}
+				moved++
 				movedAny = true
 				v.appendLog(fmt.Sprintf("[OK] Moved %s -> %s", baseName, dateFolder))
 			}
@@ -374,11 +379,27 @@ func (v *OrganizeView) startOrganize(root string) {
 		// Preserve the "Cancelled." status set above; only declare completion
 		// when the pass ran to the end.
 		if ctx.Err() == nil {
-			v.statusMsg = "Organization complete."
+			v.statusMsg = organizeSummary(moved, errs, warns)
 		}
 		v.mismatched = nil
 		v.mu.Unlock()
 	}()
+}
+
+// organizeSummary is the status line for a move pass that ran to the end.
+// Failures are logged per file; the summary makes sure they aren't hidden
+// behind a plain "complete".
+func organizeSummary(moved, errs, warns int) string {
+	switch {
+	case errs == 0 && warns == 0:
+		return fmt.Sprintf("Organization complete. Moved %d.", moved)
+	case warns == 0:
+		return fmt.Sprintf("Organization finished. Moved %d • %d error(s) — see log.", moved, errs)
+	case errs == 0:
+		return fmt.Sprintf("Organization finished. Moved %d • %d warning(s) — see log.", moved, warns)
+	default:
+		return fmt.Sprintf("Organization finished. Moved %d • %d error(s) • %d warning(s) — see log.", moved, errs, warns)
+	}
 }
 
 // scheduleInvalidate wakes the Gio frame loop through the process registry's
