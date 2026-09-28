@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -380,4 +381,77 @@ func TestRecompressFileHEICReencodesNotPlainCopy(t *testing.T) {
 		t.Fatalf("recompressFile reported HEIC unhandled (plain-copy) despite a decoder being present")
 	}
 	assertJPEGWithin(t, dst, 256)
+}
+
+// TestPublishTemp pins the S-22 publish step shared by the ffmpeg export
+// paths: success moves the temp to dst; any failure leaves no temp behind.
+func TestPublishTemp(t *testing.T) {
+	dir := t.TempDir()
+	tmp := filepath.Join(dir, "out.mp4.tmp.mp4")
+	dst := filepath.Join(dir, "out.mp4")
+	writeFile(t, tmp, "encoded")
+	if err := publishTemp(tmp, dst); err != nil {
+		t.Fatalf("publishTemp: %v", err)
+	}
+	if got, _ := os.ReadFile(dst); string(got) != "encoded" {
+		t.Errorf("dst = %q, want encoded", got)
+	}
+	if _, err := os.Stat(tmp); !os.IsNotExist(err) {
+		t.Errorf("temp left behind: %v", err)
+	}
+
+	// Rename onto a directory fails: the temp must be cleaned up.
+	writeFile(t, tmp, "encoded again")
+	if err := publishTemp(tmp, dir); err == nil {
+		t.Fatal("publishTemp onto a directory: want error")
+	}
+	if _, err := os.Stat(tmp); !os.IsNotExist(err) {
+		t.Errorf("temp left behind after failed publish: %v", err)
+	}
+}
+
+// TestRecompressVideo round-trips a tiny clip through the ffmpeg transcode:
+// output fits maxEdge, carries the source mtime, and leaves no temp. Gated
+// on an ffmpeg build with libx264 (the export's video encoder).
+func TestRecompressVideo(t *testing.T) {
+	if !haveFfmpeg() {
+		t.Skip("ffmpeg not installed")
+	}
+	if out, err := exec.Command("ffmpeg", "-hide_banner", "-encoders").Output(); err != nil || !strings.Contains(string(out), "libx264") {
+		t.Skip("ffmpeg lacks libx264")
+	}
+	dir := t.TempDir()
+	src := filepath.Join(dir, "clip.mov")
+	gen := exec.Command("ffmpeg", "-loglevel", "error", "-f", "lavfi", "-i", "testsrc=size=320x240:rate=10",
+		"-f", "lavfi", "-i", "sine=frequency=440", "-t", "1", "-c:v", "mpeg4", "-c:a", "aac", src)
+	if out, err := gen.CombinedOutput(); err != nil {
+		t.Skipf("cannot synthesize fixture: %v: %s", err, out)
+	}
+	want := time.Date(2019, 7, 4, 9, 0, 0, 0, time.UTC)
+	if err := os.Chtimes(src, want, want); err != nil {
+		t.Fatal(err)
+	}
+
+	dst := filepath.Join(dir, "clip.mp4")
+	if err := recompressVideo(context.Background(), src, dst, 160, 30); err != nil {
+		t.Fatalf("recompressVideo: %v", err)
+	}
+	if _, err := os.Stat(dst + ".tmp.mp4"); !os.IsNotExist(err) {
+		t.Errorf("temp left behind: %v", err)
+	}
+	info, err := os.Stat(dst)
+	if err != nil {
+		t.Fatalf("stat dst: %v", err)
+	}
+	if !info.ModTime().Equal(want) {
+		t.Errorf("mtime = %v, want %v", info.ModTime(), want)
+	}
+	probe, err := exec.Command("ffprobe", "-v", "error", "-select_streams", "v:0",
+		"-show_entries", "stream=width,height", "-of", "csv=p=0", dst).Output()
+	if err != nil {
+		t.Skipf("ffprobe unavailable: %v", err)
+	}
+	if got := strings.TrimSpace(string(probe)); got != "160,120" {
+		t.Errorf("output dims = %s, want 160,120", got)
+	}
 }

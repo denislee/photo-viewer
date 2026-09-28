@@ -225,7 +225,7 @@ func recompressHEIC(ctx context.Context, src, dst string, maxEdge, quality int) 
 // ffmpeg auto-applies the HEIF container rotation (the same autorotate the
 // thumb path relies on), so the output is upright with no orientation tag,
 // matching recompressImage's baked-in-orientation contract. The write is
-// atomic (temp + rename), like recompressVideo.
+// atomic and durable (temp + fsync + rename), like recompressVideo.
 func recompressHEICViaFfmpeg(ctx context.Context, src, dst string, maxEdge, quality int) error {
 	tmp := dst + ".tmp.jpg"
 	args := []string{
@@ -244,15 +244,36 @@ func recompressHEICViaFfmpeg(ctx context.Context, src, dst string, maxEdge, qual
 		os.Remove(tmp)
 		return fmt.Errorf("ffmpeg: %v: %s", err, strings.TrimSpace(string(out)))
 	}
-	if _, err := os.Stat(tmp); err != nil {
+	return publishTemp(tmp, dst)
+}
+
+// publishTemp makes an ffmpeg-written temp durable and moves it into place. The
+// child process's write leaves the bytes only in the page cache; fsync before
+// the rename so a yanked USB drive or power loss can't leave a truncated file
+// at dst after the export reported success — the guarantee recompressImage
+// gives its in-process encode (S-22). The temp is removed on any failure.
+func publishTemp(tmp, dst string) error {
+	err := syncFile(tmp)
+	if err == nil {
+		err = os.Rename(tmp, dst)
+	}
+	if err != nil {
 		os.Remove(tmp)
+	}
+	return err
+}
+
+// syncFile fsyncs the file at p.
+func syncFile(p string) error {
+	f, err := os.Open(p)
+	if err != nil {
 		return err
 	}
-	if err := os.Rename(tmp, dst); err != nil {
-		os.Remove(tmp)
+	if err := f.Sync(); err != nil {
+		f.Close()
 		return err
 	}
-	return nil
+	return f.Close()
 }
 
 // heicScaleFilter builds the ffmpeg `-vf` scale expression that fits the long
@@ -312,7 +333,7 @@ func recompressVideo(ctx context.Context, src, dst string, maxEdge, crf int) err
 		os.Remove(tmp)
 		return fmt.Errorf("ffmpeg: %v: %s", err, strings.TrimSpace(string(out)))
 	}
-	if err := os.Rename(tmp, dst); err != nil {
+	if err := publishTemp(tmp, dst); err != nil {
 		return err
 	}
 	// Preserve the source's mtime so the transcoded clip sorts by capture time,
