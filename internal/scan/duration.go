@@ -16,25 +16,10 @@ import (
 // cancelled.
 const probeTimeout = 10 * time.Second
 
-// ffprobeOnce caches whether ffprobe is available on PATH. We probe a lot of
+// haveFFprobe caches whether ffprobe is available on PATH. We probe a lot of
 // files per scan, so a per-call exec.LookPath would dominate when the binary
 // is missing.
-var (
-	ffprobeChecked bool
-	ffprobeOK      bool
-	ffprobeMu      sync.Mutex
-)
-
-func haveFFprobe() bool {
-	ffprobeMu.Lock()
-	defer ffprobeMu.Unlock()
-	if !ffprobeChecked {
-		_, err := exec.LookPath("ffprobe")
-		ffprobeOK = err == nil
-		ffprobeChecked = true
-	}
-	return ffprobeOK
-}
+var haveFFprobe = sync.OnceValue(func() bool { _, err := exec.LookPath("ffprobe"); return err == nil })
 
 // probeVideoDurationMs returns the playback length of path in milliseconds,
 // or 0 if ffprobe is missing or fails. Stream-level duration is preferred
