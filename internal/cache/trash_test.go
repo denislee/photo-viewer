@@ -165,7 +165,7 @@ func TestRestoreFromTrashRoundTrip(t *testing.T) {
 	}
 }
 
-// TestRestoreFromTrashCollision drives the uniqueRestorePath loop through the
+// TestRestoreFromTrashCollision drives the restore-name claim loop through the
 // public API: when the original location is re-occupied before a restore, the
 // file comes back under a "(restored)" name instead of clobbering the occupant.
 func TestRestoreFromTrashCollision(t *testing.T) {
@@ -200,34 +200,44 @@ func TestRestoreFromTrashCollision(t *testing.T) {
 	}
 }
 
-// TestUniqueRestorePath unit-tests the collision loop directly: the first free
-// name is returned unchanged, and each successive occupied name adds the next
-// "(restored N)" suffix before the extension.
-func TestTrashUniqueRestorePath(t *testing.T) {
-	dir := t.TempDir()
-	target := filepath.Join(dir, "clip.mov")
-
-	// Nothing there yet -> target as-is.
-	if got := uniqueRestorePath(target); got != target {
-		t.Errorf("uniqueRestorePath on free name = %q, want %q", got, target)
+// TestTrashRestoreCandidate pins the restore naming sequence: the original
+// name first, then "(restored)", "(restored 2)", … before the extension.
+func TestTrashRestoreCandidate(t *testing.T) {
+	target := filepath.Join("/lib", "clip.mov")
+	for n, want := range []string{"clip.mov", "clip (restored).mov", "clip (restored 2).mov", "clip (restored 3).mov"} {
+		if got := restoreCandidate(target, n); got != filepath.Join("/lib", want) {
+			t.Errorf("restoreCandidate(%d) = %q, want %q", n, got, want)
+		}
 	}
+}
 
-	writeMedia(t, target, "a")
-	want1 := filepath.Join(dir, "clip (restored).mov")
-	if got := uniqueRestorePath(target); got != want1 {
-		t.Errorf("first collision = %q, want %q", got, want1)
+// TestRestoreFromTrashSkipsTakenRestoreNames covers the C-16 path end to end:
+// with both the original name and "(restored)" occupied, the file lands on
+// "(restored 2)" and neither occupant is touched.
+func TestRestoreFromTrashSkipsTakenRestoreNames(t *testing.T) {
+	tmp := t.TempDir()
+	root := filepath.Join(tmp, "lib")
+	orig := filepath.Join(root, "clip.mov")
+	writeMedia(t, orig, "trashed")
+	dst, err := MoveToTrash(orig, filepath.Join(tmp, ".photo-viewer-trash"))
+	if err != nil {
+		t.Fatalf("MoveToTrash: %v", err)
 	}
+	writeMedia(t, orig, "occupant")
+	restored1 := filepath.Join(root, "clip (restored).mov")
+	writeMedia(t, restored1, "earlier restore")
 
-	writeMedia(t, want1, "b")
-	want2 := filepath.Join(dir, "clip (restored 2).mov")
-	if got := uniqueRestorePath(target); got != want2 {
-		t.Errorf("second collision = %q, want %q", got, want2)
+	restored, err := RestoreFromTrash(dst, nil)
+	if err != nil {
+		t.Fatalf("RestoreFromTrash: %v", err)
 	}
-
-	writeMedia(t, want2, "c")
-	want3 := filepath.Join(dir, "clip (restored 3).mov")
-	if got := uniqueRestorePath(target); got != want3 {
-		t.Errorf("third collision = %q, want %q", got, want3)
+	if want := filepath.Join(root, "clip (restored 2).mov"); restored != want {
+		t.Errorf("restored path = %q, want %q", restored, want)
+	}
+	for p, want := range map[string]string{restored: "trashed", orig: "occupant", restored1: "earlier restore"} {
+		if got := readFile(t, p); got != want {
+			t.Errorf("%s = %q, want %q", filepath.Base(p), got, want)
+		}
 	}
 }
 

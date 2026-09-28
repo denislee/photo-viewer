@@ -13,7 +13,7 @@ import (
 // cache.MoveToTrash (the exact path the delete flow uses, sidecar and all), and
 // returns the resulting trash paths alongside their original locations. Because
 // the move empties the source, a later restore puts each file back at its exact
-// original path (uniqueRestorePath never has to disambiguate).
+// original path (no "(restored)" suffix is needed).
 func seedTrashFixture(t *testing.T, root, trashDir string, n int) (trashPaths, origPaths []string) {
 	t.Helper()
 	if err := os.MkdirAll(root, 0o755); err != nil {

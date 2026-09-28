@@ -415,3 +415,114 @@ func TestProcessBatchNeverDeletesAlreadyFiled(t *testing.T) {
 		}
 	})
 }
+
+// TestProcessBatchCollisionNeverOverwrites is the U-18 regression: when the
+// destination name is taken by different content, the file must land on the
+// next free _N name — the old fallback renamed onto an unchecked
+// UnixNano-suffixed name — and no existing file may be touched.
+func TestProcessBatchCollisionNeverOverwrites(t *testing.T) {
+	when := time.Date(2024, 3, 5, 12, 0, 0, 0, time.Local)
+	outbox := t.TempDir()
+	dateDir := filepath.Join(outbox, when.Format("2006-01-02"))
+	if err := os.MkdirAll(dateDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	occupants := map[string]string{"IMG_0001.jpg": "first", "IMG_0001_1.jpg": "second"}
+	for name, content := range occupants {
+		if err := os.WriteFile(filepath.Join(dateDir, name), []byte(content), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	src := filepath.Join(t.TempDir(), "IMG_0001.jpg")
+	if err := os.WriteFile(src, []byte("third, different"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chtimes(src, when, when); err != nil {
+		t.Fatal(err)
+	}
+
+	v := &ImportView{}
+	v.processBatch(context.Background(), outbox, []string{src})
+
+	if m := atomic.LoadInt64(&v.statMoved); m != 1 {
+		t.Fatalf("statMoved = %d, want 1 (errors=%d)", m, atomic.LoadInt64(&v.statErrors))
+	}
+	for name, want := range occupants {
+		if got, _ := os.ReadFile(filepath.Join(dateDir, name)); string(got) != want {
+			t.Errorf("%s = %q, want %q (clobbered)", name, got, want)
+		}
+	}
+	if got, err := os.ReadFile(filepath.Join(dateDir, "IMG_0001_2.jpg")); err != nil || string(got) != "third, different" {
+		t.Errorf("IMG_0001_2.jpg = %q, %v; want the imported file", got, err)
+	}
+	if _, err := os.Stat(src); !os.IsNotExist(err) {
+		t.Errorf("source should be moved away, stat err = %v", err)
+	}
+}
+
+// TestCopyFileNoReplace: the durable copy used for cross-device filing must
+// refuse to publish over an existing file and must not leave its temp behind.
+func TestCopyFileNoReplace(t *testing.T) {
+	dir := t.TempDir()
+	src := filepath.Join(dir, "src.jpg")
+	dst := filepath.Join(dir, "dst.jpg")
+	if err := os.WriteFile(src, []byte("new"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(dst, []byte("occupant"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := copyFileNoReplace(src, dst); !errors.Is(err, os.ErrExist) {
+		t.Fatalf("copy onto existing file: err = %v, want os.ErrExist", err)
+	}
+	if got, _ := os.ReadFile(dst); string(got) != "occupant" {
+		t.Errorf("occupant clobbered: %q", got)
+	}
+	if _, err := os.Stat(dst + ".tmp"); !os.IsNotExist(err) {
+		t.Errorf("temp left behind: %v", err)
+	}
+}
+
+// TestFileIntoCrossDevice drives fileInto's EXDEV branch for real by moving
+// from /dev/shm to a TempDir on a different filesystem: the file must land on
+// the next free name via the durable copy, the occupant must be untouched, and
+// the source must be removed only after that.
+func TestFileIntoCrossDevice(t *testing.T) {
+	destDir := t.TempDir()
+	srcDir, err := os.MkdirTemp("/dev/shm", "pv-fileinto-")
+	if err != nil {
+		t.Skipf("no /dev/shm: %v", err)
+	}
+	t.Cleanup(func() { os.RemoveAll(srcDir) })
+	if sameDevice(srcDir, destDir) {
+		t.Skip("/dev/shm and TempDir share a filesystem; EXDEV path not reachable")
+	}
+
+	if err := os.WriteFile(filepath.Join(destDir, "clip.mov"), []byte("occupant"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	src := filepath.Join(srcDir, "clip.mov")
+	if err := os.WriteFile(src, []byte("from the card"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	dest, err := fileInto(src, destDir, "clip.mov")
+	if err != nil {
+		t.Fatalf("fileInto: %v", err)
+	}
+	if want := filepath.Join(destDir, "clip_1.mov"); dest != want {
+		t.Errorf("dest = %q, want %q", dest, want)
+	}
+	if got, _ := os.ReadFile(dest); string(got) != "from the card" {
+		t.Errorf("dest content = %q", got)
+	}
+	if got, _ := os.ReadFile(filepath.Join(destDir, "clip.mov")); string(got) != "occupant" {
+		t.Errorf("occupant clobbered: %q", got)
+	}
+	if _, err := os.Stat(src); !os.IsNotExist(err) {
+		t.Errorf("source should be removed after a durable copy, stat err = %v", err)
+	}
+	if matches, _ := filepath.Glob(filepath.Join(destDir, "*.tmp")); len(matches) > 0 {
+		t.Errorf("temp files left behind: %v", matches)
+	}
+}

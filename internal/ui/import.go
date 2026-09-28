@@ -27,6 +27,7 @@ import (
 	"gioui.org/widget"
 	"gioui.org/widget/material"
 
+	"github.com/dns/photo-viewer/internal/fsutil"
 	"github.com/dns/photo-viewer/internal/scan"
 )
 
@@ -1292,27 +1293,8 @@ func (v *ImportView) processBatch(ctx context.Context, outboxDir string, entries
 				v.bumpProgress()
 				continue
 			}
-			ext := filepath.Ext(baseName)
-			dest = filepath.Join(destDir, fmt.Sprintf("%s_%d%s", base, time.Now().UnixNano(), ext))
 		}
-		moveErr := os.Rename(src, dest)
-		if moveErr != nil && errors.Is(moveErr, syscall.EXDEV) {
-			// os.Rename can't cross filesystems (EXDEV): when the inbox and
-			// outbox live on different mounts, every move would otherwise
-			// fail and the files would stay stuck in the inbox. Fall back to
-			// a crash-safe copy + remove so they still land in the library.
-			// Gate strictly on EXDEV so genuine errors (permission denied,
-			// disk full) still surface as failures instead of silent copies.
-			if moveErr = copyFile(src, dest); moveErr == nil {
-				// Fsync the destination directory so the copy's directory entry
-				// is durable before we unlink the source — otherwise a power
-				// loss could lose the entry even though copyFile synced the
-				// data, leaving zero copies of the file.
-				if moveErr = syncDir(filepath.Dir(dest)); moveErr == nil {
-					moveErr = os.Remove(src)
-				}
-			}
-		}
+		dest, moveErr := fileInto(src, destDir, baseName)
 		if moveErr != nil {
 			atomic.AddInt64(&v.statErrors, 1)
 			v.appendLog("[ERROR] Could not move " + baseName + ": " + moveErr.Error())
@@ -1403,6 +1385,46 @@ func (v *ImportView) bumpProgress() {
 
 // File helpers (mirrored from internal/ui/import.go).
 
+// fileInto moves src into destDir as baseName, or baseName_N when that name is
+// taken, never replacing an existing file (U-18): the old collision fallback
+// picked a UnixNano-suffixed name and os.Rename'd onto it unchecked. Returns the
+// path the file now lives at.
+//
+// os.Rename can't cross filesystems (EXDEV): when the inbox and outbox live on
+// different mounts, every move would otherwise fail and the files would stay
+// stuck in the inbox. Fall back to a crash-safe copy that claims its name the
+// same no-replace way, then remove the source. Gate strictly on EXDEV so genuine
+// errors (permission denied, disk full) still surface as failures instead of
+// silent copies.
+func fileInto(src, destDir, baseName string) (string, error) {
+	for n := 0; n <= fsutil.MaxCollisionSuffix; n++ {
+		dest := fsutil.SuffixName(destDir, baseName, n)
+		// Cheap skip of names already taken, so a cross-device collision
+		// doesn't copy the whole file only to be refused at the final rename.
+		// The no-replace rename below is what actually guarantees safety.
+		if _, err := os.Lstat(dest); err == nil {
+			continue
+		}
+		err := fsutil.RenameNoReplace(src, dest)
+		if errors.Is(err, syscall.EXDEV) {
+			if err = copyFileNoReplace(src, dest); err == nil {
+				// Fsync the destination directory so the copy's directory entry
+				// is durable before we unlink the source — otherwise a power
+				// loss could lose the entry even though the copy synced the
+				// data, leaving zero copies of the file.
+				if err = syncDir(destDir); err == nil {
+					err = os.Remove(src)
+				}
+				return dest, err
+			}
+		}
+		if !errors.Is(err, fs.ErrExist) {
+			return dest, err
+		}
+	}
+	return "", fmt.Errorf("no free name for %s in %s after %d attempts", baseName, destDir, fsutil.MaxCollisionSuffix)
+}
+
 func uniqueInboxPath(dir, base string) string {
 	p := filepath.Join(dir, base)
 	if _, err := os.Stat(p); os.IsNotExist(err) {
@@ -1452,6 +1474,17 @@ func copyFile(src, dst string) error {
 	return writeFileDurable(dst, in)
 }
 
+// copyFileNoReplace is copyFile, except the final publish fails with
+// fs.ErrExist instead of replacing a file already at dst.
+func copyFileNoReplace(src, dst string) error {
+	in, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer in.Close()
+	return writeDurable(dst, in, fsutil.RenameNoReplace)
+}
+
 // syncDir fsyncs a directory so a rename/create within it is itself durable.
 // copyFile/writeFileDurable fsync the file's *data* before the rename, but the
 // rename only adds a directory entry — on a crash that entry can still be lost
@@ -1480,6 +1513,13 @@ func syncDir(dir string) error {
 // only in the page cache. (dst's .tmp is a real *os.File, so plain io.Copy keeps
 // the kernel copy_file_range/sendfile fast path — no pooled buffer needed.)
 func writeFileDurable(dst string, r io.Reader) error {
+	return writeDurable(dst, r, os.Rename)
+}
+
+// writeDurable is writeFileDurable with the final publish step (tmp → dst)
+// supplied by the caller: os.Rename, or fsutil.RenameNoReplace when an
+// existing dst must never be replaced.
+func writeDurable(dst string, r io.Reader, publish func(tmp, dst string) error) error {
 	tmp := dst + ".tmp"
 	out, err := os.Create(tmp)
 	if err != nil {
@@ -1504,7 +1544,11 @@ func writeFileDurable(dst string, r io.Reader) error {
 	}
 	// Rename is atomic within a filesystem: dst either doesn't exist or is the
 	// fully-written, fsynced file — never a half-copy.
-	return os.Rename(tmp, dst)
+	if err := publish(tmp, dst); err != nil {
+		os.Remove(tmp)
+		return err
+	}
+	return nil
 }
 
 // sameContent reports whether two files hold identical bytes. It short-circuits

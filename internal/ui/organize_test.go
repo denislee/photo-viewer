@@ -2,6 +2,7 @@ package ui
 
 import (
 	"context"
+	"os"
 	"path/filepath"
 	"strconv"
 	"sync/atomic"
@@ -130,5 +131,63 @@ func TestOrganizeAppendLogCapsBuffer(t *testing.T) {
 	}
 	if last, want := v.log.pending[len(v.log.pending)-1], "line "+strconv.Itoa(n-1); last != want {
 		t.Errorf("newest line = %q, want %q", last, want)
+	}
+}
+
+// TestOrganizeCollisionNeverOverwrites is the U-18 guard for the Organize
+// move: a video whose target date folder already holds a same-named file lands
+// on the next free _N name, the occupant stays intact, and applyMove is told
+// the name actually used.
+func TestOrganizeCollisionNeverOverwrites(t *testing.T) {
+	root := t.TempDir()
+	want := time.Date(2024, 3, 5, 0, 0, 0, 0, time.Local)
+	wrongDir := filepath.Join(root, "2023-01-01")
+	rightDir := filepath.Join(root, want.Format("2006-01-02"))
+	for _, d := range []string{wrongDir, rightDir} {
+		if err := os.MkdirAll(d, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	occupant := filepath.Join(rightDir, "clip.mov")
+	if err := os.WriteFile(occupant, []byte("occupant"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	src := filepath.Join(wrongDir, "clip.mov")
+	if err := os.WriteFile(src, []byte("misfiled"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	var movedTo atomic.Value
+	v := &OrganizeView{
+		mismatched: []MismatchedVideo{{Entry: cache.Entry{Path: src, Type: scan.TypeVideo}, ExpectedDate: want}},
+		applyMove: func(oldPath, newPath string) error {
+			movedTo.Store(newPath)
+			return nil
+		},
+	}
+	v.startOrganize(root)
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		v.mu.Lock()
+		running := v.running
+		v.mu.Unlock()
+		if !running {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("organize did not finish")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	dest := filepath.Join(rightDir, "clip_1.mov")
+	if got, _ := movedTo.Load().(string); got != dest {
+		t.Errorf("applyMove newPath = %q, want %q", got, dest)
+	}
+	if got, _ := os.ReadFile(dest); string(got) != "misfiled" {
+		t.Errorf("moved file content = %q", got)
+	}
+	if got, _ := os.ReadFile(occupant); string(got) != "occupant" {
+		t.Errorf("occupant clobbered: %q", got)
 	}
 }

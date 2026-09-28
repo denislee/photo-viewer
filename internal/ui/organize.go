@@ -7,7 +7,6 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
-	"strings"
 	"sync"
 	"time"
 
@@ -19,6 +18,7 @@ import (
 	"gioui.org/widget/material"
 
 	"github.com/dns/photo-viewer/internal/cache"
+	"github.com/dns/photo-viewer/internal/fsutil"
 	"github.com/dns/photo-viewer/internal/scan"
 )
 
@@ -344,19 +344,16 @@ func (v *OrganizeView) startOrganize(root string) {
 			}
 
 			baseName := filepath.Base(m.Entry.Path)
-			dest := filepath.Join(destDir, baseName)
 
-			// Handle collisions. The organize move stays within the library
-			// root, so source and destination are always on the same
-			// filesystem — os.Rename is atomic here and the EXDEV copy fallback
-			// that pv-organize needs doesn't apply.
-			if _, err := os.Stat(dest); err == nil {
-				ext := filepath.Ext(baseName)
-				base := strings.TrimSuffix(baseName, ext)
-				dest = filepath.Join(destDir, fmt.Sprintf("%s_%d%s", base, time.Now().UnixNano(), ext))
-			}
-
-			if err := os.Rename(m.Entry.Path, dest); err != nil {
+			// Claim the first free name (baseName, baseName_1, …) without ever
+			// replacing an existing file (U-18). The organize move stays within
+			// the library root, so source and destination are always on the
+			// same filesystem and the EXDEV copy fallback that import and
+			// pv-organize need doesn't apply.
+			dest, err := fsutil.RenameUnique(m.Entry.Path, func(n int) string {
+				return fsutil.SuffixName(destDir, baseName, n)
+			})
+			if err != nil {
 				v.appendLog(fmt.Sprintf("[ERROR] Move %s: %v", baseName, err))
 			} else {
 				// Relocate the index row + thumbnail so the grid resolves the

@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/dns/photo-viewer/internal/fsutil"
 	"github.com/dns/photo-viewer/internal/scan"
 )
 
@@ -116,8 +117,12 @@ func RestoreFromTrash(trashPath string, store *ThumbStore) (string, error) {
 		return "", fmt.Errorf("recreate parent: %w", err)
 	}
 
-	dst := uniqueRestorePath(meta.OriginalPath)
-	if err := os.Rename(trashPath, dst); err != nil {
+	// Claim the name atomically: a stat-then-rename would silently replace a
+	// file created at the chosen name in between (C-16).
+	dst, err := fsutil.RenameUnique(trashPath, func(n int) string {
+		return restoreCandidate(meta.OriginalPath, n)
+	})
+	if err != nil {
 		return "", fmt.Errorf("rename back: %w", err)
 	}
 	if store != nil {
@@ -127,26 +132,18 @@ func RestoreFromTrash(trashPath string, store *ThumbStore) (string, error) {
 	return dst, nil
 }
 
-// uniqueRestorePath returns target if no file lives there, otherwise
-// inserts " (restored)" / " (restored 2)" / ... before the extension until
-// it finds a free name.
-func uniqueRestorePath(target string) string {
-	if _, err := os.Stat(target); os.IsNotExist(err) {
+// restoreCandidate returns the n-th restore name for target: n == 0 is target
+// itself, then " (restored)", " (restored 2)", … inserted before the extension.
+func restoreCandidate(target string, n int) string {
+	if n == 0 {
 		return target
 	}
 	ext := filepath.Ext(target)
 	stem := strings.TrimSuffix(target, ext)
-	for n := 1; ; n++ {
-		var candidate string
-		if n == 1 {
-			candidate = fmt.Sprintf("%s (restored)%s", stem, ext)
-		} else {
-			candidate = fmt.Sprintf("%s (restored %d)%s", stem, n, ext)
-		}
-		if _, err := os.Stat(candidate); os.IsNotExist(err) {
-			return candidate
-		}
+	if n == 1 {
+		return fmt.Sprintf("%s (restored)%s", stem, ext)
 	}
+	return fmt.Sprintf("%s (restored %d)%s", stem, n, ext)
 }
 
 // EmptyTrash deletes every entry inside trashDir. Returns the number of
