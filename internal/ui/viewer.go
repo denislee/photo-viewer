@@ -164,6 +164,16 @@ func (v *Viewer) Show(entries []cache.Entry, idx int) {
 	v.prefetchAt(idx - 1)
 }
 
+// SetFavorite updates the viewer's own copy of path's favorite flag — used
+// when the controller undoes a toggle whose write failed.
+func (v *Viewer) SetFavorite(path string, fav bool) {
+	for i := range v.entries {
+		if v.entries[i].Path == path {
+			v.entries[i].Favorite = fav
+		}
+	}
+}
+
 func (v *Viewer) Close() {
 	v.Open = false
 	v.Confirming = false

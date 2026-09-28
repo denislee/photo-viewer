@@ -143,6 +143,16 @@ type Controller struct {
 	trashCount      int
 	trashCountValid bool
 
+	// Favorite writes (G-14). ToggleFavorite flips the UI at once and queues
+	// the DB write; a single drain goroutine applies the queue in order, so
+	// rapid presses on one file can't land out of order. A failed write is
+	// undone and recorded in favReverts for the UI goroutine, since the viewer
+	// keeps its own copy of the entries. Guarded by favMu.
+	favMu      sync.Mutex
+	favQueue   []favWrite
+	favRunning bool
+	favReverts []FavoriteRevert
+
 	// Selection state. Guarded by mu; read through SelectionMode /
 	// IsSelected / SnapshotSelected.
 	selectionMode bool
@@ -1104,34 +1114,110 @@ func (c *Controller) EmptyTrash(done func(count int, bytes int64, err error)) {
 	}()
 }
 
-// ToggleFavorite flips the favorite flag for path and reflects the change in
-// the grid + sidebar counts immediately. Returns the new favorite state.
-//
-// The DB flip is a single `UPDATE ... RETURNING` (one round-trip, atomic against
-// a concurrent scan) instead of the former IsFavorite (SELECT) + SetFavorite
-// (UPDATE) pair. The UI update is an in-memory patch (patchFavorite) rather than
-// a full refreshFromIndex: flipping one bit no longer re-runs ListDir over the
-// whole active directory plus the sidebar COUNT queries, so rating a 10k-photo
-// shoot with `f` stops re-querying and re-filtering 10k rows per keypress. The
-// full-refresh path is kept only for the favorites view, where un-favoriting
-// must actually remove the row from the grid.
-func (c *Controller) ToggleFavorite(path string) bool {
+// favWrite is one queued favorite write: set path's flag to want.
+type favWrite struct {
+	path string
+	want bool
+}
+
+// FavoriteRevert reports a favorite toggle whose write failed and was undone:
+// Favorite is the restored value.
+type FavoriteRevert struct {
+	Path     string
+	Favorite bool
+}
+
+// favoriteWarnFn tells the user a favorite could not be saved. A package var
+// only so tests can capture the message instead of spawning zenity.
+var favoriteWarnFn = func(msg string) {
+	_, _ = runZenity("--warning", "--no-markup", "--title=Favorite not saved", "--text="+msg)
+}
+
+// ToggleFavorite flips path's favorite flag from current and returns the new
+// value. The grid and sidebar counts update at once (patchFavorite, an
+// in-memory patch rather than a refreshFromIndex, so rating a 10k-photo shoot
+// with `f` doesn't re-query 10k rows per keypress); the DB write runs in the
+// background (G-14) so a WAL checkpoint or slow disk can't stall the frame
+// goroutine. Writes store the absolute value and are applied in order, so the
+// DB ends up matching the last press. If a write fails, the flip is undone,
+// the viewer is told via TakeFavoriteReverts, and the user gets a warning.
+func (c *Controller) ToggleFavorite(path string, current bool) bool {
 	if path == "" {
-		return false
+		return current
 	}
-	newVal, err := c.index.ToggleFavorite(path)
-	if err != nil {
-		// No row for path (or a DB error): nothing flipped, nothing to patch.
-		return false
+	want := !current
+	c.patchFavorite(path, want)
+	c.favMu.Lock()
+	c.favQueue = append(c.favQueue, favWrite{path: path, want: want})
+	start := !c.favRunning
+	c.favRunning = true
+	c.favMu.Unlock()
+	if start {
+		go c.drainFavorites()
 	}
-	if c.activeDir() == FavoritesView {
-		// Un-favoriting here removes the row from the favorites listing, which
-		// only a full re-query can do — patch-in-place can't drop rows.
-		c.scheduleRefresh(FavoritesView)
-		return newVal
+	return want
+}
+
+// drainFavorites applies queued favorite writes until the queue is empty.
+func (c *Controller) drainFavorites() {
+	for {
+		c.favMu.Lock()
+		if len(c.favQueue) == 0 {
+			c.favRunning = false
+			c.favMu.Unlock()
+			return
+		}
+		fw := c.favQueue[0]
+		c.favQueue = c.favQueue[1:]
+		c.favMu.Unlock()
+		c.writeFavorite(fw)
 	}
-	c.patchFavorite(path, newVal)
-	return newVal
+}
+
+func (c *Controller) writeFavorite(fw favWrite) {
+	err := c.index.SetFavorite(fw.path, fw.want)
+	if err == nil {
+		if c.activeDir() == FavoritesView {
+			// Un-favoriting here removes the row from the favorites listing,
+			// which only a full re-query can do — patch-in-place can't drop rows.
+			c.scheduleRefresh(FavoritesView)
+		}
+		return
+	}
+	log.Printf("favorite %s: %v", fw.path, err)
+	c.patchFavorite(fw.path, !fw.want)
+	c.favMu.Lock()
+	c.favReverts = append(c.favReverts, FavoriteRevert{Path: fw.path, Favorite: !fw.want})
+	c.favMu.Unlock()
+	if c.invalidate != nil {
+		c.invalidate()
+	}
+	go favoriteWarnFn(fmt.Sprintf("Could not save the favorite flag for %s: %v", filepath.Base(fw.path), err))
+}
+
+// TakeFavoriteReverts returns (and clears) the favorite toggles undone since
+// the last call, for the UI goroutine to apply to state it owns (the viewer).
+func (c *Controller) TakeFavoriteReverts() []FavoriteRevert {
+	c.favMu.Lock()
+	defer c.favMu.Unlock()
+	r := c.favReverts
+	c.favReverts = nil
+	return r
+}
+
+// FlushFavorites waits (up to timeout) for queued favorite writes to finish.
+// Called on window close so a press right before quitting isn't lost.
+func (c *Controller) FlushFavorites(timeout time.Duration) {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		c.favMu.Lock()
+		busy := c.favRunning
+		c.favMu.Unlock()
+		if !busy {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
 }
 
 // patchFavorite is the in-memory mirror of "path's favorite flag flipped to

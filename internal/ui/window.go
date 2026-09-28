@@ -6,6 +6,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"gioui.org/app"
 	"gioui.org/io/event"
@@ -214,9 +215,13 @@ func Run(w *app.Window, ctrl *Controller) error {
 		ev := w.Event()
 		switch e := ev.(type) {
 		case app.DestroyEvent:
+			ctrl.FlushFavorites(3 * time.Second)
 			return e.Err
 		case app.FrameEvent:
 			gtx := app.NewContext(&ops, e)
+			for _, r := range ctrl.TakeFavoriteReverts() {
+				viewer.SetFavorite(r.Path, r.Favorite)
+			}
 			// If the watcher has a fresh removable device and we aren't
 			// already showing a modal, surface the prompt. The prompt only
 			// pops up when no other modal is active so it can't get buried.
@@ -561,7 +566,7 @@ func handleViewerKey(ke key.Event, viewer *Viewer, grid *Grid, ctrl *Controller,
 	case "F":
 		if viewer.Index >= 0 && viewer.Index < len(viewer.entries) {
 			e := &viewer.entries[viewer.Index]
-			e.Favorite = ctrl.ToggleFavorite(e.Path)
+			e.Favorite = ctrl.ToggleFavorite(e.Path, e.Favorite)
 			w.Invalidate()
 		}
 	case key.NameSpace:
@@ -762,7 +767,7 @@ func handleGridKey(ke key.Event, grid *Grid, _ *Sidebar, sidebarFocus *bool, vie
 			_, _, entries, _ := ctrl.Snapshot()
 			idx := grid.SelectedIndex(len(entries))
 			if idx >= 0 && idx < len(entries) {
-				ctrl.ToggleFavorite(entries[idx].Path)
+				ctrl.ToggleFavorite(entries[idx].Path, entries[idx].Favorite)
 				w.Invalidate()
 			}
 		}

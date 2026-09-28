@@ -2,6 +2,7 @@ package ui
 
 import (
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 
@@ -77,7 +78,7 @@ func TestPatchFavoriteAdjustsEntryAndCount(t *testing.T) {
 
 // TestToggleFavoriteEndToEnd drives ToggleFavorite through a real Controller +
 // index while the active view is an ordinary directory (not the favorites view).
-// It confirms the flip persists to the DB (single UPDATE ... RETURNING), the
+// It confirms the flip persists to the DB (written in the background, G-14), the
 // returned value is the new state, the grid entry's star flips in place, and the
 // sidebar's cached favorites count moves by ±1 — all without the full
 // refreshFromIndex the pre-U-07 code paid per keystroke.
@@ -120,10 +121,11 @@ func TestToggleFavoriteEndToEnd(t *testing.T) {
 	c.dirCountsVer = 1
 	c.mu.Unlock()
 
-	got := c.ToggleFavorite(paths[1])
+	got := c.ToggleFavorite(paths[1], false)
 	if !got {
 		t.Fatalf("ToggleFavorite returned %v, want true", got)
 	}
+	c.FlushFavorites(5 * time.Second)
 	if !idx.IsFavorite(paths[1]) {
 		t.Fatalf("flag not persisted to the index")
 	}
@@ -140,13 +142,81 @@ func TestToggleFavoriteEndToEnd(t *testing.T) {
 	}
 
 	// Toggling back returns false and drops the count to 0.
-	if got := c.ToggleFavorite(paths[1]); got {
+	if got := c.ToggleFavorite(paths[1], true); got {
 		t.Fatalf("second ToggleFavorite returned %v, want false", got)
 	}
+	c.FlushFavorites(5 * time.Second)
 	if idx.IsFavorite(paths[1]) {
 		t.Fatalf("flag still set after second toggle")
 	}
 	if n := c.DirCounts()[FavoritesView]; n != 0 {
 		t.Fatalf("FavoritesView count = %d after un-favoriting, want 0", n)
+	}
+}
+
+// TestToggleFavoriteOrderedAndReverted is the G-14 guard for the background
+// write: rapid toggles land in order (the DB matches the last press), and a
+// failed write undoes the optimistic flip in the grid and the favorites count,
+// reports a revert for the viewer, and warns the user.
+func TestToggleFavoriteOrderedAndReverted(t *testing.T) {
+	dir := t.TempDir()
+	root := filepath.Join(dir, "lib")
+	c := newTestController(t, root, filepath.Join(dir, "cache"))
+	path := filepath.Join(root, "a.jpg")
+	c.index.ReconcileBatch([]scan.Result{{Path: path, Type: scan.TypePhoto, Size: 1, ModTime: time.Unix(1000, 0)}})
+	c.mu.Lock()
+	c.entries = c.index.ListDir(root)
+	c.dirCounts = map[string]int{root: 1, FavoritesView: 0}
+	c.mu.Unlock()
+
+	var warned []string
+	var warnMu sync.Mutex
+	orig := favoriteWarnFn
+	favoriteWarnFn = func(msg string) { warnMu.Lock(); warned = append(warned, msg); warnMu.Unlock() }
+	defer func() { favoriteWarnFn = orig }()
+
+	fav := false
+	for range 7 { // odd number of presses: ends favorited
+		fav = c.ToggleFavorite(path, fav)
+	}
+	c.FlushFavorites(5 * time.Second)
+	if !fav || !c.index.IsFavorite(path) {
+		t.Fatalf("after 7 presses: returned %v, DB %v; want both true", fav, c.index.IsFavorite(path))
+	}
+
+	// Make the next write fail: the row disappears underneath the grid.
+	if err := c.index.RemoveEntry(path); err != nil {
+		t.Fatal(err)
+	}
+	if got := c.ToggleFavorite(path, true); got {
+		t.Fatalf("optimistic value = %v, want false", got)
+	}
+	c.FlushFavorites(5 * time.Second)
+
+	_, _, entries, _ := c.Snapshot()
+	if len(entries) != 1 || !entries[0].Favorite {
+		t.Errorf("grid entry not reverted to favorite: %+v", entries)
+	}
+	if n := c.DirCounts()[FavoritesView]; n != 1 {
+		t.Errorf("FavoritesView count = %d after revert, want 1", n)
+	}
+	if r := c.TakeFavoriteReverts(); len(r) != 1 || r[0] != (FavoriteRevert{Path: path, Favorite: true}) {
+		t.Errorf("reverts = %+v, want one restoring true", r)
+	}
+	if r := c.TakeFavoriteReverts(); r != nil {
+		t.Errorf("reverts not cleared: %+v", r)
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		warnMu.Lock()
+		n := len(warned)
+		warnMu.Unlock()
+		if n == 1 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("warnings = %d, want 1", n)
+		}
+		time.Sleep(2 * time.Millisecond)
 	}
 }

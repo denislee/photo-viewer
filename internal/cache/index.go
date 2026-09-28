@@ -944,8 +944,16 @@ func (i *Index) SetFavorite(path string, favorite bool) error {
 	if favorite {
 		v = 1
 	}
-	_, err := i.db.Exec("UPDATE entries SET favorite = ? WHERE path = ?", v, path)
-	return err
+	res, err := i.db.Exec("UPDATE entries SET favorite = ? WHERE path = ?", v, path)
+	if err != nil {
+		return err
+	}
+	// No row for path: report it like ToggleFavorite does, rather than
+	// letting the caller believe a flag was stored.
+	if n, err := res.RowsAffected(); err == nil && n == 0 {
+		return sql.ErrNoRows
+	}
+	return nil
 }
 
 // SetDurationMs records a video's playback length (in milliseconds) on its
