@@ -17,6 +17,7 @@ const (
 	ProcScan
 	ProcWarmUp
 	ProcExportFavorites
+	ProcExportSelection
 )
 
 func (k ProcKind) String() string {
@@ -33,6 +34,8 @@ func (k ProcKind) String() string {
 		return "Thumbnails"
 	case ProcExportFavorites:
 		return "Export favorites"
+	case ProcExportSelection:
+		return "Export selection"
 	}
 	return "Process"
 }

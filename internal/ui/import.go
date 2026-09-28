@@ -1397,28 +1397,38 @@ func (v *ImportView) bumpProgress() {
 // errors (permission denied, disk full) still surface as failures instead of
 // silent copies.
 func fileInto(src, destDir, baseName string) (string, error) {
+	return claimName(destDir, baseName, func(dest string) error {
+		err := fsutil.RenameNoReplace(src, dest)
+		if !errors.Is(err, syscall.EXDEV) {
+			return err
+		}
+		if err := copyFileNoReplace(src, dest); err != nil {
+			return err
+		}
+		// Fsync the destination directory so the copy's directory entry is
+		// durable before we unlink the source — otherwise a power loss could
+		// lose the entry even though the copy synced the data, leaving zero
+		// copies of the file.
+		if err := syncDir(destDir); err != nil {
+			return err
+		}
+		return os.Remove(src)
+	})
+}
+
+// claimName calls place with destDir/baseName, then baseName_1, baseName_2, …
+// until place stops failing with fs.ErrExist, and returns the name it settled
+// on. place must never replace an existing file (use fsutil.RenameNoReplace or
+// copyFileNoReplace) — that is what makes the claim safe; the Lstat below only
+// skips names that are visibly taken, so a collision on a cross-device copy
+// doesn't copy the whole file just to be refused at the final rename.
+func claimName(destDir, baseName string, place func(dest string) error) (string, error) {
 	for n := 0; n <= fsutil.MaxCollisionSuffix; n++ {
 		dest := fsutil.SuffixName(destDir, baseName, n)
-		// Cheap skip of names already taken, so a cross-device collision
-		// doesn't copy the whole file only to be refused at the final rename.
-		// The no-replace rename below is what actually guarantees safety.
 		if _, err := os.Lstat(dest); err == nil {
 			continue
 		}
-		err := fsutil.RenameNoReplace(src, dest)
-		if errors.Is(err, syscall.EXDEV) {
-			if err = copyFileNoReplace(src, dest); err == nil {
-				// Fsync the destination directory so the copy's directory entry
-				// is durable before we unlink the source — otherwise a power
-				// loss could lose the entry even though the copy synced the
-				// data, leaving zero copies of the file.
-				if err = syncDir(destDir); err == nil {
-					err = os.Remove(src)
-				}
-				return dest, err
-			}
-		}
-		if !errors.Is(err, fs.ErrExist) {
+		if err := place(dest); !errors.Is(err, fs.ErrExist) {
 			return dest, err
 		}
 	}

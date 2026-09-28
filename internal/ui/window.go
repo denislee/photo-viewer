@@ -2,6 +2,7 @@ package ui
 
 import (
 	"image"
+	"log"
 	"os/exec"
 	"path/filepath"
 	"strings"
@@ -762,24 +763,21 @@ func handleGridKey(ke key.Event, grid *Grid, _ *Sidebar, sidebarFocus *bool, vie
 				}
 			}
 			if len(selected) > 0 {
-				// For now, let's use a simple way to get a target dir.
-				// We don't have a folder picker in this Gio UI yet.
-				// I'll implement a simple one or just use zenity if available.
 				go func() {
-					// Use zenity to pick a directory if available
-					cmd := exec.Command("zenity", "--file-selection", "--directory", "--title=Select Export Directory")
-					out, err := cmd.Output()
-					if err != nil {
+					target, err := runZenity("--file-selection", "--directory", "--title=Select Export Directory")
+					if err != nil || target == "" {
 						return
 					}
-					target := strings.TrimSpace(string(out))
-					if target == "" {
-						return
-					}
-					for _, src := range selected {
-						dst := filepath.Join(target, filepath.Base(src))
-						_ = copyFile(src, dst)
-					}
+					ctrl.ExportSelection(selected, target, func(copied int, errs []error) {
+						if len(errs) == 0 {
+							return
+						}
+						for _, e := range errs {
+							log.Printf("export selection to %s: %v", target, e)
+						}
+						_, _ = runZenity("--warning", "--no-markup", "--title=Export selection",
+							"--text="+exportSelectionSummary(copied, len(selected), target, errs))
+					})
 				}()
 			}
 			ctrl.ClearSelection()
