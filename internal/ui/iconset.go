@@ -24,6 +24,7 @@ type IconSet struct {
 	SortDur    *widget.Icon
 	Trash      *widget.Icon
 	WebServer  *widget.Icon
+	ExportFav  *widget.Icon
 }
 
 func newIconSet() *IconSet {
@@ -47,5 +48,6 @@ func newIconSet() *IconSet {
 		SortDur:    mk(icons.AVAVTimer),
 		Trash:      mk(icons.ActionDelete),
 		WebServer:  mk(icons.ActionDNS),
+		ExportFav:  mk(icons.FileFileUpload),
 	}
 }

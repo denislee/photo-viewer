@@ -148,6 +148,9 @@ func Run(w *app.Window, ctrl *Controller) error {
 		organize.Show(ctrl.Index(), ctrl.LibraryRoot())
 		w.Invalidate()
 	}
+	toolbar.OnExportFavorites = func() {
+		go exportFavoritesViaPicker(ctrl, w.Invalidate)
+	}
 	toolbar.OnSettings = func() {
 		settings.Show()
 		w.Invalidate()

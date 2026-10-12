@@ -35,21 +35,23 @@ type Toolbar struct {
 	duplicatesBtn widget.Clickable
 	settingsBtn   widget.Clickable
 	organizeBtn   widget.Clickable
+	exportFavBtn  widget.Clickable
 	rebuildBtn    widget.Clickable
 	warmUpBtn     widget.Clickable
 	webBtn        widget.Clickable
 
-	OnFilter       func(string)
-	OnShowRAW      func(bool)
-	OnGroupByYear  func(bool)
-	OnSortByLength func(bool)
-	OnImport       func()
-	OnDuplicates   func()
-	OnOrganize     func()
-	OnSettings     func()
-	OnRebuild      func()
-	OnWarmUp       func()
-	OnWebServer    func()
+	OnFilter          func(string)
+	OnShowRAW         func(bool)
+	OnGroupByYear     func(bool)
+	OnSortByLength    func(bool)
+	OnImport          func()
+	OnDuplicates      func()
+	OnOrganize        func()
+	OnExportFavorites func()
+	OnSettings        func()
+	OnRebuild         func()
+	OnWarmUp          func()
+	OnWebServer       func()
 
 	// WebServerRunning, when true, renders the webserver button in the
 	// "active" accent so users can see at a glance that the server is up.
@@ -126,6 +128,9 @@ func (t *Toolbar) Layout(gtx layout.Context, th *Theme, path string, count int) 
 	}
 	if t.organizeBtn.Clicked(gtx) && t.OnOrganize != nil {
 		t.OnOrganize()
+	}
+	if t.exportFavBtn.Clicked(gtx) && t.OnExportFavorites != nil {
+		t.OnExportFavorites()
 	}
 	if t.settingsBtn.Clicked(gtx) && t.OnSettings != nil {
 		t.OnSettings()
@@ -210,6 +215,8 @@ func (t *Toolbar) Layout(gtx layout.Context, th *Theme, path string, count int) 
 			icon(&t.duplicatesBtn, th.Icons.Duplicates, "Find duplicates", false, false),
 			layout.Rigid(layout.Spacer{Width: unit.Dp(2)}.Layout),
 			icon(&t.organizeBtn, th.Icons.Organize, "Organize", false, false),
+			layout.Rigid(layout.Spacer{Width: unit.Dp(2)}.Layout),
+			icon(&t.exportFavBtn, th.Icons.ExportFav, "Export favorites to folder…", false, false),
 
 			groupSep(th),
 
