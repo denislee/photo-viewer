@@ -1,0 +1,37 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" width="128" height="128">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#2c2c33"/>
+      <stop offset="1" stop-color="#1e1e22"/>
+    </linearGradient>
+    <linearGradient id="sky" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#7db2f0"/>
+      <stop offset="1" stop-color="#5e9cea"/>
+    </linearGradient>
+    <clipPath id="photo"><rect x="22" y="22" width="52" height="52" rx="8"/></clipPath>
+  </defs>
+  <!-- app tile -->
+  <rect x="8" y="8" width="112" height="112" rx="26" fill="url(#bg)"/>
+  <rect x="8.5" y="8.5" width="111" height="111" rx="25.5" fill="none" stroke="#ffffff" stroke-opacity="0.08"/>
+
+  <!-- featured photo: sky, sun, mountains -->
+  <g clip-path="url(#photo)">
+    <rect x="22" y="22" width="52" height="52" fill="url(#sky)"/>
+    <circle cx="58" cy="37" r="6.5" fill="#ffe7a3"/>
+    <path d="M22 74 L41 47 L52 61 L59 53 L74 74 Z" fill="#2a4f86"/>
+    <path d="M22 74 L41 47 L47 55 L36 74 Z" fill="#3a5588" opacity="0.8"/>
+  </g>
+
+  <!-- video tile -->
+  <rect x="80" y="22" width="26" height="52" rx="7" fill="#2a2a30" stroke="#90959f" stroke-opacity="0.35"/>
+  <path d="M88 40 L100 48 L88 56 Z" fill="#5e9cea"/>
+
+  <!-- smaller thumbnails row -->
+  <rect x="22" y="80" width="24" height="26" rx="6" fill="#2a2a30" stroke="#90959f" stroke-opacity="0.35"/>
+  <rect x="52" y="80" width="24" height="26" rx="6" fill="#2a2a30" stroke="#90959f" stroke-opacity="0.35"/>
+  <path d="M56 101 L62 92 L66 97 L69 94 L72 101 Z" fill="#90959f" opacity="0.7"/>
+  <rect x="82" y="80" width="24" height="26" rx="6" fill="#2a2a30" stroke="#90959f" stroke-opacity="0.35"/>
+  <!-- favorite star -->
+  <path d="M34 85.5 l2.35 4.76 5.25 .76 -3.8 3.7 .9 5.23 -4.7 -2.47 -4.7 2.47 .9 -5.23 -3.8 -3.7 5.25 -.76 Z" fill="#ffd166"/>
+  <circle cx="90" cy="93" r="2" fill="#90959f" opacity="0.7"/><circle cx="94" cy="93" r="2" fill="#90959f" opacity="0.7"/><circle cx="98" cy="93" r="2" fill="#90959f" opacity="0.7"/>
+</svg>
