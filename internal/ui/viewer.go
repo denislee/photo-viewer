@@ -101,6 +101,16 @@ type Viewer struct {
 	playerErr  error
 	player     atomic.Pointer[video.Player]
 
+	// lastVideoOp is the most recent frame playVideo handed to Gio, keyed by
+	// the file and target size it was rendered for. Gio redraws for many
+	// reasons besides a new video frame (cursor motion, overlays, a paused
+	// clip); reusing the op keeps its texture handle, so those frames skip
+	// both the mpv render and the RAM→GPU upload. It aliases the player's
+	// frame buffer, so it is dropped when playback stops. UI goroutine only.
+	lastVideoOp   paint.ImageOp
+	lastVideoPath string
+	lastVideoSize image.Point
+
 	invalidate func()
 }
 
@@ -203,6 +213,7 @@ func (v *Viewer) stopVideoIfRunning() {
 	}
 	if v.Index < 0 || v.Index >= len(v.entries) || v.entries[v.Index].Type != scan.TypeVideo {
 		p.Stop()
+		v.lastVideoOp, v.lastVideoPath = paint.ImageOp{}, ""
 	}
 }
 
@@ -409,12 +420,17 @@ func (v *Viewer) playVideo(e cache.Entry, w, h int) (paint.ImageOp, bool) {
 			return paint.ImageOp{}, false
 		}
 	}
+	sz := image.Pt(w, h)
+	if !p.NeedsRedraw() && v.lastVideoPath == e.Path && v.lastVideoSize == sz {
+		return v.lastVideoOp, true
+	}
 	frame, ok := p.Render(w, h)
 	if !ok {
 		return paint.ImageOp{}, false
 	}
 	op := paint.NewImageOp(frame)
 	op.Filter = paint.FilterLinear
+	v.lastVideoOp, v.lastVideoPath, v.lastVideoSize = op, e.Path, sz
 	return op, true
 }
 

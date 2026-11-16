@@ -1,19 +1,36 @@
-// Package video embeds libmpv into the Gio UI via mpv's software render API.
+// Package video embeds libmpv into the Gio UI.
 //
-// We use MPV_RENDER_API_TYPE_SW so mpv composites the current frame into a
-// CPU pixel buffer we own, which we then hand to Gio as a paint.ImageOp.
-// This avoids needing to share an OpenGL context between mpv and Gio — at the
-// cost of a per-frame texture upload from system RAM to GPU. For a photo
-// library player that's an acceptable trade.
+// mpv renders each frame into a CPU pixel buffer we own, which we then hand
+// to Gio as a paint.ImageOp, so mpv never has to share a GPU context with
+// Gio. Two render paths produce that buffer:
+//
+//   - OpenGL (preferred): mpv gets its own headless EGL context (no window,
+//     no surface) and renders through MPV_RENDER_API_TYPE_OPENGL into an
+//     offscreen framebuffer, which we read back at window size. Decoding uses
+//     VAAPI with zero-copy GPU interop, and scaling/colour conversion happen
+//     on the GPU, so only the final window-sized RGBA crosses back to RAM.
+//     This is what makes 4K 10-bit HEVC (e.g. DJI footage) play in real time:
+//     software decode of those manages ~0.6x, and even hwdec=*-copy only
+//     ~0.9x because downloading full-size 10-bit frames is the bottleneck.
+//   - Software (fallback): MPV_RENDER_API_TYPE_SW, decode and scale on the
+//     CPU. Used when no EGL/OpenGL context can be created, or when forced
+//     with PV_VIDEO_RENDER=sw.
 package video
 
 /*
-#cgo pkg-config: mpv
+#cgo pkg-config: mpv egl
 #include <mpv/client.h>
 #include <mpv/render.h>
+#include <mpv/render_gl.h>
+#include <EGL/egl.h>
+#include <EGL/eglext.h>
+#include <GL/gl.h>
+#include <GL/glext.h>
+#include <fcntl.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 
 // Go-side callbacks. We pass our cgo.Handle as a uintptr_t through C so
 // Go never has to do an unsafe.Pointer(uintptr(...)) round-trip, which
@@ -58,7 +75,13 @@ static int render_sw(mpv_render_context *ctx, int w, int h, size_t stride, void 
     int sz[2] = {w, h};
     char fmt[] = "rgb0";
     size_t st = stride;
-    mpv_render_param params[5];
+    // Don't let mpv sleep inside render until the frame's display time: the
+    // call runs on the Gio UI goroutine, and blocking there for up to a full
+    // frame period stalls the whole frame loop (input, paint, texture upload),
+    // so the next render lands late and mpv drops frames to catch up. Gio's
+    // own vsync-paced loop plus the render-update callback provide timing.
+    int block = 0;
+    mpv_render_param params[6];
     params[0].type = MPV_RENDER_PARAM_SW_SIZE;
     params[0].data = sz;
     params[1].type = MPV_RENDER_PARAM_SW_FORMAT;
@@ -67,9 +90,265 @@ static int render_sw(mpv_render_context *ctx, int w, int h, size_t stride, void 
     params[2].data = &st;
     params[3].type = MPV_RENDER_PARAM_SW_POINTER;
     params[3].data = dst;
-    params[4].type = MPV_RENDER_PARAM_INVALID;
-    params[4].data = NULL;
+    params[4].type = MPV_RENDER_PARAM_BLOCK_FOR_TARGET_TIME;
+    params[4].data = &block;
+    params[5].type = MPV_RENDER_PARAM_INVALID;
+    params[5].data = NULL;
     return mpv_render_context_render(ctx, params);
+}
+
+// ---- OpenGL render path -------------------------------------------------
+//
+// pv_gl owns a headless EGL context (Mesa surfaceless platform, no config, no
+// surface) plus the offscreen framebuffer mpv renders into. The context is
+// made current only for the duration of each call below, so it is never
+// bound to a thread between calls: Go may run successive cgo calls on
+// different OS threads, and the Go side serialises every call through
+// Player.mu.
+//
+// EGL's current context and bound API are per *thread*, shared with Gio,
+// whose own window context is often current on the very thread that calls
+// Render. So "release" must not mean "make nothing current": that unbinds
+// Gio's context and its next eglSwapBuffers fails with EGL_BAD_SURFACE,
+// destroying the window. pv_gl_make_current snapshots the thread's EGL
+// state and pv_gl_release puts exactly that state back. All GL entry points are resolved
+// via eglGetProcAddress so we link against libEGL only.
+typedef struct pv_gl {
+    EGLDisplay dpy;
+    EGLContext ctx;
+    GLuint fbo, tex;
+    int w, h;
+    // drm_fd is the DRM render node of the GPU behind dpy, or -1. mpv's
+    // VAAPI interop opens its VA display from it: with no window there is
+    // no X11/Wayland display to derive one from.
+    int drm_fd;
+    // The calling thread's EGL state from before pv_gl_make_current.
+    EGLenum saved_api;
+    EGLDisplay saved_dpy;
+    EGLContext saved_ctx;
+    EGLSurface saved_draw, saved_read;
+    PFNGLGENFRAMEBUFFERSPROC GenFramebuffers;
+    PFNGLDELETEFRAMEBUFFERSPROC DeleteFramebuffers;
+    PFNGLBINDFRAMEBUFFERPROC BindFramebuffer;
+    PFNGLFRAMEBUFFERTEXTURE2DPROC FramebufferTexture2D;
+    PFNGLCHECKFRAMEBUFFERSTATUSPROC CheckFramebufferStatus;
+    void (*GenTextures)(GLsizei, GLuint *);
+    void (*DeleteTextures)(GLsizei, const GLuint *);
+    void (*BindTexture)(GLenum, GLuint);
+    void (*TexImage2D)(GLenum, GLint, GLint, GLsizei, GLsizei, GLint, GLenum, GLenum, const void *);
+    void (*TexParameteri)(GLenum, GLenum, GLint);
+    void (*PixelStorei)(GLenum, GLint);
+    void (*ReadPixels)(GLint, GLint, GLsizei, GLsizei, GLenum, GLenum, void *);
+} pv_gl;
+
+static void *pv_gl_proc(void *ctx, const char *name) {
+    (void)ctx;
+    return (void *)eglGetProcAddress(name);
+}
+
+// pv_gl_restore puts back the EGL state pv_gl_make_current saved.
+static void pv_gl_restore(pv_gl *g) {
+    if (g->saved_ctx != EGL_NO_CONTEXT)
+        eglMakeCurrent(g->saved_dpy, g->saved_draw, g->saved_read, g->saved_ctx);
+    else
+        eglMakeCurrent(g->dpy, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
+    eglBindAPI(g->saved_api);
+}
+
+// pv_gl_make_current saves the thread's EGL state and makes g current. Every
+// successful call must be paired with pv_gl_release.
+static int pv_gl_make_current(pv_gl *g) {
+    g->saved_api = eglQueryAPI();
+    g->saved_dpy = eglGetCurrentDisplay();
+    g->saved_ctx = eglGetCurrentContext();
+    g->saved_draw = eglGetCurrentSurface(EGL_DRAW);
+    g->saved_read = eglGetCurrentSurface(EGL_READ);
+    if (eglBindAPI(EGL_OPENGL_API) &&
+        eglMakeCurrent(g->dpy, EGL_NO_SURFACE, EGL_NO_SURFACE, g->ctx))
+        return 0;
+    pv_gl_restore(g);
+    return -1;
+}
+
+static void pv_gl_release(pv_gl *g) {
+    pv_gl_restore(g);
+}
+
+// pv_gl_destroy frees the framebuffer, the context and the display. Safe on
+// a partially-initialised g.
+static void pv_gl_destroy(pv_gl *g) {
+    if (!g) return;
+    if (g->ctx != EGL_NO_CONTEXT) {
+        if (pv_gl_make_current(g) == 0) {
+            if (g->fbo) g->DeleteFramebuffers(1, &g->fbo);
+            if (g->tex) g->DeleteTextures(1, &g->tex);
+            pv_gl_release(g);
+        }
+        eglDestroyContext(g->dpy, g->ctx);
+    }
+    // No eglReleaseThread: it would also unbind Gio's context on this thread.
+    if (g->dpy != EGL_NO_DISPLAY) eglTerminate(g->dpy);
+    if (g->drm_fd >= 0) close(g->drm_fd);
+    free(g);
+}
+
+// pv_gl_create returns a usable headless GL context, or NULL when the
+// platform has none (no Mesa surfaceless EGL, no GPU, no driver).
+static pv_gl *pv_gl_create(void) {
+    pv_gl *g = calloc(1, sizeof *g);
+    if (!g) return NULL;
+    // eglCreateContext needs EGL_OPENGL_API bound; restore the caller's
+    // binding (Gio's GLES) on the way out either way.
+    EGLenum prev_api = eglQueryAPI();
+    g->dpy = EGL_NO_DISPLAY;
+    g->ctx = EGL_NO_CONTEXT;
+    g->drm_fd = -1;
+    g->dpy = eglGetPlatformDisplay(EGL_PLATFORM_SURFACELESS_MESA, EGL_DEFAULT_DISPLAY, NULL);
+    if (g->dpy == EGL_NO_DISPLAY || !eglInitialize(g->dpy, NULL, NULL)) {
+        g->dpy = EGL_NO_DISPLAY;
+        goto fail;
+    }
+    if (!eglBindAPI(EGL_OPENGL_API)) goto fail;
+    EGLint core[] = {
+        EGL_CONTEXT_MAJOR_VERSION, 3,
+        EGL_CONTEXT_MINOR_VERSION, 3,
+        EGL_CONTEXT_OPENGL_PROFILE_MASK, EGL_CONTEXT_OPENGL_CORE_PROFILE_BIT,
+        EGL_NONE,
+    };
+    g->ctx = eglCreateContext(g->dpy, EGL_NO_CONFIG_KHR, EGL_NO_CONTEXT, core);
+    if (g->ctx == EGL_NO_CONTEXT)
+        g->ctx = eglCreateContext(g->dpy, EGL_NO_CONFIG_KHR, EGL_NO_CONTEXT, NULL);
+    if (g->ctx == EGL_NO_CONTEXT) goto fail;
+
+#define PV_LOAD(field, name) \
+    if (!(*(void **)&g->field = (void *)eglGetProcAddress(name))) goto fail;
+    PV_LOAD(GenFramebuffers, "glGenFramebuffers")
+    PV_LOAD(DeleteFramebuffers, "glDeleteFramebuffers")
+    PV_LOAD(BindFramebuffer, "glBindFramebuffer")
+    PV_LOAD(FramebufferTexture2D, "glFramebufferTexture2D")
+    PV_LOAD(CheckFramebufferStatus, "glCheckFramebufferStatus")
+    PV_LOAD(GenTextures, "glGenTextures")
+    PV_LOAD(DeleteTextures, "glDeleteTextures")
+    PV_LOAD(BindTexture, "glBindTexture")
+    PV_LOAD(TexImage2D, "glTexImage2D")
+    PV_LOAD(TexParameteri, "glTexParameteri")
+    PV_LOAD(PixelStorei, "glPixelStorei")
+    PV_LOAD(ReadPixels, "glReadPixels")
+#undef PV_LOAD
+
+    // Surfaceless make-current needs EGL_KHR_surfaceless_context; prove it
+    // works now rather than on the first frame.
+    if (pv_gl_make_current(g) < 0) goto fail;
+    pv_gl_release(g);
+
+    // Find the render node of the device EGL picked (EGL_EXT_device_query),
+    // so VAAPI decodes on the same GPU that renders; else the first node.
+    const char *node = NULL;
+    PFNEGLQUERYDISPLAYATTRIBEXTPROC qda =
+        (PFNEGLQUERYDISPLAYATTRIBEXTPROC)eglGetProcAddress("eglQueryDisplayAttribEXT");
+    PFNEGLQUERYDEVICESTRINGEXTPROC qds =
+        (PFNEGLQUERYDEVICESTRINGEXTPROC)eglGetProcAddress("eglQueryDeviceStringEXT");
+    EGLAttrib dev = 0;
+    if (qda && qds && qda(g->dpy, EGL_DEVICE_EXT, &dev) && dev)
+        node = qds((EGLDeviceEXT)dev, EGL_DRM_RENDER_NODE_FILE_EXT);
+    if (!node) node = "/dev/dri/renderD128";
+    g->drm_fd = open(node, O_RDWR | O_CLOEXEC);
+    eglBindAPI(prev_api);
+    return g;
+fail:
+    pv_gl_destroy(g);
+    eglBindAPI(prev_api);
+    return NULL;
+}
+
+static int create_render_ctx_gl(mpv_handle *h, pv_gl *g, mpv_render_context **ctx) {
+    if (pv_gl_make_current(g) < 0) return MPV_ERROR_UNSUPPORTED;
+    mpv_opengl_init_params ip = { .get_proc_address = pv_gl_proc, .get_proc_address_ctx = NULL };
+    // Only render_fd matters here (VAAPI's VA display); fd = -1 means no
+    // KMS master, which keeps mpv's drmprime-overlay (KMS planes) disabled.
+    mpv_opengl_drm_params_v2 drm = { .fd = -1, .render_fd = g->drm_fd };
+    mpv_render_param params[4];
+    int n = 0;
+    params[n].type = MPV_RENDER_PARAM_API_TYPE;
+    params[n++].data = (void *)MPV_RENDER_API_TYPE_OPENGL;
+    params[n].type = MPV_RENDER_PARAM_OPENGL_INIT_PARAMS;
+    params[n++].data = &ip;
+    if (g->drm_fd >= 0) {
+        params[n].type = MPV_RENDER_PARAM_DRM_DISPLAY_V2;
+        params[n++].data = &drm;
+    }
+    params[n].type = MPV_RENDER_PARAM_INVALID;
+    params[n].data = NULL;
+    int rc = mpv_render_context_create(ctx, h, params);
+    pv_gl_release(g);
+    return rc;
+}
+
+// free_render_ctx_gl frees an mpv GL render context; mpv needs the GL
+// context current to release its GPU resources.
+static void free_render_ctx_gl(pv_gl *g, mpv_render_context *ctx) {
+    int cur = pv_gl_make_current(g) == 0;
+    mpv_render_context_free(ctx);
+    if (cur) pv_gl_release(g);
+}
+
+// pv_gl_ensure_fbo (re)creates the w×h RGBA8 render target. Context must be
+// current.
+static int pv_gl_ensure_fbo(pv_gl *g, int w, int h) {
+    if (g->fbo && g->w == w && g->h == h) return 0;
+    if (!g->tex) g->GenTextures(1, &g->tex);
+    g->BindTexture(GL_TEXTURE_2D, g->tex);
+    g->TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+    g->TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+    g->TexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+    g->BindTexture(GL_TEXTURE_2D, 0);
+    if (!g->fbo) g->GenFramebuffers(1, &g->fbo);
+    g->BindFramebuffer(GL_FRAMEBUFFER, g->fbo);
+    g->FramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, g->tex, 0);
+    GLenum st = g->CheckFramebufferStatus(GL_FRAMEBUFFER);
+    g->BindFramebuffer(GL_FRAMEBUFFER, 0);
+    if (st != GL_FRAMEBUFFER_COMPLETE) {
+        g->w = g->h = 0;
+        return -1;
+    }
+    g->w = w;
+    g->h = h;
+    return 0;
+}
+
+// render_gl renders the current frame into the offscreen w×h framebuffer
+// and reads it back into dst (tightly packed RGBA, top row first). Like
+// render_sw it does not block for the frame's target time (see there).
+static int render_gl(pv_gl *g, mpv_render_context *ctx, int w, int h, void *dst) {
+    if (pv_gl_make_current(g) < 0) return MPV_ERROR_GENERIC;
+    int rc = MPV_ERROR_GENERIC;
+    if (pv_gl_ensure_fbo(g, w, h) == 0) {
+        mpv_opengl_fbo fbo = { .fbo = (int)g->fbo, .w = w, .h = h, .internal_format = GL_RGBA8 };
+        // No flip: into an FBO, mpv writes the top image row at GL row 0,
+        // which is also the first row glReadPixels returns, so the buffer
+        // comes back top-row-first as image.RGBA expects. (FLIP_Y=1 is for
+        // the default framebuffer and would read back upside down.)
+        int flip = 0;
+        int block = 0;
+        mpv_render_param params[4];
+        params[0].type = MPV_RENDER_PARAM_OPENGL_FBO;
+        params[0].data = &fbo;
+        params[1].type = MPV_RENDER_PARAM_FLIP_Y;
+        params[1].data = &flip;
+        params[2].type = MPV_RENDER_PARAM_BLOCK_FOR_TARGET_TIME;
+        params[2].data = &block;
+        params[3].type = MPV_RENDER_PARAM_INVALID;
+        params[3].data = NULL;
+        rc = mpv_render_context_render(ctx, params);
+        if (rc >= 0) {
+            g->BindFramebuffer(GL_FRAMEBUFFER, g->fbo);
+            g->PixelStorei(GL_PACK_ALIGNMENT, 4);
+            g->ReadPixels(0, 0, w, h, GL_RGBA, GL_UNSIGNED_BYTE, dst);
+            g->BindFramebuffer(GL_FRAMEBUFFER, 0);
+        }
+    }
+    pv_gl_release(g);
+    return rc;
 }
 
 static int command_str(mpv_handle *h, const char *s) {
@@ -114,6 +393,10 @@ import (
 type Player struct {
 	h   *C.mpv_handle
 	ctx *C.mpv_render_context
+	// gl is the headless GL context behind ctx when the OpenGL render path
+	// is active, nil on the software path. Only touched under mu (and by
+	// Close after the last Render).
+	gl *C.pv_gl
 
 	handle cgo.Handle
 
@@ -142,26 +425,71 @@ type Player struct {
 	updatePending atomic.Bool
 }
 
-// hwdecMode returns the value for mpv's hwdec option. It defaults to "no"
-// (software decode) because hardware decoding is unavailable on the target
-// machines and its failed probes destabilise the SW render path; PV_HWDEC
-// overrides it for hosts with a working GPU stack (e.g. PV_HWDEC=auto-safe).
-func hwdecMode() string {
+// hwdecMode returns the value for mpv's hwdec option; PV_HWDEC overrides
+// the default on either render path.
+//
+// On the OpenGL path it defaults to "vaapi": zero-copy GPU decode mapped
+// straight into mpv's GL renderer, which is what lets 4K 10-bit HEVC play in
+// real time. Where VAAPI is missing mpv logs the failure once per file and
+// decodes in software, still scaling on the GPU.
+//
+// On the software path it defaults to "no": there, hwdec frames have to be
+// copied back to RAM (too slow for 4K 10-bit anyway), and on machines with a
+// broken GPU stack the failing probes hand the SW renderer half-initialised
+// frames that trip libmpv's mp_image_crop assertion (see New).
+func hwdecMode(gl bool) string {
 	if v := strings.TrimSpace(os.Getenv("PV_HWDEC")); v != "" {
 		return v
+	}
+	if gl {
+		return "vaapi"
 	}
 	return "no"
 }
 
-// New constructs and initialises a libmpv handle with the SW render API
-// attached. invalidate is called from mpv's worker threads whenever a new
-// frame is available or an internal state change occurs; the caller should
-// wire it to the Gio window's Invalidate so the frame loop wakes and calls
-// Render.
+// hwdecInterop returns the gpu-hwdec-interop option matching hwdecMode:
+// "vaapi" for the GL path's default, "auto" when PV_HWDEC picks something
+// else (or on the SW path, where no interop is used).
+func hwdecInterop(gl bool) string {
+	if gl && hwdecMode(gl) == "vaapi" {
+		return "vaapi"
+	}
+	return "auto"
+}
+
+// wantGL reports whether to try the OpenGL render path. PV_VIDEO_RENDER=sw
+// forces the software path (e.g. to rule out a GPU driver problem).
+func wantGL() bool {
+	return strings.TrimSpace(os.Getenv("PV_VIDEO_RENDER")) != "sw"
+}
+
+// New constructs and initialises a libmpv handle with a render context
+// attached: OpenGL on a headless EGL context when one can be created,
+// otherwise the software renderer (see the package doc). invalidate is
+// called from mpv's worker threads whenever a new frame is available or an
+// internal state change occurs; the caller should wire it to the Gio
+// window's Invalidate so the frame loop wakes and calls Render.
 func New(invalidate func()) (*Player, error) {
+	// Create the GL context first: whether we have one decides the hwdec
+	// and rotation options below, which must be set before mpv_initialize.
+	var gl *C.pv_gl
+	if wantGL() {
+		gl = C.pv_gl_create()
+		if gl == nil {
+			log.Printf("video: no headless OpenGL context, using software rendering")
+		}
+	}
 	h := C.mpv_create()
 	if h == nil {
+		C.pv_gl_destroy(gl)
 		return nil, errors.New("mpv_create failed")
+	}
+	// rotate is the video-rotate option: on the software path rotation is
+	// zeroed and baked in with a filter instead (see below); mpv's GL
+	// renderer rotates correctly by itself.
+	rotate := "no"
+	if gl != nil {
+		rotate = "0"
 	}
 
 	// Options must be set before mpv_initialize. We disable on-screen text
@@ -179,18 +507,23 @@ func New(invalidate func()) (*Player, error) {
 	}
 	for _, kv := range [][2]string{
 		{"vo", "libmpv"},
-		// Software decode only. On the target machines every hardware
-		// backend is unavailable (no libcuda, vaapi setup fails, vulkan
-		// lacks VK_KHR_video_decode_queue, the vdpau nvidia driver is
+		// Software path: software decode only. On some machines every
+		// hardware backend is unavailable (no libcuda, vaapi setup fails,
+		// vulkan lacks VK_KHR_video_decode_queue, the vdpau nvidia driver is
 		// missing), so hwdec=auto-safe just churns through failing
 		// "Failed setup … no frame!" probes on every load. Besides the log
 		// spam, a half-initialised hwdec frame can be handed to the SW
 		// renderer with dimensions that disagree with the params it computed
 		// its source crop from — which trips libmpv's mp_image_crop assertion
 		// (`x1 <= img->w`) and aborts the whole process. Forcing pure SW
-		// decode removes that class of frame entirely. Set PV_HWDEC to
-		// override (e.g. "auto-safe") on a box with a working GPU stack.
-		{"hwdec", hwdecMode()},
+		// decode removes that class of frame entirely. The GL path has no
+		// such crop and defaults to VAAPI instead (see hwdecMode).
+		{"hwdec", hwdecMode(gl != nil)},
+		// Load only the GPU interop that hwdec will use. mpv otherwise probes
+		// every one it was built with, and in a headless context cuda,
+		// vdpau and drmprime-overlay all fail, the last at error level on
+		// every start.
+		{"gpu-hwdec-interop", hwdecInterop(gl != nil)},
 		// Defer all cropping to mpv's own (params-consistent) VO crop rather
 		// than letting libavcodec crop inside the decoder. With the default
 		// vd-apply-cropping=yes, libavcodec applies only the alignment-aligned
@@ -215,8 +548,10 @@ func New(invalidate func()) (*Player, error) {
 		// tagged rotate=90 gets src y1=1920 against h=1080 and libmpv aborts
 		// on mp_image_crop's `y1 <= img->h` assertion. We zero the rotation
 		// here and instead bake it into the pixels with a lavfi transpose
-		// filter per file (applyRotation, on MPV_EVENT_FILE_LOADED).
-		{"video-rotate", "no"},
+		// filter per file (applyRotation, on MPV_EVENT_FILE_LOADED). This is
+		// SW-path only: the GL renderer rotates in its shader, and the lavfi
+		// transpose could not take VAAPI GPU frames anyway.
+		{"video-rotate", rotate},
 		{"loop-file", "inf"},
 		{"keep-open", "always"},
 		{"audio-display", "no"},
@@ -244,12 +579,14 @@ func New(invalidate func()) (*Player, error) {
 	} {
 		if err := setOpt(kv[0], kv[1]); err != nil {
 			C.mpv_terminate_destroy(h)
+			C.pv_gl_destroy(gl)
 			return nil, err
 		}
 	}
 
 	if rc := C.mpv_initialize(h); rc < 0 {
 		C.mpv_terminate_destroy(h)
+		C.pv_gl_destroy(gl)
 		return nil, fmt.Errorf("mpv_initialize: %s", C.GoString(C.mpv_error_string(rc)))
 	}
 
@@ -267,12 +604,32 @@ func New(invalidate func()) (*Player, error) {
 	user := C.uintptr_t(p.handle)
 
 	var ctx *C.mpv_render_context
-	if rc := C.create_render_ctx_sw(h, &ctx); rc < 0 {
-		p.handle.Delete()
-		C.mpv_terminate_destroy(h)
-		return nil, fmt.Errorf("mpv_render_context_create: %s", C.GoString(C.mpv_error_string(rc)))
+	if gl != nil {
+		if rc := C.create_render_ctx_gl(h, gl, &ctx); rc < 0 {
+			log.Printf("video: mpv OpenGL render context: %s; using software rendering",
+				C.GoString(C.mpv_error_string(rc)))
+			C.pv_gl_destroy(gl)
+			gl = nil
+			ctx = nil
+			// The options above were chosen for GL; switch them to the
+			// SW-safe values before any file is loaded.
+			for _, kv := range [][2]string{{"hwdec", hwdecMode(false)}, {"video-rotate", "no"}} {
+				cn, cv := C.CString(kv[0]), C.CString(kv[1])
+				C.mpv_set_property_string(h, cn, cv)
+				C.free(unsafe.Pointer(cn))
+				C.free(unsafe.Pointer(cv))
+			}
+		}
+	}
+	if gl == nil {
+		if rc := C.create_render_ctx_sw(h, &ctx); rc < 0 {
+			p.handle.Delete()
+			C.mpv_terminate_destroy(h)
+			return nil, fmt.Errorf("mpv_render_context_create: %s", C.GoString(C.mpv_error_string(rc)))
+		}
 	}
 	p.ctx = ctx
+	p.gl = gl
 	C.set_render_update_cb(ctx, user)
 	C.set_wakeup_cb(h, user)
 
@@ -423,9 +780,14 @@ func (p *Player) Render(w, h int) (*image.RGBA, bool) {
 	// paused in that window could sit on one stale frame until the next
 	// callback.
 	p.updatePending.Store(false)
-	stride := C.size_t(p.buf.Stride)
-	rc := C.render_sw(p.ctx, C.int(w), C.int(h),
-		stride, unsafe.Pointer(&p.buf.Pix[0]))
+	var rc C.int
+	if p.gl != nil {
+		rc = C.render_gl(p.gl, p.ctx, C.int(w), C.int(h), unsafe.Pointer(&p.buf.Pix[0]))
+	} else {
+		stride := C.size_t(p.buf.Stride)
+		rc = C.render_sw(p.ctx, C.int(w), C.int(h),
+			stride, unsafe.Pointer(&p.buf.Pix[0]))
+	}
 	if rc < 0 {
 		return nil, false
 	}
@@ -510,16 +872,23 @@ func (p *Player) Close() {
 	// is using p.h when it is destroyed below. libmpv requires the render
 	// context to be freed before the handle.
 	p.mu.Lock()
-	ctx := p.ctx
-	p.ctx = nil
+	ctx, gl := p.ctx, p.gl
+	p.ctx, p.gl = nil, nil
 	p.mu.Unlock()
 	if ctx != nil {
-		C.mpv_render_context_free(ctx)
+		if gl != nil {
+			C.free_render_ctx_gl(gl, ctx)
+		} else {
+			C.mpv_render_context_free(ctx)
+		}
 	}
 	if p.h != nil {
 		C.mpv_terminate_destroy(p.h)
 		p.h = nil
 	}
+	// Last: the decoder's VA display lives on gl's DRM fd, so the fd must
+	// outlive mpv itself, not just the render context.
+	C.pv_gl_destroy(gl)
 	p.handle.Delete()
 }
 
@@ -540,7 +909,9 @@ func (p *Player) drainEvents() {
 		case C.MPV_EVENT_LOG_MESSAGE:
 			logMpvMessage((*C.mpv_event_log_message)(ev.data))
 		case C.MPV_EVENT_FILE_LOADED:
-			p.applyRotation()
+			if p.gl == nil {
+				p.applyRotation()
+			}
 		}
 	}
 }

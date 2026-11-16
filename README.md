@@ -85,6 +85,12 @@ GUI preferences live in `$XDG_CONFIG_HOME/photo-viewer/config.json`
 `group_by_year` (sidebar), `sort_mode`, `show_shortcut_hints`, `web_server_port`, and
 `web_server_bind_all`. Import refuses an Inbox/Outbox pair where one is inside the other.
 
+Video playback renders through a headless OpenGL context and decodes on the GPU via VAAPI
+(Intel needs `intel-media-driver`, AMD `libva-mesa-driver`). Without VAAPI it decodes in
+software, and without OpenGL it falls back to mpv's CPU renderer. Two environment variables
+override this: `PV_HWDEC` sets mpv's `hwdec` (for example `no` or `auto-safe`), and
+`PV_VIDEO_RENDER=sw` forces the CPU renderer.
+
 ## Keyboard shortcuts
 
 Turn on Settings → "Show keyboard-shortcut hints" to see the shortcuts for the current pane. The main
