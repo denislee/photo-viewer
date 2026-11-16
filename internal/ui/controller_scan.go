@@ -50,6 +50,7 @@ type IndexStatus struct {
 	StartedAt   time.Time
 	EndedAt     time.Time
 	Batched     int
+	ScanTotal   int // files the scan will visit (scan.Count); 0 while still counting
 	TotalRows   int
 	LastError   string
 	WarmUp      WarmUpStatus
@@ -77,6 +78,7 @@ func (c *Controller) IndexStatus() IndexStatus {
 		StartedAt:   c.scanStartedAt,
 		EndedAt:     c.scanEndedAt,
 		Batched:     c.scanBatched,
+		ScanTotal:   c.scanTotal,
 		LastError:   c.scanLastErr,
 		WarmUp: WarmUpStatus{
 			Active:    c.warmUpRunning,
@@ -204,6 +206,9 @@ func (c *Controller) scanInto(ctx context.Context, dir string) {
 	c.scanStartedAt = time.Now()
 	c.scanEndedAt = time.Time{}
 	c.scanBatched = 0
+	c.scanTotal = 0
+	c.scanGen++
+	gen := c.scanGen
 	c.scanLastErr = ""
 	c.mu.Unlock()
 	if c.invalidate != nil {
@@ -229,6 +234,25 @@ func (c *Controller) scanInto(ctx context.Context, dir string) {
 		}
 		if c.invalidate != nil {
 			c.invalidate()
+		}
+	}()
+
+	// Count the files alongside the scan so the process bar and the info
+	// modal can show "done / total (pct)" instead of a bare running count.
+	// The count only reads directory entries, so it finishes long before the
+	// scan's stat/ffprobe work; until then the bar stays indeterminate.
+	go func() {
+		n, err := scan.Count(ctx, dir)
+		if err != nil {
+			return // cancelled along with the scan
+		}
+		c.mu.Lock()
+		if c.scanGen == gen {
+			c.scanTotal = n
+		}
+		c.mu.Unlock()
+		if proc != nil {
+			proc.SetTotal(int64(n))
 		}
 	}()
 

@@ -158,35 +158,7 @@ func WalkWith(ctx context.Context, root string, opts WalkOptions) <-chan Result 
 	}
 
 	go func() {
-		_ = filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
-			if err != nil {
-				if opts.OnError != nil {
-					opts.OnError(path, err)
-				}
-				return nil
-			}
-			if ctx.Err() != nil {
-				return ctx.Err()
-			}
-			name := d.Name()
-			if d.IsDir() {
-				if path != root && strings.HasPrefix(name, ".") {
-					return fs.SkipDir
-				}
-				return nil
-			}
-			// Skip hidden files, matching the hidden-directory semantics above.
-			// macOS-written SD cards litter every folder with AppleDouble forks
-			// (._IMG_1234.jpg, ._clip.mov) whose extensions match real media;
-			// without this they get indexed as ~4 KB resource-fork "media" that
-			// pollute the grid and double per-directory counts.
-			if strings.HasPrefix(name, ".") {
-				return nil
-			}
-			t := DetectType(path)
-			if t == TypeUnknown {
-				return nil
-			}
+		_ = walkMedia(ctx, root, opts.OnError, func(path string, t MediaType, d fs.DirEntry) error {
 			select {
 			case jobs <- work{path: path, t: t, d: d}:
 			case <-ctx.Done():
@@ -202,4 +174,62 @@ func WalkWith(ctx context.Context, root string, opts WalkOptions) <-chan Result 
 	}()
 
 	return out
+}
+
+// walkMedia walks root and calls fn for every media file, applying the
+// filters shared by WalkWith and Count: hidden directories (names starting
+// with '.', so the .photo-viewer-cache dir is never picked up) and hidden
+// files are skipped, as is anything DetectType doesn't recognise.
+// Filesystem errors go to onErr (if non-nil) and the walk carries on into
+// sibling paths. A non-nil error from fn stops the walk.
+func walkMedia(ctx context.Context, root string, onErr func(path string, err error), fn func(path string, t MediaType, d fs.DirEntry) error) error {
+	return filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			if onErr != nil {
+				onErr(path, err)
+			}
+			return nil
+		}
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		name := d.Name()
+		if d.IsDir() {
+			if path != root && strings.HasPrefix(name, ".") {
+				return fs.SkipDir
+			}
+			return nil
+		}
+		// Skip hidden files, matching the hidden-directory semantics above.
+		// macOS-written SD cards litter every folder with AppleDouble forks
+		// (._IMG_1234.jpg, ._clip.mov) whose extensions match real media;
+		// without this they get indexed as ~4 KB resource-fork "media" that
+		// pollute the grid and double per-directory counts.
+		if strings.HasPrefix(name, ".") {
+			return nil
+		}
+		t := DetectType(path)
+		if t == TypeUnknown {
+			return nil
+		}
+		return fn(path, t, d)
+	})
+}
+
+// Count returns how many media files a walk of root will visit, so progress
+// UIs can show a total. It reads directory entries only (no stat, no
+// ffprobe), which makes it far cheaper than WalkWith itself. WalkWith may
+// still emit slightly fewer results (unreadable files, dangling symlinks),
+// and files added mid-scan are not counted, so treat it as an estimate.
+// Returns ctx.Err() if cancelled.
+func Count(ctx context.Context, root string) (int, error) {
+	n := 0
+	err := walkMedia(ctx, root, nil, func(string, MediaType, fs.DirEntry) error {
+		n++
+		return nil
+	})
+	if err != nil {
+		return n, err
+	}
+	return n, ctx.Err()
 }

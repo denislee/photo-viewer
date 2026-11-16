@@ -95,3 +95,40 @@ func TestWalkSymlinkFollowsTarget(t *testing.T) {
 		t.Errorf("Size = %d, want %d (must follow the symlink to the target, not the link's lstat size)", got[0].Size, len(content))
 	}
 }
+
+// TestCountMatchesWalk verifies Count applies exactly the walk's filters
+// (hidden files and dirs, unknown extensions, nested dirs), so the indexing
+// progress total lines up with what the scan actually emits.
+func TestCountMatchesWalk(t *testing.T) {
+	dir := t.TempDir()
+	for _, name := range []string{
+		"a.jpg", "b.mp4", "notes.txt", "._c.jpg", ".hidden.png",
+		"sub/d.png", "sub/deeper/e.mov", ".cache/f.jpg",
+	} {
+		p := filepath.Join(dir, name)
+		if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(p, []byte("x"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	n, err := Count(context.Background(), dir)
+	if err != nil {
+		t.Fatalf("Count: %v", err)
+	}
+	walked := 0
+	for range WalkWith(context.Background(), dir, WalkOptions{SkipDurationProbe: true}) {
+		walked++
+	}
+	if n != 4 || walked != 4 {
+		t.Fatalf("Count = %d, walk emitted %d; want 4 and 4 (a.jpg, b.mp4, sub/d.png, sub/deeper/e.mov)", n, walked)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := Count(ctx, dir); err == nil {
+		t.Fatal("Count with a cancelled context returned nil error")
+	}
+}

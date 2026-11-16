@@ -71,7 +71,7 @@ func (v *IndexInfoView) Layout(gtx layout.Context, th *Theme) layout.Dimensions 
 			v.row(th, "Started", fmtTime(st.StartedAt)),
 			v.row(th, "Ended", fmtTime(st.EndedAt)),
 			v.row(th, "Elapsed", elapsedString(st)),
-			v.row(th, "Reconciled this run", fmt.Sprintf("%d", st.Batched)),
+			v.row(th, "Reconciled this run", reconciledString(st)),
 			v.row(th, "Thumbnail warm-up", warmUpString(st.WarmUp)),
 			v.row(th, "Last error", fallback(st.LastError, "—")),
 			layout.Rigid(layout.Spacer{Height: unit.Dp(16)}.Layout),
@@ -121,6 +121,19 @@ func elapsedString(s IndexStatus) string {
 	}
 	d := end.Sub(s.StartedAt).Round(time.Millisecond)
 	return d.String()
+}
+
+// reconciledString reports scan progress, e.g. "1200 / 4000 (30%)", or
+// "1200 (counting files…)" while the total is still being counted.
+func reconciledString(s IndexStatus) string {
+	if s.ScanTotal > 0 {
+		pct := min(s.Batched*100/s.ScanTotal, 100)
+		return fmt.Sprintf("%d / %d (%d%%)", s.Batched, s.ScanTotal, pct)
+	}
+	if s.Active {
+		return fmt.Sprintf("%d (counting files…)", s.Batched)
+	}
+	return fmt.Sprintf("%d", s.Batched)
 }
 
 // warmUpString summarises the thumbnail warm-up pass on one line, e.g.

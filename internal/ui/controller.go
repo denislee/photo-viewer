@@ -93,6 +93,8 @@ type Controller struct {
 	scanStartedAt time.Time
 	scanEndedAt   time.Time
 	scanBatched   int // entries reconciled during the current/last scan
+	scanTotal     int // media files the current/last scan will visit; 0 while still counting
+	scanGen       int // bumped per scanInto so a stale count can't set a newer scan's total
 	scanLastErr   string
 
 	// IndexStatus is polled every frame the index-info modal is open, and its
