@@ -49,11 +49,18 @@ func main() {
 	if err != nil {
 		log.Fatalf("resolve root: %v", err)
 	}
-	cacheDir, err := cache.CacheDir(absRoot)
+	// The index lives inside the library when the GUI/pv-scan ran with
+	// --root, or in the user cache when the GUI ran from the library folder
+	// without it; look in both.
+	_, dbPath, err := cache.Locate(absRoot, true)
 	if err != nil {
 		log.Fatalf("cache dir: %v", err)
 	}
-	dbPath := cache.IndexPath(absRoot, cacheDir)
+	if _, statErr := os.Stat(dbPath); statErr != nil {
+		if _, alt, err := cache.Locate(absRoot, false); err == nil {
+			dbPath = alt
+		}
+	}
 	if _, err := os.Stat(dbPath); err != nil {
 		log.Fatalf("index not found at %s: %v\n(run the GUI or pv-scan against the library first)", dbPath, err)
 	}

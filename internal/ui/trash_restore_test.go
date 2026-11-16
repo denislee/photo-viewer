@@ -98,7 +98,7 @@ func TestRestoreBatchReconcilesOnce(t *testing.T) {
 	}
 
 	root := filepath.Join(dir, "lib")
-	c := NewController(root, idx, store, cacheDir)
+	c := NewController(root, idx, store, cacheDir, cache.IndexPath(root, cacheDir))
 	trashDir := c.TrashDir()
 	if trashDir == "" {
 		t.Fatal("controller has no trash dir")

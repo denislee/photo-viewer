@@ -30,7 +30,7 @@ func TestRebuildWipesCacheSubtrees(t *testing.T) {
 	if err := os.MkdirAll(root, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	c := NewController(root, idx, store, cacheDir)
+	c := NewController(root, idx, store, cacheDir, cache.IndexPath(root, cacheDir))
 
 	// Seed a sentinel file in each cache subtree Rebuild is expected to wipe.
 	subs := []string{"thumbs", "hls", "display"}
@@ -85,7 +85,7 @@ func TestRebuildFailureSurfaced(t *testing.T) {
 	if err := os.MkdirAll(root, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	c := NewController(root, idx, store, cacheDir)
+	c := NewController(root, idx, store, cacheDir, cache.IndexPath(root, cacheDir))
 
 	var invalidated atomic.Int32
 	c.SetInvalidate(func() { invalidated.Add(1) })

@@ -99,15 +99,24 @@ ones:
 
 ## Data on disk
 
+Where the data goes depends on how the app is started.
+
+**With `--root <dir>`**, everything lives inside the library so it travels with it:
+
 ```
-<library-root>/.photo-viewer.db         # SQLite index (entries, favorites, hashes, faces)
-<library-root>/.photo-viewer-trash/     # soft-deleted files, restorable
-<drive-root>/.photo-viewer-cache/
+<root>/.photo-viewer.db                 # SQLite index (entries, favorites, hashes, faces)
+<root>/.photo-viewer-trash/             # soft-deleted files, restorable
+<root>/.photo-viewer-cache/
 ├── thumbs/ab/abc123…ef.jpg             # 256 px grid thumbnails, name = SHA-1(absolute path)
 └── display/ab/abc123…ef.jpg            # ≤2048 px web-viewer renditions (RAW/HEIC/TIFF/oversized)
 ```
 
-When a location isn't writable, the data moves:
+**Without `--root`** (the library is the working directory), the index and cache go in this
+computer's user cache, `~/.cache/photo-viewer/` (`thumbs/`, `display/`, `index-<hash>.db`).
+An existing `<library>/.photo-viewer.db` is still used so favorites aren't lost. The trash
+stays in `<library>/.photo-viewer-trash/` because deleting is a same-filesystem rename.
+
+With `--root`, if the library isn't writable, the data moves:
 
 - The cache falls back to `~/.cache/photo-viewer/`.
 - The index falls back to `index-<hash>.db` inside that cache directory.

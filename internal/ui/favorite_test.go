@@ -112,7 +112,7 @@ func TestToggleFavoriteEndToEnd(t *testing.T) {
 	}
 	idx.ReconcileBatch(results)
 
-	c := NewController(root, idx, store, cacheDir)
+	c := NewController(root, idx, store, cacheDir, cache.IndexPath(root, cacheDir))
 	// currentDir defaults to root (an ordinary dir), so ToggleFavorite takes the
 	// patch-in-place branch rather than the favorites-view full-refresh branch.
 	c.mu.Lock()

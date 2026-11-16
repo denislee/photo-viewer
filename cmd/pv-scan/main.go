@@ -29,13 +29,12 @@ func main() {
 		log.Fatal("pv-scan: -root is required")
 	}
 
-	cacheDir, err := cache.CacheDir(*root)
+	cacheDir, dbPath, err := cache.Locate(*root, true)
 	if err != nil {
 		log.Fatalf("pv-scan: cache dir: %v", err)
 	}
 	fmt.Println("cache dir:", cacheDir)
 
-	dbPath := cache.IndexPath(*root, cacheDir)
 	idx, err := cache.Load(dbPath)
 	if err != nil {
 		log.Fatalf("pv-scan: open index: %v", err)

@@ -77,7 +77,7 @@ func TestPerformDeletionSurfacesIndexError(t *testing.T) {
 	if err := os.MkdirAll(root, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	c := NewController(root, idx, store, cacheDir)
+	c := NewController(root, idx, store, cacheDir, cache.IndexPath(root, cacheDir))
 	if c.TrashDir() == "" {
 		t.Fatal("controller has no trash dir; the trash branch is untested")
 	}
@@ -133,7 +133,7 @@ func TestPerformDeletionSurfacesIndexErrorNoTrash(t *testing.T) {
 	if err := os.MkdirAll(root, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	c := NewController(root, idx, store, cacheDir)
+	c := NewController(root, idx, store, cacheDir, cache.IndexPath(root, cacheDir))
 	// Force the no-trash branch.
 	c.trashDir = ""
 

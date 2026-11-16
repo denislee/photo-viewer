@@ -53,7 +53,7 @@ type Controller struct {
 	cacheDir    string
 	trashDir    string
 	// indexPath is the real on-disk SQLite path, resolved once at construction
-	// via cache.IndexPath (which may fall back to cacheDir on a read-only
+	// via cache.Locate (which may fall back to cacheDir on a read-only
 	// library root). Stored so IndexStatus reports the true path without
 	// re-deriving or re-statting the filesystem on every modal poll.
 	indexPath string
@@ -167,13 +167,14 @@ type Controller struct {
 	webserver *webserver.Server
 }
 
-func NewController(root string, idx *cache.Index, store *cache.ThumbStore, cacheDir string) *Controller {
+// dbPath is the on-disk index path idx was loaded from (see cache.Locate).
+func NewController(root string, idx *cache.Index, store *cache.ThumbStore, cacheDir, dbPath string) *Controller {
 	trashDir, _ := cache.TrashDir(root, cacheDir)
 	c := &Controller{
 		libraryRoot:   root,
 		cacheDir:      cacheDir,
 		trashDir:      trashDir,
-		indexPath:     cache.IndexPath(root, cacheDir),
+		indexPath:     dbPath,
 		index:         idx,
 		store:         store,
 		treeDir:       root,

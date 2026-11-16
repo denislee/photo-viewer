@@ -18,6 +18,9 @@ func main() {
 	flag.StringVar(&rootFlag, "root", "", "library root (defaults to the current working directory)")
 	flag.Parse()
 
+	// An explicit --root keeps the cache and index inside that library; the
+	// working-directory default uses this computer's user cache instead.
+	inRoot := rootFlag != ""
 	if rootFlag == "" {
 		cwd, err := os.Getwd()
 		if err != nil {
@@ -33,11 +36,10 @@ func main() {
 		log.Fatalf("library root %q is not a directory: %v", abs, err)
 	}
 
-	cacheDir, err := cache.CacheDir(abs)
+	cacheDir, dbPath, err := cache.Locate(abs, inRoot)
 	if err != nil {
 		log.Fatalf("cache dir: %v", err)
 	}
-	dbPath := cache.IndexPath(abs, cacheDir)
 	idx, err := cache.Load(dbPath)
 	if err != nil {
 		log.Fatalf("load index: %v", err)
@@ -47,7 +49,7 @@ func main() {
 		log.Fatalf("thumb store: %v", err)
 	}
 
-	ctrl := ui.NewController(abs, idx, store, cacheDir)
+	ctrl := ui.NewController(abs, idx, store, cacheDir, dbPath)
 
 	go func() {
 		w := new(app.Window)

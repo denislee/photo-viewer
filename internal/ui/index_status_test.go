@@ -21,7 +21,7 @@ func newTestController(t *testing.T, root, cacheDir string) *Controller {
 	if err != nil {
 		t.Fatalf("NewThumbStore: %v", err)
 	}
-	return NewController(root, idx, store, cacheDir)
+	return NewController(root, idx, store, cacheDir, cache.IndexPath(root, cacheDir))
 }
 
 // TestIndexStatusReportsResolvedPath verifies IndexStatus surfaces the path

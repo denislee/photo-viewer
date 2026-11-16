@@ -6,61 +6,66 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"syscall"
 )
 
-// FindDriveRoot walks up from p until the parent directory is on a different
-// filesystem. The returned path is the topmost directory that still lives on
-// the same mount point as p.
-func FindDriveRoot(p string) (string, error) {
-	abs, err := filepath.Abs(p)
-	if err != nil {
-		return "", err
+// CacheDir returns the directory where thumbnails and other generated files
+// for an explicitly chosen library (--root) are written: <libraryRoot>/
+// .photo-viewer-cache, so the cache travels with the library. Falls back to
+// the per-user cache dir when the library root is not writable.
+func CacheDir(libraryRoot string) (string, error) {
+	candidate := filepath.Join(libraryRoot, ".photo-viewer-cache")
+	if writable(candidate) {
+		return candidate, nil
 	}
-	var st syscall.Stat_t
-	if err := syscall.Stat(abs, &st); err != nil {
-		return "", err
-	}
-	dev := st.Dev
-	cur := abs
-	for {
-		parent := filepath.Dir(cur)
-		if parent == cur {
-			return cur, nil
-		}
-		var ps syscall.Stat_t
-		if err := syscall.Stat(parent, &ps); err != nil {
-			return cur, nil
-		}
-		if ps.Dev != dev {
-			return cur, nil
-		}
-		cur = parent
-	}
+	return UserCacheDir()
 }
 
-// CacheDir returns the directory where the index and thumbnails should be
-// written. It first tries <drive-root>/.photo-viewer-cache and falls back to
-// the user cache dir if the drive root is not writable.
-func CacheDir(libraryRoot string) (string, error) {
-	driveRoot, err := FindDriveRoot(libraryRoot)
-	if err == nil {
-		candidate := filepath.Join(driveRoot, ".photo-viewer-cache")
-		if writable(candidate) {
-			if err := os.MkdirAll(candidate, 0o755); err == nil {
-				return candidate, nil
-			}
-		}
-	}
+// UserCacheDir returns (creating it if needed) this computer's per-user cache
+// directory, e.g. ~/.cache/photo-viewer on Linux.
+func UserCacheDir() (string, error) {
 	user, err := os.UserCacheDir()
 	if err != nil {
 		return "", err
 	}
-	fallback := filepath.Join(user, "photo-viewer")
-	if err := os.MkdirAll(fallback, 0o755); err != nil {
+	dir := filepath.Join(user, "photo-viewer")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return "", err
 	}
-	return fallback, nil
+	return dir, nil
+}
+
+// Locate picks where the cache directory and SQLite index live.
+//
+// With inRoot (the user passed --root) both are stored inside the library:
+// <root>/.photo-viewer-cache and <root>/.photo-viewer.db, falling back to the
+// user cache dir when the root is read-only.
+//
+// Without it (the library defaulted to the working directory) nothing is
+// written into the library: the cache is the user cache dir and the index is
+// index-<hash>.db inside it. An index that already exists at
+// <root>/.photo-viewer.db is still used, since it holds favorites and other
+// user data that would otherwise silently vanish.
+func Locate(libraryRoot string, inRoot bool) (cacheDir, dbPath string, err error) {
+	if inRoot {
+		cacheDir, err = CacheDir(libraryRoot)
+		if err != nil {
+			return "", "", err
+		}
+		return cacheDir, IndexPath(libraryRoot, cacheDir), nil
+	}
+	cacheDir, err = UserCacheDir()
+	if err != nil {
+		return "", "", err
+	}
+	if local := filepath.Join(libraryRoot, ".photo-viewer.db"); fileExists(local) {
+		return cacheDir, local, nil
+	}
+	return cacheDir, hashedIndexPath(libraryRoot, cacheDir), nil
+}
+
+func fileExists(p string) bool {
+	_, err := os.Stat(p)
+	return err == nil
 }
 
 // IndexPath returns the path to the SQLite database for the given library. It
@@ -80,9 +85,13 @@ func IndexPath(libraryRoot, cacheDir string) string {
 
 	// Library root is read-only or doesn't exist. Use cacheDir with a
 	// deterministic name unique to this library path.
+	return hashedIndexPath(libraryRoot, cacheDir)
+}
+
+// hashedIndexPath is the index location inside cacheDir, unique per library.
+func hashedIndexPath(libraryRoot, cacheDir string) string {
 	sum := sha1.Sum([]byte(libraryRoot))
-	name := fmt.Sprintf("index-%x.db", sum[:8])
-	return filepath.Join(cacheDir, name)
+	return filepath.Join(cacheDir, fmt.Sprintf("index-%x.db", sum[:8]))
 }
 
 func writable(dir string) bool {
