@@ -30,20 +30,21 @@ const largeFolderThreshold = 1000
 
 // viewInfo couples a cache.View with the user-facing metadata the
 // gallery and viewer pages need: a page title, the canonical URL for
-// the "back to gallery" link, and the query-string fragment that
-// forwards the view (plus filter/raw) through /view/<id> for prev/next.
+// the "back to gallery" link, the base gallery path (without query) the
+// toolbar builds its flip-state links from, and the query-string fragment
+// that forwards the view (plus filter/raw) through /view/<id> for prev/next.
+// The title doubles as the gallery's back-link label.
 //
 // kind is held separately because "trash" doesn't map onto cache.View —
 // trashed items aren't in the index. Renderers branch on kind for those
 // extra paths.
 type viewInfo struct {
-	v          cache.View
-	kind       string // "all" | "favorites" | "year" | "dir" | "trash"
-	title      string
-	backHref   string
-	backLabel  string
-	ctxQuery   string // forwarded to viewer + api endpoints
-	contextURL string // canonical gallery URL without ?p=
+	v        cache.View
+	kind     string // "all" | "favorites" | "year" | "dir" | "trash"
+	title    string
+	backHref string
+	base     string // canonical gallery path without any query (toolbar flip links)
+	ctxQuery string // forwarded to viewer + api endpoints
 }
 
 // parseFilter normalizes the filter query param, defaulting to "All".
@@ -101,80 +102,80 @@ func appendQuery(href, extra string) string {
 	return href + "?" + extra
 }
 
-// viewFromQuery parses a request's `from=...` (plus `y=` / `path=` / `filter=` /
-// `raw=`) query parameters and returns the corresponding view metadata.
-// Used by the viewer + /api/page to recover the surrounding list context.
-func (s *Server) viewFromQuery(q url.Values) (viewInfo, bool) {
-	filter := parseFilter(q.Get("filter"))
-	showRAW := parseShowRAW(q)
+// newViewInfo builds the viewInfo for one gallery view. It is the single
+// constructor every gallery handler and viewFromQuery share (W4-03), so the
+// title, back link, toolbar base path and forwarded context query can't drift
+// between what a page renders and what the viewer + /api/page recover from the
+// same query string.
+func (s *Server) newViewInfo(kind string, year int, dirAbs, filter string, showRAW bool) viewInfo {
 	extra := extraQuery(filter, showRAW)
-	withExtra := func(href string) string { return appendQuery(href, extra) }
-
-	switch q.Get("from") {
+	vi := viewInfo{
+		kind: kind,
+		v:    cache.View{Kind: kind, Filter: filter, ShowRAW: showRAW},
+	}
+	switch kind {
 	case "all":
-		return viewInfo{
-			v:          cache.View{Kind: "all", Filter: filter, ShowRAW: showRAW},
-			kind:       "all",
-			title:      "All media",
-			backHref:   withExtra("/"),
-			backLabel:  "All media",
-			ctxQuery:   buildCtxQuery("all", "", "", filter, showRAW),
-			contextURL: withExtra("/"),
-		}, true
+		vi.title = "All media"
+		vi.base = "/"
+		vi.ctxQuery = buildCtxQuery("all", "", "", filter, showRAW)
 	case "favorites":
-		return viewInfo{
-			v:          cache.View{Kind: "favorites", Filter: filter, ShowRAW: showRAW},
-			kind:       "favorites",
-			title:      "Favorites",
-			backHref:   withExtra("/favorites"),
-			backLabel:  "Favorites",
-			ctxQuery:   buildCtxQuery("favorites", "", "", filter, showRAW),
-			contextURL: withExtra("/favorites"),
-		}, true
+		vi.title = "Favorites"
+		vi.base = "/favorites"
+		vi.ctxQuery = buildCtxQuery("favorites", "", "", filter, showRAW)
 	case "trash":
 		// Trash isn't in the index, so vi.v drives no listing here — but the
 		// sidebar rendered on the trash page reads vi.v.Filter/ShowRAW to build
 		// its links, so carry the toolbar state through exactly like the other
 		// views instead of leaving a zero-value (Filter:"", ShowRAW:false) that
 		// would flip the user's RAW/filter state (W-04).
-		return viewInfo{
-			v:          cache.View{Filter: filter, ShowRAW: showRAW},
-			kind:       "trash",
-			title:      "Trash",
-			backHref:   "/trash",
-			backLabel:  "Trash",
-			ctxQuery:   buildCtxQuery("trash", "", "", filter, showRAW),
-			contextURL: "/trash",
-		}, true
+		vi.v.Kind = ""
+		vi.title = "Trash"
+		vi.base = "/trash"
+		vi.ctxQuery = buildCtxQuery("trash", "", "", filter, showRAW)
+	case "year":
+		vi.v.Year = year
+		ys := strconv.Itoa(year)
+		vi.title = "Year " + ys
+		vi.base = "/year/" + ys
+		vi.ctxQuery = buildCtxQuery("year", ys, "", filter, showRAW)
+	case "dir":
+		vi.v.Dir = dirAbs
+		vi.title = filepath.Base(dirAbs)
+		vi.base = s.dirHref(dirAbs)
+		vi.ctxQuery = buildCtxQuery("dir", "", s.relPath(dirAbs), filter, showRAW)
+	}
+	if kind == "trash" {
+		// Trash has no filter semantics, so its back link deliberately omits
+		// the toolbar query, as before.
+		vi.backHref = vi.base
+	} else {
+		vi.backHref = appendQuery(vi.base, extra)
+	}
+	return vi
+}
+
+// viewFromQuery parses a request's `from=...` (plus `y=` / `path=` / `filter=` /
+// `raw=`) query parameters and returns the corresponding view metadata.
+// Used by the viewer + /api/page to recover the surrounding list context.
+func (s *Server) viewFromQuery(q url.Values) (viewInfo, bool) {
+	filter := parseFilter(q.Get("filter"))
+	showRAW := parseShowRAW(q)
+
+	switch q.Get("from") {
+	case "all", "favorites", "trash":
+		return s.newViewInfo(q.Get("from"), 0, "", filter, showRAW), true
 	case "year":
 		y, err := strconv.Atoi(q.Get("y"))
 		if err != nil {
 			return viewInfo{}, false
 		}
-		ys := q.Get("y")
-		return viewInfo{
-			v:          cache.View{Kind: "year", Year: y, Filter: filter, ShowRAW: showRAW},
-			kind:       "year",
-			title:      "Year " + ys,
-			backHref:   withExtra("/year/" + url.PathEscape(ys)),
-			backLabel:  "Year " + ys,
-			ctxQuery:   buildCtxQuery("year", ys, "", filter, showRAW),
-			contextURL: withExtra("/year/" + url.PathEscape(ys)),
-		}, true
+		return s.newViewInfo("year", y, "", filter, showRAW), true
 	case "dir":
 		abs, ok := s.resolveDirParam(q.Get("path"))
 		if !ok {
 			return viewInfo{}, false
 		}
-		return viewInfo{
-			v:          cache.View{Kind: "dir", Dir: abs, Filter: filter, ShowRAW: showRAW},
-			kind:       "dir",
-			title:      filepath.Base(abs),
-			backHref:   withExtra(s.dirHref(abs)),
-			backLabel:  filepath.Base(abs),
-			ctxQuery:   buildCtxQuery("dir", "", s.relPath(abs), filter, showRAW),
-			contextURL: withExtra(s.dirHref(abs)),
-		}, true
+		return s.newViewInfo("dir", 0, abs, filter, showRAW), true
 	}
 	return viewInfo{}, false
 }
@@ -202,59 +203,20 @@ func (s *Server) handleIndex(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	q := r.URL.Query()
-	filter := parseFilter(q.Get("filter"))
-	showRAW := parseShowRAW(q)
-	extra := extraQuery(filter, showRAW)
-	vi := viewInfo{
-		v:          cache.View{Kind: "all", Filter: filter, ShowRAW: showRAW},
-		kind:       "all",
-		title:      "All media",
-		backHref:   appendQuery("/", extra),
-		backLabel:  "All media",
-		ctxQuery:   buildCtxQuery("all", "", "", filter, showRAW),
-		contextURL: appendQuery("/", extra),
-	}
-	s.renderGalleryPage(w, r, vi)
+	s.renderGalleryPage(w, r, s.newViewInfo("all", 0, "", parseFilter(q.Get("filter")), parseShowRAW(q)))
 }
 
 // handleFavorites serves only the entries flagged as favorites.
 func (s *Server) handleFavorites(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
-	filter := parseFilter(q.Get("filter"))
-	showRAW := parseShowRAW(q)
-	extra := extraQuery(filter, showRAW)
-	vi := viewInfo{
-		v:          cache.View{Kind: "favorites", Filter: filter, ShowRAW: showRAW},
-		kind:       "favorites",
-		title:      "Favorites",
-		backHref:   appendQuery("/favorites", extra),
-		backLabel:  "Favorites",
-		ctxQuery:   buildCtxQuery("favorites", "", "", filter, showRAW),
-		contextURL: appendQuery("/favorites", extra),
-	}
-	s.renderGalleryPage(w, r, vi)
+	s.renderGalleryPage(w, r, s.newViewInfo("favorites", 0, "", parseFilter(q.Get("filter")), parseShowRAW(q)))
 }
 
 // handleTrash serves a listing of soft-deleted files. Trashed items are
 // not in the index — they're read from the trash directory directly.
 func (s *Server) handleTrash(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
-	filter := parseFilter(q.Get("filter"))
-	showRAW := parseShowRAW(q)
-	// vi.v doesn't drive the trash listing (trashEntries does), but renderSidebar
-	// reads vi.v.Filter/ShowRAW to build its links. Parse them from the query
-	// like every other handler so the sidebar carries the user's toolbar state
-	// instead of a zero-value view that hides RAW and forces filter= (W-04).
-	vi := viewInfo{
-		v:          cache.View{Filter: filter, ShowRAW: showRAW},
-		kind:       "trash",
-		title:      "Trash",
-		backHref:   "/trash",
-		backLabel:  "Trash",
-		ctxQuery:   buildCtxQuery("trash", "", "", filter, showRAW),
-		contextURL: "/trash",
-	}
-	s.renderGalleryPage(w, r, vi)
+	s.renderGalleryPage(w, r, s.newViewInfo("trash", 0, "", parseFilter(q.Get("filter")), parseShowRAW(q)))
 }
 
 // handleYear serves the entries whose capture year matches /year/<YYYY>.
@@ -267,19 +229,7 @@ func (s *Server) handleYear(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	q := r.URL.Query()
-	filter := parseFilter(q.Get("filter"))
-	showRAW := parseShowRAW(q)
-	extra := extraQuery(filter, showRAW)
-	vi := viewInfo{
-		v:          cache.View{Kind: "year", Year: year, Filter: filter, ShowRAW: showRAW},
-		kind:       "year",
-		title:      "Year " + rest,
-		backHref:   appendQuery("/year/"+rest, extra),
-		backLabel:  "Year " + rest,
-		ctxQuery:   buildCtxQuery("year", rest, "", filter, showRAW),
-		contextURL: appendQuery("/year/"+rest, extra),
-	}
-	s.renderGalleryPage(w, r, vi)
+	s.renderGalleryPage(w, r, s.newViewInfo("year", year, "", parseFilter(q.Get("filter")), parseShowRAW(q)))
 }
 
 // handleDir serves the entries under /dir?path=<library-relative path>. The
@@ -297,19 +247,7 @@ func (s *Server) handleDir(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	q := r.URL.Query()
-	filter := parseFilter(q.Get("filter"))
-	showRAW := parseShowRAW(q)
-	extra := extraQuery(filter, showRAW)
-	vi := viewInfo{
-		v:          cache.View{Kind: "dir", Dir: abs, Filter: filter, ShowRAW: showRAW},
-		kind:       "dir",
-		title:      filepath.Base(abs),
-		backHref:   appendQuery(s.dirHref(abs), extra),
-		backLabel:  filepath.Base(abs),
-		ctxQuery:   buildCtxQuery("dir", "", s.relPath(abs), filter, showRAW),
-		contextURL: appendQuery(s.dirHref(abs), extra),
-	}
-	s.renderGalleryPage(w, r, vi)
+	s.renderGalleryPage(w, r, s.newViewInfo("dir", 0, abs, parseFilter(q.Get("filter")), parseShowRAW(q)))
 }
 
 // withinRoot reports whether abs is the library root itself or a path
@@ -436,13 +374,8 @@ func (s *Server) renderGalleryPage(w http.ResponseWriter, r *http.Request, vi vi
 	if hasNext {
 		fmt.Fprint(w, `<div class="loader" id="loader">Loading more…</div>`)
 		// Fallback link for users with JS disabled or assistive tech.
-		nextURL := vi.contextURL
-		sep := "?"
-		if strings.Contains(nextURL, "?") {
-			sep = "&"
-		}
-		fmt.Fprintf(w, `<noscript><a class="pager" href="%s%sp=%d">Next page →</a></noscript>`,
-			html.EscapeString(nextURL), sep, page+1)
+		fmt.Fprintf(w, `<noscript><a class="pager" href="%s">Next page →</a></noscript>`,
+			html.EscapeString(appendQuery(vi.backHref, "p="+strconv.Itoa(page+1))))
 	}
 	fmt.Fprint(w, `</main></div>`)
 	fmt.Fprint(w, gridScript)
@@ -514,7 +447,7 @@ func (s *Server) renderToolbar(w http.ResponseWriter, vi viewInfo) {
 	rawOn := vi.v.ShowRAW
 
 	makeURL := func(filter string, showRAW bool) string {
-		return appendQuery(s.basePathFor(vi), extraQuery(filter, showRAW))
+		return appendQuery(vi.base, extraQuery(filter, showRAW))
 	}
 
 	fmt.Fprint(w, `<div class="toolbar">`)
@@ -538,23 +471,6 @@ func (s *Server) renderToolbar(w http.ResponseWriter, vi viewInfo) {
 	fmt.Fprintf(w, `<a class="%s" href="%s" title="Toggle RAW visibility">%s</a>`,
 		rawCls, html.EscapeString(makeURL(currentFilter, !rawOn)), html.EscapeString(rawLabel))
 	fmt.Fprint(w, `</div>`)
-}
-
-// basePathFor returns the canonical URL path (no query) for the gallery
-// view described by vi. Used by the toolbar to build flip-state links.
-func (s *Server) basePathFor(vi viewInfo) string {
-	switch vi.kind {
-	case "favorites":
-		return "/favorites"
-	case "trash":
-		return "/trash"
-	case "year":
-		return "/year/" + strconv.Itoa(vi.v.Year)
-	case "dir":
-		return s.dirHref(vi.v.Dir)
-	default:
-		return "/"
-	}
 }
 
 // listSubdirsHook, when non-nil, is invoked with every listSubdirs argument.

@@ -29,7 +29,6 @@ func (s *Server) handleView(w http.ResponseWriter, r *http.Request) {
 	vi, hasCtx := s.viewFromQuery(r.URL.Query())
 	var prev, next *cache.Entry
 	var pos, total int
-	var ctxQ, backHref, backLabel string
 	if hasCtx {
 		switch vi.kind {
 		case "trash":
@@ -41,15 +40,11 @@ func (s *Server) handleView(w http.ResponseWriter, r *http.Request) {
 			total = s.cachedCountView(vi.v)
 			prev, next, pos, total = s.index.NeighborsWithTotal(vi.v, cur.Path, total)
 		}
-		ctxQ = vi.ctxQuery
-		backHref = vi.backHref
-		backLabel = vi.backLabel
 	} else {
-		backHref = "/"
-		backLabel = "Gallery"
+		vi = viewInfo{backHref: "/", title: "Gallery"}
 	}
 
-	s.renderViewer(w, cur, prev, next, ctxQ, backHref, backLabel, pos, total)
+	s.renderViewer(w, cur, prev, next, vi, pos, total)
 }
 
 // trashNeighbors returns the prev/next/pos/total tuple for the trash listing,
@@ -75,12 +70,14 @@ func (s *Server) trashNeighbors(path string) (prev, next *cache.Entry, pos, tota
 	return nil, nil, 0, total
 }
 
-// renderViewer writes the single-media page. pos is the 1-based position
-// in the surrounding list (0 when no context was provided); total is the
-// list length. prev/next are nil at the edges.
+// renderViewer writes the single-media page. vi carries the surrounding list
+// context the page links back into — its title is the back-link label, its
+// backHref the gallery URL, and its ctxQuery is forwarded onto the prev/next
+// viewer links. pos is the 1-based position in that list (0 when no context
+// was provided); total is the list length. prev/next are nil at the edges.
 func (s *Server) renderViewer(w http.ResponseWriter,
 	cur cache.Entry, prev, next *cache.Entry,
-	ctxQ, backHref, backLabel string, pos, total int,
+	vi viewInfo, pos, total int,
 ) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	fmt.Fprint(w, pageHeader)
@@ -88,15 +85,15 @@ func (s *Server) renderViewer(w http.ResponseWriter,
 	prevHref := ""
 	if prev != nil {
 		prevHref = "/view/" + prev.ThumbID
-		if ctxQ != "" {
-			prevHref += "?" + ctxQ
+		if vi.ctxQuery != "" {
+			prevHref += "?" + vi.ctxQuery
 		}
 	}
 	nextHref := ""
 	if next != nil {
 		nextHref = "/view/" + next.ThumbID
-		if ctxQ != "" {
-			nextHref += "?" + ctxQ
+		if vi.ctxQuery != "" {
+			nextHref += "?" + vi.ctxQuery
 		}
 	}
 
@@ -109,7 +106,7 @@ func (s *Server) renderViewer(w http.ResponseWriter,
 
 	fmt.Fprint(w, `<div class="viewer">`)
 	fmt.Fprint(w, `<header class="vbar">`)
-	fmt.Fprintf(w, `<a class="back" href="%s">‹ %s</a>`, html.EscapeString(backHref), html.EscapeString(backLabel))
+	fmt.Fprintf(w, `<a class="back" href="%s">‹ %s</a>`, html.EscapeString(vi.backHref), html.EscapeString(vi.title))
 	fmt.Fprintf(w, `<span class="vname">%s</span>`, html.EscapeString(filepath.Base(cur.Path)))
 	if pos > 0 && total > 0 {
 		fmt.Fprintf(w, `<span class="vpos">%d / %d</span>`, pos, total)
@@ -185,6 +182,6 @@ func (s *Server) renderViewer(w http.ResponseWriter,
 
 	// Inline the keybinding + favorite + info JS so the viewer doesn't
 	// require an external script file.
-	fmt.Fprint(w, viewerScript(prevHref, nextHref, backHref))
+	fmt.Fprint(w, viewerScript(prevHref, nextHref, vi.backHref))
 	fmt.Fprint(w, `</body></html>`)
 }
