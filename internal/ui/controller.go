@@ -170,11 +170,6 @@ type Controller struct {
 	// skip the registration calls.
 	processes *ProcessRegistry
 
-	// webserver is the optional HTTP server that serves the index to a
-	// browser. Lazily constructed when the user first opens the webserver
-	// modal so headless / unused sessions don't allocate it.
-	webserver *webserver.Server
-
 	displayOnce sync.Once
 	display     *cache.ThumbStore
 }
@@ -213,21 +208,17 @@ func (c *Controller) SetInvalidate(f func()) { c.invalidate = f }
 // process bar with pause / resume / cancel controls.
 func (c *Controller) SetProcessRegistry(r *ProcessRegistry) { c.processes = r }
 
-// WebServer lazily constructs and returns the controller's HTTP server.
-// The instance is reused across Start/Stop cycles so its state survives
-// the modal closing.
-func (c *Controller) WebServer() *webserver.Server {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if c.webserver == nil {
-		// Second thumb store rooted at <cacheDir>/display for the larger
-		// browser-viewer renditions (W-03). Best-effort: cacheDir is the same
-		// always-writable root the primary thumb store already resolved, so this
-		// only fails in pathological cases; a nil store degrades /display to
-		// serving originals (fine for JPEG/PNG, no RAW/HEIC rendition).
-		c.webserver = webserver.New(c.index, c.store, c.DisplayStore(), c.libraryRoot, c.trashDir)
-	}
-	return c.webserver
+// NewWebServer constructs the HTTP server that serves the index to a browser.
+// Run calls it exactly once at startup and hands it to the web-server modal,
+// which reuses it across Start/Stop cycles (U4-14: the old lazily-built,
+// mutex-guarded getter had a single caller, which ran at startup anyway).
+func (c *Controller) NewWebServer() *webserver.Server {
+	// Second thumb store rooted at <cacheDir>/display for the larger
+	// browser-viewer renditions (W-03). Best-effort: cacheDir is the same
+	// always-writable root the primary thumb store already resolved, so this
+	// only fails in pathological cases; a nil store degrades /display to
+	// serving originals (fine for JPEG/PNG, no RAW/HEIC rendition).
+	return webserver.New(c.index, c.store, c.DisplayStore(), c.libraryRoot, c.trashDir)
 }
 
 // DisplayStore returns the shared <cacheDir>/display rendition store, creating

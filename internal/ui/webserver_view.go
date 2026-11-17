@@ -25,7 +25,8 @@ type WebServerView struct {
 	Open    bool
 	OnClose func()
 
-	srv *webserver.Server
+	srv        *webserver.Server
+	invalidate func()
 
 	portEditor     widget.Editor
 	passwordEditor widget.Editor
@@ -34,14 +35,15 @@ type WebServerView struct {
 	stopBtn        widget.Clickable
 	closeBtn       widget.Clickable
 
-	mu     sync.Mutex
-	status string
+	mu       sync.Mutex
+	status   string
+	stopping bool // guarded by mu; a background Stop is in flight
 }
 
-// NewWebServerView constructs the modal bound to srv. srv may be nil at
-// construction time; the modal won't be functional until SetServer is called.
-func NewWebServerView(srv *webserver.Server) *WebServerView {
-	v := &WebServerView{srv: srv}
+// NewWebServerView constructs the modal bound to srv, which must be non-nil.
+// invalidate wakes the frame loop when a background Stop finishes.
+func NewWebServerView(srv *webserver.Server, invalidate func()) *WebServerView {
+	v := &WebServerView{srv: srv, invalidate: invalidate}
 	v.portEditor.SingleLine = true
 	v.passwordEditor.SingleLine = true
 	v.passwordEditor.Mask = '•'
@@ -73,17 +75,13 @@ func (v *WebServerView) Close() {
 // Running reports whether the underlying server is up. Used by window.go to
 // reflect state in the toolbar button without reaching into the controller.
 func (v *WebServerView) Running() bool {
-	return v.srv != nil && v.srv.Running()
+	return v.srv.Running()
 }
 
 // refreshStatus rebuilds the status line from the server's current state.
 func (v *WebServerView) refreshStatus() {
 	v.mu.Lock()
 	defer v.mu.Unlock()
-	if v.srv == nil {
-		v.status = "Server not initialized."
-		return
-	}
 	if v.srv.Running() {
 		v.status = fmt.Sprintf("Running at %s", reachableURLs(v.srv.Addr()))
 	} else {
@@ -107,6 +105,7 @@ func (v *WebServerView) Layout(gtx layout.Context, th *Theme) layout.Dimensions 
 
 	v.mu.Lock()
 	status := v.status
+	stopping := v.stopping
 	v.mu.Unlock()
 	running := v.Running()
 
@@ -146,7 +145,7 @@ func (v *WebServerView) Layout(gtx layout.Context, th *Theme) layout.Dimensions 
 			layout.Rigid(layout.Spacer{Height: unit.Dp(16)}.Layout),
 			layout.Rigid(func(gtx layout.Context) layout.Dimensions {
 				return layout.Flex{Axis: layout.Horizontal}.Layout(gtx,
-					layout.Rigid(v.actionButton(th, running)),
+					layout.Rigid(v.actionButton(th, running, stopping)),
 					layout.Rigid(layout.Spacer{Width: unit.Dp(8)}.Layout),
 					layout.Rigid(material.Button(th.Theme, &v.closeBtn, "Close (esc)").Layout),
 				)
@@ -156,8 +155,13 @@ func (v *WebServerView) Layout(gtx layout.Context, th *Theme) layout.Dimensions 
 }
 
 // actionButton returns the Start or Stop button depending on the running
-// state so the user can only invoke the valid action.
-func (v *WebServerView) actionButton(th *Theme, running bool) layout.Widget {
+// state so the user can only invoke the valid action. While a background Stop
+// is in flight it renders a disabled-looking "Stopping…" Start button instead,
+// since starting before the old listener releases the port would just fail.
+func (v *WebServerView) actionButton(th *Theme, running, stopping bool) layout.Widget {
+	if stopping {
+		return material.Button(th.Theme, &v.startBtn, "Stopping…").Layout
+	}
 	if running {
 		return material.Button(th.Theme, &v.stopBtn, "Stop server").Layout
 	}
@@ -187,8 +191,11 @@ func (v *WebServerView) fieldRow(th *Theme, label string, ed *widget.Editor, hin
 }
 
 func (v *WebServerView) handleStart() {
-	if v.srv == nil {
-		v.setStatus("Server not initialized.")
+	// Wait for the previous Stop to release the port.
+	v.mu.Lock()
+	stopping := v.stopping
+	v.mu.Unlock()
+	if stopping {
 		return
 	}
 	if v.srv.Running() {
@@ -223,15 +230,33 @@ func (v *WebServerView) handleStart() {
 	v.refreshStatus()
 }
 
+// Stop can wait out the server's 2 s shutdown grace with an open keep-alive or
+// a streaming download, so it runs on a goroutine instead of freezing the frame
+// goroutine (U3-02); the stopping flag ignores a second click while it runs.
 func (v *WebServerView) handleStop() {
-	if v.srv == nil {
+	v.mu.Lock()
+	if v.stopping {
+		v.mu.Unlock()
 		return
 	}
-	if err := v.srv.Stop(); err != nil {
-		v.setStatus("Stop failed: " + err.Error())
-		return
-	}
-	v.setStatus("Stopped.")
+	v.stopping = true
+	v.status = "Stopping…"
+	v.mu.Unlock()
+
+	go func() {
+		err := v.srv.Stop()
+		v.mu.Lock()
+		v.stopping = false
+		if err != nil {
+			v.status = "Stop failed: " + err.Error()
+		} else {
+			v.status = "Stopped."
+		}
+		v.mu.Unlock()
+		if v.invalidate != nil {
+			v.invalidate()
+		}
+	}()
 }
 
 func (v *WebServerView) setStatus(s string) {

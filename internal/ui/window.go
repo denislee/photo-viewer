@@ -90,7 +90,7 @@ func Run(w *app.Window, ctrl *Controller) error {
 		w.Invalidate()
 	}
 	indexInfo := NewIndexInfoView(ctrl.IndexStatus)
-	webView := NewWebServerView(ctrl.WebServer())
+	webView := NewWebServerView(ctrl.NewWebServer(), w.Invalidate)
 	search := NewFuzzySearchView(ctrl.Index())
 	search.SetInvalidate(func() { w.Invalidate() })
 	search.OnPick = func(path string, isDir bool) {
