@@ -1,6 +1,7 @@
 package export
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -23,6 +24,7 @@ import (
 	"github.com/dns/photo-viewer/internal/imgfit"
 	"github.com/dns/photo-viewer/internal/imgorient"
 	"github.com/dns/photo-viewer/internal/scan"
+	"github.com/dns/photo-viewer/internal/thumb"
 )
 
 // External-tool availability is probed once via exec.LookPath and cached, the
@@ -62,7 +64,7 @@ func recompressOutputPath(dst string, t scan.MediaType) string {
 func recompressFile(ctx context.Context, t scan.MediaType, src, dst string, maxEdge, jpegQuality, videoCRF int) (bool, error) {
 	switch t {
 	case scan.TypePhoto:
-		return true, recompressImage(src, dst, maxEdge, jpegQuality)
+		return true, recompressImage(ctx, src, dst, maxEdge, jpegQuality)
 	case scan.TypeHEIC:
 		// Either decoder can satisfy HEIC: recompressHEIC prefers a single
 		// ffmpeg pass and falls back to heif-convert. Only plain-copy (return
@@ -85,20 +87,26 @@ func recompressFile(ctx context.Context, t scan.MediaType, src, dst string, maxE
 // recompressImage decodes any image format supported by image.Decode (plus
 // the x/image additions: webp, bmp, tiff), resizes it so the longest edge
 // is at most maxEdge (no upscaling), and writes a JPEG at the given
-// quality.
-func recompressImage(src, dst string, maxEdge, quality int) error {
-	in, err := os.Open(src)
-	if err != nil {
-		return err
-	}
-	defer in.Close()
+// quality. JPEGs decode through libjpeg-turbo with DCT scaling
+// (thumb.DecodeFit), so a large photo is decoded only as large as the output
+// needs; ctx cancels the read and the decode.
+func recompressImage(ctx context.Context, src, dst string, maxEdge, quality int) error {
 	// Capture the source mtime before decoding so we can stamp it onto the
 	// finalized output (see the Chtimes after rename below).
-	info, err := in.Stat()
+	info, err := os.Stat(src)
 	if err != nil {
 		return err
 	}
-	img, _, err := image.Decode(in)
+	// One read serves the decode and the orientation lookup (E4-01). DecodeFit
+	// lets libjpeg-turbo DCT-scale a JPEG to no less than the fitted size, so a
+	// 24 MP photo is never expanded to full resolution only to be scaled down;
+	// other formats decode through image.Decode as before. Both stop early
+	// when ctx is cancelled.
+	data, err := thumb.ReadFile(ctx, src)
+	if err != nil {
+		return err
+	}
+	img, err := thumb.DecodeFit(ctx, data, maxEdge)
 	if err != nil {
 		return err
 	}
@@ -112,7 +120,7 @@ func recompressImage(src, dst string, maxEdge, quality int) error {
 	// scaling, so the remap runs on the small output, not the full-res source.
 	// imgfit.Within is fed the stored dims; for the transpose orientations (5–8) the
 	// output's axes swap, both staying ≤ maxEdge.
-	orient := imgorient.ReadOrientation(src)
+	orient := imgorient.ReadOrientationFrom(bytes.NewReader(data))
 	b := img.Bounds()
 	tw, th := imgfit.Within(b.Dx(), b.Dy(), maxEdge)
 	scaled := image.NewRGBA(image.Rect(0, 0, tw, th))
@@ -123,6 +131,9 @@ func recompressImage(src, dst string, maxEdge, quality int) error {
 	// ffmpeg-bound anyway), so the extra CPU is fine.
 	draw.CatmullRom.Scale(scaled, scaled.Rect, img, b, draw.Src, nil)
 	dstImg := imgorient.Apply(scaled, orient)
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 
 	tmp := dst + ".tmp"
 	out, err := os.Create(tmp)
@@ -209,7 +220,7 @@ func recompressHEIC(ctx context.Context, src, dst string, maxEdge, quality int) 
 	if out, err := cmd.CombinedOutput(); err != nil {
 		return fmt.Errorf("heif-convert: %v: %s", err, strings.TrimSpace(string(out)))
 	}
-	if err := recompressImage(tmpFull.Name(), dst, maxEdge, quality); err != nil {
+	if err := recompressImage(ctx, tmpFull.Name(), dst, maxEdge, quality); err != nil {
 		return err
 	}
 	// Override the intermediate-temp mtime recompressImage stamped with the

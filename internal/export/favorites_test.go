@@ -1,11 +1,14 @@
 package export
 
 import (
+	"bytes"
 	"context"
+	"errors"
 	"image"
 	"image/color"
-	_ "image/jpeg"
+	"image/jpeg"
 	"image/png"
+	"io/fs"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -230,7 +233,7 @@ func TestRecompressImagePreservesMtime(t *testing.T) {
 	}
 
 	dst := filepath.Join(dir, "out.jpg")
-	if err := recompressImage(src, dst, 32, 82); err != nil {
+	if err := recompressImage(context.Background(), src, dst, 32, 82); err != nil {
 		t.Fatalf("recompressImage: %v", err)
 	}
 
@@ -242,6 +245,127 @@ func TestRecompressImagePreservesMtime(t *testing.T) {
 	// an encode-time (~now) mtime, which would be years off.
 	if d := info.ModTime().Sub(want); d < -2*time.Second || d > 2*time.Second {
 		t.Fatalf("recompressed mtime = %v, want ~%v (delta %v)", info.ModTime(), want, d)
+	}
+}
+
+// exifAPP1 builds a minimal EXIF APP1 segment carrying a single Orientation
+// tag (big-endian TIFF, one-entry IFD0 with the SHORT value in the high bytes).
+// Copied verbatim from internal/thumb/orient_test.go; goexif reads only the
+// Orientation tag from it, which is all imgorient consults.
+func exifAPP1(orientation byte) []byte {
+	payload := []byte{
+		'E', 'x', 'i', 'f', 0, 0, // EXIF identifier
+		'M', 'M', // big-endian
+		0x00, 0x2A, // TIFF magic 42
+		0x00, 0x00, 0x00, 0x08, // offset to IFD0
+		0x00, 0x01, // one directory entry
+		0x01, 0x12, // tag = Orientation
+		0x00, 0x03, // type = SHORT
+		0x00, 0x00, 0x00, 0x01, // count = 1
+		0x00, orientation, 0x00, 0x00, // value (SHORT in high bytes)
+		0x00, 0x00, 0x00, 0x00, // next-IFD offset = 0
+	}
+	segLen := len(payload) + 2 // +2 for the length field itself
+	seg := []byte{0xFF, 0xE1, byte(segLen >> 8), byte(segLen)}
+	return append(seg, payload...)
+}
+
+// jpegWithOrientation encodes a w×h gradient JPEG into memory and splices an
+// EXIF APP1 Orientation segment right after the 2-byte SOI, so the file
+// exercises the orientation path without needing exiftool.
+func jpegWithOrientation(t *testing.T, w, h int, orientation byte) []byte {
+	t.Helper()
+	img := image.NewRGBA(image.Rect(0, 0, w, h))
+	for y := 0; y < h; y++ {
+		for x := 0; x < w; x++ {
+			i := y*img.Stride + x*4
+			img.Pix[i] = uint8(x)
+			img.Pix[i+1] = uint8(y)
+			img.Pix[i+2] = 0
+			img.Pix[i+3] = 255
+		}
+	}
+	var buf bytes.Buffer
+	if err := jpeg.Encode(&buf, img, &jpeg.Options{Quality: 85}); err != nil {
+		t.Fatalf("encode jpeg: %v", err)
+	}
+	enc := buf.Bytes()
+	exif := exifAPP1(orientation)
+	out := make([]byte, 0, len(enc)+len(exif))
+	out = append(out, enc[:2]...) // SOI
+	out = append(out, exif...)
+	out = append(out, enc[2:]...)
+	return out
+}
+
+// TestRecompressImageOrientedFit is the E4-01 guarantee in one pass: a portrait
+// 4000×3000 JPEG (EXIF Orientation 6) decodes through the fitted/DCT-scaled
+// path, is downscaled to fit 2048, has its rotation baked into the pixels (so
+// the output axes swap to 1536×2048), and still carries the source mtime.
+func TestRecompressImageOrientedFit(t *testing.T) {
+	srcDir := t.TempDir()
+	src := filepath.Join(srcDir, "in.jpg")
+	if err := os.WriteFile(src, jpegWithOrientation(t, 4000, 3000, 6), 0o644); err != nil {
+		t.Fatalf("write src: %v", err)
+	}
+	stamped := time.Date(2020, 1, 2, 3, 4, 5, 0, time.UTC)
+	if err := os.Chtimes(src, stamped, stamped); err != nil {
+		t.Fatalf("chtimes src: %v", err)
+	}
+
+	dst := filepath.Join(t.TempDir(), "out.jpg")
+	if err := recompressImage(context.Background(), src, dst, 2048, 82); err != nil {
+		t.Fatalf("recompressImage: %v", err)
+	}
+
+	f, err := os.Open(dst)
+	if err != nil {
+		t.Fatalf("open dst: %v", err)
+	}
+	cfg, _, err := image.DecodeConfig(f)
+	f.Close()
+	if err != nil {
+		t.Fatalf("decode config: %v", err)
+	}
+	if cfg.Width != 1536 || cfg.Height != 2048 {
+		t.Fatalf("output = %dx%d, want 1536x2048 (orientation 6 baked in after the 2048 fit)", cfg.Width, cfg.Height)
+	}
+
+	info, err := os.Stat(dst)
+	if err != nil {
+		t.Fatalf("stat dst: %v", err)
+	}
+	if !info.ModTime().Equal(stamped) {
+		t.Fatalf("mtime = %v, want %v", info.ModTime(), stamped)
+	}
+	if _, err := os.Stat(dst + ".tmp"); !os.IsNotExist(err) {
+		t.Fatalf("leftover temp after recompress: %v", err)
+	}
+}
+
+// TestRecompressImageCancelled pins the cancellation contract: an already
+// cancelled ctx makes recompressImage fail with context.Canceled and leaves
+// neither the destination nor a ".tmp" behind, so an interrupted export can't
+// masquerade as a finished file.
+func TestRecompressImageCancelled(t *testing.T) {
+	src := filepath.Join(t.TempDir(), "in.jpg")
+	if err := os.WriteFile(src, jpegWithOrientation(t, 400, 300, 1), 0o644); err != nil {
+		t.Fatalf("write src: %v", err)
+	}
+	dst := filepath.Join(t.TempDir(), "out.jpg")
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	err := recompressImage(ctx, src, dst, 256, 82)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("recompressImage with cancelled ctx = %v, want context.Canceled", err)
+	}
+	if _, err := os.Stat(dst); !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("destination exists after cancelled recompress: %v", err)
+	}
+	if _, err := os.Stat(dst + ".tmp"); !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("temp left behind after cancelled recompress: %v", err)
 	}
 }
 
