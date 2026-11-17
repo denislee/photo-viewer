@@ -3,6 +3,7 @@ package webserver
 import (
 	"compress/gzip"
 	"crypto/subtle"
+	"io"
 	"net"
 	"net/http"
 	"strconv"
@@ -174,6 +175,15 @@ func basicAuth(next http.Handler, password string) http.Handler {
 	})
 }
 
+// gzipPool recycles gzip.Writer values across responses. A gzip.Writer carries
+// ~1 MB of deflate state, so allocating one per response dominated small
+// replies (W4-01): a few-hundred-byte JSON answer cost a megabyte of allocation
+// and the GC work that goes with it. Writers are Reset before reuse and only
+// returned to the pool once Close has flushed them.
+var gzipPool = sync.Pool{
+	New: func() any { return gzip.NewWriter(io.Discard) },
+}
+
 // gzipMiddleware wraps next so text responses are gzip-compressed when the
 // client advertises support. The ~50 KB gallery HTML and the infinite-scroll
 // JSON compress roughly 5×, which matters on the phone-over-WiFi use case this
@@ -216,7 +226,9 @@ func (g *gzipResponseWriter) WriteHeader(status int) {
 		g.Header().Del("Content-Length")
 		g.Header().Set("Content-Encoding", "gzip")
 		g.Header().Add("Vary", "Accept-Encoding")
-		g.gz = gzip.NewWriter(g.ResponseWriter)
+		gz := gzipPool.Get().(*gzip.Writer)
+		gz.Reset(g.ResponseWriter)
+		g.gz = gz
 	}
 	g.ResponseWriter.WriteHeader(status)
 }
@@ -233,11 +245,37 @@ func (g *gzipResponseWriter) Write(b []byte) (int, error) {
 	return g.ResponseWriter.Write(b)
 }
 
-// Close flushes and finishes the gzip stream. A no-op when the response was
-// not compressed. Called via defer by gzipMiddleware.
+// Flush implements http.Flusher so a streaming handler behind the middleware
+// reaches the client (W3-07). Without it the wrapper hid the underlying
+// ResponseWriter's Flusher and every chunk sat in the deflate buffer until the
+// handler returned; http.ResponseController.Flush would then fall back to
+// "not supported" as well.
+func (g *gzipResponseWriter) Flush() {
+	if !g.wroteHeader {
+		g.WriteHeader(http.StatusOK)
+	}
+	if g.gz != nil {
+		_ = g.gz.Flush()
+	}
+	if f, ok := g.ResponseWriter.(http.Flusher); ok {
+		f.Flush()
+	}
+}
+
+// Unwrap returns the underlying ResponseWriter, letting http.ResponseController
+// reach it (SetWriteDeadline, Hijack, and other optional interfaces this wrapper
+// does not forward itself).
+func (g *gzipResponseWriter) Unwrap() http.ResponseWriter { return g.ResponseWriter }
+
+// Close flushes and finishes the gzip stream and returns the writer to the pool.
+// A no-op when the response was not compressed. Called via defer by
+// gzipMiddleware.
 func (g *gzipResponseWriter) Close() error {
 	if g.gz != nil {
-		return g.gz.Close()
+		err := g.gz.Close()
+		gzipPool.Put(g.gz)
+		g.gz = nil
+		return err
 	}
 	return nil
 }
