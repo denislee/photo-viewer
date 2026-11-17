@@ -73,7 +73,7 @@ func fileExists(p string) bool {
 // root is read-only.
 func IndexPath(libraryRoot, cacheDir string) string {
 	local := filepath.Join(libraryRoot, ".photo-viewer.db")
-	if _, err := os.Stat(local); err == nil {
+	if fileExists(local) {
 		// Existing database found in library root.
 		return local
 	}

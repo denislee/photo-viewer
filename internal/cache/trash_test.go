@@ -418,3 +418,110 @@ func TestListTrashEmpty(t *testing.T) {
 		t.Errorf("ListTrash(missing) = %v, want nil", got)
 	}
 }
+
+// TestTrashDirIsLazy pins C4-10: TrashDir only decides where the trash lives.
+// It must not create the trash directory or write a probe file into the library
+// at startup; the directory appears on the first MoveToTrash.
+func TestTrashDirIsLazy(t *testing.T) {
+	root := t.TempDir()
+	dir, err := TrashDir(root, t.TempDir())
+	if err != nil {
+		t.Fatalf("TrashDir: %v", err)
+	}
+	if want := filepath.Join(root, ".photo-viewer-trash"); dir != want {
+		t.Fatalf("TrashDir = %q, want %q", dir, want)
+	}
+	entries, err := os.ReadDir(root)
+	if err != nil {
+		t.Fatalf("read root: %v", err)
+	}
+	if len(entries) != 0 {
+		names := make([]string, 0, len(entries))
+		for _, e := range entries {
+			names = append(names, e.Name())
+		}
+		t.Fatalf("TrashDir wrote %d entries into the library at startup: %v", len(entries), names)
+	}
+
+	// First delete materialises the trash dir.
+	orig := filepath.Join(root, "a.jpg")
+	writeMedia(t, orig, "bytes")
+	if _, err := MoveToTrash(orig, dir); err != nil {
+		t.Fatalf("MoveToTrash: %v", err)
+	}
+	if !exists(dir) {
+		t.Errorf("trash dir %s does not exist after the first MoveToTrash", dir)
+	}
+}
+
+// TestTrashDirReadOnlyRootFallsBack verifies the read-only library root path:
+// access(2) fails on the root, so the trash moves to <cacheDir>/trash, which is
+// created eagerly as before.
+func TestTrashDirReadOnlyRootFallsBack(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("running as root: access(2) reports a read-only dir as writable")
+	}
+	root := t.TempDir()
+	if err := os.Chmod(root, 0o555); err != nil {
+		t.Fatalf("chmod root: %v", err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(root, 0o755) })
+
+	cacheDir := t.TempDir()
+	dir, err := TrashDir(root, cacheDir)
+	if err != nil {
+		t.Fatalf("TrashDir: %v", err)
+	}
+	if want := filepath.Join(cacheDir, "trash"); dir != want {
+		t.Fatalf("TrashDir = %q, want fallback %q", dir, want)
+	}
+	if info, err := os.Stat(dir); err != nil || !info.IsDir() {
+		t.Errorf("fallback trash dir %s not created (err=%v)", dir, err)
+	}
+}
+
+// TestTrashDirReusesExistingDir checks that an already-present trash dir inside
+// the library is reused as-is.
+func TestTrashDirReusesExistingDir(t *testing.T) {
+	root := t.TempDir()
+	want := filepath.Join(root, ".photo-viewer-trash")
+	if err := os.MkdirAll(want, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	dir, err := TrashDir(root, t.TempDir())
+	if err != nil {
+		t.Fatalf("TrashDir: %v", err)
+	}
+	if dir != want {
+		t.Errorf("TrashDir = %q, want existing dir %q", dir, want)
+	}
+}
+
+// TestTrashStatsCountsNestedDirBytes covers the directory branch of the size
+// helper: subdirectory contents count towards the reported bytes, sidecars do
+// not, and TrashStats agrees with what EmptyTrash then reports and frees.
+func TestTrashStatsCountsNestedDirBytes(t *testing.T) {
+	trashDir := t.TempDir()
+	writeMedia(t, filepath.Join(trashDir, "f.jpg"), "abc")
+	writeMedia(t, filepath.Join(trashDir, "sub", "x.bin"), "12345")
+	writeMedia(t, filepath.Join(trashDir, "f.jpg"+trashMetaSuffix), "{}")
+
+	count, bytes := TrashStats(trashDir)
+	if count != 2 {
+		t.Errorf("TrashStats count = %d, want 2", count)
+	}
+	if bytes != 8 {
+		t.Errorf("TrashStats bytes = %d, want 8", bytes)
+	}
+
+	removed, freed, err := EmptyTrash(trashDir)
+	if err != nil {
+		t.Fatalf("EmptyTrash: %v", err)
+	}
+	if removed != 2 {
+		t.Errorf("EmptyTrash count = %d, want 2", removed)
+	}
+	if freed != 8 {
+		t.Errorf("EmptyTrash bytes = %d, want 8", freed)
+	}
+}

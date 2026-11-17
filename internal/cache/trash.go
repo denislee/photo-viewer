@@ -7,12 +7,12 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"sort"
 	"strings"
 	"time"
 
 	"github.com/dns/photo-viewer/internal/fsutil"
 	"github.com/dns/photo-viewer/internal/scan"
+	"golang.org/x/sys/unix"
 )
 
 // trashMetaSuffix is appended to a trashed file's name to form the sidecar
@@ -29,14 +29,24 @@ type trashMeta struct {
 
 // TrashDir returns the directory used for soft-deleted files. It prefers
 // <libraryRoot>/.photo-viewer-trash so MoveToTrash can use an atomic
-// same-filesystem rename regardless of the source file's size. Falls back to
-// <cacheDir>/trash if the library root is read-only. The dir name starts with
-// "." so internal/scan skips it.
+// same-filesystem rename regardless of the source file's size — but it only
+// decides on it: the directory itself is created lazily by MoveToTrash on the
+// first delete. Writability is checked with access(2) W_OK on the existing
+// trash dir or on the library root, so startup writes no directory and no
+// probe file into the library (C4-10). Falls back to <cacheDir>/trash when the
+// library root is read-only. The dir name starts with "." so internal/scan
+// skips it.
 func TrashDir(libraryRoot, cacheDir string) (string, error) {
 	if libraryRoot != "" {
 		candidate := filepath.Join(libraryRoot, ".photo-viewer-trash")
-		if writable(candidate) {
-			return candidate, nil
+		if info, err := os.Stat(candidate); err == nil {
+			if info.IsDir() && unix.Access(candidate, unix.W_OK) == nil {
+				return candidate, nil
+			}
+		} else if errors.Is(err, os.ErrNotExist) {
+			if info, err := os.Stat(libraryRoot); err == nil && info.IsDir() && unix.Access(libraryRoot, unix.W_OK) == nil {
+				return candidate, nil
+			}
 		}
 	}
 	if cacheDir == "" {
@@ -165,12 +175,8 @@ func EmptyTrash(trashDir string) (count int, bytes int64, err error) {
 		full := filepath.Join(trashDir, e.Name())
 		isMeta := strings.HasSuffix(e.Name(), trashMetaSuffix)
 		if !isMeta {
-			if info, statErr := e.Info(); statErr == nil {
-				if info.Mode().IsRegular() {
-					bytes += info.Size()
-				} else if info.IsDir() {
-					bytes += dirSize(full)
-				}
+			if n, statErr := trashItemBytes(full, e); statErr == nil {
+				bytes += n
 			}
 		}
 		if rmErr := os.RemoveAll(full); rmErr != nil {
@@ -201,7 +207,11 @@ func ListTrash(trashDir string) []Entry {
 		return nil
 	}
 	out := make([]Entry, 0, len(dirEntries))
-	for _, de := range dirEntries {
+	// os.ReadDir returns entries sorted by filename ascending, and trash names
+	// lead with a UTC timestamp (YYYYMMDDTHHMMSS), so walking the slice in
+	// reverse yields newest first without a sort.
+	for k := len(dirEntries) - 1; k >= 0; k-- {
+		de := dirEntries[k]
 		if de.IsDir() {
 			continue
 		}
@@ -229,11 +239,6 @@ func ListTrash(trashDir string) []Entry {
 			ThumbID: ThumbIDFor(full),
 		})
 	}
-	sort.Slice(out, func(i, j int) bool {
-		// Filenames lead with a UTC timestamp prefix (YYYYMMDDTHHMMSS), so a
-		// reverse-lexical sort puts the most recently trashed item first.
-		return filepath.Base(out[i].Path) > filepath.Base(out[j].Path)
-	})
 	return out
 }
 
@@ -253,27 +258,43 @@ func TrashStats(trashDir string) (count int, bytes int64) {
 			continue
 		}
 		full := filepath.Join(trashDir, e.Name())
-		info, statErr := e.Info()
+		n, statErr := trashItemBytes(full, e)
 		if statErr != nil {
 			continue
 		}
 		count++
-		if info.Mode().IsRegular() {
-			bytes += info.Size()
-		} else if info.IsDir() {
-			bytes += dirSize(full)
-		}
+		bytes += n
 	}
 	return count, bytes
 }
 
+// trashItemBytes returns the on-disk size of one trash entry: the size of a
+// regular file, the recursive total for a directory, and 0 for anything else
+// (symlinks, devices, …).
+func trashItemBytes(full string, e os.DirEntry) (int64, error) {
+	info, err := e.Info()
+	if err != nil {
+		return 0, err
+	}
+	switch {
+	case info.Mode().IsRegular():
+		return info.Size(), nil
+	case info.IsDir():
+		return dirSize(full), nil
+	}
+	return 0, nil
+}
+
 func dirSize(root string) int64 {
 	var total int64
-	_ = filepath.Walk(root, func(_ string, info os.FileInfo, err error) error {
-		if err != nil || info == nil {
+	_ = filepath.WalkDir(root, func(_ string, d os.DirEntry, err error) error {
+		if err != nil {
 			return nil
 		}
-		if info.Mode().IsRegular() {
+		if !d.Type().IsRegular() {
+			return nil
+		}
+		if info, infoErr := d.Info(); infoErr == nil {
 			total += info.Size()
 		}
 		return nil
