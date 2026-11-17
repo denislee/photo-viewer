@@ -113,8 +113,11 @@ func TestPathRegeneratesStale(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Source now appears newer than the cached thumb → must regenerate.
-	newMod := time.Now()
+	// Source now appears newer than the cached thumb → must regenerate. Use a
+	// time safely in the past: file mtimes come from the kernel's coarse clock,
+	// so a thumb written right after time.Now() can carry an mtime a few µs
+	// *before* it and read as stale.
+	newMod := time.Now().Add(-time.Hour)
 	e2 := Entry{Path: src, Type: scan.TypePhoto, ThumbID: ThumbIDFor(src), ModTime: newMod}
 	if store.Has(e2) {
 		t.Fatal("Has = true for a stale thumb")
@@ -278,5 +281,87 @@ func TestTierFollowsForgetAndRename(t *testing.T) {
 	store.Forget(moved.ThumbID)
 	if store.Has(moved) || large.Has(moved) {
 		t.Fatal("Forget left a rendition behind")
+	}
+}
+
+// TestPathRecreatesShardAfterRemoveAll verifies Path recreates a shard
+// directory that vanished under it (e.g. the cache was wiped mid-session):
+// CreateTemp reports the missing dir, Path MkdirAll's it and retries, so the
+// generation succeeds instead of failing on a missing directory.
+func TestPathRecreatesShardAfterRemoveAll(t *testing.T) {
+	cacheDir := t.TempDir()
+	store, err := NewThumbStore(cacheDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	src := filepath.Join(t.TempDir(), "photo.jpg")
+	writeTestJPEG(t, src, color.RGBA{10, 20, 30, 255})
+	info, err := os.Stat(src)
+	if err != nil {
+		t.Fatal(err)
+	}
+	e := Entry{Path: src, Type: scan.TypePhoto, ThumbID: ThumbIDFor(src), ModTime: info.ModTime()}
+	if _, err := store.Path(e); err != nil {
+		t.Fatalf("Path: %v", err)
+	}
+
+	if err := os.RemoveAll(filepath.Join(cacheDir, "thumbs")); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := store.Path(e)
+	if err != nil {
+		t.Fatalf("Path after RemoveAll: %v", err)
+	}
+	fi, err := os.Stat(got)
+	if err != nil {
+		t.Fatalf("thumb not recreated: %v", err)
+	}
+	if fi.Size() == 0 {
+		t.Fatal("recreated thumb is empty")
+	}
+}
+
+// TestTierSizeMismatch covers the size guard: an existing subdir is returned
+// unchanged for a repeat request at the same size, and a request at a different
+// size is an error rather than silently reusing a store that renders another
+// size.
+func TestTierSizeMismatch(t *testing.T) {
+	store, err := NewThumbStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	first, err := store.Tier("x", 512)
+	if err != nil {
+		t.Fatalf("Tier: %v", err)
+	}
+	again, err := store.Tier("x", 512)
+	if err != nil {
+		t.Fatalf("Tier repeat: %v", err)
+	}
+	if again != first {
+		t.Fatal("Tier created a second store for the same subdir and size")
+	}
+	if _, err := store.Tier("x", 300); err == nil {
+		t.Fatal("Tier with a different size returned nil error")
+	}
+}
+
+// TestTierSharesSemaphores verifies a tier reuses its parent's generation
+// semaphores so every size together stays within one CPU / external-tool bound.
+func TestTierSharesSemaphores(t *testing.T) {
+	store, err := NewThumbStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t512, err := store.Tier("x", 512)
+	if err != nil {
+		t.Fatalf("Tier: %v", err)
+	}
+	if t512.cpuSem != store.cpuSem {
+		t.Fatal("tier does not share the parent cpuSem")
+	}
+	if t512.extSem != store.extSem {
+		t.Fatal("tier does not share the parent extSem")
 	}
 }

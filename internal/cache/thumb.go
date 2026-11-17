@@ -2,6 +2,7 @@ package cache
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -84,7 +85,7 @@ type ThumbStore struct {
 }
 
 func NewThumbStore(cacheDir string) (*ThumbStore, error) {
-	return newStore(cacheDir, "thumbs", ThumbSize)
+	return newStore(cacheDir, "thumbs", ThumbSize, nil, nil)
 }
 
 // NewDisplayStore constructs a second store rooted at <cacheDir>/display that
@@ -95,19 +96,27 @@ func NewThumbStore(cacheDir string) (*ThumbStore, error) {
 // originals for free (W-03). Wipe <cacheDir>/display alongside thumbs/ and hls/
 // on a rebuild.
 func NewDisplayStore(cacheDir string) (*ThumbStore, error) {
-	return newStore(cacheDir, DisplayDir, DisplaySize)
+	return newStore(cacheDir, DisplayDir, DisplaySize, nil, nil)
 }
 
 // newStore builds a store rooted at <cacheDir>/<subdir> whose generated
 // renditions fit within size×size. NewThumbStore and NewDisplayStore differ
-// only in these two parameters.
-func newStore(cacheDir, subdir string, size int) (*ThumbStore, error) {
+// only in the subdirectory and size parameters and pass nil semaphores, so each
+// independent store root owns its own generation pools; Tier passes the parent
+// store's semaphores so all its sizes together stay within one CPU /
+// external-tool bound. A nil cpuSem is allocated at max(runtime.NumCPU(), 2)
+// and a nil extSem at three times that width (at least 6).
+func newStore(cacheDir, subdir string, size int, cpuSem, extSem chan struct{}) (*ThumbStore, error) {
 	d := filepath.Join(cacheDir, subdir)
 	if err := os.MkdirAll(d, 0o755); err != nil {
 		return nil, err
 	}
-	cpu := max(runtime.NumCPU(), 2)
-	ext := max(cpu*3, 6)
+	if cpuSem == nil {
+		cpuSem = make(chan struct{}, max(runtime.NumCPU(), 2))
+	}
+	if extSem == nil {
+		extSem = make(chan struct{}, max(cap(cpuSem)*3, 6))
+	}
 	// Reclaim any "*.tmp" renditions a previous run's crash stranded between
 	// os.CreateTemp and rename. Run in the background so the walk never blocks
 	// store construction (mirrors the webserver kicking its HLS sweep off a
@@ -117,27 +126,31 @@ func newStore(cacheDir, subdir string, size int) (*ThumbStore, error) {
 	return &ThumbStore{
 		dir:      d,
 		size:     size,
-		cpuSem:   make(chan struct{}, cpu),
-		extSem:   make(chan struct{}, ext),
+		cpuSem:   cpuSem,
+		extSem:   extSem,
 		inflight: make(map[string]chan struct{}),
 	}, nil
 }
 
 // Tier returns the sibling store at <cacheDir>/<subdir> generating size px
-// renditions, creating it on first use. A tier shares this store's generation
-// semaphores, so all sizes together stay within one CPU / external-tool bound,
-// and follows this store's Forget and Rename.
+// renditions, creating it on first use. Asking for an existing subdir with a
+// different size is an error, since that subdir's renditions are already
+// generated at the size it was created with. A tier shares this store's
+// generation semaphores, so all sizes together stay within one CPU /
+// external-tool bound, and follows this store's Forget and Rename.
 func (s *ThumbStore) Tier(subdir string, size int) (*ThumbStore, error) {
 	s.tierMu.Lock()
 	defer s.tierMu.Unlock()
 	if t, ok := s.tiers[subdir]; ok {
+		if t.size != size {
+			return nil, fmt.Errorf("cache: tier %q already exists with size %d, not %d", subdir, t.size, size)
+		}
 		return t, nil
 	}
-	t, err := newStore(s.CacheDir(), subdir, size)
+	t, err := newStore(s.CacheDir(), subdir, size, s.cpuSem, s.extSem)
 	if err != nil {
 		return nil, err
 	}
-	t.cpuSem, t.extSem = s.cpuSem, s.extSem
 	if s.tiers == nil {
 		s.tiers = map[string]*ThumbStore{}
 	}
@@ -251,22 +264,21 @@ func (s *ThumbStore) Path(e Entry) (string, error) {
 	if s.fresh(dst, e.ModTime) {
 		return dst, nil
 	}
-	// A stale thumb (older than the source) is removed here, inside the flight,
-	// so a concurrent follower can't stat/remove a thumb this leader is about to
-	// regenerate. (The stale check used to run before the flight — a TOCTOU that
-	// could drop a freshly written file.)
-	os.Remove(dst)
-
-	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
-		return "", err
-	}
 
 	// Unique temp name. The GUI and pv-scan share this cache directory, so a
 	// fixed "<id>.jpg.tmp" would collide across processes and let one truncate
 	// the other's half-written thumb; os.CreateTemp gives each writer its own.
 	// We only need the name — the thumbnailers (re)write it via their own fd —
 	// so close our handle immediately.
+	// The shard dir is only created when CreateTemp reports it missing, so the
+	// common case (shard already present) pays no MkdirAll.
 	tmpf, err := os.CreateTemp(filepath.Dir(dst), e.ThumbID+"-*.tmp")
+	if errors.Is(err, os.ErrNotExist) {
+		if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
+			return "", err
+		}
+		tmpf, err = os.CreateTemp(filepath.Dir(dst), e.ThumbID+"-*.tmp")
+	}
 	if err != nil {
 		return "", err
 	}
