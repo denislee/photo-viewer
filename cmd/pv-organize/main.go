@@ -4,12 +4,17 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"os"
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"slices"
+	"sync"
+	"sync/atomic"
 	"syscall"
+	"time"
 
 	"github.com/dns/photo-viewer/internal/fsutil"
 	"github.com/dns/photo-viewer/internal/scan"
@@ -36,8 +41,40 @@ func main() {
 		log.Fatalf("Error resolving destination path: %v", err)
 	}
 
-	count := 0
-	failures := 0
+	ctx := interruptContext()
+	count, failures := organize(ctx, *srcDir, absDst, *dryRun, scan.ExiftoolPoolSize(), os.Stdout)
+
+	if ctx.Err() != nil {
+		fmt.Printf("\nInterrupted. Moved %d files (%d error(s)); nothing was left half-moved.\n", count, failures)
+		os.Exit(130)
+	}
+	if *dryRun {
+		fmt.Printf("\nDry run finished. Would have moved %d files (%d planning error(s)).\n", count, failures)
+	} else {
+		fmt.Printf("\nFinished. Moved %d files (%d error(s)).\n", count, failures)
+	}
+	// Mirror pv-export-favorites: any failed operation makes the whole run a
+	// failure so scripts and cron jobs don't treat a partial move as success.
+	if failures > 0 {
+		os.Exit(1)
+	}
+}
+
+// mediaDate resolves a file's date. A var so tests run without exiftool.
+var mediaDate = scan.GetMediaDate
+
+// organize plans (dryRun) or performs the moves of every media file under
+// srcDir into absDst/YYYY/MM/DD and returns how many files it moved or
+// planned and how many failed. Per-file lines go to out.
+func organize(ctx context.Context, srcDir, absDst string, dryRun bool, workers int, out io.Writer) (count, failures int) {
+	cwd, _ := os.Getwd()
+	absPath := func(p string) string {
+		if filepath.IsAbs(p) || cwd == "" {
+			return p
+		}
+		return filepath.Join(cwd, p)
+	}
+
 	// claimed records destinations the dry-run planner has already handed out
 	// this run so two identically-named sources resolve to distinct names —
 	// exactly what the real run's atomic claim does when the first source takes
@@ -48,47 +85,78 @@ func main() {
 	// SkipDurationProbe: pv-organize only needs each file's path and date, never
 	// a video's duration, so suppress the per-video ffprobe fork that a plain
 	// Walk would pay for every clip.
-	ctx := interruptContext()
-	for res := range scan.WalkWith(ctx, *srcDir, scan.WalkOptions{SkipDurationProbe: true}) {
-		if ctx.Err() != nil {
-			break
-		}
+	var files []string
+	for res := range scan.WalkWith(ctx, srcDir, scan.WalkOptions{SkipDurationProbe: true}) {
 		if res.Type == scan.TypeUnknown {
 			continue
 		}
+		files = append(files, res.Path)
+	}
+	if ctx.Err() != nil {
+		return count, failures
+	}
 
-		// scan.GetMediaDate rides the shared -stay_open exiftool daemon
-		// (≈two orders of magnitude faster than a fresh process per file) and
-		// already falls back to the file's mtime when no metadata date exists,
-		// so the old per-file exec + manual mtime fallback is gone.
-		date := scan.GetMediaDate(res.Path)
+	// The walk emits from parallel workers in no fixed order; sorting gives a
+	// deterministic (lexical, WalkDir) order so collision suffixes and the
+	// printed plan are reproducible.
+	slices.Sort(files)
 
-		destSubDir := filepath.Join(absDst, date.Format("2006/01/02"))
-		baseName := filepath.Base(res.Path)
+	// scan.GetMediaDate rides the pooled -stay_open exiftool daemons, so
+	// ExiftoolPoolSize concurrent callers resolve ~8x faster than a serial loop
+	// (S4-05); each worker writes only its own slot.
+	dates := make([]time.Time, len(files))
+	var next atomic.Int64
+	var wg sync.WaitGroup
+	for range min(workers, len(files)) {
+		wg.Go(func() {
+			for {
+				i := int(next.Add(1) - 1)
+				if i >= len(files) || ctx.Err() != nil {
+					return
+				}
+				// GetMediaDate already falls back to the file's mtime when no
+				// metadata date exists, so the old per-file exec + manual mtime
+				// fallback is gone.
+				dates[i] = mediaDate(files[i])
+			}
+		})
+	}
+	wg.Wait()
+	if ctx.Err() != nil {
+		return count, failures
+	}
+
+	for i, path := range files {
+		if ctx.Err() != nil {
+			break
+		}
+
+		destSubDir := filepath.Join(absDst, dates[i].Format("2006/01/02"))
+		baseName := filepath.Base(path)
 		destPath := filepath.Join(destSubDir, baseName)
 
 		// Avoid moving a file to itself or into its own subdirectory if src and
 		// dst overlap: a file already sitting at its correct destination is
 		// left untouched (a rename onto its own path would otherwise be pushed
 		// to a needless "_1" suffix).
-		absSrc, _ := filepath.Abs(res.Path)
+		absSrc := absPath(path)
 		if absSrc == destPath {
 			continue
 		}
 
-		if *dryRun {
+		if dryRun {
 			// Plan the destination with the SAME name sequence and collision
 			// rule the real run uses, treating a path as taken if it exists on
 			// disk OR we've already planned to fill it this run. This is what
 			// makes the printed plan match a real run file-for-file.
 			finalDest, err := planDest(destSubDir, baseName, claimed)
 			if err != nil {
-				log.Printf("Error planning destination for %s: %v", res.Path, err)
+				log.Printf("Error planning destination for %s: %v", path, err)
 				failures++
 				continue
 			}
 			claimed[finalDest] = true
-			fmt.Printf("[Dry Run] %s -> %s\n", res.Path, finalDest)
+			fmt.Fprintf(out, "[Dry Run] %s -> %s\n", path, finalDest)
 			count++
 			continue
 		}
@@ -107,28 +175,15 @@ func main() {
 			if ctx.Err() != nil {
 				break // interrupted mid-copy: the move was rolled back, not a failure
 			}
-			log.Printf("Error moving %s: %v", res.Path, err)
+			log.Printf("Error moving %s: %v", path, err)
 			failures++
 			continue
 		}
-		fmt.Printf("Moving %s -> %s\n", res.Path, finalDest)
+		fmt.Fprintf(out, "Moving %s -> %s\n", path, finalDest)
 		count++
 	}
 
-	if ctx.Err() != nil {
-		fmt.Printf("\nInterrupted. Moved %d files (%d error(s)); nothing was left half-moved.\n", count, failures)
-		os.Exit(130)
-	}
-	if *dryRun {
-		fmt.Printf("\nDry run finished. Would have moved %d files (%d planning error(s)).\n", count, failures)
-	} else {
-		fmt.Printf("\nFinished. Moved %d files (%d error(s)).\n", count, failures)
-	}
-	// Mirror pv-export-favorites: any failed operation makes the whole run a
-	// failure so scripts and cron jobs don't treat a partial move as success.
-	if failures > 0 {
-		os.Exit(1)
-	}
+	return count, failures
 }
 
 // interruptContext returns a context cancelled by the first SIGINT/SIGTERM, so

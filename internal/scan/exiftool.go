@@ -77,6 +77,11 @@ func exiftoolPoolSize() int {
 	return min(max(runtime.NumCPU(), 2), 4)
 }
 
+// ExiftoolPoolSize is how many pooled exiftool daemons serve metadata reads,
+// i.e. how many concurrent callers run without queueing. Bulk callers
+// outside the package (pv-organize's date pass) size their workers with it.
+func ExiftoolPoolSize() int { return exiftoolPoolSize() }
+
 // exifPoolChan lazily builds the daemon pool as a buffered channel pre-filled
 // with empty (nil) slots, each spawned into a live daemon on first use.
 func exifPoolChan() chan *exiftoolDaemon {

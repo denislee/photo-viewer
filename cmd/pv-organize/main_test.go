@@ -1,10 +1,12 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/dns/photo-viewer/internal/fsutil"
 )
@@ -72,5 +74,68 @@ func TestDryRunPlanDistinctForSameNamedSources(t *testing.T) {
 	}
 	if want := filepath.Join(destDir, "img_1.jpg"); second != want {
 		t.Fatalf("second = %s, want %s", second, want)
+	}
+}
+
+// TestOrganizeDryRunOutputIsStable pins organize's dry-run plan to a fixed
+// order: the walk emits from parallel workers in no fixed order, so the sort
+// (and the collision sequence that follows it) must make a 1-worker run and a
+// 4-worker run print exactly the same plan.
+func TestOrganizeDryRunOutputIsStable(t *testing.T) {
+	dir := t.TempDir()
+	t.Chdir(dir)
+
+	for _, p := range []string{
+		filepath.Join("src", "a", "img.jpg"),
+		filepath.Join("src", "b", "img.jpg"),
+		filepath.Join("src", "c", "IMG.JPG"),
+		filepath.Join("src", "clip.mp4"),
+		filepath.Join("src", "notes.txt"),
+	} {
+		if err := os.MkdirAll(filepath.Dir(p), 0755); err != nil {
+			t.Fatal(err)
+		}
+		writeFile(t, p, "x")
+	}
+	if err := os.MkdirAll(filepath.Join("dst", "2024", "01", "02"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	writeFile(t, filepath.Join("dst", "2024", "01", "02", "img.jpg"), "x")
+
+	orig := mediaDate
+	t.Cleanup(func() { mediaDate = orig })
+	mediaDate = func(path string) time.Time {
+		if filepath.Ext(path) == ".mp4" {
+			return time.Date(2023, 12, 31, 10, 0, 0, 0, time.Local)
+		}
+		return time.Date(2024, 1, 2, 10, 0, 0, 0, time.Local)
+	}
+
+	absDst := filepath.Join(dir, "dst")
+	want := "[Dry Run] " + filepath.Join("src", "a", "img.jpg") + " -> " +
+		filepath.Join(absDst, "2024", "01", "02", "img_1.jpg") + "\n" +
+		"[Dry Run] " + filepath.Join("src", "b", "img.jpg") + " -> " +
+		filepath.Join(absDst, "2024", "01", "02", "img_2.jpg") + "\n" +
+		"[Dry Run] " + filepath.Join("src", "c", "IMG.JPG") + " -> " +
+		filepath.Join(absDst, "2024", "01", "02", "IMG.JPG") + "\n" +
+		"[Dry Run] " + filepath.Join("src", "clip.mp4") + " -> " +
+		filepath.Join(absDst, "2023", "12", "31", "clip.mp4") + "\n"
+
+	for _, workers := range []int{1, 4} {
+		var buf bytes.Buffer
+		count, failures := organize(context.Background(), "src", absDst, true, workers, &buf)
+		if count != 4 || failures != 0 {
+			t.Fatalf("workers=%d: count=%d failures=%d, want 4 and 0", workers, count, failures)
+		}
+		if got := buf.String(); got != want {
+			t.Fatalf("workers=%d: plan =\n%s\nwant\n%s", workers, got, want)
+		}
+	}
+
+	if _, err := os.Stat(filepath.Join("src", "a", "img.jpg")); err != nil {
+		t.Fatalf("dry run moved src/a/img.jpg: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join("dst", "2023")); !os.IsNotExist(err) {
+		t.Fatalf("dry run created dst/2023 (stat err = %v)", err)
 	}
 }
