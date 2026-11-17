@@ -48,6 +48,11 @@ type FuzzySearchView struct {
 	// dataset rarely shifts under the user during a search session.
 	candidates []searchCandidate
 
+	// alphaTop is the empty-query result list for candidates (their
+	// alphabetical top searchResultCap), built alongside them so an empty
+	// palette never sorts the whole library on the UI goroutine.
+	alphaTop *alphaRanking
+
 	// Candidate memoization across palette opens (G-04). Building candidates
 	// runs Index.All() over the whole table and allocates ~5 strings per
 	// entry; on a large library that is a visible pause on *every* Ctrl+K.
@@ -96,6 +101,38 @@ type searchCandidate struct {
 	isDir     bool
 	baseLower string // strings.ToLower(base), precomputed
 	relLower  string // strings.ToLower(rel), precomputed
+}
+
+// searchResultCap bounds the palette's result list.
+const searchResultCap = 500
+
+// alphaRanking is the empty-query ranking of one candidate slice.
+type alphaRanking struct {
+	cands []searchCandidate // the slice top indexes into
+	top   []searchResult
+}
+
+// alphaTopResults returns the n candidates with the smallest rel, in rel
+// order: the empty-query listing. Ties on rel fall back to index order so the
+// result is deterministic.
+func alphaTopResults(cands []searchCandidate, n int) []searchResult {
+	idx := make([]int, len(cands))
+	for i := range idx {
+		idx[i] = i
+	}
+	sort.Slice(idx, func(i, j int) bool {
+		a, b := idx[i], idx[j]
+		if cands[a].rel != cands[b].rel {
+			return cands[a].rel < cands[b].rel
+		}
+		return a < b
+	})
+	idx = idx[:min(n, len(idx))]
+	out := make([]searchResult, len(idx))
+	for i, c := range idx {
+		out[i] = searchResult{idx: c, score: len(cands[c].rel)}
+	}
+	return out
 }
 
 type searchResult struct {
@@ -265,8 +302,10 @@ func (v *FuzzySearchView) rebuildCandidates(libraryRoot string) {
 			relLower:  strings.ToLower(rel),
 		})
 	}
+	alpha := &alphaRanking{cands: cand, top: alphaTopResults(cand, searchResultCap)}
 	v.mu.Lock()
 	v.candidates = cand
+	v.alphaTop = alpha
 	v.candidatesReady = true
 	v.cacheGen = gen
 	v.cacheRows = len(all)
@@ -296,7 +335,16 @@ func relTo(root, path string) string {
 // consecutive hits, with a bonus for matches that start in the basename.
 func (v *FuzzySearchView) recomputeResults() {
 	q := strings.TrimSpace(v.editor.Text())
-	if q == v.lastQuery {
+	// Read the candidate slice before the early return (G4-05): a rebuild
+	// that lands after the first frame of a cold open (or mid-session) leaves
+	// the query unchanged but replaces the candidates, and the results must be
+	// re-derived from the new slice. Skip only when both the query and the
+	// slice the current results were scored on are unchanged.
+	v.mu.Lock()
+	candidates := v.candidates
+	alpha := v.alphaTop
+	v.mu.Unlock()
+	if q == v.lastQuery && sameCandidateSlice(candidates, v.activeCandidates) {
 		return
 	}
 	// Capture the previous pass's state before we overwrite it — the
@@ -311,28 +359,27 @@ func (v *FuzzySearchView) recomputeResults() {
 	v.lastQuery = q
 	v.selected = 0
 
-	// Snapshot the candidate slice under the mutex so the background
+	// candidates was snapshotted under the mutex above so the background
 	// rebuild goroutine can safely replace v.candidates concurrently.
 	// activeCandidates is the UI-goroutine-only copy used by layoutResults
 	// and Activate for the rest of this frame.
-	v.mu.Lock()
-	candidates := v.candidates
-	v.mu.Unlock()
 	v.activeCandidates = candidates
 
 	if q == "" {
-		out := make([]searchResult, 0, min(500, len(candidates)))
-		for i, c := range candidates {
-			out = append(out, searchResult{idx: i, score: len(c.rel)})
-			if len(out) >= 500 {
-				break
+		// The alphabetical top searchResultCap of *all* candidates, not the
+		// first searchResultCap in index order sorted afterwards (G4-05).
+		// rebuildCandidates precomputes it off the UI goroutine; a slice
+		// published without one (tests) is ranked here, once.
+		if alpha == nil || !sameCandidateSlice(alpha.cands, candidates) {
+			alpha = &alphaRanking{cands: candidates, top: alphaTopResults(candidates, searchResultCap)}
+			v.mu.Lock()
+			if sameCandidateSlice(v.candidates, candidates) {
+				v.alphaTop = alpha
 			}
+			v.mu.Unlock()
 		}
-		sort.SliceStable(out, func(i, j int) bool {
-			return candidates[out[i].idx].rel < candidates[out[j].idx].rel
-		})
-		v.results = out
-		v.resultsTruncated = len(out) >= 500
+		v.results = alpha.top
+		v.resultsTruncated = len(candidates) > searchResultCap
 		return
 	}
 
@@ -373,8 +420,8 @@ func (v *FuzzySearchView) recomputeResults() {
 	}
 	sortSearchResults(out, candidates)
 	truncated := false
-	if len(out) > 500 {
-		out = out[:500]
+	if len(out) > searchResultCap {
+		out = out[:searchResultCap]
 		truncated = true
 	}
 	v.results = out
@@ -584,7 +631,7 @@ func (v *FuzzySearchView) statusLine() string {
 		return "Index is empty — scan the library first."
 	case len(v.results) == 0:
 		return "No matches."
-	case len(v.results) == 500:
+	case v.resultsTruncated:
 		return "500+ matches — refine your query"
 	default:
 		return ""

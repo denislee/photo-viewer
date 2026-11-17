@@ -374,3 +374,72 @@ func TestFuzzySearchRowCountProbeCoalesces(t *testing.T) {
 		t.Errorf("rowCount re-queried within TTL: got %d, want cached 7", got)
 	}
 }
+
+// TestFuzzySearchColdOpenShowsResults is the G4-05 regression: on a cold open
+// the first frame's recompute runs before the background build lands, so it
+// sees no candidates. When the build lands (same, empty query) the next
+// recompute must pick the new candidates up instead of early-returning on the
+// unchanged query and leaving "No matches." on screen.
+func TestFuzzySearchColdOpenShowsResults(t *testing.T) {
+	idx, root := newSearchIndex(t, 9)
+	v := NewFuzzySearchView(idx)
+
+	// Show's cold path, minus the goroutine: reset and clear the candidates.
+	v.Open = true
+	v.editor.SetText("")
+	v.lastQuery = "\x00"
+	v.mu.Lock()
+	v.candidates, v.candidatesReady = nil, false
+	v.mu.Unlock()
+
+	v.recomputeResults() // first frame: the build has not landed
+	if len(v.results) != 0 {
+		t.Fatalf("results before the build = %d, want 0", len(v.results))
+	}
+	v.rebuildCandidates(root) // the build lands and invalidates
+	v.recomputeResults()      // next frame, query still ""
+	if len(v.results) == 0 {
+		t.Fatalf("results stayed empty after the build landed (status %q)", v.statusLine())
+	}
+	if got := v.statusLine(); got != "" {
+		t.Fatalf("status = %q, want none", got)
+	}
+
+	// A rebuild that lands mid-session under an unchanged non-empty query is
+	// picked up too.
+	typeQuery(v, "a")
+	before := len(v.results)
+	seedSearchIndex(t, idx, filepath.Join(root, "more"), 0, 9)
+	v.rebuildCandidates(root)
+	v.recomputeResults()
+	if len(v.results) <= before {
+		t.Fatalf("mid-session rebuild not picked up: %d results, had %d", len(v.results), before)
+	}
+}
+
+// TestFuzzySearchEmptyQueryAlphabeticalTop checks the empty-query listing is
+// the alphabetical top searchResultCap of *all* candidates, not the first
+// searchResultCap in index order.
+func TestFuzzySearchEmptyQueryAlphabeticalTop(t *testing.T) {
+	v := NewFuzzySearchView(nil)
+	n := searchResultCap + 100
+	cands := make([]searchCandidate, 0, n)
+	// Index order is reverse-alphabetical, so the first searchResultCap by
+	// index are the alphabetically last ones.
+	for i := n - 1; i >= 0; i-- {
+		cands = append(cands, mkCand("/lib", fmt.Sprintf("f%04d.jpg", i), false))
+	}
+	setCandidates(v, cands)
+	typeQuery(v, "")
+	if len(v.results) != searchResultCap {
+		t.Fatalf("results = %d, want %d", len(v.results), searchResultCap)
+	}
+	for i, r := range v.results {
+		if want := fmt.Sprintf("f%04d.jpg", i); v.activeCandidates[r.idx].rel != want {
+			t.Fatalf("result %d = %q, want %q", i, v.activeCandidates[r.idx].rel, want)
+		}
+	}
+	if !v.resultsTruncated || v.statusLine() != "500+ matches — refine your query" {
+		t.Fatalf("truncated = %v, status %q", v.resultsTruncated, v.statusLine())
+	}
+}
