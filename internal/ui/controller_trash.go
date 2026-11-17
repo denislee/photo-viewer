@@ -22,10 +22,12 @@ import (
 // path falls back to a plain os.Remove. EmptyTrash actually frees the
 // disk space later.
 //
-// When path is itself already inside the trash dir, DeletePath is
-// repurposed as restore — moving the file back to its recorded original
-// location and refreshing the active view. Restore goes through a full
-// refresh because it's rare and needs to repopulate the destination dir.
+// When path is itself already inside the trash dir, DeletePath restores it
+// instead — on a goroutine through the same restoreBatch the multi-select
+// path uses, so the sidecar read, MkdirAll, renames, stat and index write
+// never run on the frame goroutine (U4-11). Callers patch their own view
+// optimistically (as for delete); restoreBatch's refresh repaints from the
+// index, which re-shows the entry if the restore failed.
 //
 // Always returns nil — errors from the deferred I/O are logged but the
 // UI has already advanced past the entry.
@@ -34,7 +36,8 @@ func (c *Controller) DeletePath(path string) error {
 		return nil
 	}
 	if c.isInTrash(path) {
-		return c.restoreFromTrash(path)
+		go c.restoreBatch([]string{path})
+		return nil
 	}
 	c.patchLocalDeletion([]string{path}, c.trashDir != "")
 	go c.performDeletion([]string{path})
@@ -121,31 +124,6 @@ func collectRestores(paths []string, store *cache.ThumbStore) (results []scan.Re
 		})
 	}
 	return results, restored
-}
-
-// restoreFromTrash handles the "delete from inside Trash view" case —
-// moves the file back to its recorded original location, reconciles the
-// row back into the index, and refreshes the view. Kept on the synchronous
-// path because restore needs the destination directory's entries
-// repopulated, which is a refresh-from-index job anyway.
-func (c *Controller) restoreFromTrash(path string) error {
-	restored, err := cache.RestoreFromTrash(path, c.store)
-	if err != nil {
-		log.Printf("trash: restore failed for %s: %v", path, err)
-		c.scheduleRefresh(c.activeDir())
-		return err
-	}
-	if info, sErr := os.Stat(restored); sErr == nil {
-		c.index.ReconcileBatch([]scan.Result{{
-			Path:    restored,
-			Type:    scan.DetectType(restored),
-			Size:    info.Size(),
-			ModTime: info.ModTime(),
-		}})
-	}
-	c.bumpTrashCount(-1)
-	c.scheduleRefresh(c.activeDir())
-	return nil
 }
 
 // patchLocalDeletion is the in-memory mirror of "these paths went away" —
