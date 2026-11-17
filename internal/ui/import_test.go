@@ -3,6 +3,7 @@ package ui
 import (
 	"bytes"
 	"context"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -85,6 +86,16 @@ func TestInboxHasFiles(t *testing.T) {
 		write(t, filepath.Join(dir, "sub", "readme.md"))
 		if inboxHasFiles(dir) {
 			t.Error("inboxHasFiles with only non-media files = true, want false")
+		}
+	})
+
+	t.Run("junk only", func(t *testing.T) {
+		dir := t.TempDir()
+		write(t, filepath.Join(dir, "._a.jpg"))
+		write(t, filepath.Join(dir, ".Trashes", "x.jpg"))
+		write(t, filepath.Join(dir, ".Spotlight-V100", "y.mp4"))
+		if inboxHasFiles(dir) {
+			t.Error("inboxHasFiles with only hidden junk = true, want false")
 		}
 	})
 
@@ -295,5 +306,90 @@ func TestProcessBatchProgressReachesMaxOnMkdirError(t *testing.T) {
 	}
 	if done, max := v.progress.load(); done != max || max != int64(2*len(entries)) {
 		t.Errorf("progress = %d/%d, want %d/%d", done, max, 2*len(entries), 2*len(entries))
+	}
+}
+
+// TestZipJunkName pins the archive filter: entries whose path contains a
+// hidden component (._a.jpg, dir/._a.jpg, .Trashes/x.jpg) or __MACOSX must be
+// rejected, while ordinary relative paths — including a leading "./" — are
+// kept.
+func TestZipJunkName(t *testing.T) {
+	cases := []struct {
+		name string
+		want bool
+	}{
+		{"__MACOSX/._a.jpg", true},
+		{"._a.jpg", true},
+		{"dir/._a.jpg", true},
+		{".Trashes/x.jpg", true},
+		{"a.jpg", false},
+		{"dir/a.jpg", false},
+		{"./a.jpg", false},
+	}
+	for _, tc := range cases {
+		if got := zipJunkName(tc.name); got != tc.want {
+			t.Errorf("zipJunkName(%q) = %v, want %v", tc.name, got, tc.want)
+		}
+	}
+}
+
+// TestRunImportSkipsHiddenCardFiles is the U4-04 regression: a card holding a
+// real photo next to macOS litter (._a.jpg AppleDouble fork, .Trashes/) must
+// file only the real photo — the junk used to be copied into the Outbox as if
+// it were media.
+func TestRunImportSkipsHiddenCardFiles(t *testing.T) {
+	when := time.Date(2024, 3, 5, 12, 0, 0, 0, time.Local)
+	card := t.TempDir()
+	for name, content := range map[string]string{
+		"a.jpg":                            "real",
+		"._a.jpg":                          "fork",
+		filepath.Join(".Trashes", "x.jpg"): "trash",
+	} {
+		p := filepath.Join(card, name)
+		if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+			t.Fatalf("mkdir: %v", err)
+		}
+		if err := os.WriteFile(p, []byte(content), 0o644); err != nil {
+			t.Fatalf("write %s: %v", p, err)
+		}
+		if err := os.Chtimes(p, when, when); err != nil {
+			t.Fatalf("chtimes %s: %v", p, err)
+		}
+	}
+
+	inbox := t.TempDir()
+	outbox := t.TempDir()
+	v := &ImportView{}
+	v.runImport(context.Background(), Config{InboxDir: inbox, OutboxDir: outbox}, []string{card}, nil, false)
+
+	var filed []string
+	if err := filepath.WalkDir(outbox, func(p string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if d.IsDir() {
+			return nil
+		}
+		rel, err := filepath.Rel(outbox, p)
+		if err != nil {
+			return err
+		}
+		filed = append(filed, rel)
+		return nil
+	}); err != nil {
+		t.Fatalf("walk outbox: %v", err)
+	}
+	// Only the base name is checked: the Inbox copy doesn't keep the source
+	// mtime yet (S3-01/H4-01), so the date folder depends on that fix.
+	if len(filed) != 1 || filepath.Base(filed[0]) != "a.jpg" {
+		t.Errorf("outbox files = %v, want exactly one <date>/a.jpg", filed)
+	}
+	if m := atomic.LoadInt64(&v.statMoved); m != 1 {
+		t.Errorf("statMoved = %d, want 1", m)
+	}
+	for _, name := range []string{"a.jpg", "._a.jpg", filepath.Join(".Trashes", "x.jpg")} {
+		if _, err := os.Stat(filepath.Join(card, name)); err != nil {
+			t.Errorf("card file %s should still exist: %v", name, err)
+		}
 	}
 }

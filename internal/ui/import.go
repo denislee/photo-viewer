@@ -878,23 +878,20 @@ func (v *ImportView) haveSomethingToImport(cfg Config, inboxHas bool) bool {
 }
 
 // inboxHasFiles reports whether dir holds at least one importable media file.
-// It short-circuits: the WalkDir callback returns fs.SkipAll on the first hit,
-// so a huge inbox costs O(1) in the common "has files" case instead of a full
-// recursive count — this runs on the frame goroutine, so a stall here shows up
-// as a dropped frame per Start click (U-10). Only DetectType != TypeUnknown
-// files count, matching what phase-2 processing actually files, so a stray
-// .DS_Store in an otherwise-empty inbox doesn't claim "something to import".
+// It walks with scan.WalkMediaPaths — the same rules as the indexer's walk —
+// so hidden files and hidden directories (._* AppleDouble junk, .Trashes) don't
+// count (U4-04). It short-circuits: the callback returns fs.SkipAll on the
+// first hit, so a huge inbox costs O(1) in the common "has files" case instead
+// of a full recursive count — this runs on the frame goroutine, so a stall here
+// shows up as a dropped frame per Start click (U-10). Only DetectType !=
+// TypeUnknown files count, matching what phase-2 processing actually files, so
+// a stray .DS_Store in an otherwise-empty inbox doesn't claim "something to
+// import".
 func inboxHasFiles(dir string) bool {
 	found := false
-	_ = filepath.WalkDir(dir, func(p string, d fs.DirEntry, err error) error {
-		if err != nil || d == nil || d.IsDir() {
-			return nil
-		}
-		if scan.DetectType(p) != scan.TypeUnknown {
-			found = true
-			return fs.SkipAll
-		}
-		return nil
+	_ = scan.WalkMediaPaths(context.Background(), dir, func(string, scan.MediaType) error {
+		found = true
+		return fs.SkipAll
 	})
 	return found
 }
@@ -994,13 +991,8 @@ func (v *ImportView) runImport(ctx context.Context, cfg Config, importDirs, zipF
 	if ctx.Err() == nil {
 		v.setStatus("Scanning Inbox…")
 		var inbox []string
-		_ = filepath.WalkDir(cfg.InboxDir, func(p string, d fs.DirEntry, err error) error {
-			if err != nil || d == nil || d.IsDir() {
-				return nil
-			}
-			if scan.DetectType(p) != scan.TypeUnknown {
-				inbox = append(inbox, p)
-			}
+		_ = scan.WalkMediaPaths(ctx, cfg.InboxDir, func(p string, _ scan.MediaType) error {
+			inbox = append(inbox, p)
 			return nil
 		})
 		if len(inbox) > 0 {
@@ -1023,10 +1015,9 @@ func (v *ImportView) runImport(ctx context.Context, cfg Config, importDirs, zipF
 		subdirFiles := map[string][]string{}
 		var subdirOrder []string
 		var zipsInDir []string
-		_ = filepath.WalkDir(src, func(p string, d fs.DirEntry, err error) error {
-			if err != nil || d == nil || d.IsDir() {
-				return nil
-			}
+		// Hidden files and hidden directories are skipped, like the indexer
+		// (U4-04).
+		_ = scan.WalkVisibleFiles(ctx, src, func(p string) error {
 			if strings.EqualFold(filepath.Ext(p), ".zip") {
 				zipsInDir = append(zipsInDir, p)
 				return nil
@@ -1322,6 +1313,9 @@ func (v *ImportView) extractZipToInbox(ctx context.Context, zipPath, inboxDir st
 		if f.FileInfo().IsDir() {
 			continue
 		}
+		if zipJunkName(f.Name) {
+			continue
+		}
 		if scan.DetectType(f.Name) == scan.TypeUnknown {
 			continue
 		}
@@ -1343,6 +1337,20 @@ func (v *ImportView) extractZipToInbox(ctx context.Context, zipPath, inboxDir st
 		extracted = append(extracted, dest)
 	}
 	return extracted
+}
+
+// zipJunkName reports archive entries that are hidden or macOS metadata: any
+// path component that starts with "." (._IMG.jpg, .Trashes/…) or is __MACOSX.
+func zipJunkName(name string) bool {
+	for _, part := range strings.Split(name, "/") {
+		if part == "" || part == "." {
+			continue
+		}
+		if strings.HasPrefix(part, ".") || part == "__MACOSX" {
+			return true
+		}
+	}
+	return false
 }
 
 func (v *ImportView) setProgress(done, max int64) {
