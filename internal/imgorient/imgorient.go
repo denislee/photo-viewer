@@ -13,6 +13,7 @@
 package imgorient
 
 import (
+	"encoding/binary"
 	"image"
 	"image/draw"
 	"io"
@@ -38,7 +39,17 @@ func ReadOrientation(path string) int {
 // ReadOrientationFrom is ReadOrientation for an already-open (or in-memory)
 // image stream, so a caller that has the file's bytes loaded doesn't reopen it.
 // The same "1 on any failure" contract applies.
+//
+// A TIFF-structured file (CR2, NEF, ARW, DNG, PEF, TIFF: "II*\0" / "MM\0*")
+// read through an io.ReaderAt positioned at its start (*os.File and
+// *bytes.Reader both qualify) has its IFD0 Orientation parsed directly (T4-01):
+// goexif would buffer the whole stream twice to reach the same 12-byte entry,
+// which on a 36 MB RAW costs ~76 ms and ~300 MB of allocation per call.
+// Everything else (JPEG, HEIC, MP4, other readers) goes through exif.Decode.
 func ReadOrientationFrom(r io.Reader) int {
+	if o, ok := tiffOrientation(r); ok {
+		return o
+	}
 	x, err := exif.Decode(r)
 	if err != nil {
 		return 1
@@ -52,6 +63,79 @@ func ReadOrientationFrom(r io.Reader) int {
 		return 1
 	}
 	return o
+}
+
+// orientationTag is the EXIF/TIFF Orientation tag; tiffShort is the SHORT
+// field type it is stored as.
+const (
+	orientationTag = 0x0112
+	tiffShort      = 3
+)
+
+// tiffOrientation reads the Orientation entry of IFD0 straight from a TIFF
+// header. ok is false when r is not an io.ReaderAt at offset 0 or does not
+// start with TIFF magic, in which case the caller falls back to goexif. Once
+// the magic matches, every failure (truncated IFD, absent tag, wrong type,
+// out-of-range value) yields (1, true): the file is TIFF and goexif would read
+// the same IFD0.
+func tiffOrientation(r io.Reader) (int, bool) {
+	ra, ok := r.(io.ReaderAt)
+	if !ok {
+		return 0, false
+	}
+	// ReadAt is absolute; only take the fast path when the stream is at its
+	// start, which is where exif.Decode would begin reading too.
+	if s, ok := r.(io.Seeker); ok {
+		if pos, err := s.Seek(0, io.SeekCurrent); err != nil || pos != 0 {
+			return 0, false
+		}
+	}
+	// One buffer serves the header, the entry count and the entry blocks: it
+	// escapes through the ReaderAt interface, so this is the only allocation.
+	var buf [64 * 12]byte
+	head := buf[:8]
+	if _, err := ra.ReadAt(head, 0); err != nil {
+		return 0, false
+	}
+	var bo binary.ByteOrder
+	switch {
+	case head[0] == 'I' && head[1] == 'I' && head[2] == 42 && head[3] == 0:
+		bo = binary.LittleEndian
+	case head[0] == 'M' && head[1] == 'M' && head[2] == 0 && head[3] == 42:
+		bo = binary.BigEndian
+	default:
+		return 0, false
+	}
+	off := int64(bo.Uint32(head[4:]))
+	if _, err := ra.ReadAt(buf[:2], off); err != nil {
+		return 1, true
+	}
+	n := int(bo.Uint16(buf[:2]))
+	off += 2
+	// Scan the n 12-byte entries in fixed-size blocks so a corrupt count can't
+	// force a large allocation.
+	for n > 0 {
+		k := min(n, len(buf)/12)
+		got, _ := ra.ReadAt(buf[:k*12], off)
+		for e := buf[:got/12*12]; len(e) >= 12; e = e[12:] {
+			if bo.Uint16(e[0:]) != orientationTag {
+				continue
+			}
+			if bo.Uint16(e[2:]) != tiffShort {
+				return 1, true
+			}
+			if o := int(bo.Uint16(e[8:])); o >= 1 && o <= 8 {
+				return o, true
+			}
+			return 1, true
+		}
+		if got < k*12 {
+			return 1, true // truncated IFD
+		}
+		n -= k
+		off += int64(k * 12)
+	}
+	return 1, true
 }
 
 // Apply returns img transformed so its pixels are upright for the given EXIF
@@ -72,48 +156,30 @@ func ReadOrientationFrom(r io.Reader) int {
 //	7 = transverse     (reflect across the anti-diagonal)
 //	8 = rotate 90° CCW
 //
-// For the two packed 4-byte-per-pixel layouts the decode/scale pipeline
-// actually produces — *image.RGBA (from draw.Scale) and *image.NRGBA (from the
-// PNG decoder) — Apply remaps whole pixels through the Pix slice, which skips
-// the per-pixel interface dispatch that At/Set would pay. A *image.YCbCr (what
-// image/jpeg returns) is first converted to RGBA with image/draw's vectorised
-// YCbCr path and then remapped the same way: ~150 ms for 12 MP versus ~1 s for
-// the per-pixel At/Set loop. Any other image type falls back to the generic
-// At/Set remap. All are O(w·h); callers should orient *after* downscaling so the
-// remap runs at output resolution, not source resolution.
+// An *image.NRGBA (from the PNG decoder) is remapped in place through its Pix
+// slice and stays non-premultiplied. Every other image is first made an
+// *image.RGBA (an RGBA is used as is; anything else is converted with ToRGBA,
+// which takes image/draw's vectorised YCbCr/Gray paths and is exact for every
+// other type) and then remapped the same way. Both are O(w·h); callers should
+// orient *after* downscaling so the remap runs at output resolution, not source
+// resolution.
 func Apply(img image.Image, orientation int) image.Image {
 	if orientation <= 1 || orientation > 8 {
 		return img
 	}
 	b := img.Bounds()
 	w, h := b.Dx(), b.Dy()
-
-	switch src := img.(type) {
-	case *image.RGBA:
-		dst := image.NewRGBA(orientedRect(b, orientation))
-		remapPix(src.Pix, src.Stride, dst.Pix, dst.Stride, w, h, orientation)
-		return dst
-	case *image.NRGBA:
+	if src, ok := img.(*image.NRGBA); ok {
 		dst := image.NewNRGBA(orientedRect(b, orientation))
 		remapPix(src.Pix, src.Stride, dst.Pix, dst.Stride, w, h, orientation)
 		return dst
-	case *image.YCbCr:
-		rgba := ToRGBA(src)
-		dst := image.NewRGBA(orientedRect(b, orientation))
-		remapPix(rgba.Pix, rgba.Stride, dst.Pix, dst.Stride, w, h, orientation)
-		return dst
 	}
-
-	// Generic fallback for any other image.Image (e.g. a small, already-≤max
-	// YCbCr JPEG handed over without a downscale): a plain per-pixel At/Set
-	// remap. Correct for every image type, just slower.
+	src, ok := img.(*image.RGBA)
+	if !ok {
+		src = ToRGBA(img)
+	}
 	dst := image.NewRGBA(orientedRect(b, orientation))
-	for y := range h {
-		for x := range w {
-			dx, dy := destXY(orientation, x, y, w, h)
-			dst.Set(dx, dy, img.At(b.Min.X+x, b.Min.Y+y))
-		}
-	}
+	remapPix(src.Pix, src.Stride, dst.Pix, dst.Stride, w, h, orientation)
 	return dst
 }
 
@@ -142,41 +208,63 @@ func orientedRect(b image.Rectangle, orientation int) image.Rectangle {
 	return image.Rect(0, 0, b.Dx(), b.Dy())
 }
 
-// destXY returns the destination coordinate that source pixel (x, y) — given
-// in local [0,w)×[0,h) coordinates — lands on under the given orientation.
-func destXY(orientation, x, y, w, h int) (int, int) {
-	switch orientation {
-	case 2: // mirror horizontal
-		return w - 1 - x, y
-	case 3: // rotate 180°
-		return w - 1 - x, h - 1 - y
-	case 4: // mirror vertical
-		return x, h - 1 - y
-	case 5: // transpose (main diagonal)
-		return y, x
-	case 6: // rotate 90° CW
-		return h - 1 - y, x
-	case 7: // transverse (anti-diagonal)
-		return h - 1 - y, w - 1 - x
-	case 8: // rotate 90° CCW
-		return y, w - 1 - x
-	}
-	return x, y
-}
+// remapTile is the edge of the square tiles remapPix walks for the transpose
+// orientations: 32×32 RGBA pixels is 4 KiB per tile on each side, so a tile's
+// source rows and destination columns both stay in L1.
+const remapTile = 32
 
 // remapPix copies 4-byte pixels from a packed source (spix/sstride, the top-left
 // pixel at spix[0]) into a packed destination (dpix/dstride, sized per
 // orientedRect and origin-anchored) under the given orientation. It handles the
 // RGBA and NRGBA cases identically because both share the same 4-byte layout;
 // copying raw bytes preserves the exact colour, so this is a pure spatial remap.
+//
+// Every orientation is affine in the source coordinates: source pixel (x, y)
+// lands at byte base + x·xstep + y·ystep of dpix. The steps are derived once
+// (H4-02) instead of switching per pixel; orientations that keep rows
+// left-to-right (1, 4) copy whole rows, and the rest walk remapTile-square
+// tiles so the column-wise destination writes of a transpose stay cache-local.
 func remapPix(spix []uint8, sstride int, dpix []uint8, dstride, w, h, orientation int) {
-	for y := range h {
-		so := y * sstride
-		for x := range w {
-			dx, dy := destXY(orientation, x, y, w, h)
-			di := dy*dstride + dx*4
-			copy(dpix[di:di+4], spix[so:so+4])
-			so += 4
+	if w <= 0 || h <= 0 {
+		return
+	}
+	base, xstep, ystep := 0, 4, dstride
+	switch orientation {
+	case 2: // mirror horizontal: (w-1-x, y)
+		base, xstep, ystep = (w-1)*4, -4, dstride
+	case 3: // rotate 180°: (w-1-x, h-1-y)
+		base, xstep, ystep = (h-1)*dstride+(w-1)*4, -4, -dstride
+	case 4: // mirror vertical: (x, h-1-y)
+		base, xstep, ystep = (h-1)*dstride, 4, -dstride
+	case 5: // transpose: (y, x)
+		base, xstep, ystep = 0, dstride, 4
+	case 6: // rotate 90° CW: (h-1-y, x)
+		base, xstep, ystep = (h-1)*4, dstride, -4
+	case 7: // transverse: (h-1-y, w-1-x)
+		base, xstep, ystep = (w-1)*dstride+(h-1)*4, -dstride, -4
+	case 8: // rotate 90° CCW: (y, w-1-x)
+		base, xstep, ystep = (w-1)*dstride, -dstride, 4
+	}
+	if xstep == 4 {
+		for y := range h {
+			di := base + y*ystep
+			copy(dpix[di:di+4*w], spix[y*sstride:y*sstride+4*w])
+		}
+		return
+	}
+	for ty := 0; ty < h; ty += remapTile {
+		yEnd := min(ty+remapTile, h)
+		for tx := 0; tx < w; tx += remapTile {
+			xEnd := min(tx+remapTile, w)
+			for y := ty; y < yEnd; y++ {
+				so := y*sstride + tx*4
+				di := base + tx*xstep + y*ystep
+				for x := tx; x < xEnd; x++ {
+					copy(dpix[di:di+4], spix[so:so+4])
+					so += 4
+					di += xstep
+				}
+			}
 		}
 	}
 }
