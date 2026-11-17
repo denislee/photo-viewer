@@ -1270,7 +1270,7 @@ func decodeOriginal(ctx context.Context, e cache.Entry, target image.Point, disp
 			return decodedImage{}, false
 		}
 		defer os.RemoveAll(tmpDir)
-		jpgPath, err2 := thumb.HEICToJPEG(ctx, e.Path, tmpDir)
+		jpgPath, err2 := thumb.HEICToJPEG(ctx, e.Path, tmpDir, false)
 		if err2 != nil {
 			return decodedImage{}, false
 		}

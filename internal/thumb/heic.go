@@ -45,7 +45,7 @@ func HEIC(ctx context.Context, src, dst string, size int) error {
 		return err
 	}
 	defer os.RemoveAll(tmpDir)
-	jpg, lastErr := decodeHEIC(ctx, src, tmpDir)
+	jpg, lastErr := HEICToJPEG(ctx, src, tmpDir, ffmpegTried)
 	if lastErr != nil {
 		return lastErr
 	}
@@ -71,12 +71,11 @@ func HEIC(ctx context.Context, src, dst string, size int) error {
 
 // HEICToJPEG decodes a HEIC/HEIF file to a full-resolution JPEG written under
 // tmpDir. Returns the path of the produced JPEG; the caller is responsible for
-// removing tmpDir.
-func HEICToJPEG(ctx context.Context, src, tmpDir string) (string, error) {
-	return decodeHEIC(ctx, src, tmpDir)
-}
-
-func decodeHEIC(ctx context.Context, src, tmpDir string) (string, error) {
+// removing tmpDir. skipFfmpeg skips the ffmpeg fallback; HEIC sets it when its
+// own ffmpeg attempt just failed on this file, so a machine whose ffmpeg lacks
+// HEIC and has no heif-convert pays one doomed fork per file, not two (T4-03).
+// The fallback is also skipped once ffmpegNoHEIC has latched.
+func HEICToJPEG(ctx context.Context, src, tmpDir string, skipFfmpeg bool) (string, error) {
 	var firstErr error
 	if haveHeifConvert() {
 		intermediate := filepath.Join(tmpDir, "out.jpg")
@@ -106,7 +105,7 @@ func decodeHEIC(ctx context.Context, src, tmpDir string) (string, error) {
 	}
 
 	// Fallback: ffmpeg can decode HEIC via libheif/HEVC and write a JPEG.
-	if haveFfmpeg() {
+	if !skipFfmpeg && !ffmpegNoHEIC.Load() && haveFfmpeg() {
 		out := filepath.Join(tmpDir, "ff-out.jpg")
 		var stderr bytes.Buffer
 		// -threads 1 (before -i) caps the HEVC-intra decoder — a single-frame
