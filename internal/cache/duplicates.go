@@ -88,6 +88,130 @@ func quickHash(path string, size int64) (string, error) {
 // to SQLite. Smaller = more granular resume on cancel, but more transactions.
 const hashBatchSize = 500
 
+// hashCand is one file considered by EnsureHashes, carrying both its cached
+// hashes and the ones computed during the current pass. quick/full are empty
+// when the hash is not known yet.
+type hashCand struct {
+	path  string
+	size  int64
+	quick string // cached or freshly computed quick hash, empty if none
+	full  string // cached or freshly computed full hash, empty if none
+}
+
+// hashResult is a hash produced by a hashPass worker for todo[k].
+type hashResult struct {
+	k    int
+	hash string
+}
+
+// hashPass runs one hashing pass over the todo items listed in items: workers
+// call hash for each item, and the collector persists the results in
+// hashBatchSize batches, writing each hash back into todo in place through
+// field.
+//
+// One worker pool + batched UPDATE shared by both passes; the statement is
+// prepared once and bound per batch with tx.Stmt (C3-01); results are written
+// into todo in place on the collector goroutine (C4-03).
+//
+// The collector runs on the calling goroutine, so an early return (a flush
+// error) leaves no reader behind — that is why workers select on ctx.Done()
+// when sending.
+func (i *Index) hashPass(
+	ctx context.Context,
+	todo []hashCand,
+	items []int,
+	workers int,
+	hash func(path string, size int64) (string, error),
+	field func(c *hashCand) *string,
+	updateSQL string,
+	waitIfPaused func(),
+	progress func(done, total int),
+	done, total int,
+) error {
+	stmt, err := i.db.Prepare(updateSQL)
+	if err != nil {
+		return err
+	}
+	defer stmt.Close()
+
+	jobs := make(chan int, workers*2)
+	go func() {
+		defer close(jobs)
+		for _, k := range items {
+			select {
+			case <-ctx.Done():
+				return
+			case jobs <- k:
+			}
+		}
+	}()
+
+	results := make(chan hashResult, workers*2)
+	var wg sync.WaitGroup
+	for range workers {
+		wg.Go(func() {
+			for k := range jobs {
+				if waitIfPaused != nil {
+					waitIfPaused()
+				}
+				if ctx.Err() != nil {
+					continue
+				}
+				h, err := hash(todo[k].path, todo[k].size)
+				if err != nil {
+					if errors.Is(err, os.ErrNotExist) {
+						_ = i.RemoveEntry(todo[k].path)
+					}
+					continue
+				}
+				// Select on ctx.Done() so the worker can't wedge on this send
+				// once the reader has bailed out early (flush error); the
+				// caller's deferred cancel releases every blocked worker.
+				select {
+				case results <- hashResult{k: k, hash: h}:
+				case <-ctx.Done():
+					return
+				}
+			}
+		})
+	}
+	go func() { wg.Wait(); close(results) }()
+
+	pending := make([]int, 0, hashBatchSize)
+	flush := func() error {
+		if len(pending) == 0 {
+			return nil
+		}
+		tx, err := i.db.Begin()
+		if err != nil {
+			return err
+		}
+		ts := tx.Stmt(stmt)
+		for _, k := range pending {
+			_, _ = ts.Exec(*field(&todo[k]), todo[k].path)
+		}
+		ts.Close()
+		err = tx.Commit()
+		pending = pending[:0]
+		return err
+	}
+
+	for r := range results {
+		*field(&todo[r.k]) = r.hash
+		pending = append(pending, r.k)
+		done++
+		if progress != nil {
+			progress(done, total)
+		}
+		if len(pending) >= hashBatchSize {
+			if err := flush(); err != nil {
+				return err
+			}
+		}
+	}
+	return flush()
+}
+
 // EnsureHashes fills in missing content hashes for entries that share a size
 // with at least one other entry. It runs in two passes: a quick hash of the
 // first and last 64 KiB to prune size collisions, then a full SHA-256 only on
@@ -113,13 +237,6 @@ func (i *Index) EnsureHashes(ctx context.Context, progress func(done, total int)
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
-	type cand struct {
-		path  string
-		size  int64
-		quick string // already-cached quick hash, empty if not computed yet
-		full  string // already-cached full hash, empty if not computed yet
-	}
-
 	rows, err := i.db.Query(`
 		SELECT path, size, COALESCE(quick_hash, ''), COALESCE(content_hash, '')
 		FROM entries
@@ -133,10 +250,10 @@ func (i *Index) EnsureHashes(ctx context.Context, progress func(done, total int)
 	// A cursor error mid-iteration would leave todo partial and duplicate
 	// detection silently incomplete, so it fails the pass. A row that won't
 	// scan is skipped (it just isn't hashed this run) but counted and logged.
-	var todo []cand
+	var todo []hashCand
 	var badRows int
 	for rows.Next() {
-		var c cand
+		var c hashCand
 		if err := rows.Scan(&c.path, &c.size, &c.quick, &c.full); err != nil {
 			if badRows == 0 {
 				log.Printf("cache: EnsureHashes: skip unreadable row: %v", err)
@@ -170,18 +287,10 @@ func (i *Index) EnsureHashes(ctx context.Context, progress func(done, total int)
 	ioWorkers := max(cpuWorkers*3, 6)
 
 	// Phase 1: quick-hash candidates that don't have a cached quick hash.
-	var phase1 []cand
-	for _, c := range todo {
+	var phase1 []int
+	for k, c := range todo {
 		if c.quick == "" {
-			phase1 = append(phase1, c)
-		}
-	}
-
-	// Track quick hashes (cached + freshly computed).
-	quicks := make(map[string]string, len(todo))
-	for _, c := range todo {
-		if c.quick != "" {
-			quicks[c.path] = c.quick
+			phase1 = append(phase1, k)
 		}
 	}
 
@@ -190,90 +299,13 @@ func (i *Index) EnsureHashes(ctx context.Context, progress func(done, total int)
 	}
 
 	if len(phase1) > 0 {
-		type qres struct {
-			path  string
-			quick string
-		}
-		jobs := make(chan cand, ioWorkers*2)
-		go func() {
-			defer close(jobs)
-			for _, t := range phase1 {
-				select {
-				case <-ctx.Done():
-					return
-				case jobs <- t:
-				}
-			}
-		}()
-		results := make(chan qres, ioWorkers*2)
-		var wg sync.WaitGroup
-		for range ioWorkers {
-			wg.Go(func() {
-				for t := range jobs {
-					if waitIfPaused != nil {
-						waitIfPaused()
-					}
-					if ctx.Err() != nil {
-						continue
-					}
-					q, err := quickHash(t.path, t.size)
-					if err != nil {
-						if errors.Is(err, os.ErrNotExist) {
-							_ = i.RemoveEntry(t.path)
-						}
-						continue
-					}
-					// Select on ctx.Done() so the worker can't wedge on this
-					// send once the reader has bailed out early (flush error);
-					// the deferred cancel releases every blocked worker.
-					select {
-					case results <- qres{path: t.path, quick: q}:
-					case <-ctx.Done():
-						return
-					}
-				}
-			})
-		}
-		go func() { wg.Wait(); close(results) }()
-
-		pending := make([]qres, 0, hashBatchSize)
-		flush := func() error {
-			if len(pending) == 0 {
-				return nil
-			}
-			tx, err := i.db.Begin()
-			if err != nil {
-				return err
-			}
-			stmt, err := tx.Prepare("UPDATE entries SET quick_hash = ? WHERE path = ?")
-			if err != nil {
-				tx.Rollback()
-				return err
-			}
-			for _, r := range pending {
-				_, _ = stmt.Exec(r.quick, r.path)
-			}
-			stmt.Close()
-			err = tx.Commit()
-			pending = pending[:0]
-			return err
-		}
-
-		done := len(todo) - len(phase1)
-		for r := range results {
-			quicks[r.path] = r.quick
-			pending = append(pending, r)
-			done++
-			if progress != nil {
-				progress(done, len(todo))
-			}
-			if len(pending) >= hashBatchSize {
-				if err := flush(); err != nil {
-					return err
-				}
-			}
-		}
-		if err := flush(); err != nil {
+		if err := i.hashPass(ctx, todo, phase1, ioWorkers,
+			quickHash,
+			func(c *hashCand) *string { return &c.quick },
+			"UPDATE entries SET quick_hash = ? WHERE path = ?",
+			waitIfPaused, progress,
+			len(todo)-len(phase1), len(todo),
+		); err != nil {
 			return err
 		}
 		if ctx.Err() != nil {
@@ -284,28 +316,24 @@ func (i *Index) EnsureHashes(ctx context.Context, progress func(done, total int)
 	// Group by quick hash alone. Size is mixed into the digest by quickHash,
 	// so a quick-hash collision already implies same size — no need for a
 	// composite (size, quick) key.
-	groups := map[string][]cand{}
-	for _, c := range todo {
-		q := c.quick
-		if q == "" {
-			q = quicks[c.path]
-		}
-		if q == "" {
+	groups := map[string][]int{}
+	for k, c := range todo {
+		if c.quick == "" {
 			continue // quick hash failed earlier
 		}
-		groups[q] = append(groups[q], cand{path: c.path, size: c.size, quick: q, full: c.full})
+		groups[c.quick] = append(groups[c.quick], k)
 	}
 
 	// Phase 2: full-hash files whose quick hash collides with another and
 	// don't already have a cached content hash.
-	var toFull []cand
-	for _, gs := range groups {
-		if len(gs) < 2 {
+	var toFull []int
+	for _, ks := range groups {
+		if len(ks) < 2 {
 			continue
 		}
-		for _, c := range gs {
-			if c.full == "" {
-				toFull = append(toFull, c)
+		for _, k := range ks {
+			if todo[k].full == "" {
+				toFull = append(toFull, k)
 			}
 		}
 	}
@@ -318,88 +346,14 @@ func (i *Index) EnsureHashes(ctx context.Context, progress func(done, total int)
 		progress(0, len(toFull))
 	}
 
-	type fres struct {
-		path string
-		hash string
-	}
-	jobs2 := make(chan cand, cpuWorkers*2)
-	go func() {
-		defer close(jobs2)
-		for _, c := range toFull {
-			select {
-			case <-ctx.Done():
-				return
-			case jobs2 <- c:
-			}
-		}
-	}()
-	results2 := make(chan fres, cpuWorkers*2)
-	var wg2 sync.WaitGroup
-	for range cpuWorkers {
-		wg2.Go(func() {
-			for c := range jobs2 {
-				if waitIfPaused != nil {
-					waitIfPaused()
-				}
-				if ctx.Err() != nil {
-					continue
-				}
-				h, err := hashFile(c.path)
-				if err != nil {
-					if errors.Is(err, os.ErrNotExist) {
-						_ = i.RemoveEntry(c.path)
-					}
-					continue
-				}
-				// Same ctx.Done() guard as phase 1: never block on the send
-				// when the reader may have returned on a flush error.
-				select {
-				case results2 <- fres{path: c.path, hash: h}:
-				case <-ctx.Done():
-					return
-				}
-			}
-		})
-	}
-	go func() { wg2.Wait(); close(results2) }()
-
-	pending := make([]fres, 0, hashBatchSize)
-	flushFull := func() error {
-		if len(pending) == 0 {
-			return nil
-		}
-		tx, err := i.db.Begin()
-		if err != nil {
-			return err
-		}
-		stmt, err := tx.Prepare("UPDATE entries SET content_hash = ? WHERE path = ?")
-		if err != nil {
-			tx.Rollback()
-			return err
-		}
-		for _, r := range pending {
-			_, _ = stmt.Exec(r.hash, r.path)
-		}
-		stmt.Close()
-		err = tx.Commit()
-		pending = pending[:0]
-		return err
-	}
-
-	done := 0
-	for r := range results2 {
-		pending = append(pending, r)
-		done++
-		if progress != nil {
-			progress(done, len(toFull))
-		}
-		if len(pending) >= hashBatchSize {
-			if err := flushFull(); err != nil {
-				return err
-			}
-		}
-	}
-	if err := flushFull(); err != nil {
+	err = i.hashPass(ctx, todo, toFull, cpuWorkers,
+		func(p string, _ int64) (string, error) { return hashFile(p) },
+		func(c *hashCand) *string { return &c.full },
+		"UPDATE entries SET content_hash = ? WHERE path = ?",
+		waitIfPaused, progress,
+		0, len(toFull),
+	)
+	if err != nil {
 		return err
 	}
 

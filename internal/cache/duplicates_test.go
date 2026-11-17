@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -173,7 +174,58 @@ func TestEnsureHashesFindsDuplicates(t *testing.T) {
 	}
 }
 
+// TestEnsureHashesResumesAfterPhase2Cancel guards resume-on-cancel across the
+// two passes: cancelling during phase 2 has already persisted the phase-1 quick
+// hashes, so a follow-up run skips them and only completes the full hashes.
+func TestEnsureHashesResumesAfterPhase2Cancel(t *testing.T) {
+	idx, cleanup := loadEmpty(t)
+	defer cleanup()
+
+	const pairs = 4
+	idx.ReconcileBatch(seedDupFiles(t, t.TempDir(), pairs))
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// Phase 1 hashes 8 files (4 pairs), so cancelling after more than 8
+	// waitIfPaused calls lands the cancel inside phase 2.
+	var calls atomic.Int64
+	waitIfPaused := func() {
+		if calls.Add(1) > 8 {
+			cancel()
+		}
+	}
+	// The cancel may or may not be observed before the pass completes; either
+	// outcome is fine, only the persisted state matters.
+	_ = idx.EnsureHashes(ctx, nil, waitIfPaused)
+
+	if n := countNull(t, idx, "quick_hash"); n != 0 {
+		t.Fatalf("%d entries still have a NULL quick_hash after phase 1, want 0", n)
+	}
+
+	if err := idx.EnsureHashes(context.Background(), nil, nil); err != nil {
+		t.Fatalf("resume EnsureHashes: %v", err)
+	}
+	if groups := idx.FindDuplicates(); len(groups) != pairs {
+		t.Fatalf("FindDuplicates returned %d groups, want %d", len(groups), pairs)
+	}
+	if n := countNull(t, idx, "content_hash"); n != 0 {
+		t.Fatalf("%d entries still have a NULL content_hash after resume, want 0", n)
+	}
+}
+
+// countNull returns how many entries rows have a NULL in the given column.
+func countNull(t *testing.T, idx *Index, column string) int {
+	t.Helper()
+	var n int
+	if err := idx.db.QueryRow("SELECT COUNT(*) FROM entries WHERE " + column + " IS NULL").Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	return n
+}
+
 // TestEnsureHashesSkipsUnreadableRow guards C-13: a candidate row that won't
+
 // scan (here a NULL path sharing a size with real files) is skipped and
 // logged, not allowed to abort the pass or hide the real duplicates.
 func TestEnsureHashesSkipsUnreadableRow(t *testing.T) {
