@@ -1281,7 +1281,9 @@ func decodeOriginal(ctx context.Context, e cache.Entry, target image.Point, disp
 		// heif-convert / ffmpeg bake in the HEIF rotation: orientation 1.
 		img, native, err = decodeFitted(ctx, data, 1, target)
 	case scan.TypeRAW:
-		img, orientation, err = thumb.LoadRAWImage(ctx, e.Path)
+		img, orientation, err = thumb.LoadRAWImage(ctx, e.Path, func(w, h, o int) (int, int) {
+			return fitMinimum(w, h, o, target)
+		})
 	case scan.TypePhoto:
 		data, err2 := thumb.ReadFile(ctx, e.Path)
 		if err2 != nil {

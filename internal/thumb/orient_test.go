@@ -10,6 +10,8 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+
+	"github.com/dns/photo-viewer/internal/jpegturbo"
 )
 
 // exifAPP1 builds a minimal EXIF APP1 segment carrying a single Orientation
@@ -124,7 +126,7 @@ func TestLoadRAWImageReportsPreviewOrientation(t *testing.T) {
 	}{{1, 1}, {6, 6}, {8, 8}} {
 		p := filepath.Join(dir, fmt.Sprintf("o%d.cr2", tc.orientation))
 		writeJPEGWithOrientation(t, p, 40, 20, tc.orientation)
-		img, got, err := LoadRAWImage(context.Background(), p)
+		img, got, err := LoadRAWImage(context.Background(), p, nil)
 		if err != nil {
 			t.Fatalf("orientation %d: LoadRAWImage: %v", tc.orientation, err)
 		}
@@ -135,5 +137,45 @@ func TestLoadRAWImageReportsPreviewOrientation(t *testing.T) {
 		if b := img.Bounds(); b.Dx() != 40 || b.Dy() != 20 {
 			t.Errorf("orientation %d: bounds %v, want stored 40x20", tc.orientation, b)
 		}
+	}
+}
+
+// TestLoadRAWImageFit is the T4-05 guard: the viewer's fit must see the
+// preview's stored size together with the orientation still to be applied, and
+// its minimum must drive a DCT-scaled decode instead of a full-resolution one.
+func TestLoadRAWImageFit(t *testing.T) {
+	dir := t.TempDir()
+	p := filepath.Join(dir, "fit.cr2")
+	writeJPEGWithOrientation(t, p, 400, 200, 6)
+
+	var gotW, gotH, gotO, calls int
+	fit := func(w, h, o int) (int, int) {
+		calls++
+		gotW, gotH, gotO = w, h, o
+		return 100, 50
+	}
+	img, orientation, err := LoadRAWImage(context.Background(), p, fit)
+	if err != nil {
+		t.Fatalf("LoadRAWImage: %v", err)
+	}
+	if calls == 0 {
+		t.Fatalf("fit was never called")
+	}
+	if gotW != 400 || gotH != 200 || gotO != 6 {
+		t.Errorf("fit called with (%d, %d, %d), want (400, 200, 6)", gotW, gotH, gotO)
+	}
+	if orientation != 6 {
+		t.Errorf("reported orientation %d, want 6", orientation)
+	}
+	b := img.Bounds()
+	if jpegturbo.Available() {
+		if b.Dx() < 100 || b.Dy() < 50 {
+			t.Errorf("bounds %v, want at least 100x50", b)
+		}
+		if b.Dx() >= 400 {
+			t.Errorf("bounds %v, want DCT-scaled below the stored 400 width", b)
+		}
+	} else if b.Dx() != 400 {
+		t.Errorf("bounds %v, want full-size 400 without libjpeg-turbo", b)
 	}
 }

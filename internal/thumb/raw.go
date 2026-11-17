@@ -50,16 +50,21 @@ func RAW(ctx context.Context, src, dst string, size int) error {
 		}
 	}
 
-	// Fallback: ffmpeg decodes the full RAW directly (and autorotates), so the
-	// image is already upright — pass orientation 1 (identity).
-	img, err := decodeRAWViaFfmpeg(ctx, src)
+	// Fallback: ffmpeg decodes the full RAW, scales it and writes the thumbnail
+	// in one pass (T4-02), autorotating as it goes — the same imageViaFfmpeg path
+	// large plain images take, instead of a full-resolution MJPEG round trip
+	// through Go's decoder.
+	err := errFfmpegNotInstalled
+	if haveFfmpeg() {
+		err = imageViaFfmpeg(ctx, src, dst, size)
+	}
 	if err != nil {
 		if previewErr != nil {
 			return previewErr
 		}
 		return err
 	}
-	return writeThumb(img, dst, size, 1)
+	return nil
 }
 
 // LoadRAWImage returns a decoded image.Image from a RAW file. It tries
@@ -72,16 +77,22 @@ func RAW(ctx context.Context, src, dst string, size int) error {
 // carries the RAW's tag, while the ffmpeg fallback autorotates and reports 1.
 // Orientation is returned rather than applied so the caller can rotate after
 // downscaling — previews are often full-resolution (S-21).
-func LoadRAWImage(ctx context.Context, src string) (img image.Image, orientation int, err error) {
+//
+// fit, when non-nil, receives the decoded JPEG's stored size and the
+// orientation still to be applied, and returns the minimum stored-orientation
+// size to DCT-scale to (T4-05): a viewer window smaller than a 24–45 MP preview
+// then decodes only what it shows. nil decodes at full size.
+func LoadRAWImage(ctx context.Context, src string, fit func(w, h, orientation int) (minW, minH int)) (img image.Image, orientation int, err error) {
 	data, err := LoadRAWPreview(ctx, src)
 	if err == nil {
-		img, derr := DecodeScaled(ctx, data, 0, 0)
+		o := imgorient.ReadOrientation(src)
+		img, _, derr := DecodeFitFunc(ctx, data, bindFit(fit, o))
 		if derr == nil {
-			return img, imgorient.ReadOrientation(src), nil
+			return img, o, nil
 		}
 	}
 
-	img, ferr := decodeRAWViaFfmpeg(ctx, src)
+	img, ferr := decodeRAWViaFfmpeg(ctx, src, bindFit(fit, 1))
 	if ferr == nil {
 		return img, 1, nil
 	}
@@ -91,24 +102,34 @@ func LoadRAWImage(ctx context.Context, src string) (img image.Image, orientation
 	return nil, 1, errors.New("could not decode RAW file")
 }
 
+// bindFit fixes the orientation argument of a LoadRAWImage fit, giving the
+// two-argument form DecodeFitFunc takes. A nil fit stays nil (full size).
+func bindFit(fit func(w, h, orientation int) (int, int), orientation int) func(w, h int) (int, int) {
+	if fit == nil {
+		return nil
+	}
+	return func(w, h int) (int, int) { return fit(w, h, orientation) }
+}
+
 // decodeRAWViaFfmpeg decodes the full RAW via ffmpeg (which handles DNG, CR2,
-// etc. and auto-applies orientation), returning the decoded image.
-func decodeRAWViaFfmpeg(ctx context.Context, src string) (image.Image, error) {
+// etc. and auto-applies orientation) and DCT-scales the single MJPEG frame it
+// emits with libjpeg-turbo. It is the viewer's fallback (LoadRAWImage) only —
+// the thumbnail path (RAW) has imageViaFfmpeg to write straight to disk.
+// -threads 1 keeps the fork inside the C-06 cap and -loglevel error leaves
+// stderr carrying only the failure reason.
+func decodeRAWViaFfmpeg(ctx context.Context, src string, fit func(w, h int) (int, int)) (image.Image, error) {
 	if !haveFfmpeg() {
 		return nil, errFfmpegNotInstalled
 	}
-	cmd := exec.CommandContext(ctx, "ffmpeg", "-i", src, "-frames:v", "1", "-f", "image2pipe", "-vcodec", "mjpeg", "-")
+	cmd := exec.CommandContext(ctx, "ffmpeg", "-loglevel", "error", "-threads", "1", "-i", src, "-frames:v", "1", "-f", "image2pipe", "-vcodec", "mjpeg", "-")
 	var out, stderr bytes.Buffer
 	cmd.Stdout = &out
 	cmd.Stderr = &stderr
 	if err := cmd.Run(); err != nil {
 		return nil, ffmpegError(err, &stderr)
 	}
-	img, _, err := image.Decode(&out)
-	if err != nil {
-		return nil, err
-	}
-	return img, nil
+	img, _, err := DecodeFitFunc(ctx, out.Bytes(), fit)
+	return img, err
 }
 
 // LoadRAWPreview returns the bytes of an embedded JPEG/TIFF preview.
