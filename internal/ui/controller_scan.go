@@ -373,32 +373,23 @@ func (c *Controller) WarmUp() {
 		workers := max(c.store.WarmUpConcurrency(), 1)
 		jobs := make(chan cache.Entry, workers*2)
 
-		// Throttle the redraw notifications so a burst of fast thumb decodes
-		// doesn't pile dozens of frame requests onto Gio's loop. The progress
-		// bar still ticks at full granularity via proc.SetDone.
+		// proc.SetDone already goes through the registry's ~30Hz coalescer, so
+		// no second throttle here (U4-09). Without a registry (tests) invalidate
+		// directly. warmUpDone is published every 50 items for the info modal
+		// and once more, exactly, after the pool drains.
 		var done, generated int64
-		var invMu sync.Mutex
-		var lastInv time.Time
 		notify := func(n int64) {
 			if proc != nil {
 				proc.SetDone(n)
+			} else if c.invalidate != nil {
+				c.invalidate()
 			}
-			if n%50 == 0 || n == int64(total) {
+			if n%50 == 0 {
 				c.mu.Lock()
 				if c.warmUpGen == myGen {
 					c.warmUpDone = int(n)
 				}
 				c.mu.Unlock()
-			}
-			if c.invalidate != nil {
-				invMu.Lock()
-				if time.Since(lastInv) >= 33*time.Millisecond {
-					lastInv = time.Now()
-					invMu.Unlock()
-					c.invalidate()
-				} else {
-					invMu.Unlock()
-				}
 			}
 		}
 
@@ -432,11 +423,24 @@ func (c *Controller) WarmUp() {
 		})
 		close(jobs)
 		wg.Wait()
+		// Concurrent workers can publish their n out of order and a cancel can
+		// stop at any count, so the final value is stored unconditionally
+		// (U4-09: it used to be stored only when n%50==0 or n==total, so a
+		// cancelled pass could show a count up to 49 too low forever).
+		final := atomic.LoadInt64(&done)
+		if proc != nil {
+			proc.SetDone(final)
+		}
+		c.mu.Lock()
+		if c.warmUpGen == myGen {
+			c.warmUpDone = int(final)
+		}
+		c.mu.Unlock()
 
 		if proc != nil {
 			n := atomic.LoadInt64(&generated)
 			proc.SetStatus(fmt.Sprintf("Generated %d new thumbnail(s), skipped %d existing",
-				n, atomic.LoadInt64(&done)-n))
+				n, final-n))
 		}
 	}()
 }

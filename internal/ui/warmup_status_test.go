@@ -1,7 +1,9 @@
 package ui
 
 import (
+	"fmt"
 	"path/filepath"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -54,5 +56,75 @@ func TestWarmUpKeepsScanStatus(t *testing.T) {
 	w := st.WarmUp
 	if w.StartedAt.IsZero() || w.EndedAt.IsZero() || w.Done != 3 || w.Total != 3 {
 		t.Errorf("WarmUp status = %+v, want started+ended with 3/3 done", w)
+	}
+}
+
+// TestWarmUpCancelledDoneIsExact guards U4-09: a cancelled warm-up pass must
+// publish the exact number of entries it processed, not the last multiple of
+// 50 it happened to report, so the info modal never shows a stale count while
+// the pass sits idle forever.
+func TestWarmUpCancelledDoneIsExact(t *testing.T) {
+	dir := t.TempDir()
+	root := filepath.Join(dir, "lib")
+	c := newTestController(t, root, filepath.Join(dir, "cache"))
+
+	// 500 index rows whose files do not exist on disk: thumbnail generation
+	// fails fast, which keeps the pass quick while still driving the counter.
+	const total = 500
+	results := make([]scan.Result, 0, total)
+	for i := 0; i < total; i++ {
+		results = append(results, scan.Result{
+			Path:    filepath.Join(root, fmt.Sprintf("p%04d.jpg", i)),
+			Type:    scan.TypePhoto,
+			Size:    1,
+			ModTime: time.Now(),
+		})
+	}
+	c.index.ReconcileBatch(results)
+
+	var calls atomic.Int64
+	c.SetInvalidate(func() {
+		if calls.Add(1) == 8 {
+			c.CancelScan()
+		}
+	})
+
+	c.WarmUp()
+	deadline := time.Now().Add(10 * time.Second)
+	for c.IndexStatus().WarmUp.Active {
+		if time.Now().After(deadline) {
+			t.Fatal("warm-up did not finish")
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+	// The final defer publishes its invalidate just after clearing Active, so
+	// wait for the count to stop moving before deriving the expectation.
+	settled := int64(-1)
+	for {
+		n := calls.Load()
+		if n == settled {
+			break
+		}
+		settled = n
+		if time.Now().After(deadline) {
+			t.Fatal("invalidate count did not settle")
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+
+	w := c.IndexStatus().WarmUp
+	// One call at WarmUp start, one per processed entry, one in the final defer.
+	want := int(calls.Load()) - 2
+	if w.Done != want {
+		t.Errorf("WarmUp.Done = %d, want %d (processed entries)", w.Done, want)
+	}
+	if w.Done <= 0 {
+		t.Errorf("WarmUp.Done = %d, want > 0", w.Done)
+	}
+	if w.Done >= w.Total {
+		t.Errorf("WarmUp.Done = %d of %d, want a cancelled pass to stop short", w.Done, w.Total)
+	}
+	if w.Total != total {
+		t.Errorf("WarmUp.Total = %d, want %d", w.Total, total)
 	}
 }
