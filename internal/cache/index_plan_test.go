@@ -3,8 +3,11 @@ package cache
 import (
 	"fmt"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
+
+	"github.com/dns/photo-viewer/internal/scan"
 )
 
 // explainPlan runs EXPLAIN QUERY PLAN for the given statement and returns the
@@ -419,5 +422,94 @@ func TestCountDirFiltered(t *testing.T) {
 	}
 	if got := idx.CountDirFiltered("/lib", "All", true); got != 5 {
 		t.Errorf("CountDirFiltered(/lib) = %d, want 5", got)
+	}
+}
+
+// TestPlanCountFavorites guards the favorites badge count: CountFavorites must
+// stream off the covering (favorite, path) index under every filter combination
+// rather than scanning the entries table.
+//
+// The query below is a copy of CountFavorites' SQL in index.go — keep it in
+// sync if that statement changes.
+func TestPlanCountFavorites(t *testing.T) {
+	idx, cleanup := loadEmpty(t)
+	defer cleanup()
+	seed(t, idx, "/lib", 200)
+
+	for _, tc := range []struct {
+		filter  string
+		showRAW bool
+	}{
+		{"All", true},
+		{"Photos", false},
+		{"Videos", true},
+	} {
+		where, args := typeFilterClause(tc.filter, tc.showRAW)
+		plan := explainPlan(t, idx, "SELECT COUNT(*) FROM entries WHERE favorite = 1"+where, args...)
+		label := fmt.Sprintf("count favorites %s raw=%v", tc.filter, tc.showRAW)
+		mustContain(t, label, plan, "idx_entries_favorite_path")
+		mustNotContain(t, label, plan, "SCAN entries")
+	}
+}
+
+// TestPlanCountChildDirsFiltered guards the sidebar's per-child-directory count
+// query: it must be a PK range SEARCH over the parent's subtree.
+//
+// The query below is a copy of CountChildDirsFiltered's SQL in index.go — keep
+// it in sync if that statement changes.
+func TestPlanCountChildDirsFiltered(t *testing.T) {
+	idx, cleanup := loadEmpty(t)
+	defer cleanup()
+	seed(t, idx, "/lib", 200)
+
+	parent := "/lib"
+	lower, upper := dirRange(parent)
+	startCol := len(lower) + 1
+	where, args := typeFilterClause("All", true)
+	q := `
+		SELECT
+			substr(path, ?, instr(substr(path, ?), '/') - 1) AS child,
+			COUNT(*)
+		FROM entries
+		WHERE path >= ? AND path < ?
+		  AND instr(substr(path, ?), '/') > 0` + where + `
+		GROUP BY child`
+	queryArgs := []any{startCol, startCol, lower, upper, startCol}
+	queryArgs = append(queryArgs, args...)
+
+	plan := explainPlan(t, idx, q, queryArgs...)
+	mustContain(t, "child dirs", plan, "SEARCH entries")
+	// The group-by b-tree is inherent to this query shape (the child name is a
+	// computed expression, so no index can serve the GROUP BY). Asserted as
+	// documentation: it is over the parent's subtree only, not the whole table.
+	mustContain(t, "child dirs", plan, "TEMP B-TREE FOR GROUP BY")
+}
+
+// TestCountChildDirsFiltered pins the per-child-directory recursive counts and
+// the type filters applied to them.
+func TestCountChildDirsFiltered(t *testing.T) {
+	idx, cleanup := loadEmpty(t)
+	defer cleanup()
+
+	idx.ReconcileBatch([]scan.Result{
+		{Path: "/lib/a/1.jpg", Type: scan.TypePhoto, Size: 1},
+		{Path: "/lib/a/b/2.jpg", Type: scan.TypePhoto, Size: 2},
+		{Path: "/lib/c/3.mp4", Type: scan.TypeVideo, Size: 3},
+		{Path: "/lib/top.jpg", Type: scan.TypePhoto, Size: 4},
+	})
+
+	for _, tc := range []struct {
+		filter  string
+		showRAW bool
+		want    map[string]int
+	}{
+		{"All", true, map[string]int{"/lib/a": 2, "/lib/c": 1}},
+		{"Photos", true, map[string]int{"/lib/a": 2}},
+		{"Videos", true, map[string]int{"/lib/c": 1}},
+	} {
+		got := idx.CountChildDirsFiltered("/lib", tc.filter, tc.showRAW)
+		if !reflect.DeepEqual(got, tc.want) {
+			t.Errorf("CountChildDirsFiltered(/lib, %q, %v) = %v, want %v", tc.filter, tc.showRAW, got, tc.want)
+		}
 	}
 }
