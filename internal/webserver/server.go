@@ -40,11 +40,10 @@ type Server struct {
 	trashIndex map[string]cache.Entry
 	trashAt    time.Time
 
-	mu       sync.Mutex
-	srv      *http.Server
-	listener net.Listener
-	addr     string // resolved listen address (host:port) once running
-	running  bool
+	mu      sync.Mutex
+	srv     *http.Server
+	addr    string // resolved listen address (host:port) once running
+	running bool
 
 	// HLS on-the-fly transcode state (see hls.go). Lazily initialised by
 	// hlsInit so New stays a plain literal. hlsSem bounds concurrent ffmpeg
@@ -156,7 +155,6 @@ func (s *Server) Start(host string, port int, password string) error {
 		IdleTimeout:  120 * time.Second,
 	}
 	s.srv = srv
-	s.listener = ln
 	s.addr = ln.Addr().String()
 	s.running = true
 	s.mu.Unlock()
@@ -190,7 +188,6 @@ func (s *Server) Stop() error {
 	s.mu.Lock()
 	srv := s.srv
 	s.srv = nil
-	s.listener = nil
 	s.running = false
 	s.addr = ""
 	s.mu.Unlock()

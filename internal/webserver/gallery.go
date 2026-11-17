@@ -371,11 +371,15 @@ func (s *Server) renderGalleryPage(w http.ResponseWriter, r *http.Request, vi vi
 
 	var entries []cache.Entry
 	var total int
+	var trashCount int
 	var hasNext bool
 
 	if vi.kind == "trash" {
 		all := s.trashEntries()
 		total = len(all)
+		// The page already holds the whole listing, so the sidebar reuses its
+		// length instead of a second trashEntries call (W3-06).
+		trashCount = total
 		offset := (page - 1) * pageSize
 		if offset > total {
 			offset = 0
@@ -393,6 +397,7 @@ func (s *Server) renderGalleryPage(w http.ResponseWriter, r *http.Request, vi vi
 		}
 		entries = s.index.ListPage(vi.v, offset, pageSize)
 		hasNext = offset+len(entries) < total
+		trashCount = len(s.trashEntries())
 	}
 
 	// For a directory view both the sidebar's "In <dir>" section and the
@@ -415,7 +420,7 @@ func (s *Server) renderGalleryPage(w http.ResponseWriter, r *http.Request, vi vi
 	fmt.Fprint(w, pageHeader)
 	fmt.Fprint(w, `<input type="checkbox" id="navtoggle" class="navtoggle" hidden>`)
 	fmt.Fprint(w, `<div class="layout">`)
-	s.renderSidebar(w, vi, dirChildren, dirChildCounts)
+	s.renderSidebar(w, vi, dirChildren, dirChildCounts, trashCount)
 	fmt.Fprint(w, `<main class="content">`)
 	fmt.Fprint(w, mobileTopBar)
 	s.renderToolbar(w, vi)
@@ -598,7 +603,7 @@ func (s *Server) trashEntries() []cache.Entry {
 	if s.trashDir == "" {
 		return nil
 	}
-	if !s.trashAt.IsZero() && time.Since(s.trashAt) < trashEntriesTTL {
+	if time.Since(s.trashAt) < trashEntriesTTL {
 		return s.trashCache
 	}
 	entries := cache.ListTrash(s.trashDir)
@@ -609,10 +614,4 @@ func (s *Server) trashEntries() []cache.Entry {
 	}
 	s.trashAt = time.Now()
 	return entries
-}
-
-// countTrash returns the number of items currently in the trash, using the
-// cached listing when fresh.
-func (s *Server) countTrash() int {
-	return len(s.trashEntries())
 }

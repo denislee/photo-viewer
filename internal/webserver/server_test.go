@@ -698,7 +698,7 @@ func TestStopForceClosesActiveConnections(t *testing.T) {
 	// WriteTimeout: 0 mirrors the production server (server.go:213) — the very
 	// setting that lets a stream run forever absent the hard close.
 	srv := &http.Server{Handler: handler, WriteTimeout: 0}
-	s := &Server{srv: srv, listener: ln, running: true, addr: ln.Addr().String()}
+	s := &Server{srv: srv, running: true, addr: ln.Addr().String()}
 	go func() { _ = srv.Serve(ln) }()
 
 	// Fire an in-flight request and wait until it's parked inside the handler.

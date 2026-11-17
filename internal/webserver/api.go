@@ -84,13 +84,12 @@ func (s *Server) handleAPIPage(w http.ResponseWriter, r *http.Request) {
 	_ = json.NewEncoder(w).Encode(resp)
 }
 
-// favoriteRequest is the body shape for POST /api/favorite. Either
-// `on` or `toggle` controls the resulting state; with both omitted we
-// toggle.
+// favoriteRequest is the body shape for POST /api/favorite. on sets the
+// resulting state; omitted, the flag is toggled. Older clients also send
+// toggle:true, which the decoder ignores.
 type favoriteRequest struct {
-	ID     string `json:"id"`
-	On     *bool  `json:"on,omitempty"`
-	Toggle bool   `json:"toggle,omitempty"`
+	ID string `json:"id"`
+	On *bool  `json:"on,omitempty"`
 }
 
 // favoriteMaxBody caps the POST /api/favorite body. A real request is under

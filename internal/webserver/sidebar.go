@@ -53,7 +53,7 @@ type viewCountEntry struct {
 // top-level subdirectories (with year grouping), and a year list. Active row
 // matches the currently-rendered view. Each link preserves the filter+raw
 // toolbar state so toggling a category doesn't reset the view options.
-func (s *Server) renderSidebar(w http.ResponseWriter, vi viewInfo, dirChildren []string, dirChildCounts map[string]int) {
+func (s *Server) renderSidebar(w http.ResponseWriter, vi viewInfo, dirChildren []string, dirChildCounts map[string]int, trashCount int) {
 	extra := extraQuery(vi.v.Filter, vi.v.ShowRAW)
 	withExtra := func(href string) string { return appendQuery(href, extra) }
 
@@ -61,12 +61,11 @@ func (s *Server) renderSidebar(w http.ResponseWriter, vi viewInfo, dirChildren [
 	agg := s.rootSidebarAgg(v.Filter, v.ShowRAW)
 	fmt.Fprint(w, `<nav class="sidebar"><div class="sec">Library</div>`)
 
-	s.sidebarRow(w, withExtra("/"), "All media", "", agg.allCount, vi.kind == "all")
-	s.sidebarRow(w, withExtra("/favorites"), "Favorites", "★", agg.favCount, vi.kind == "favorites")
+	sidebarRow(w, withExtra("/"), "All media", "", agg.allCount, vi.kind == "all")
+	sidebarRow(w, withExtra("/favorites"), "Favorites", "★", agg.favCount, vi.kind == "favorites")
 
-	trashCount := s.countTrash()
 	if trashCount > 0 || vi.kind == "trash" {
-		s.sidebarRow(w, "/trash", "Trash", "🗑", trashCount, vi.kind == "trash")
+		sidebarRow(w, "/trash", "Trash", "🗑", trashCount, vi.kind == "trash")
 	}
 
 	// Top-level subdirectories. Sourced from the filesystem (mirroring the
@@ -93,7 +92,7 @@ func (s *Server) renderSidebar(w http.ResponseWriter, vi viewInfo, dirChildren [
 		for _, y := range agg.years {
 			ys := strconv.Itoa(y.Year)
 			active := vi.kind == "year" && v.Year == y.Year
-			s.sidebarRow(w, withExtra("/year/"+ys), ys, "", y.Count, active)
+			sidebarRow(w, withExtra("/year/"+ys), ys, "", y.Count, active)
 		}
 	}
 	fmt.Fprint(w, `</nav>`)
@@ -207,7 +206,7 @@ func (s *Server) renderSubdirsGrouped(w http.ResponseWriter, subdirs []string, c
 	for _, d := range nonDate {
 		href := withExtra(s.dirHref(d))
 		active := vi.kind == "dir" && vi.v.Dir == d
-		s.sidebarRow(w, href, filepath.Base(d), "", counts[d], active)
+		sidebarRow(w, href, filepath.Base(d), "", counts[d], active)
 	}
 
 	years := make([]string, 0, len(buckets))
@@ -233,7 +232,7 @@ func (s *Server) renderSubdirsGrouped(w http.ResponseWriter, subdirs []string, c
 		for _, d := range b.dirs {
 			href := withExtra(s.dirHref(d))
 			active := vi.kind == "dir" && vi.v.Dir == d
-			s.sidebarRow(w, href, filepath.Base(d), "", counts[d], active)
+			sidebarRow(w, href, filepath.Base(d), "", counts[d], active)
 		}
 		fmt.Fprint(w, `</details>`)
 	}
@@ -279,7 +278,7 @@ func (s *Server) renderSubdirChips(w http.ResponseWriter, vi viewInfo, children 
 
 // sidebarRow renders one anchor in the sidebar with an optional leading
 // glyph (used for the Favorites star) and a right-aligned count badge.
-func (s *Server) sidebarRow(w http.ResponseWriter, href, label, glyph string, count int, active bool) {
+func sidebarRow(w http.ResponseWriter, href, label, glyph string, count int, active bool) {
 	cls := "row"
 	if active {
 		cls += " active"

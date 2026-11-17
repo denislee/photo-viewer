@@ -326,7 +326,7 @@ func TestHLSSegmentHonorsCancellation(t *testing.T) {
 	cancel() // client already gone
 
 	done := make(chan error, 1)
-	go func() { done <- s.transcodeSegment(ctx, id, e, 0, dst) }()
+	go func() { done <- s.transcodeSegment(ctx, e, 0, dst) }()
 
 	select {
 	case err := <-done:

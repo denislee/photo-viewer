@@ -92,7 +92,7 @@ func (s *Server) handleHLS(w http.ResponseWriter, r *http.Request) {
 
 	switch {
 	case file == "index.m3u8":
-		s.serveHLSPlaylist(w, r, id, e)
+		s.serveHLSPlaylist(w, r, e)
 	case strings.HasPrefix(file, "seg") && strings.HasSuffix(file, ".ts"):
 		k, err := strconv.Atoi(strings.TrimSuffix(strings.TrimPrefix(file, "seg"), ".ts"))
 		if err != nil || k < 0 {
@@ -109,7 +109,7 @@ func (s *Server) handleHLS(w http.ResponseWriter, r *http.Request) {
 // duration comes from the index row the caller already fetched (via
 // hlsDuration), so the common path costs no ffprobe fork — only videos indexed
 // without a duration fall back to probing.
-func (s *Server) serveHLSPlaylist(w http.ResponseWriter, r *http.Request, _ string, e cache.Entry) {
+func (s *Server) serveHLSPlaylist(w http.ResponseWriter, r *http.Request, e cache.Entry) {
 	dur := s.hlsDuration(r.Context(), e)
 	if dur <= 0 {
 		http.Error(w, "cannot probe video duration", http.StatusInternalServerError)
@@ -173,7 +173,7 @@ func (s *Server) serveHLSSegment(w http.ResponseWriter, r *http.Request, id stri
 		log.Printf("webserver: HLS: stat segment %s: %v", dst, err)
 	}
 
-	if err := s.transcodeSegment(r.Context(), id, e, k, dst); err != nil {
+	if err := s.transcodeSegment(r.Context(), e, k, dst); err != nil {
 		http.Error(w, "segment transcode failed", http.StatusInternalServerError)
 		return
 	}
@@ -191,7 +191,7 @@ func (s *Server) serveSegmentFile(w http.ResponseWriter, r *http.Request, dst st
 // total parallel transcodes with a semaphore. Writes to a temp file and
 // atomically renames, so a killed transcode never leaves a half-written
 // segment in the cache.
-func (s *Server) transcodeSegment(ctx context.Context, _ string, e cache.Entry, k int, dst string) error {
+func (s *Server) transcodeSegment(ctx context.Context, e cache.Entry, k int, dst string) error {
 	s.hlsInit()
 
 	// Singleflight on the destination path.
