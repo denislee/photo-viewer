@@ -215,10 +215,11 @@ func (v *WebServerView) handleStart() {
 		return
 	}
 	// Persist port + bind preference (but never the password).
-	c := GetConfig()
-	c.WebServerPort = port
-	c.WebServerBindAll = v.bindAll.Value
-	_ = SaveConfig(c)
+	bindAll := v.bindAll.Value
+	UpdateConfig(func(c *Config) {
+		c.WebServerPort = port
+		c.WebServerBindAll = bindAll
+	})
 	v.refreshStatus()
 }
 

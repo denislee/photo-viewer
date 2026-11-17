@@ -159,16 +159,20 @@ func (v *SettingsView) Layout(gtx layout.Context, th *Theme) layout.Dimensions {
 		go v.pickDir(pickOutbox, "Select outbox directory")
 	}
 	if v.saveBtn.Clicked(gtx) {
-		c := GetConfig()
-		c.InboxDir = v.inboxEditor.Text()
-		c.OutboxDir = v.outboxEditor.Text()
-		c.SDCardAutoDetect = v.sdAutoDetect.Value
-		c.ShowShortcutHints = v.showShortcuts.Value
+		inbox := v.inboxEditor.Text()
+		outbox := v.outboxEditor.Text()
+		sd := v.sdAutoDetect.Value
+		hints := v.showShortcuts.Value
 		msg := "Saved to " + configPath()
-		if p := importDirsProblem(c.InboxDir, c.OutboxDir); p != "" {
+		if p := importDirsProblem(inbox, outbox); p != "" {
 			msg = "Not saved: " + p
-		} else if err := SaveConfig(c); err != nil {
-			msg = "Save failed: " + err.Error()
+		} else {
+			UpdateConfig(func(c *Config) {
+				c.InboxDir = inbox
+				c.OutboxDir = outbox
+				c.SDCardAutoDetect = sd
+				c.ShowShortcutHints = hints
+			})
 		}
 		v.mu.Lock()
 		v.statusMsg = msg
@@ -177,14 +181,12 @@ func (v *SettingsView) Layout(gtx layout.Context, th *Theme) layout.Dimensions {
 	// Persist the toggle immediately so the watcher reacts even if the user
 	// flips it and then closes without clicking Save.
 	if v.sdAutoDetect.Update(gtx) {
-		c := GetConfig()
-		c.SDCardAutoDetect = v.sdAutoDetect.Value
-		_ = SaveConfig(c)
+		val := v.sdAutoDetect.Value
+		UpdateConfig(func(c *Config) { c.SDCardAutoDetect = val })
 	}
 	if v.showShortcuts.Update(gtx) {
-		c := GetConfig()
-		c.ShowShortcutHints = v.showShortcuts.Value
-		_ = SaveConfig(c)
+		val := v.showShortcuts.Value
+		UpdateConfig(func(c *Config) { c.ShowShortcutHints = val })
 	}
 	if v.exportFavBtn.Clicked(gtx) && v.ctrl != nil {
 		opts := ExportFavoritesOptions{

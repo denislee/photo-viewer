@@ -168,10 +168,8 @@ func (v *ImportView) ShowForDevice(dev removableDevice, deleteSource bool) {
 	v.deleteCheck.Value = deleteSource
 	v.deleteSource = deleteSource
 	v.mu.Unlock()
-	cfg := GetConfig()
-	if cfg.ImportDeleteSource != deleteSource {
-		cfg.ImportDeleteSource = deleteSource
-		_ = SaveConfig(cfg)
+	if GetConfig().ImportDeleteSource != deleteSource {
+		UpdateConfig(func(c *Config) { c.ImportDeleteSource = deleteSource })
 	}
 	go v.handleSDDeviceClick(dev)
 }
@@ -440,9 +438,8 @@ func (v *ImportView) Layout(gtx layout.Context, th *Theme) layout.Dimensions {
 		}
 	}
 	if v.deleteCheck.Update(gtx) {
-		c := GetConfig()
-		c.ImportDeleteSource = v.deleteCheck.Value
-		_ = SaveConfig(c)
+		val := v.deleteCheck.Value
+		UpdateConfig(func(c *Config) { c.ImportDeleteSource = val })
 		v.mu.Lock()
 		v.deleteSource = v.deleteCheck.Value
 		v.mu.Unlock()

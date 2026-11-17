@@ -2,10 +2,15 @@ package ui
 
 import (
 	"encoding/json"
+	"errors"
+	"log"
 	"os"
 	"path/filepath"
 	"strings"
 	"sync"
+	"time"
+
+	"github.com/dns/photo-viewer/internal/fsutil"
 )
 
 // Config is the small persisted-prefs replacement for the Fyne build's
@@ -109,19 +114,121 @@ func resolveDir(p string) string {
 	return filepath.Clean(p)
 }
 
-// SaveConfig writes the supplied config to disk and updates the in-memory
-// copy. Returns the disk-write error if any.
-func SaveConfig(c Config) error {
+// UpdateConfig applies mutate to the in-memory config under cfgMu and
+// schedules an asynchronous save. It never touches the disk itself, so it is
+// safe to call from Layout and key handlers on the frame goroutine (U4-02).
+//
+// Each call mutates the live config rather than storing a caller-held copy,
+// so concurrent updates of different fields (the zoom timer goroutine and a
+// frame-goroutine toggle, say) can no longer overwrite each other. Saves are
+// coalesced by a single writer goroutine that always persists the newest
+// snapshot, so the file can't end up older than memory either.
+func UpdateConfig(mutate func(*Config)) {
 	cfgMu.Lock()
-	cfg = c
-	data, err := json.MarshalIndent(cfg, "", "  ")
+	mutate(&cfg)
+	cfgGen++
 	cfgMu.Unlock()
+	cfgWriterOnce.Do(func() { go configWriter() })
+	select {
+	case cfgKick <- struct{}{}:
+	default: // a save is already pending; it will pick up this change too
+	}
+}
+
+var (
+	// cfgGen counts UpdateConfig mutations (guarded by cfgMu); cfgSavedGen is
+	// the generation last persisted (guarded by cfgWriteMu).
+	cfgGen        uint64
+	cfgSavedGen   uint64
+	cfgWriteMu    sync.Mutex // serialises persistConfig (writer vs FlushConfig)
+	cfgKick       = make(chan struct{}, 1)
+	cfgWriterOnce sync.Once
+
+	// writeConfigFile is the disk write, indirected so tests can stall it or
+	// make it fail.
+	writeConfigFile = writeFileAtomic
+)
+
+// configWriter is the single background config writer. A kick that arrives
+// while a write is in flight leaves one pending token, so a burst of updates
+// collapses into at most one extra write of the latest snapshot.
+func configWriter() {
+	for range cfgKick {
+		if err := persistConfig(); err != nil {
+			log.Printf("config: save failed: %v", err)
+		}
+	}
+}
+
+// persistConfig writes the current config if it changed since the last
+// successful save. Writes are serialised by cfgWriteMu and each marshals the
+// snapshot taken after acquiring it, so the file always ends up holding the
+// newest generation.
+func persistConfig() error {
+	cfgWriteMu.Lock()
+	defer cfgWriteMu.Unlock()
+	cfgMu.Lock()
+	gen, c := cfgGen, cfg
+	cfgMu.Unlock()
+	if gen == cfgSavedGen {
+		return nil
+	}
+	data, err := json.MarshalIndent(c, "", "  ")
 	if err != nil {
 		return err
 	}
-	p := configPath()
-	if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+	if err := writeConfigFile(configPath(), data); err != nil {
 		return err
 	}
-	return os.WriteFile(p, data, 0o644)
+	cfgSavedGen = gen
+	return nil
+}
+
+// FlushConfig persists any pending config change, waiting at most timeout.
+// Called on window close (next to FlushFavorites) so a toggle flipped right
+// before quitting isn't lost. Returns the write error, or an error when the
+// timeout expires first (e.g. a hung disk wedging the writer).
+func FlushConfig(timeout time.Duration) error {
+	done := make(chan error, 1)
+	go func() { done <- persistConfig() }()
+	select {
+	case err := <-done:
+		return err
+	case <-time.After(timeout):
+		return errors.New("config: flush timed out")
+	}
+}
+
+// writeFileAtomic replaces p with data crash-safely: write a temp file in the
+// same directory, fsync it, rename it over p, then fsync the directory. A
+// crash mid-write leaves the previous file intact instead of a truncated one
+// that LoadConfig would silently discard along with every setting.
+func writeFileAtomic(p string, data []byte) error {
+	dir := filepath.Dir(p)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return err
+	}
+	f, err := os.CreateTemp(dir, filepath.Base(p)+".*.tmp")
+	if err != nil {
+		return err
+	}
+	tmp := f.Name()
+	_, err = f.Write(data)
+	if err == nil {
+		err = f.Chmod(0o644)
+	}
+	if err == nil {
+		err = f.Sync()
+	}
+	if cerr := f.Close(); err == nil {
+		err = cerr
+	}
+	if err == nil {
+		err = os.Rename(tmp, p)
+	}
+	if err != nil {
+		_ = os.Remove(tmp)
+		return err
+	}
+	return fsutil.SyncDir(dir)
 }

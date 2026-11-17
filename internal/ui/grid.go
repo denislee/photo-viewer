@@ -62,7 +62,7 @@ type Grid struct {
 	// persisted across launches.
 	lastSelByDir map[string]int
 
-	// zoomSaveTimer debounces SaveConfig calls on zoom so rapid
+	// zoomSaveTimer debounces UpdateConfig calls on zoom so rapid
 	// scroll-wheel zooming doesn't hammer the config file.
 	zoomSaveTimer *time.Timer
 
@@ -255,9 +255,7 @@ func (g *Grid) Zoom(dir int) bool {
 		}
 		sz := g.cellSize
 		g.zoomSaveTimer = time.AfterFunc(500*time.Millisecond, func() {
-			c := GetConfig()
-			c.GridCellDp = int(sz)
-			_ = SaveConfig(c)
+			UpdateConfig(func(c *Config) { c.GridCellDp = int(sz) })
 		})
 		return true
 	}

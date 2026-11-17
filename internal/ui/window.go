@@ -177,20 +177,16 @@ func Run(w *app.Window, ctrl *Controller) error {
 		ctrl.SetShowRAW(v)
 	}
 	toolbar.OnGroupByYear = func(v bool) {
-		c := GetConfig()
-		c.GroupByYear = v
-		_ = SaveConfig(c)
+		UpdateConfig(func(c *Config) { c.GroupByYear = v })
 		w.Invalidate()
 	}
 	toolbar.OnSortByLength = func(v bool) {
-		c := GetConfig()
+		mode := SortByName
 		if v {
-			c.SortMode = SortByDuration
-		} else {
-			c.SortMode = SortByName
+			mode = SortByDuration
 		}
-		_ = SaveConfig(c)
-		ctrl.SetSort(c.SortMode)
+		UpdateConfig(func(c *Config) { c.SortMode = mode })
+		ctrl.SetSort(mode)
 		w.Invalidate()
 	}
 	toolbar.Filter = ctrl.Filter()
@@ -213,6 +209,7 @@ func Run(w *app.Window, ctrl *Controller) error {
 		switch e := ev.(type) {
 		case app.DestroyEvent:
 			ctrl.FlushFavorites(3 * time.Second)
+			_ = FlushConfig(3 * time.Second)
 			return e.Err
 		case app.FrameEvent:
 			gtx := app.NewContext(&ops, e)
@@ -535,10 +532,8 @@ func layoutSplitter(gtx layout.Context, th *Theme, sp *sidebarSplitter, w, h, le
 		case pointer.Release, pointer.Cancel:
 			if sp.dragging {
 				sp.dragging = false
-				c := GetConfig()
-				if c.SidebarWidthDp != pxToDp(gtx, sp.pendingW) {
-					c.SidebarWidthDp = pxToDp(gtx, sp.pendingW)
-					_ = SaveConfig(c)
+				if wdp := pxToDp(gtx, sp.pendingW); GetConfig().SidebarWidthDp != wdp {
+					UpdateConfig(func(c *Config) { c.SidebarWidthDp = wdp })
 				}
 			}
 		}
