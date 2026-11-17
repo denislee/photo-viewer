@@ -125,6 +125,12 @@ type Viewer struct {
 	infoCache map[string]cachedInfo
 	infoAsked map[string]bool
 
+	// infoRows is the info panel's formatted text, rebuilt only when infoKey
+	// changes (G3-03); infoBuilds counts rebuilds for tests. UI goroutine only.
+	infoKey    infoPanelKey
+	infoRows   []infoRow
+	infoBuilds int
+
 	// player is lazily created the first time the viewer lands on a video.
 	// It's kept alive between videos so navigation between clips doesn't
 	// pay the libmpv-init cost each time; the player itself is also a
@@ -823,58 +829,88 @@ func (v *Viewer) layoutInfoPanel(gtx layout.Context, th *Theme, e cache.Entry, r
 	off := opOffset(gtx, image.Pt(rect.Min.X+pad, rect.Min.Y+pad))
 	defer off.Pop()
 
-	rows := []layout.FlexChild{
-		layout.Rigid(func(gtx layout.Context) layout.Dimensions {
-			lbl := material.Label(th.Theme, unit.Sp(14), filepath.Base(e.Path))
-			lbl.Color = th.Foreground
-			lbl.Font.Weight = 700
-			lbl.MaxLines = 3
-			return lbl.Layout(gtx)
-		}),
-		layout.Rigid(layout.Spacer{Height: unit.Dp(10)}.Layout),
+	// The strings only change with the entry or its async metadata, so they
+	// are built once per change, not every frame (G3-03), and the rows are
+	// stacked directly instead of through ~30 per-frame Flex closures.
+	key := infoPanelKey{path: e.Path, mod: e.ModTime.UnixNano(), size: e.Size, typ: e.Type, fav: e.Favorite, dims: dims, info: info}
+	if key != v.infoKey || v.infoRows == nil {
+		v.infoKey = key
+		v.infoRows = buildInfoRows(e, info, dims)
+		v.infoBuilds++
 	}
-	addRow := func(label, value string) {
-		rows = append(rows,
-			layout.Rigid(func(gtx layout.Context) layout.Dimensions {
-				lbl := material.Label(th.Theme, unit.Sp(11), label)
-				lbl.Color = color.NRGBA{R: 0x90, G: 0x95, B: 0xa0, A: 0xff}
-				lbl.Font.Weight = 700
-				return lbl.Layout(gtx)
-			}),
-			layout.Rigid(func(gtx layout.Context) layout.Dimensions {
-				lbl := material.Label(th.Theme, unit.Sp(12), value)
-				lbl.Color = th.Foreground
-				lbl.MaxLines = 4
-				return lbl.Layout(gtx)
-			}),
-			layout.Rigid(layout.Spacer{Height: unit.Dp(8)}.Layout),
-		)
-	}
-	addRow("Path", e.Path)
-	addRow("Type", titleCaseGio(e.Type.String()))
-	addRow("Size", formatBytesGio(e.Size))
-	addRow("Created", info.Created)
-	addRow("Modified", e.ModTime.Local().Format("2006-01-02 15:04:05"))
-	addRow("Dimensions", dims)
-	addRow("Camera", info.Camera)
-	addRow("Lens", info.Lens)
 
+	y := 0
+	put := func(lbl material.LabelStyle) {
+		g := innerGtx
+		g.Constraints.Max.Y = innerH - y
+		if g.Constraints.Max.Y <= 0 {
+			return
+		}
+		st := op.Offset(image.Pt(0, y)).Push(gtx.Ops)
+		y += lbl.Layout(g).Size.Y
+		st.Pop()
+	}
+	title := material.Label(th.Theme, unit.Sp(14), v.infoRows[0].value)
+	title.Color = th.Foreground
+	title.Font.Weight = 700
+	title.MaxLines = 3
+	put(title)
+	y += gtx.Dp(unit.Dp(10))
+	rowGap := gtx.Dp(unit.Dp(8))
+	for _, r := range v.infoRows[1:] {
+		lbl := material.Label(th.Theme, unit.Sp(11), r.label)
+		lbl.Color = infoLabelColor
+		lbl.Font.Weight = 700
+		put(lbl)
+		val := material.Label(th.Theme, unit.Sp(12), r.value)
+		val.Color = th.Foreground
+		val.MaxLines = 4
+		put(val)
+		y += rowGap
+	}
+}
+
+// infoLabelColor is the info panel's row-label colour.
+var infoLabelColor = color.NRGBA{R: 0x90, G: 0x95, B: 0xa0, A: 0xff}
+
+// infoRow is one label/value line of the info panel.
+type infoRow struct{ label, value string }
+
+// infoPanelKey is everything the info panel's text depends on.
+type infoPanelKey struct {
+	path string
+	mod  int64
+	size int64
+	typ  scan.MediaType
+	fav  bool
+	dims string
+	info cachedInfo
+}
+
+// buildInfoRows formats the info panel's text for e. Row 0 is the title (the
+// file name, value only); the rest are label/value pairs. mediaInfoFor already
+// substitutes "—" for missing fields.
+func buildInfoRows(e cache.Entry, info cachedInfo, dims string) []infoRow {
+	rows := []infoRow{
+		{value: filepath.Base(e.Path)},
+		{"Path", e.Path},
+		{"Type", titleCaseGio(e.Type.String())},
+		{"Size", formatBytesGio(e.Size)},
+		{"Created", info.Created},
+		{"Modified", e.ModTime.Local().Format("2006-01-02 15:04:05")},
+		{"Dimensions", dims},
+		{"Camera", info.Camera},
+		{"Lens", info.Lens},
+	}
 	if info.Aperture != "—" || info.ShutterSpeed != "—" || info.ISO != "—" || info.FocalLength != "—" {
-		config := fmt.Sprintf("%s  %s  ISO %s  %s",
-			fallback(info.Aperture, "—"),
-			fallback(info.ShutterSpeed, "—"),
-			fallback(info.ISO, "—"),
-			fallback(info.FocalLength, "—"))
-		addRow("Settings", config)
+		rows = append(rows, infoRow{"Settings", fmt.Sprintf("%s  %s  ISO %s  %s",
+			info.Aperture, info.ShutterSpeed, info.ISO, info.FocalLength)})
 	}
-
+	fav := "No"
 	if e.Favorite {
-		addRow("Favorite", "Yes")
-	} else {
-		addRow("Favorite", "No")
+		fav = "Yes"
 	}
-
-	layout.Flex{Axis: layout.Vertical}.Layout(innerGtx, rows...)
+	return append(rows, infoRow{"Favorite", fav})
 }
 
 // dimensionsFor returns a "WxH" string for image entries, "—" for video/RAW/
