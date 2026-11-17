@@ -204,3 +204,79 @@ func TestSweepStaleTmp(t *testing.T) {
 func TestSweepStaleTmpMissingRoot(t *testing.T) {
 	sweepStaleTmp(filepath.Join(t.TempDir(), "does-not-exist"), staleTmpMaxAge, time.Now())
 }
+
+// TestZeroByteThumbIsNotFresh covers G4: without the fsync a crash can leave a
+// zero-byte thumbnail behind the rename; it must count as missing and be
+// regenerated rather than served forever.
+func TestZeroByteThumbIsNotFresh(t *testing.T) {
+	store, err := NewThumbStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	src := filepath.Join(t.TempDir(), "photo.jpg")
+	writeTestJPEG(t, src, color.RGBA{10, 20, 30, 255})
+	info, _ := os.Stat(src)
+	e := Entry{Path: src, Type: scan.TypePhoto, ThumbID: ThumbIDFor(src), ModTime: info.ModTime()}
+	p, err := store.Path(e)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Truncate(p, 0); err != nil {
+		t.Fatal(err)
+	}
+	if store.Has(e) {
+		t.Fatal("zero-byte thumbnail reported fresh")
+	}
+	if _, err := store.Path(e); err != nil {
+		t.Fatal(err)
+	}
+	if fi, err := os.Stat(p); err != nil || fi.Size() == 0 {
+		t.Fatalf("thumbnail not regenerated: %v, %v", fi, err)
+	}
+}
+
+// TestTierFollowsForgetAndRename covers the G5 tier bookkeeping: a tier's
+// renditions are removed and renamed along with the base store's, and Discard
+// touches only the store it is called on.
+func TestTierFollowsForgetAndRename(t *testing.T) {
+	cacheDir := t.TempDir()
+	store, err := NewThumbStore(cacheDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	large, err := store.Tier(LargeThumbDir, LargeThumbSize)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if again, _ := store.Tier(LargeThumbDir, LargeThumbSize); again != large {
+		t.Fatal("Tier created a second store for the same subdir")
+	}
+	src := filepath.Join(t.TempDir(), "photo.jpg")
+	writeTestJPEG(t, src, color.RGBA{10, 20, 30, 255})
+	info, _ := os.Stat(src)
+	e := Entry{Path: src, Type: scan.TypePhoto, ThumbID: ThumbIDFor(src), ModTime: info.ModTime()}
+	for _, s := range []*ThumbStore{store, large} {
+		if _, err := s.Path(e); err != nil {
+			t.Fatal(err)
+		}
+	}
+	moved := e
+	moved.ThumbID = ThumbIDFor(src + ".moved")
+	if err := store.Rename(e.ThumbID, moved.ThumbID); err != nil {
+		t.Fatal(err)
+	}
+	if !large.Has(moved) || large.Has(e) {
+		t.Fatal("tier rendition did not follow Rename")
+	}
+	large.Discard(moved.ThumbID)
+	if !store.Has(moved) {
+		t.Fatal("Discard on the tier removed the base thumbnail")
+	}
+	if _, err := large.Path(moved); err != nil {
+		t.Fatal(err)
+	}
+	store.Forget(moved.ThumbID)
+	if store.Has(moved) || large.Has(moved) {
+		t.Fatal("Forget left a rendition behind")
+	}
+}

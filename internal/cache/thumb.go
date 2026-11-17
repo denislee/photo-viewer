@@ -17,6 +17,14 @@ import (
 // ThumbSize is the target longest-edge of cached thumbnails.
 const ThumbSize = 256
 
+// LargeThumbSize is the longest edge of the larger thumbnail tier the grid
+// uses for big cells (G5). It is generated on demand, only for thumbnails
+// actually viewed large, under LargeThumbDir.
+const LargeThumbSize = 512
+
+// LargeThumbDir is the cache subdirectory of the LargeThumbSize tier.
+const LargeThumbDir = "thumbs-512"
+
 // DisplaySize is the target longest-edge of the larger "display" renditions
 // the webserver serves to the browser viewer (W-03). A file a browser can't
 // render (RAW/HEIC/TIFF) or a needlessly-large JPEG is downscaled to this size
@@ -64,6 +72,12 @@ type ThumbStore struct {
 	// it and re-stat the result. Keyed by thumb id.
 	flightMu sync.Mutex
 	inflight map[string]chan struct{}
+
+	// tiers are sibling stores of other sizes created through Tier. Forget
+	// and Rename on this store apply to them too, so trashing or deleting a
+	// file doesn't orphan its larger renditions.
+	tierMu sync.Mutex
+	tiers  map[string]*ThumbStore
 }
 
 func NewThumbStore(cacheDir string) (*ThumbStore, error) {
@@ -104,6 +118,38 @@ func newStore(cacheDir, subdir string, size int) (*ThumbStore, error) {
 		extSem:   make(chan struct{}, ext),
 		inflight: make(map[string]chan struct{}),
 	}, nil
+}
+
+// Tier returns the sibling store at <cacheDir>/<subdir> generating size px
+// renditions, creating it on first use. A tier shares this store's generation
+// semaphores, so all sizes together stay within one CPU / external-tool bound,
+// and follows this store's Forget and Rename.
+func (s *ThumbStore) Tier(subdir string, size int) (*ThumbStore, error) {
+	s.tierMu.Lock()
+	defer s.tierMu.Unlock()
+	if t, ok := s.tiers[subdir]; ok {
+		return t, nil
+	}
+	t, err := newStore(s.CacheDir(), subdir, size)
+	if err != nil {
+		return nil, err
+	}
+	t.cpuSem, t.extSem = s.cpuSem, s.extSem
+	if s.tiers == nil {
+		s.tiers = map[string]*ThumbStore{}
+	}
+	s.tiers[subdir] = t
+	return t, nil
+}
+
+func (s *ThumbStore) tierList() []*ThumbStore {
+	s.tierMu.Lock()
+	defer s.tierMu.Unlock()
+	out := make([]*ThumbStore, 0, len(s.tiers))
+	for _, t := range s.tiers {
+		out = append(out, t)
+	}
+	return out
 }
 
 // sweepStaleTmp walks root once, removing crash-orphaned "*.tmp" files older
@@ -242,14 +288,11 @@ func (s *ThumbStore) Path(e Entry) (string, error) {
 		os.Remove(tmp)
 		return "", err
 	}
-	// fsync the finished thumb before publishing it. Without this a crash after
-	// the rename but before writeback can leave a zero-byte file whose mtime
-	// still passes the freshness check forever — a permanently broken thumb.
-	// The rename then makes the complete, durable thumb visible atomically.
-	if err := syncFile(tmp); err != nil {
-		os.Remove(tmp)
-		return "", err
-	}
+	// No fsync before the rename (G4): it cost one disk flush per thumbnail,
+	// which dominated first-time generation and pv-scan on HDDs and SD cards.
+	// A crash before writeback can still leave a zero-byte or truncated file
+	// behind the rename; fresh() rejects zero-byte files, and readers that
+	// fail to decode a thumb call Forget and regenerate it (self-healing).
 	if err := os.Rename(tmp, dst); err != nil {
 		os.Remove(tmp)
 		return "", err
@@ -257,25 +300,12 @@ func (s *ThumbStore) Path(e Entry) (string, error) {
 	return dst, nil
 }
 
-// fresh reports whether a thumbnail at dst exists and is at least as new as the
-// source's mod time (i.e. not stale).
+// fresh reports whether a non-empty thumbnail at dst exists and is at least as
+// new as the source's mod time (i.e. not stale). A zero-byte file, which a
+// crash between rename and writeback can leave, counts as missing.
 func (s *ThumbStore) fresh(dst string, srcMod time.Time) bool {
 	info, err := os.Stat(dst)
-	return err == nil && !info.ModTime().Before(srcMod)
-}
-
-// syncFile fsyncs the file at path so its contents are durable before a rename
-// publishes it.
-func syncFile(path string) error {
-	f, err := os.Open(path)
-	if err != nil {
-		return err
-	}
-	if err := f.Sync(); err != nil {
-		f.Close()
-		return err
-	}
-	return f.Close()
+	return err == nil && info.Size() > 0 && !info.ModTime().Before(srcMod)
 }
 
 func (s *ThumbStore) semFor(t scan.MediaType) chan struct{} {
@@ -301,8 +331,19 @@ func (s *ThumbStore) generate(ctx context.Context, e Entry, dst string) error {
 	return fmt.Errorf("unsupported media type: %s", e.Type)
 }
 
-// Forget deletes the thumbnail file for the given thumb id, if any.
+// Forget deletes the thumbnail file for the given thumb id, if any, in this
+// store and its tiers.
 func (s *ThumbStore) Forget(id string) {
+	os.Remove(s.thumbPath(id))
+	for _, t := range s.tierList() {
+		t.Forget(id)
+	}
+}
+
+// Discard deletes this store's thumbnail for id only, leaving its tiers alone.
+// Readers call it on a thumbnail that exists but won't decode, so the next
+// Path regenerates it.
+func (s *ThumbStore) Discard(id string) {
 	os.Remove(s.thumbPath(id))
 }
 
@@ -313,6 +354,9 @@ func (s *ThumbStore) Forget(id string) {
 func (s *ThumbStore) Rename(oldID, newID string) error {
 	if oldID == newID {
 		return nil
+	}
+	for _, t := range s.tierList() {
+		_ = t.Rename(oldID, newID)
 	}
 	src := s.thumbPath(oldID)
 	if _, err := os.Stat(src); os.IsNotExist(err) {
