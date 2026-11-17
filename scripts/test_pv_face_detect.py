@@ -24,6 +24,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import time
 
 SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "pv-face-detect.py")
 
@@ -33,6 +34,9 @@ name=$(basename "$(dirname "$(dirname "$0")")")
 if [ "$1" = "-c" ]; then
     case "$2" in
         *"import face_recognition"*)
+            case ":$FR_HANG_VENVS:" in
+                *":$name:"*) exec sleep 30 ;;
+            esac
             case ":$FR_OK_VENVS:" in
                 *":$name:"*) exit 0 ;;
                 *) exit 1 ;;
@@ -58,14 +62,20 @@ def _make_tree(home, venvs):
         os.chmod(py, 0o755)
 
 
-def _run(venvs, fr_ok):
-    """Run the real script with a fake HOME/pipx tree. Returns (rc, stdout)."""
+def _run(venvs, fr_ok, extra_env=None):
+    """Run the real script with a fake HOME/pipx tree.
+
+    Returns (rc, stdout, elapsed) where elapsed is the wall time of the script
+    subprocess.
+    """
     with tempfile.TemporaryDirectory() as home:
         _make_tree(home, venvs)
         env = dict(os.environ)
         env["HOME"] = home
         env["FR_OK_VENVS"] = ":".join(fr_ok)
         env.pop("PV_FACE_REEXECED", None)
+        env.pop("FR_HANG_VENVS", None)
+        env.update(extra_env or {})
         # If face_recognition happens to be importable in the test runner's
         # own interpreter, the script returns before touching pipx at all and
         # these tests are moot -- skip loudly rather than pass vacuously.
@@ -75,11 +85,13 @@ def _run(venvs, fr_ok):
         )
         if probe.returncode == 0:
             raise RuntimeError("face_recognition importable in test runner; cannot test re-exec")
+        started = time.monotonic()
         proc = subprocess.run(
             [sys.executable, SCRIPT, "--check"],
             env=env, capture_output=True, text=True, timeout=30,
         )
-        return proc.returncode, proc.stdout
+        elapsed = time.monotonic() - started
+        return proc.returncode, proc.stdout, elapsed
 
 
 def _reexec_target(stdout):
@@ -92,20 +104,20 @@ def _reexec_target(stdout):
 def test_prefers_named_face_recognition_venv():
     # face-recognition sorts AFTER ansible/black; the old code would have
     # execve'd ansible first. We must pick face-recognition regardless.
-    rc, out = _run(["ansible", "black", "face-recognition", "zzz"],
-                   fr_ok=["face-recognition"])
+    rc, out, _ = _run(["ansible", "black", "face-recognition", "zzz"],
+                      fr_ok=["face-recognition"])
     assert _reexec_target(out) == "face-recognition", out
 
 
 def test_underscore_named_venv_also_matches():
-    rc, out = _run(["aaa", "face_recognition"], fr_ok=["face_recognition"])
+    rc, out, _ = _run(["aaa", "face_recognition"], fr_ok=["face_recognition"])
     assert _reexec_target(out) == "face_recognition", out
 
 
 def test_falls_back_to_probed_working_venv_when_no_named_one():
     # No venv is literally named face_recognition, but `myfaces` can import it.
     # The probe must find myfaces and skip ansible/black.
-    rc, out = _run(["ansible", "black", "myfaces", "zzz"], fr_ok=["myfaces"])
+    rc, out, _ = _run(["ansible", "black", "myfaces", "zzz"], fr_ok=["myfaces"])
     assert _reexec_target(out) == "myfaces", out
 
 
@@ -113,22 +125,56 @@ def test_named_but_broken_venv_is_skipped_for_a_working_one():
     # A face-recognition venv exists but its import fails (e.g. package removed
     # from the venv); another venv actually works. Probing must skip the broken
     # named one and land on the working fallback rather than stranding us.
-    rc, out = _run(["face-recognition", "myfaces"], fr_ok=["myfaces"])
+    rc, out, _ = _run(["face-recognition", "myfaces"], fr_ok=["myfaces"])
     assert _reexec_target(out) == "myfaces", out
 
 
 def test_no_working_venv_degrades_to_unavailable_not_crash():
     # Nothing can import face_recognition. The script must NOT re-exec, and
     # must exit 2 (the "not importable" contract the Go Probe() relies on).
-    rc, out = _run(["ansible", "black"], fr_ok=[])
+    rc, out, _ = _run(["ansible", "black"], fr_ok=[])
     assert _reexec_target(out) is None, out
     assert rc == 2, (rc, out)
 
 
 def test_no_pipx_dir_at_all_degrades_to_unavailable():
-    rc, out = _run([], fr_ok=[])
+    rc, out, _ = _run([], fr_ok=[])
     assert _reexec_target(out) is None, out
     assert rc == 2, (rc, out)
+
+
+def test_wedged_interpreters_respect_total_budget():
+    # Every candidate hangs on its probe and the working venv sorts last. Once
+    # _PROBE_TOTAL_BUDGET is spent we must stop probing and degrade to
+    # "unavailable" instead of running out the Go --check window.
+    rc, out, elapsed = _run(
+        ["face-recognition", "hang1", "hang2", "zzz-works"],
+        fr_ok=["zzz-works"],
+        extra_env={
+            "FR_HANG_VENVS": "face-recognition:hang1:hang2",
+            "PV_FACE_PROBE_TIMEOUT": "1",
+            "PV_FACE_PROBE_BUDGET": "1.5",
+        },
+    )
+    assert _reexec_target(out) is None, out
+    assert rc == 2, (rc, out)
+    assert elapsed < 4.0, elapsed
+
+
+def test_per_probe_timeout_skips_wedged_to_working():
+    # A wedged probe is abandoned after _PROBE_IMPORT_TIMEOUT and probing
+    # continues to the working venv.
+    rc, out, elapsed = _run(
+        ["face-recognition", "zzz-works"],
+        fr_ok=["zzz-works"],
+        extra_env={
+            "FR_HANG_VENVS": "face-recognition",
+            "PV_FACE_PROBE_TIMEOUT": "1",
+            "PV_FACE_PROBE_BUDGET": "10",
+        },
+    )
+    assert _reexec_target(out) == "zzz-works", out
+    assert elapsed < 5.0, elapsed
 
 
 def _main():

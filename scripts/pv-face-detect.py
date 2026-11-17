@@ -15,13 +15,26 @@ import json
 import os
 import subprocess
 import sys
+import time
 
-# Upper bound on how long a single `python -c "import face_recognition"` probe
-# may run before we treat that interpreter as unusable and move on. Kept well
-# under the Go side's 15s `--check` window (see internal/face/detector.go) so a
-# probe can't eat the whole budget, yet generous enough for a real (cold) dlib
-# import, which is a few seconds. A wedged interpreter is skipped, not hung on.
-_PROBE_IMPORT_TIMEOUT = 12.0
+# Probe budgets for picking a pipx venv (S3-05). A single
+# `python -c "import face_recognition"` probe may run for at most
+# _PROBE_IMPORT_TIMEOUT seconds (a cold dlib import is a few seconds), and all
+# probes together for at most _PROBE_TOTAL_BUDGET, after which we stop looking.
+# The total keeps a run of wedged interpreters (NFS home, cold antivirus,
+# half-installed venv) from eating the Go side's 15 s `--check` window (see
+# internal/face/detector.go) and leaving no time for the re-exec'd self-test.
+# The PV_FACE_PROBE_TIMEOUT / PV_FACE_PROBE_BUDGET env overrides exist for
+# scripts/test_pv_face_detect.py.
+def _env_seconds(name: str, default: float) -> float:
+    try:
+        return float(os.environ.get(name, default))
+    except ValueError:
+        return default
+
+
+_PROBE_IMPORT_TIMEOUT = _env_seconds("PV_FACE_PROBE_TIMEOUT", 4.0)
+_PROBE_TOTAL_BUDGET = _env_seconds("PV_FACE_PROBE_BUDGET", 12.0)
 
 
 def _normalize_venv_name(name: str) -> str:
@@ -55,7 +68,7 @@ def _pipx_venv_pythons(bases: "list[str]") -> "list[str]":
     return named + others
 
 
-def _can_import_face_recognition(py: str) -> bool:
+def _can_import_face_recognition(py: str, timeout: float = _PROBE_IMPORT_TIMEOUT) -> bool:
     """True iff interpreter `py` can `import face_recognition` without raising
     ImportError. Runs the import in a throwaway child so we never mutate — or
     hang — this process. A crash, non-zero exit, or timeout counts as "no".
@@ -71,7 +84,7 @@ def _can_import_face_recognition(py: str) -> bool:
             stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
-            timeout=_PROBE_IMPORT_TIMEOUT,
+            timeout=timeout,
         )
     except (OSError, subprocess.SubprocessError):
         return False
@@ -93,6 +106,8 @@ def _try_reexec_with_pipx() -> None:
     `import face_recognition` before committing to it, only re-exec'ing into
     one whose probe succeeds. If none qualifies we return and let the normal
     import path below degrade to "unavailable".
+
+    Probing stops once _PROBE_TOTAL_BUDGET is spent.
     """
     if os.environ.get("PV_FACE_REEXECED") == "1":
         return
@@ -106,8 +121,14 @@ def _try_reexec_with_pipx() -> None:
         os.path.join(home, ".local", "pipx", "venvs"),
         os.path.join(home, ".local", "share", "pipx", "venvs"),
     ]
+    deadline = time.monotonic() + _PROBE_TOTAL_BUDGET
     for py in _pipx_venv_pythons(bases):
-        if not _can_import_face_recognition(py):
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            # Budget spent; degrade to "unavailable" rather than time out the
+            # Go --check.
+            return
+        if not _can_import_face_recognition(py, min(_PROBE_IMPORT_TIMEOUT, remaining)):
             continue
         env = os.environ.copy()
         env["PV_FACE_REEXECED"] = "1"
