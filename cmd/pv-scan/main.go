@@ -19,6 +19,27 @@ import (
 
 const batchSize = 256
 
+// newFacePipeline builds the face pipeline. It is a var so tests can prove
+// -no-faces never constructs one: face.NewPipeline runs the 1–15 s
+// pv-face-detect --check probe (S4-01).
+var newFacePipeline = func(idx *cache.Index) *face.Pipeline {
+	return face.NewPipeline(idx, nil)
+}
+
+// startFaces returns nil when noFaces is set, so the helper is never probed.
+// Otherwise it builds the pipeline and starts it if the helper works; a
+// disabled pipeline is still returned so the caller can report it.
+func startFaces(ctx context.Context, idx *cache.Index, noFaces bool) *face.Pipeline {
+	if noFaces {
+		return nil
+	}
+	p := newFacePipeline(idx)
+	if p.Enabled() {
+		p.Start(ctx)
+	}
+	return p
+}
+
 func main() {
 	root := flag.String("root", "", "library root to scan (required)")
 	noFaces := flag.Bool("no-faces", false, "skip face detection even if pv-face-detect is installed")
@@ -48,7 +69,8 @@ func main() {
 	// Start the face pipeline up front so face jobs stream as thumbnails are
 	// produced, rather than accumulating a library-sized backlog before any
 	// detection begins. Start and SubmitBlocking are both no-ops when the
-	// helper is unavailable, so this degrades gracefully.
+	// helper is unavailable, so this degrades gracefully, and -no-faces skips
+	// building the pipeline at all so the slow --check probe never runs.
 	// The first SIGINT/SIGTERM cancels ctx: the walk stops, queued thumbnails
 	// and face jobs are skipped, and the batch already walked is still
 	// reconciled and the index saved (S-23). A second Ctrl-C force-quits.
@@ -58,13 +80,10 @@ func main() {
 		stop()
 	}()
 
-	pipe := face.NewPipeline(idx, nil)
 	faceCtx, faceCancel := context.WithCancel(ctx)
 	defer faceCancel()
-	facesActive := !*noFaces && pipe.Enabled()
-	if facesActive {
-		pipe.Start(faceCtx)
-	}
+	pipe := startFaces(faceCtx, idx, *noFaces)
+	facesActive := pipe != nil && pipe.Enabled()
 
 	prog := &progress{out: os.Stdout, verbose: *verbose, every: progressEvery}
 
@@ -82,7 +101,9 @@ func main() {
 				}
 				p, perr := store.Path(e)
 				prog.record(e.Path, p, perr)
-				if facesActive && perr == nil && p != "" {
+				// Stat only thumbnails the pipeline would accept
+				// (photo/RAW/HEIC); videos are refused anyway.
+				if facesActive && perr == nil && p != "" && face.Candidate(e.Type) {
 					if info, statErr := os.Stat(p); statErr == nil {
 						pipe.SubmitBlocking(faceCtx, face.Job{
 							Entry:     e,
@@ -129,15 +150,17 @@ func main() {
 	fmt.Println(prog.line())
 
 	// Drain any face jobs still queued and wait for the workers to exit.
-	pipe.Stop()
+	if pipe != nil {
+		pipe.Stop()
+	}
 
 	if ctx.Err() != nil {
 		fmt.Println("interrupted: index saved; rerun to pick up where the scan stopped")
 		os.Exit(130)
 	}
 
-	if *noFaces {
-		return
+	if pipe == nil {
+		return // -no-faces
 	}
 	if !pipe.Enabled() {
 		fmt.Println("face: pv-face-detect unavailable, skipping detection")
