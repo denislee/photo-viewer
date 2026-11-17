@@ -7,6 +7,7 @@ import (
 	"errors"
 	"log"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -149,6 +150,12 @@ func Load(dbPath string) (*Index, error) {
 	if err != nil {
 		return nil, err
 	}
+	// database/sql keeps only 2 idle connections by default, so a burst of
+	// concurrent readers (webserver thumbnails + UI + scan + faces) closes the
+	// extras and reopens them later, each reopen paying the open, a schema
+	// parse, the PRAGMAs, a cold 64 MB page cache and re-prepared statements
+	// (C4-04).
+	db.SetMaxIdleConns(max(runtime.NumCPU(), 4))
 
 	_, err = db.Exec(`
 		CREATE TABLE IF NOT EXISTS entries (
