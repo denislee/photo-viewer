@@ -4,6 +4,7 @@ import (
 	"image"
 	"image/color"
 	"log"
+	"strconv"
 	"time"
 
 	"gioui.org/f32"
@@ -535,90 +536,83 @@ var (
 	favoriteBadgeInset = unit.Dp(6)
 )
 
+// badgeCorner names the corner of a cell that a glyph badge sits in.
+type badgeCorner uint8
+
+const (
+	cornerTopLeft badgeCorner = iota
+	cornerTopRight
+	cornerBottomRight
+)
+
+// drawGlyphBadge draws glyph centred in a favouriteBadgeSize square, inset by
+// favouriteBadgeInset from the given corner of cell, over a dark backdrop so
+// the glyph stays legible on any thumbnail content. It returns the square's
+// rectangle so callers can hang more chrome off it. This is the one drawing
+// path shared by the favourite, selection and video badges (G4-10).
+func drawGlyphBadge(gtx layout.Context, th *Theme, cell image.Rectangle, corner badgeCorner, glyph string, sp unit.Sp, col color.NRGBA) image.Rectangle {
+	pad := gtx.Dp(favoriteBadgeInset)
+	size := gtx.Dp(favoriteBadgeSize)
+	var x0, y0, x1, y1 int
+	switch corner {
+	case cornerTopLeft:
+		x0 = cell.Min.X + pad
+		y0 = cell.Min.Y + pad
+		x1 = x0 + size
+		y1 = y0 + size
+	case cornerTopRight:
+		x1 = cell.Max.X - pad
+		y0 = cell.Min.Y + pad
+		x0 = x1 - size
+		y1 = y0 + size
+	default: // cornerBottomRight
+		x1 = cell.Max.X - pad
+		y1 = cell.Max.Y - pad
+		x0 = x1 - size
+		y0 = y1 - size
+	}
+	bg := image.Rect(x0, y0, x1, y1)
+
+	// Dark backdrop so the glyph reads on bright thumbs.
+	ca := clip.Rect(bg).Push(gtx.Ops)
+	paint.ColorOp{Color: favoriteShadow}.Add(gtx.Ops)
+	paint.PaintOp{}.Add(gtx.Ops)
+	ca.Pop()
+
+	// Glyph, sized to roughly fill the badge.
+	stack := op.Offset(image.Pt(x0, y0)).Push(gtx.Ops)
+	gtx2 := gtx
+	gtx2.Constraints.Max = image.Pt(size, size)
+	gtx2.Constraints.Min = image.Pt(size, size)
+	layout.Center.Layout(gtx2, func(gtx layout.Context) layout.Dimensions {
+		lbl := material.Label(th.Theme, sp, glyph)
+		lbl.Color = col
+		return lbl.Layout(gtx)
+	})
+	stack.Pop()
+
+	return bg
+}
+
 // drawFavoriteBadge renders a gold ★ in the top-right corner of cell. The
-// glyph is centered in a dark rounded square so it stays legible over any
-// thumbnail content.
+// glyph is centered in a dark square so it stays legible over any thumbnail
+// content.
 func drawFavoriteBadge(gtx layout.Context, th *Theme, cell image.Rectangle) {
-	pad := gtx.Dp(favoriteBadgeInset)
-	size := gtx.Dp(favoriteBadgeSize)
-	x1 := cell.Max.X - pad
-	y0 := cell.Min.Y + pad
-	x0 := x1 - size
-	y1 := y0 + size
-	bg := image.Rect(x0, y0, x1, y1)
-
-	// Dark backdrop so the gold star reads on bright thumbs.
-	ca := clip.Rect(bg).Push(gtx.Ops)
-	paint.ColorOp{Color: favoriteShadow}.Add(gtx.Ops)
-	paint.PaintOp{}.Add(gtx.Ops)
-	ca.Pop()
-
-	// Star glyph, sized to roughly fill the badge.
-	stack := op.Offset(image.Pt(x0, y0)).Push(gtx.Ops)
-	gtx2 := gtx
-	gtx2.Constraints.Max = image.Pt(size, size)
-	gtx2.Constraints.Min = image.Pt(size, size)
-	layout.Center.Layout(gtx2, func(gtx layout.Context) layout.Dimensions {
-		lbl := material.Label(th.Theme, unit.Sp(20), "★")
-		lbl.Color = favoriteGold
-		return lbl.Layout(gtx)
-	})
-	stack.Pop()
+	drawGlyphBadge(gtx, th, cell, cornerTopRight, "★", unit.Sp(20), favoriteGold)
 }
 
+// drawSelectionBadge renders a ✓ in the top-left corner of cell, marking it as
+// part of a multi-selection.
 func drawSelectionBadge(gtx layout.Context, th *Theme, cell image.Rectangle) {
-	pad := gtx.Dp(favoriteBadgeInset)
-	size := gtx.Dp(favoriteBadgeSize)
-	x0 := cell.Min.X + pad
-	y0 := cell.Min.Y + pad
-	x1 := x0 + size
-	y1 := y0 + size
-	bg := image.Rect(x0, y0, x1, y1)
-
-	ca := clip.Rect(bg).Push(gtx.Ops)
-	paint.ColorOp{Color: favoriteShadow}.Add(gtx.Ops)
-	paint.PaintOp{}.Add(gtx.Ops)
-	ca.Pop()
-
-	stack := op.Offset(image.Pt(x0, y0)).Push(gtx.Ops)
-	gtx2 := gtx
-	gtx2.Constraints.Max = image.Pt(size, size)
-	gtx2.Constraints.Min = image.Pt(size, size)
-	layout.Center.Layout(gtx2, func(gtx layout.Context) layout.Dimensions {
-		lbl := material.Label(th.Theme, unit.Sp(16), "✓")
-		lbl.Color = th.Accent
-		return lbl.Layout(gtx)
-	})
-	stack.Pop()
+	drawGlyphBadge(gtx, th, cell, cornerTopLeft, "✓", unit.Sp(16), th.Accent)
 }
 
+// drawVideoBadge renders a ▶ in the bottom-right corner of cell, with the
+// clip's duration pill to its left when the duration is known.
 func drawVideoBadge(gtx layout.Context, th *Theme, cell image.Rectangle, durationMs int64) {
-	pad := gtx.Dp(favoriteBadgeInset)
-	size := gtx.Dp(favoriteBadgeSize)
-	x1 := cell.Max.X - pad
-	y1 := cell.Max.Y - pad
-	x0 := x1 - size
-	y0 := y1 - size
-	bg := image.Rect(x0, y0, x1, y1)
-
-	ca := clip.Rect(bg).Push(gtx.Ops)
-	paint.ColorOp{Color: favoriteShadow}.Add(gtx.Ops)
-	paint.PaintOp{}.Add(gtx.Ops)
-	ca.Pop()
-
-	stack := op.Offset(image.Pt(x0, y0)).Push(gtx.Ops)
-	gtx2 := gtx
-	gtx2.Constraints.Max = image.Pt(size, size)
-	gtx2.Constraints.Min = image.Pt(size, size)
-	layout.Center.Layout(gtx2, func(gtx layout.Context) layout.Dimensions {
-		lbl := material.Label(th.Theme, unit.Sp(16), "▶")
-		lbl.Color = th.Foreground
-		return lbl.Layout(gtx)
-	})
-	stack.Pop()
-
+	r := drawGlyphBadge(gtx, th, cell, cornerBottomRight, "▶", unit.Sp(16), th.Foreground)
 	if durationMs > 0 {
-		drawDurationBadge(gtx, th, cell, x0, y1, cachedFormatDuration(durationMs))
+		drawDurationBadge(gtx, th, cell, r.Min.X, r.Max.Y, cachedFormatDuration(durationMs))
 	}
 }
 
@@ -675,11 +669,21 @@ func drawDurationBadge(gtx layout.Context, th *Theme, cell image.Rectangle, badg
 // single-threaded (Gio layout goroutine), so a plain map is safe here.
 // A typical library has far fewer distinct DurationMs values than entries
 // (many videos cluster in common lengths), so the cache hit rate is high.
+// It is capped: see durationTextCacheCap.
 var durationTextCache = map[int64]string{}
+
+// durationTextCacheCap is the soft cap on durationTextCache. The map is
+// bulk-cleared when it reaches the cap so a library full of one-off durations
+// can't grow it unboundedly; recomputing a duration is trivial, so a periodic
+// clear beats running a full LRU (the tree's convention, cf. viewerMetaCap).
+const durationTextCacheCap = 2048
 
 func cachedFormatDuration(ms int64) string {
 	if s, ok := durationTextCache[ms]; ok {
 		return s
+	}
+	if len(durationTextCache) >= durationTextCacheCap {
+		clear(durationTextCache)
 	}
 	s := formatDuration(ms)
 	durationTextCache[ms] = s
@@ -717,19 +721,12 @@ func fmtDur2(m, s int64) string {
 }
 
 func fmtDur3(h, m, s int64) string {
-	// H:MM:SS — hours can be multi-digit for very long files.
-	hs := []byte{}
-	if h == 0 {
-		hs = append(hs, '0')
-	} else {
-		for h > 0 {
-			hs = append([]byte{byte('0' + h%10)}, hs...)
-			h /= 10
-		}
-	}
-	out := append(hs, ':')
-	out = append(out, byte('0'+m/10), byte('0'+m%10), ':', byte('0'+s/10), byte('0'+s%10))
-	return string(out)
+	// H:MM:SS — hours can be multi-digit for very long files. Built forward
+	// into a stack buffer so the only allocation is the returned string (G3-08).
+	var buf [24]byte
+	b := strconv.AppendInt(buf[:0], h, 10)
+	b = append(b, ':', byte('0'+m/10), byte('0'+m%10), ':', byte('0'+s/10), byte('0'+s%10))
+	return string(b)
 }
 
 // drawBorder strokes a rectangular border `width` px thick on the inside of
