@@ -1,5 +1,11 @@
 (function(){
   var prev=pvNav.prev, next=pvNav.next, back=pvNav.back;
+  // Prefetch the next photo's display rendition once this page's media has
+  // loaded, so it doesn't compete with it. new Image() rather than
+  // <link rel=prefetch>, which iOS Safari ignores (W4-04).
+  function prefetchNext() { if (pvNav.nextImg) { new Image().src = pvNav.nextImg; } }
+  if (document.readyState === 'complete') prefetchNext();
+  else window.addEventListener('load', prefetchNext);
   var infoPanel = document.getElementById('infoPanel');
   var infoBtn   = document.getElementById('infoBtn');
   var favBtn    = document.getElementById('favBtn');

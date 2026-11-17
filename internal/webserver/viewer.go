@@ -97,6 +97,14 @@ func (s *Server) renderViewer(w http.ResponseWriter,
 		}
 	}
 
+	// Warm the successor's display rendition so the next press is served from
+	// the browser cache (the display store singleflights a race with a real
+	// navigation).
+	nextImg := ""
+	if next != nil && next.Type != scan.TypeVideo {
+		nextImg = "/display/" + next.ThumbID
+	}
+
 	star := "☆"
 	starCls := "vfav"
 	if cur.Favorite {
@@ -182,6 +190,6 @@ func (s *Server) renderViewer(w http.ResponseWriter,
 
 	// Inline the keybinding + favorite + info JS so the viewer doesn't
 	// require an external script file.
-	writeViewerScript(w, prevHref, nextHref, vi.backHref)
+	writeViewerScript(w, prevHref, nextHref, vi.backHref, nextImg)
 	fmt.Fprint(w, `</body></html>`)
 }

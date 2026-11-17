@@ -39,8 +39,12 @@ var gridScript = "<script>\n" + gridJS + "</script>"
 // writeViewerScript writes the viewer's inline <script>: the pvNav literal,
 // then viewer.js streamed straight from the embedded string instead of being
 // concatenated into a fresh ~4 KB string per /view/ request (W4-12).
-func writeViewerScript(w io.Writer, prevHref, nextHref, backHref string) {
-	fmt.Fprintf(w, "<script>\nvar pvNav = {prev: %q, next: %q, back: %q};\n", prevHref, nextHref, backHref)
+//
+// nextImg is the /display URL of the next photo ("" when the successor is a
+// video or there is none).
+func writeViewerScript(w io.Writer, prevHref, nextHref, backHref, nextImg string) {
+	fmt.Fprintf(w, "<script>\nvar pvNav = {prev: %q, next: %q, back: %q, nextImg: %q};\n",
+		prevHref, nextHref, backHref, nextImg)
 	_, _ = io.WriteString(w, viewerJS)
 	_, _ = io.WriteString(w, "</script>")
 }
