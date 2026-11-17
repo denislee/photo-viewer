@@ -32,13 +32,13 @@ type Server struct {
 	libraryRoot string
 	trashDir    string // resolved by the caller (cache.TrashDir); "" when no trash
 
-	// trashMu guards the cached trash entry list. ListTrash re-scans the
-	// directory; cache it for a short window so /trash, /thumb/<trash id>,
-	// and /media/<trash id> don't all stat the dir on every request.
-	trashMu    sync.Mutex
-	trashCache []cache.Entry
-	trashIndex map[string]cache.Entry
-	trashAt    time.Time
+	// trash caches the trash listing (entries + id index) so /trash,
+	// /thumb/<trash id>, and /media/<trash id> don't stat the dir per request.
+	trash ttlCache[struct{}, trashSnapshot]
+	// sidebar caches the root sidebar aggregate per filter/raw toggles.
+	sidebar ttlCache[sidebarKey, *sidebarAgg]
+	// viewCounts caches CountView per View for the gallery header and sidebar.
+	viewCounts ttlCache[cache.View, int]
 
 	mu      sync.Mutex
 	srv     *http.Server
@@ -59,19 +59,6 @@ type Server struct {
 	hlsSweepMu sync.Mutex
 	hlsSweepAt time.Time
 
-	// Sidebar aggregate cache. renderSidebar runs several aggregate scans
-	// (CountView×2, Years, CountChildDirsFiltered, os.ReadDir) that are
-	// identical across every gallery navigation sharing the same filter/raw
-	// toggles; caching the model per (filter, showRAW) for sidebarCacheTTL
-	// coalesces a navigation burst the way trashEntries does for /trash.
-	sidebarMu    sync.Mutex
-	sidebarCache map[sidebarKey]sidebarEntry
-
-	// viewCountCache caches CountView per View for viewCountTTL so repeated
-	// gallery page loads at the same view avoid repeated O(N) index scans.
-	viewCountMu    sync.Mutex
-	viewCountCache map[cache.View]viewCountEntry
-
 	// infoCache holds /api/info's exiftool metadata + dimensions per file
 	// version, so reopening the info panel doesn't fork exiftool again.
 	infoCache infoCache
@@ -87,7 +74,12 @@ type Server struct {
 // the caller resolved with cache.TrashDir (which falls back to <cacheDir>/trash
 // on a read-only library, W4-13); "" means no trash. Call Start to bind a port.
 func New(index *cache.Index, store, display *cache.ThumbStore, libraryRoot, trashDir string) *Server {
-	return &Server{index: index, store: store, display: display, libraryRoot: libraryRoot, trashDir: trashDir}
+	return &Server{
+		index: index, store: store, display: display, libraryRoot: libraryRoot, trashDir: trashDir,
+		trash:      ttlCache[struct{}, trashSnapshot]{ttl: trashEntriesTTL},
+		sidebar:    ttlCache[sidebarKey, *sidebarAgg]{ttl: sidebarCacheTTL},
+		viewCounts: ttlCache[cache.View, int]{ttl: viewCountTTL, sweepAt: viewCountCacheCap},
+	}
 }
 
 // Running reports whether the server has an active listener.
@@ -210,21 +202,14 @@ func (s *Server) Stop() error {
 
 // lookupEntry resolves a thumb id to an Entry, checking both the index and
 // the trash listing. Used by handlers that should accept either source.
+//
+// The trash lookup is a single cache read: trashSnap holds one lock for the
+// whole snapshot, replacing the old lock/refresh/lock dance (W4-08).
 func (s *Server) lookupEntry(id string) (cache.Entry, bool) {
 	if e, ok := s.index.GetEntryByThumbID(id); ok {
 		return e, true
 	}
-	s.trashMu.Lock()
-	e, ok := s.trashIndex[id]
-	s.trashMu.Unlock()
-	if ok {
-		return e, true
-	}
-	// Trash index may be cold; refresh and try once more.
-	s.trashEntries()
-	s.trashMu.Lock()
-	e, ok = s.trashIndex[id]
-	s.trashMu.Unlock()
+	e, ok := s.trashSnap().byID[id]
 	return e, ok
 }
 

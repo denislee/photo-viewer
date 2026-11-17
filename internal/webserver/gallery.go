@@ -380,14 +380,10 @@ func (s *Server) renderGalleryPage(w http.ResponseWriter, r *http.Request, vi vi
 		// The page already holds the whole listing, so the sidebar reuses its
 		// length instead of a second trashEntries call (W3-06).
 		trashCount = total
-		offset := (page - 1) * pageSize
-		if offset > total {
-			offset = 0
+		if (page-1)*pageSize > total {
 			page = 1
 		}
-		end := min(offset+pageSize, total)
-		entries = all[offset:end]
-		hasNext = end < total
+		entries, hasNext = pageSlice(all, page)
 	} else {
 		total = s.cachedCountView(vi.v)
 		offset := (page - 1) * pageSize
@@ -493,6 +489,14 @@ func pageNumber(s string) int {
 	return n
 }
 
+// pageSlice returns page (1-based, pageSize per page) of all, clamping an
+// out-of-range page to an empty slice, and whether more items follow (W4-08).
+func pageSlice[T any](all []T, page int) ([]T, bool) {
+	offset := min((page-1)*pageSize, len(all))
+	end := min(offset+pageSize, len(all))
+	return all[offset:end], end < len(all)
+}
+
 // renderToolbar emits the segmented filter buttons + RAW toggle above the
 // gallery header. Each control is a plain link that re-renders the current
 // view with the toggle flipped, so JS isn't required for the toolbar to
@@ -595,23 +599,32 @@ func listSubdirs(dir string) []string {
 // requests for the same item.
 const trashEntriesTTL = 5 * time.Second
 
-// trashEntries returns the current trash listing, caching the result for
-// trashEntriesTTL. Also rebuilds the id→entry map used by lookupEntry.
-func (s *Server) trashEntries() []cache.Entry {
-	s.trashMu.Lock()
-	defer s.trashMu.Unlock()
+// trashSnapshot is one trash listing: the entries in listing order plus the
+// id→entry index lookupEntry uses, so both come from a single cache fill.
+type trashSnapshot struct {
+	entries []cache.Entry
+	byID    map[string]cache.Entry
+}
+
+// trashSnap returns the current trash listing snapshot, caching it for
+// trashEntriesTTL. Returns the zero snapshot when no trash directory is
+// configured.
+func (s *Server) trashSnap() trashSnapshot {
 	if s.trashDir == "" {
-		return nil
+		return trashSnapshot{}
 	}
-	if time.Since(s.trashAt) < trashEntriesTTL {
-		return s.trashCache
-	}
-	entries := cache.ListTrash(s.trashDir)
-	s.trashCache = entries
-	s.trashIndex = make(map[string]cache.Entry, len(entries))
-	for _, e := range entries {
-		s.trashIndex[e.ThumbID] = e
-	}
-	s.trashAt = time.Now()
-	return entries
+	return s.trash.get(struct{}{}, 0, func() trashSnapshot {
+		entries := cache.ListTrash(s.trashDir)
+		byID := make(map[string]cache.Entry, len(entries))
+		for _, e := range entries {
+			byID[e.ThumbID] = e
+		}
+		return trashSnapshot{entries: entries, byID: byID}
+	})
+}
+
+// trashEntries returns the current trash listing, reusing the cached snapshot
+// for trashEntriesTTL.
+func (s *Server) trashEntries() []cache.Entry {
+	return s.trashSnap().entries
 }

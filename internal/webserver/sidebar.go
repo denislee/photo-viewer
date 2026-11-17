@@ -37,18 +37,6 @@ type sidebarAgg struct {
 	years    []cache.YearStat
 }
 
-type sidebarEntry struct {
-	agg      *sidebarAgg
-	at       time.Time
-	indexGen uint64 // Index.Generation() at cache-fill time; stale if changed
-}
-
-type viewCountEntry struct {
-	n        int
-	at       time.Time
-	indexGen uint64 // Index.Generation() at cache-fill time; stale if changed
-}
-
 // renderSidebar emits the categories panel: Favorites, Trash, library root,
 // top-level subdirectories (with year grouping), and a year list. Active row
 // matches the currently-rendered view. Each link preserves the filter+raw
@@ -118,58 +106,31 @@ const viewCountCacheCap = 1024
 
 // cachedCountView returns the count for v, reusing a cached value if it is
 // fresh enough and the index has not been cleared since the value was computed.
+// The compute runs outside the cache lock, so a slow CountView doesn't stall
+// unrelated lookups.
 func (s *Server) cachedCountView(v cache.View) int {
-	gen := s.index.Generation()
-	s.viewCountMu.Lock()
-	defer s.viewCountMu.Unlock()
-	if e, ok := s.viewCountCache[v]; ok && e.indexGen == gen && time.Since(e.at) < viewCountTTL {
-		return e.n
-	}
-	n := s.index.CountView(v)
-	if s.viewCountCache == nil {
-		s.viewCountCache = make(map[cache.View]viewCountEntry)
-	}
-	// Bound the map: once it grows past the cap, drop every entry the TTL has
-	// already made stale in a single pass so browsing many dir views over a
-	// long uptime doesn't leak one entry per view forever (W-07). Only runs
-	// past the cap, so the common path stays a plain insert; the fresh entry
-	// written just below survives the sweep by definition.
-	if len(s.viewCountCache) > viewCountCacheCap {
-		for k, e := range s.viewCountCache {
-			if time.Since(e.at) >= viewCountTTL {
-				delete(s.viewCountCache, k)
-			}
-		}
-	}
-	s.viewCountCache[v] = viewCountEntry{n: n, at: time.Now(), indexGen: gen}
-	return n
+	return s.viewCounts.get(v, s.index.Generation(), func() int {
+		return s.index.CountView(v)
+	})
 }
 
 // rootSidebarAgg returns the cached library-root sidebar aggregate for the
 // given filter/raw toggles, recomputing it when the entry is missing, older
 // than sidebarCacheTTL, or the index was cleared (generation mismatch). The
-// lock is held across the recompute (as trashEntries does) so a navigation
-// burst blocks briefly on the first render then hits the cache.
+// recompute runs outside the cache lock, so concurrent renders of other
+// toggles don't queue behind it, and the All/Favorites totals share the
+// view-count cache with the gallery header (W3-01).
 func (s *Server) rootSidebarAgg(filter string, showRAW bool) *sidebarAgg {
-	gen := s.index.Generation()
 	key := sidebarKey{filter: filter, showRAW: showRAW}
-	s.sidebarMu.Lock()
-	defer s.sidebarMu.Unlock()
-	if e, ok := s.sidebarCache[key]; ok && e.indexGen == gen && time.Since(e.at) < sidebarCacheTTL {
-		return e.agg
-	}
-	agg := &sidebarAgg{
-		allCount: s.index.CountView(cache.View{Kind: "all", Filter: filter, ShowRAW: showRAW}),
-		favCount: s.index.CountView(cache.View{Kind: "favorites", Filter: filter, ShowRAW: showRAW}),
-		subdirs:  listSubdirs(s.libraryRoot),
-		counts:   s.index.CountChildDirsFiltered(s.libraryRoot, filter, showRAW),
-		years:    s.index.Years(filter, showRAW),
-	}
-	if s.sidebarCache == nil {
-		s.sidebarCache = make(map[sidebarKey]sidebarEntry)
-	}
-	s.sidebarCache[key] = sidebarEntry{agg: agg, at: time.Now(), indexGen: gen}
-	return agg
+	return s.sidebar.get(key, s.index.Generation(), func() *sidebarAgg {
+		return &sidebarAgg{
+			allCount: s.cachedCountView(cache.View{Kind: "all", Filter: filter, ShowRAW: showRAW}),
+			favCount: s.cachedCountView(cache.View{Kind: "favorites", Filter: filter, ShowRAW: showRAW}),
+			subdirs:  listSubdirs(s.libraryRoot),
+			counts:   s.index.CountChildDirsFiltered(s.libraryRoot, filter, showRAW),
+			years:    s.index.Years(filter, showRAW),
+		}
+	})
 }
 
 // renderSubdirsGrouped renders the given child directories, using the supplied

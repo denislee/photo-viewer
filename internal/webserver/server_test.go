@@ -942,48 +942,48 @@ func TestContentDispositionEscapesQuote(t *testing.T) {
 	}
 }
 
-// TestViewCountCacheSweepsPastCap verifies the W-07 fix: once viewCountCache
-// grows past its cap, the locked miss path sweeps entries the TTL has already
+// TestViewCountCacheSweepsPastCap verifies the W-07 fix: once the view-count
+// cache grows past its cap, the insert path sweeps entries the TTL has already
 // made stale, shrinking the map, while fresh entries survive.
 func TestViewCountCacheSweepsPastCap(t *testing.T) {
 	s, _, cleanup := fixture(t, 1)
 	defer cleanup()
 
-	s.viewCountMu.Lock()
-	s.viewCountCache = make(map[cache.View]viewCountEntry)
+	s.viewCounts.mu.Lock()
+	s.viewCounts.m = make(map[cache.View]ttlEntry[int])
 	// Seed past the cap with entries whose timestamps are older than the TTL,
 	// so the sweep considers every one of them stale.
 	stale := time.Now().Add(-time.Hour)
 	for i := range viewCountCacheCap + 50 {
 		key := cache.View{Kind: "dir", Dir: fmt.Sprintf("/stale/%d", i)}
-		s.viewCountCache[key] = viewCountEntry{n: i, at: stale}
+		s.viewCounts.m[key] = ttlEntry[int]{v: i, at: stale}
 	}
 	// Two fresh entries that must survive the sweep.
 	freshKeyA := cache.View{Kind: "dir", Dir: "/fresh/a"}
 	freshKeyB := cache.View{Kind: "dir", Dir: "/fresh/b"}
-	s.viewCountCache[freshKeyA] = viewCountEntry{n: 1, at: time.Now()}
-	s.viewCountCache[freshKeyB] = viewCountEntry{n: 2, at: time.Now()}
-	before := len(s.viewCountCache)
-	s.viewCountMu.Unlock()
+	s.viewCounts.m[freshKeyA] = ttlEntry[int]{v: 1, at: time.Now()}
+	s.viewCounts.m[freshKeyB] = ttlEntry[int]{v: 1, at: time.Now()}
+	before := len(s.viewCounts.m)
+	s.viewCounts.mu.Unlock()
 
 	if before <= viewCountCacheCap {
 		t.Fatalf("seed size %d is not past cap %d", before, viewCountCacheCap)
 	}
 
-	// A brand-new key is a miss, so cachedCountView takes the locked insert
-	// path — which runs the sweep because len(cache) > cap.
+	// A brand-new key is a miss, so cachedCountView takes the insert path —
+	// which runs the sweep because len(cache) > cap.
 	s.cachedCountView(cache.View{Kind: "all", Filter: "All", ShowRAW: true})
 
-	s.viewCountMu.Lock()
-	defer s.viewCountMu.Unlock()
-	after := len(s.viewCountCache)
+	s.viewCounts.mu.Lock()
+	defer s.viewCounts.mu.Unlock()
+	after := len(s.viewCounts.m)
 	if after >= before {
 		t.Fatalf("cache did not shrink: before=%d after=%d", before, after)
 	}
-	if _, ok := s.viewCountCache[freshKeyA]; !ok {
+	if _, ok := s.viewCounts.m[freshKeyA]; !ok {
 		t.Errorf("fresh entry A was evicted by the sweep")
 	}
-	if _, ok := s.viewCountCache[freshKeyB]; !ok {
+	if _, ok := s.viewCounts.m[freshKeyB]; !ok {
 		t.Errorf("fresh entry B was evicted by the sweep")
 	}
 	// Every stale entry is gone; only the two fresh entries plus the just-

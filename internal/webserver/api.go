@@ -46,12 +46,7 @@ func (s *Server) handleAPIPage(w http.ResponseWriter, r *http.Request) {
 	var entries []cache.Entry
 	var hasNext bool
 	if vi.kind == "trash" {
-		all := s.trashEntries()
-		total := len(all)
-		offset := min((page-1)*pageSize, total)
-		end := min(offset+pageSize, total)
-		entries = all[offset:end]
-		hasNext = end < total
+		entries, hasNext = pageSlice(s.trashEntries(), page)
 	} else {
 		offset := (page - 1) * pageSize
 		// Fetch one extra entry to detect the next page without a CountView scan.
