@@ -167,25 +167,23 @@ func (i *Index) Neighbors(v View, path string) (prev, next *Entry, pos, total in
 func (i *Index) NeighborsWithTotal(v View, path string, total int) (prev, next *Entry, pos, _ int) {
 	where, args := v.whereClause()
 
-	prevArgs := append(append([]any{}, args...), path)
+	probeArgs := append(append(make([]any, 0, len(args)+1), args...), path)
 	prev = i.queryOne(
 		entrySelect+" WHERE "+
 			where+" AND path < ? ORDER BY path DESC LIMIT 1",
-		prevArgs...)
+		probeArgs...)
 
-	nextArgs := append(append([]any{}, args...), path)
 	next = i.queryOne(
 		entrySelect+" WHERE "+
 			where+" AND path > ? ORDER BY path ASC LIMIT 1",
-		nextArgs...)
+		probeArgs...)
 
 	// Bounded position: rows at or before path within the view. The trailing
 	// `AND path <= ?` lets SQLite stop the index walk at the probe path, so this
 	// equals the old query's SUM(path<=?) without scanning the whole view range.
-	posArgs := append(append([]any{}, args...), path)
 	_ = i.db.QueryRow(
 		"SELECT COUNT(*) FROM entries WHERE "+where+" AND path <= ?",
-		posArgs...).Scan(&pos)
+		probeArgs...).Scan(&pos)
 
 	// Fold in the dir view's exact-path row (see dirExactEntry). Its path
 	// (== Dir) sorts strictly before every range row, so relative to the probe
@@ -212,18 +210,32 @@ func (i *Index) NeighborsWithTotal(v View, path string, total int) (prev, next *
 	return prev, next, pos, total
 }
 
-// queryOne runs a single-row SELECT and decodes one Entry. Returns nil when
-// the query produces no rows or fails.
-func (i *Index) queryOne(query string, args ...any) *Entry {
-	row := i.db.QueryRow(query, args...)
+// rowScanner is the shared surface of *sql.Row and *sql.Rows: anything that can
+// decode one entry row. scanEntry is written against it so single-row and
+// multi-row readers use the same decoder.
+type rowScanner interface{ Scan(dest ...any) error }
+
+// scanEntry is the single decoder for the entryCols column list. Every Entry
+// read goes through it, so adding a column is a one-site change.
+func scanEntry(s rowScanner) (Entry, error) {
 	var e Entry
 	var mtimeUnix int64
 	var fav int
-	if err := row.Scan(&e.Path, &e.Type, &e.Size, &mtimeUnix, &e.ThumbID, &fav, &e.DurationMs); err != nil {
-		return nil
+	if err := s.Scan(&e.Path, &e.Type, &e.Size, &mtimeUnix, &e.ThumbID, &fav, &e.DurationMs); err != nil {
+		return Entry{}, err
 	}
 	e.ModTime = time.Unix(mtimeUnix, 0)
 	e.Favorite = fav != 0
+	return e, nil
+}
+
+// queryOne runs a single-row SELECT and decodes one Entry. Returns nil when
+// the query produces no rows or fails.
+func (i *Index) queryOne(query string, args ...any) *Entry {
+	e, err := scanEntry(i.db.QueryRow(query, args...))
+	if err != nil {
+		return nil
+	}
 	return &e
 }
 
@@ -231,14 +243,10 @@ func (i *Index) queryOne(query string, args ...any) *Entry {
 func scanEntries(rows *sql.Rows) []Entry {
 	var out []Entry
 	for rows.Next() {
-		var e Entry
-		var mtimeUnix int64
-		var fav int
-		if err := rows.Scan(&e.Path, &e.Type, &e.Size, &mtimeUnix, &e.ThumbID, &fav, &e.DurationMs); err != nil {
+		e, err := scanEntry(rows)
+		if err != nil {
 			continue
 		}
-		e.ModTime = time.Unix(mtimeUnix, 0)
-		e.Favorite = fav != 0
 		out = append(out, e)
 	}
 	if err := rows.Err(); err != nil {

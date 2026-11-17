@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"log"
 	"math"
-	"time"
 )
 
 // Face is one face detection stored in the index.
@@ -371,18 +370,13 @@ func mergeCentroids(a []float32, na int, b []float32, nb int) []float32 {
 
 // GetEntry returns the index row for path, or (Entry{}, false) if unknown.
 func (i *Index) GetEntry(path string) (Entry, bool) {
-	var e Entry
-	var mtimeUnix int64
-	var fav int
-	err := i.db.QueryRow(
+	e, err := scanEntry(i.db.QueryRow(
 		entrySelect+" WHERE path = ?",
 		path,
-	).Scan(&e.Path, &e.Type, &e.Size, &mtimeUnix, &e.ThumbID, &fav, &e.DurationMs)
+	))
 	if err != nil {
 		return Entry{}, false
 	}
-	e.ModTime = time.Unix(mtimeUnix, 0)
-	e.Favorite = fav != 0
 	return e, true
 }
 
@@ -390,17 +384,12 @@ func (i *Index) GetEntry(path string) (Entry, bool) {
 // Used by the webserver to look up media by an opaque ID without exposing
 // filesystem paths to clients.
 func (i *Index) GetEntryByThumbID(id string) (Entry, bool) {
-	var e Entry
-	var mtimeUnix int64
-	var fav int
-	err := i.db.QueryRow(
+	e, err := scanEntry(i.db.QueryRow(
 		entrySelect+" WHERE thumb_id = ? LIMIT 1",
 		id,
-	).Scan(&e.Path, &e.Type, &e.Size, &mtimeUnix, &e.ThumbID, &fav, &e.DurationMs)
+	))
 	if err != nil {
 		return Entry{}, false
 	}
-	e.ModTime = time.Unix(mtimeUnix, 0)
-	e.Favorite = fav != 0
 	return e, true
 }

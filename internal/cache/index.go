@@ -533,56 +533,11 @@ func dirRange(dir string) (string, string) {
 	return prefix, upper
 }
 
-// ListDir returns a slice of entries under the specific directory prefix.
-//
-// The former "(range) OR path = ?" query forced a MULTI-INDEX OR plus a
-// "USE TEMP B-TREE FOR ORDER BY" — the whole recursive result set was
-// materialised and re-sorted on every listing. The pure range form below
-// streams straight off the covering primary-key index in path order with no
-// temp b-tree. The dropped `path = dir` disjunct matched the case where a
-// *file* path was passed as dir (the web /dir?path= handler doesn't force a
-// directory) — that exact row lives outside [dir+"/", ...), so we recover it
-// with a standalone point lookup and prepend it. dir sorts strictly before
-// dir+"/" (the range's lower bound), so the exact row is always element 0 and
-// prepending preserves path order byte-for-byte.
+// ListDir returns the unfiltered, unpaged view of the entries under dir. The
+// dir View's range query plus ListPage's exact-path row fold in both the
+// no-temp-b-tree ordering and the `path = dir` case in one place.
 func (i *Index) ListDir(dir string) []Entry {
-
-	lower, upper := dirRange(dir)
-
-	// Grown via append rather than pre-sized: a COUNT(*) pre-pass would walk
-	// the same b-tree range a second time, which costs more than the slice
-	// regrowth it would save.
-	var out []Entry
-	if e := i.queryOne(
-		entrySelect+" WHERE path = ? LIMIT 1",
-		dir,
-	); e != nil {
-		out = append(out, *e)
-	}
-
-	rows, err := i.db.Query(
-		entrySelect+" WHERE path >= ? AND path < ? ORDER BY path",
-		lower, upper,
-	)
-	if err != nil {
-		return out
-	}
-	defer rows.Close()
-
-	for rows.Next() {
-		var e Entry
-		var mtimeUnix int64
-		var fav int
-		if err := rows.Scan(&e.Path, &e.Type, &e.Size, &mtimeUnix, &e.ThumbID, &fav, &e.DurationMs); err == nil {
-			e.ModTime = time.Unix(mtimeUnix, 0)
-			e.Favorite = fav != 0
-			out = append(out, e)
-		}
-	}
-	if err := rows.Err(); err != nil {
-		log.Printf("cache: ListDir: %v", err)
-	}
-	return out
+	return i.ListPage(View{Kind: "dir", Dir: dir, Filter: "All", ShowRAW: true}, 0, 0)
 }
 
 // CountDir returns the number of entries under the specific directory prefix.
@@ -712,23 +667,7 @@ func (i *Index) ListByYear(year int, filter string, showRAW bool, dir string) []
 		return nil
 	}
 	defer rows.Close()
-
-	var out []Entry
-	for rows.Next() {
-		var e Entry
-		var mtimeUnix int64
-		var fav int
-		if err := rows.Scan(&e.Path, &e.Type, &e.Size, &mtimeUnix, &e.ThumbID, &fav, &e.DurationMs); err != nil {
-			continue
-		}
-		e.ModTime = time.Unix(mtimeUnix, 0)
-		e.Favorite = fav != 0
-		out = append(out, e)
-	}
-	if err := rows.Err(); err != nil {
-		log.Printf("cache: ListByYear: %v", err)
-	}
-	return out
+	return scanEntries(rows)
 }
 
 // backfillYear populates the `year` column for legacy rows where it's still
@@ -806,31 +745,7 @@ func typeFilterClause(filter string, showRAW bool) (string, []any) {
 
 // All returns a snapshot of the entire index.
 func (i *Index) All() []Entry {
-
-	rows, err := i.db.Query(entrySelect + " ORDER BY path")
-	if err != nil {
-		return nil
-	}
-	defer rows.Close()
-
-	// Grown via append rather than pre-sized: a COUNT(*) pre-pass would walk
-	// the full table a second time, which costs more than the slice regrowth
-	// it would save.
-	var out []Entry
-	for rows.Next() {
-		var e Entry
-		var mtimeUnix int64
-		var fav int
-		if err := rows.Scan(&e.Path, &e.Type, &e.Size, &mtimeUnix, &e.ThumbID, &fav, &e.DurationMs); err == nil {
-			e.ModTime = time.Unix(mtimeUnix, 0)
-			e.Favorite = fav != 0
-			out = append(out, e)
-		}
-	}
-	if err := rows.Err(); err != nil {
-		log.Printf("cache: All: %v", err)
-	}
-	return out
+	return i.ListPage(View{Kind: "all", Filter: "All", ShowRAW: true}, 0, 0)
 }
 
 // Count returns the number of entries in the index.
@@ -840,91 +755,53 @@ func (i *Index) Count() int {
 	return n
 }
 
-// ForEachEntry calls visit for every entry in path order. Iteration is
-// internally paged so it doesn't pin one long-running SQL read transaction
-// (which would block WAL checkpointing during a multi-minute warm-up).
-// Returning false from visit stops iteration early.
-func (i *Index) ForEachEntry(visit func(Entry) bool) {
+// pageEntries is the keyset pager behind ForEachEntry/ListByType; where is
+// either empty or ends with " AND ". Each page is fully scanned and its rows
+// closed BEFORE visit runs, so a slow or paused consumer never holds a read
+// snapshot open (which would block WAL checkpoints and let the WAL grow)
+// (U4-08).
+func (i *Index) pageEntries(where string, args []any, visit func(Entry) bool) {
 	const pageSize = 1000
 	lastPath := ""
 	for {
+		qargs := append(append(make([]any, 0, len(args)+2), args...), lastPath, pageSize)
 		rows, err := i.db.Query(
-			entrySelect+" WHERE path > ? ORDER BY path LIMIT ?",
-			lastPath, pageSize)
+			entrySelect+" WHERE "+where+"path > ? ORDER BY path LIMIT ?",
+			qargs...)
 		if err != nil {
 			return
 		}
-		seen := 0
-		stop := false
-		for rows.Next() {
-			var e Entry
-			var mtimeUnix int64
-			var fav int
-			if err := rows.Scan(&e.Path, &e.Type, &e.Size, &mtimeUnix, &e.ThumbID, &fav, &e.DurationMs); err != nil {
-				continue
-			}
-			e.ModTime = time.Unix(mtimeUnix, 0)
-			e.Favorite = fav != 0
-			lastPath = e.Path
-			seen++
-			if !visit(e) {
-				stop = true
-				break
-			}
-		}
-		if err := rows.Err(); err != nil {
-			log.Printf("cache: ForEachEntry: %v", err)
-		}
+		page := scanEntries(rows)
 		rows.Close()
-		if stop || seen == 0 {
+		if len(page) == 0 {
 			return
 		}
+		lastPath = page[len(page)-1].Path
+		for _, e := range page {
+			if !visit(e) {
+				return
+			}
+		}
 	}
+}
+
+// ForEachEntry calls visit for every entry in path order. The pager closes each
+// page's rows before visit is called, so a slow consumer never pins one
+// long-running SQL read transaction (which would block WAL checkpointing during
+// a multi-minute warm-up). Returning false from visit stops iteration early.
+func (i *Index) ForEachEntry(visit func(Entry) bool) {
+	i.pageEntries("", nil, visit)
 }
 
 // ListByType streams every entry of the given media type to visit, in path
 // order, pushing the `type = ?` filter into SQL so callers don't materialize
 // the whole index just to keep one type. Like ForEachEntry it pages internally
-// (keyset pagination on path) so a slow consumer never pins one long-running
-// read transaction — the organize scan drains this while shelling out to
-// exiftool per video, which can take minutes. Returning false from visit stops
-// iteration early.
+// (keyset pagination on path) and closes each page's rows before visit is
+// called, so a slow consumer never pins one long-running read transaction — the
+// organize scan drains this while shelling out to exiftool per video, which can
+// take minutes. Returning false from visit stops iteration early.
 func (i *Index) ListByType(t scan.MediaType, visit func(Entry) bool) {
-	const pageSize = 1000
-	lastPath := ""
-	for {
-		rows, err := i.db.Query(
-			entrySelect+" WHERE type = ? AND path > ? ORDER BY path LIMIT ?",
-			int(t), lastPath, pageSize)
-		if err != nil {
-			return
-		}
-		seen := 0
-		stop := false
-		for rows.Next() {
-			var e Entry
-			var mtimeUnix int64
-			var fav int
-			if err := rows.Scan(&e.Path, &e.Type, &e.Size, &mtimeUnix, &e.ThumbID, &fav, &e.DurationMs); err != nil {
-				continue
-			}
-			e.ModTime = time.Unix(mtimeUnix, 0)
-			e.Favorite = fav != 0
-			lastPath = e.Path
-			seen++
-			if !visit(e) {
-				stop = true
-				break
-			}
-		}
-		if err := rows.Err(); err != nil {
-			log.Printf("cache: ListByType: %v", err)
-		}
-		rows.Close()
-		if stop || seen == 0 {
-			return
-		}
-	}
+	i.pageEntries("type = ? AND ", []any{int(t)}, visit)
 }
 
 // CountByType returns the number of entries of the given media type. Pairs with
@@ -940,31 +817,7 @@ func (i *Index) CountByType(t scan.MediaType) int {
 
 // ListFavorites returns all entries flagged as favorites.
 func (i *Index) ListFavorites() []Entry {
-
-	rows, err := i.db.Query(entrySelect + " WHERE favorite = 1 ORDER BY path")
-	if err != nil {
-		return nil
-	}
-	defer rows.Close()
-
-	// Grown via append rather than pre-sized: a COUNT(*) pre-pass would scan
-	// the favorites a second time, which costs more than the slice regrowth
-	// it would save.
-	var out []Entry
-	for rows.Next() {
-		var e Entry
-		var mtimeUnix int64
-		var fav int
-		if err := rows.Scan(&e.Path, &e.Type, &e.Size, &mtimeUnix, &e.ThumbID, &fav, &e.DurationMs); err == nil {
-			e.ModTime = time.Unix(mtimeUnix, 0)
-			e.Favorite = fav != 0
-			out = append(out, e)
-		}
-	}
-	if err := rows.Err(); err != nil {
-		log.Printf("cache: ListFavorites: %v", err)
-	}
-	return out
+	return i.ListPage(View{Kind: "favorites", Filter: "All", ShowRAW: true}, 0, 0)
 }
 
 // CountFavorites returns the number of entries flagged as favorites that
