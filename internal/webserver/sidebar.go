@@ -139,29 +139,43 @@ func (s *Server) rootSidebarAgg(filter string, showRAW bool) *sidebarAgg {
 // under collapsible YYYY <details> groups so a folder with thousands of
 // date-named children doesn't blow out the sidebar. Non-date directories render
 // normally above the year buckets.
+//
+// It runs in a single pass and requires its input to be sorted by name, with
+// every element sharing one parent — which is what listSubdirs guarantees by
+// relying on os.ReadDir's lexical order. That ordering makes same-year
+// YYYY-MM-DD entries contiguous within the date dirs and the years ascend, so
+// the year buckets can be accumulated against the last one opened: no map, no
+// re-sort, no re-parse of the year (W4-09).
 func (s *Server) renderSubdirsGrouped(w http.ResponseWriter, subdirs []string, counts map[string]int, vi viewInfo) {
 	extra := extraQuery(vi.v.Filter, vi.v.ShowRAW)
 	withExtra := func(href string) string { return appendQuery(href, extra) }
 
 	type bucket struct {
+		year  string
 		dirs  []string
 		total int
+		open  bool
 	}
-	buckets := map[string]*bucket{}
+	var buckets []bucket
 	var nonDate []string
 	for _, d := range subdirs {
-		m := dateFolderRe.FindStringSubmatch(filepath.Base(d))
-		if m == nil {
+		base := filepath.Base(d)
+		if !dateFolderRe.MatchString(base) {
 			nonDate = append(nonDate, d)
 			continue
 		}
-		b, ok := buckets[m[1]]
-		if !ok {
-			b = &bucket{}
-			buckets[m[1]] = b
+		y := base[:4]
+		if len(buckets) == 0 || buckets[len(buckets)-1].year != y {
+			buckets = append(buckets, bucket{year: y})
 		}
+		b := &buckets[len(buckets)-1]
 		b.dirs = append(b.dirs, d)
 		b.total += counts[d]
+		// Open the bucket containing the active directory, so users land on
+		// an expanded tree without an extra click.
+		if vi.kind == "dir" && vi.v.Dir == d {
+			b.open = true
+		}
 	}
 
 	for _, d := range nonDate {
@@ -170,26 +184,14 @@ func (s *Server) renderSubdirsGrouped(w http.ResponseWriter, subdirs []string, c
 		sidebarRow(w, href, filepath.Base(d), "", counts[d], active)
 	}
 
-	years := make([]string, 0, len(buckets))
-	for y := range buckets {
-		years = append(years, y)
-	}
-	sort.Strings(years)
-	for _, y := range years {
-		b := buckets[y]
-		// Open the bucket by default if it contains the active directory,
-		// so users land on an expanded tree without an extra click.
+	for _, b := range buckets {
 		openAttr := ""
-		for _, d := range b.dirs {
-			if vi.kind == "dir" && vi.v.Dir == d {
-				openAttr = " open"
-				break
-			}
+		if b.open {
+			openAttr = " open"
 		}
 		fmt.Fprintf(w,
 			`<details class="year-bucket" data-year="%s"%s><summary><span class="label">%s</span><span class="badge-count">%d</span></summary>`,
-			html.EscapeString(y), openAttr, html.EscapeString(y), b.total)
-		sort.Strings(b.dirs)
+			html.EscapeString(b.year), openAttr, html.EscapeString(b.year), b.total)
 		for _, d := range b.dirs {
 			href := withExtra(s.dirHref(d))
 			active := vi.kind == "dir" && vi.v.Dir == d
