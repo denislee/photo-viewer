@@ -245,3 +245,54 @@ func scanEntries(rows *sql.Rows) []Entry {
 	}
 	return out
 }
+
+// ListPageAfter is the keyset form of ListPage: up to limit entries of v whose
+// path sorts strictly after afterPath, in path order (W4-05). An empty
+// afterPath starts at the beginning, so it equals ListPage(v, 0, limit).
+// Unlike OFFSET, which walks and discards every earlier row, the `path > ?`
+// bound seeks straight to the page, so deep infinite scroll stays O(page)
+// instead of O(offset). limit <= 0 means no limit.
+func (i *Index) ListPageAfter(v View, afterPath string, limit int) []Entry {
+	if afterPath == "" {
+		return i.ListPage(v, 0, limit)
+	}
+	// The dir view's exact-path row (see dirExactEntry) sorts before every
+	// range row. It belongs on this page only if it also sorts after the
+	// cursor — never true for a cursor taken from the view itself, but the
+	// stitch keeps the function correct for any afterPath.
+	var exact *Entry
+	if e := i.dirExactEntry(v); e != nil && e.Path > afterPath {
+		exact = e
+		if limit == 1 {
+			return []Entry{*e}
+		}
+		if limit > 1 {
+			limit--
+		}
+	}
+	q, args := listPageAfterQuery(v, afterPath, limit)
+	rows, err := i.db.Query(q, args...)
+	if err != nil {
+		log.Printf("cache: ListPageAfter: %v", err)
+		return nil
+	}
+	defer rows.Close()
+	out := scanEntries(rows)
+	if exact != nil {
+		out = append([]Entry{*exact}, out...)
+	}
+	return out
+}
+
+// listPageAfterQuery builds ListPageAfter's range statement. Split out so the
+// query-plan test checks the exact SQL that runs.
+func listPageAfterQuery(v View, afterPath string, limit int) (string, []any) {
+	where, args := v.whereClause()
+	q := entrySelect + " WHERE " + where + " AND path > ? ORDER BY path"
+	args = append(args, afterPath)
+	if limit > 0 {
+		q += " LIMIT ?"
+		args = append(args, limit)
+	}
+	return q, args
+}

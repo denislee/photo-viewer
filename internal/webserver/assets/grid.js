@@ -71,6 +71,8 @@
     if (loading || !hasNext || !loader) return;
     loading = true;
     var url = '/api/page?' + from + '&p=' + nextPage;
+    var last = grid.lastElementChild;
+    if (last && last.dataset && last.dataset.id) url += '&after=' + encodeURIComponent(last.dataset.id);
     fetch(url, { credentials: 'same-origin', headers: { 'Accept': 'application/json' } })
       .then(function(r){ return r.json(); })
       .then(function(data){

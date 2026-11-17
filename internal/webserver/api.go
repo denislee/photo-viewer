@@ -34,7 +34,8 @@ type cellJSON struct {
 }
 
 // handleAPIPage serves the next page of cells as JSON for the
-// infinite-scroll fetcher. Query: ?from=...&y=...&path=...&p=N
+// infinite-scroll fetcher. Query:
+// ?from=...&y=...&path=...&p=N&after=<id>
 func (s *Server) handleAPIPage(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
 	vi, ok := s.viewFromQuery(q)
@@ -49,9 +50,24 @@ func (s *Server) handleAPIPage(w http.ResponseWriter, r *http.Request) {
 	if vi.kind == "trash" {
 		entries, hasNext = pageSlice(s.trashEntries(), page)
 	} else {
-		offset := (page - 1) * pageSize
-		// Fetch one extra entry to detect the next page without a CountView scan.
-		raw := s.index.ListPage(vi.v, offset, pageSize+1)
+		// keyset pagination (W4-05) — grid.js sends the last rendered cell's
+		// id, which the index resolves to its path, so a deep scroll seeks
+		// instead of walking OFFSET rows; p= stays as the fallback (noscript
+		// pager, a cursor whose entry has since vanished, and trash, which is
+		// an in-memory slice).
+		keyset := false
+		var raw []cache.Entry
+		if after := q.Get("after"); validID(after) {
+			if e, ok := s.index.GetEntryByThumbID(after); ok {
+				raw = s.index.ListPageAfter(vi.v, e.Path, pageSize+1)
+				keyset = true
+			}
+		}
+		if !keyset {
+			offset := (page - 1) * pageSize
+			// Fetch one extra entry to detect the next page without a CountView scan.
+			raw = s.index.ListPage(vi.v, offset, pageSize+1)
+		}
 		hasNext = len(raw) > pageSize
 		if hasNext {
 			entries = raw[:pageSize]
