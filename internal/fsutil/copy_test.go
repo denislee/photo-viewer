@@ -4,9 +4,12 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"io"
+	"math/rand/v2"
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 )
 
 func writeFile(t *testing.T, p, content string) {
@@ -127,6 +130,96 @@ func TestCopyUniqueCancelled(t *testing.T) {
 	}
 	if readFile(t, src) != "video bytes" {
 		t.Error("source damaged")
+	}
+}
+
+// TestCopyUniqueLargerThanChunk exercises the multi-chunk path: a file bigger
+// than copyChunk copies intact through copyFileCtx, including the short final
+// io.CopyN.
+func TestCopyUniqueLargerThanChunk(t *testing.T) {
+	srcDir, dir := t.TempDir(), t.TempDir()
+	data := make([]byte, copyChunk+12345)
+	rng := rand.New(rand.NewPCG(7, 8))
+	for i := range data {
+		data[i] = byte(rng.Uint32())
+	}
+	src := filepath.Join(srcDir, "big.bin")
+	if err := os.WriteFile(src, data, 0o644); err != nil {
+		t.Fatalf("write src: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	got, err := CopyUnique(ctx, src, dir, "big.bin")
+	if err != nil {
+		t.Fatalf("CopyUnique: %v", err)
+	}
+	if want := filepath.Join(dir, "big.bin"); got != want {
+		t.Fatalf("path = %q, want %q", got, want)
+	}
+	copied, err := os.ReadFile(got)
+	if err != nil {
+		t.Fatalf("read copy: %v", err)
+	}
+	if !bytes.Equal(copied, data) {
+		t.Error("copied bytes differ from the source")
+	}
+}
+
+// TestCopyUniquePreservesMtime locks the capture-time contract: the copy keeps
+// src's mtime so it sorts by capture, not copy, time.
+func TestCopyUniquePreservesMtime(t *testing.T) {
+	srcDir, dir := t.TempDir(), t.TempDir()
+	src := filepath.Join(srcDir, "old.jpg")
+	writeFile(t, src, "small")
+	captured := time.Date(2019, 5, 4, 3, 2, 1, 0, time.UTC)
+	if err := os.Chtimes(src, captured, captured); err != nil {
+		t.Fatalf("chtimes: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	got, err := CopyUnique(ctx, src, dir, "old.jpg")
+	if err != nil {
+		t.Fatalf("CopyUnique: %v", err)
+	}
+	info, err := os.Stat(got)
+	if err != nil {
+		t.Fatalf("stat copy: %v", err)
+	}
+	if !info.ModTime().Equal(captured) {
+		t.Errorf("mtime = %v, want %v", info.ModTime(), captured)
+	}
+}
+
+// TestWriteUniqueReaderCancelled: a non-file reader under an already-cancelled
+// ctx fails with context.Canceled and leaves no temp behind.
+func TestWriteUniqueReaderCancelled(t *testing.T) {
+	dir := t.TempDir()
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	_, err := WriteUnique(ctx, dir, "x.jpg", bytes.NewReader(make([]byte, 1<<20)))
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("err = %v, want context.Canceled", err)
+	}
+	if entries, _ := os.ReadDir(dir); len(entries) != 0 {
+		t.Errorf("dir not empty after cancelled write: %v", entries)
+	}
+}
+
+// TestNewContextReader: a ctx that can never be cancelled is a no-op wrapper,
+// while a cancelled one fails reads with context.Canceled.
+func TestNewContextReader(t *testing.T) {
+	in := io.Reader(bytes.NewReader([]byte("payload")))
+	if got := NewContextReader(context.Background(), in); got != in {
+		t.Errorf("NewContextReader with a non-cancellable ctx returned a wrapper, want the input itself")
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := NewContextReader(ctx, in).Read(make([]byte, 4)); !errors.Is(err, context.Canceled) {
+		t.Errorf("err = %v, want context.Canceled", err)
 	}
 }
 

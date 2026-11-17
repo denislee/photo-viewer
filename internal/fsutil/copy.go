@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"syscall"
+	"time"
 )
 
 // MoveUnique moves src into dir as base, or base_N when that name is taken,
@@ -42,15 +43,22 @@ func MoveUnique(ctx context.Context, src, dir, base string) (string, error) {
 	return dst, nil
 }
 
-// CopyUnique copies src into dir with WriteUnique and returns the path of the
+// CopyUnique copies src into dir with writeUnique and returns the path of the
 // copy. src is never modified.
+//
+// The copy keeps src's mtime, so an imported file still sorts (and dates, via
+// GetOldestMediaDate's mtime branch) by capture time instead of copy time.
 func CopyUnique(ctx context.Context, src, dir, base string) (string, error) {
 	in, err := os.Open(src)
 	if err != nil {
 		return "", err
 	}
 	defer in.Close()
-	return WriteUnique(ctx, dir, base, in)
+	info, err := in.Stat()
+	if err != nil {
+		return "", err
+	}
+	return writeUnique(ctx, dir, base, in, info.ModTime())
 }
 
 // WriteUnique streams r into dir as base, or base_N when that name is taken,
@@ -64,17 +72,23 @@ func CopyUnique(ctx context.Context, src, dir, base string) (string, error) {
 // rename is also what lets a caller delete the source afterwards: its bytes
 // are no longer only in the page cache.
 func WriteUnique(ctx context.Context, dir, base string, r io.Reader) (string, error) {
+	return writeUnique(ctx, dir, base, r, time.Time{})
+}
+
+func writeUnique(ctx context.Context, dir, base string, r io.Reader, mtime time.Time) (string, error) {
 	tmp, err := createTemp(dir, base)
 	if err != nil {
 		return "", err
 	}
 	tmpName := tmp.Name()
-	// Plain io.Copy keeps the kernel copy_file_range/sendfile fast path when r
-	// is an *os.File; ctxReader only interposes when ctx can be cancelled.
-	if ctx.Done() != nil {
-		r = ctxReader{ctx, r}
+	// An *os.File source goes through copyFileCtx so the kernel copy fast path
+	// survives a cancellable ctx; any other reader (a zip entry, a network
+	// body) is wrapped so cancellation stops it at the next read.
+	if f, ok := r.(*os.File); ok && ctx.Done() != nil {
+		err = copyFileCtx(ctx, tmp, f)
+	} else {
+		_, err = io.Copy(tmp, NewContextReader(ctx, r))
 	}
-	_, err = io.Copy(tmp, r)
 	if err == nil {
 		// A failed Sync is exactly the "bytes still only in the page cache"
 		// case, so it fails the write like any copy error.
@@ -87,12 +101,41 @@ func WriteUnique(ctx context.Context, dir, base string, r io.Reader) (string, er
 		os.Remove(tmpName)
 		return "", err
 	}
+	// Best-effort, matching export.copyFile: a failed stamp doesn't invalidate
+	// a good copy.
+	if !mtime.IsZero() {
+		_ = os.Chtimes(tmpName, mtime, mtime)
+	}
 	dst, err := RenameUnique(tmpName, func(n int) string { return SuffixName(dir, base, n) })
 	if err != nil {
 		os.Remove(tmpName)
 		return "", err
 	}
 	return dst, nil
+}
+
+// copyChunk is the cancellation granularity of a file-to-file copy: each chunk
+// is one copy_file_range-eligible io.CopyN.
+const copyChunk = 16 << 20
+
+// copyFileCtx copies src to dst in copyChunk pieces, checking ctx between them.
+// io.CopyN wraps src in an io.LimitedReader, which (*os.File).ReadFrom still
+// hands to copy_file_range on Linux, so the in-kernel copy (and reflinks on
+// btrfs/XFS) survives a cancellable ctx; a contextReader wrapper around the
+// file would hide it and force a userspace 32 KiB loop (H4-01).
+func copyFileCtx(ctx context.Context, dst *os.File, src *os.File) error {
+	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		_, err := io.CopyN(dst, src, copyChunk)
+		if err == io.EOF {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+	}
 }
 
 // createTemp exclusively creates base.tmp in dir (base.1.tmp, … if another
@@ -113,14 +156,26 @@ func createTemp(dir, base string) (*os.File, error) {
 	}
 }
 
-// ctxReader fails reads once ctx is cancelled, so a multi-GB copy stops at the
-// next read after an interrupt instead of running to completion.
-type ctxReader struct {
+// NewContextReader wraps r so reads fail with ctx.Err() once ctx is done. Go's
+// image decoders and io.Copy pull their input in small chunks, so wrapping a
+// source in one turns a cancelled context into an early error instead of a run
+// to completion. A ctx that can never be cancelled (Done() == nil) returns r
+// unchanged.
+func NewContextReader(ctx context.Context, r io.Reader) io.Reader {
+	if ctx.Done() == nil {
+		return r
+	}
+	return &contextReader{ctx: ctx, r: r}
+}
+
+// contextReader fails reads once ctx is cancelled, so a multi-GB copy stops at
+// the next read after an interrupt instead of running to completion.
+type contextReader struct {
 	ctx context.Context
 	r   io.Reader
 }
 
-func (c ctxReader) Read(p []byte) (int, error) {
+func (c *contextReader) Read(p []byte) (int, error) {
 	if err := c.ctx.Err(); err != nil {
 		return 0, err
 	}
