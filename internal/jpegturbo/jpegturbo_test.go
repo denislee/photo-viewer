@@ -83,6 +83,46 @@ func TestDecode(t *testing.T) {
 	}
 }
 
+func TestDecodeFit(t *testing.T) {
+	if !Available() {
+		t.Skip("built without libjpeg-turbo")
+	}
+	data := encodeJPEG(t, 400, 300)
+	calls := 0
+	var gotW, gotH int
+	img, cfg, err := DecodeFit(data, func(w, h int) (int, int) {
+		calls++
+		gotW, gotH = w, h
+		return 100, 75
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if calls != 1 {
+		t.Fatalf("fit called %d times, want 1", calls)
+	}
+	if gotW != 400 || gotH != 300 {
+		t.Fatalf("fit called with %dx%d, want 400x300", gotW, gotH)
+	}
+	if cfg != (Config{Width: 400, Height: 300}) {
+		t.Fatalf("cfg = %+v, want {400 300}", cfg)
+	}
+	if b := img.Bounds(); b.Dx() < 100 || b.Dy() < 75 || b.Dx() >= 400 {
+		t.Fatalf("scaled decode bounds %v, want width in [100,400) and height >= 75", b)
+	}
+
+	full, cfg, err := DecodeFit(data, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg != (Config{Width: 400, Height: 300}) {
+		t.Fatalf("nil fit cfg = %+v, want {400 300}", cfg)
+	}
+	if full.Rect != image.Rect(0, 0, 400, 300) {
+		t.Fatalf("nil fit bounds %v, want 400x300", full.Rect)
+	}
+}
+
 func diff(a uint32, b uint8) int {
 	d := int(a) - int(b)
 	if d < 0 {

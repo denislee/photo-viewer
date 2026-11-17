@@ -24,7 +24,7 @@ func RAW(ctx context.Context, src, dst string, size int) error {
 		// fork, and the RAW's own orientation tag applied (the ffmpeg path
 		// below can only honour a tag inside the preview itself).
 		if jpegturbo.Available() && jpegturbo.IsJPEG(data) {
-			if img, err := decodeFit(ctx, data, size); err == nil {
+			if img, err := DecodeFit(ctx, data, size); err == nil {
 				return writeThumb(img, dst, size, imgorient.ReadOrientation(src))
 			}
 		}

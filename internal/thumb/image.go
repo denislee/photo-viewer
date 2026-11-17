@@ -54,7 +54,7 @@ func Image(ctx context.Context, src, dst string, size int) error {
 	// also reads the EXIF orientation from the same bytes.
 	if jpegturbo.Available() {
 		if data, err := readJPEG(ctx, src); err == nil && data != nil {
-			if img, err := decodeFit(ctx, data, size); err == nil {
+			if img, err := DecodeFit(ctx, data, size); err == nil {
 				return writeThumb(img, dst, size, imgorient.ReadOrientationFrom(bytes.NewReader(data)))
 			}
 		}

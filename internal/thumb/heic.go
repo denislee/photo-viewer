@@ -62,7 +62,7 @@ func HEIC(ctx context.Context, src, dst string, size int) error {
 	if err != nil {
 		return err
 	}
-	img, err := decodeFit(ctx, data, size)
+	img, err := DecodeFit(ctx, data, size)
 	if err != nil {
 		return err
 	}

@@ -103,28 +103,34 @@ func decodeConfig(data []byte) (Config, error) {
 	return Config{Width: w, Height: ht}, nil
 }
 
-func decode(data []byte, minW, minH int) (*image.RGBA, error) {
+func decodeFit(data []byte, fit func(w, h int) (minW, minH int)) (*image.RGBA, Config, error) {
+	var cfg Config
 	if !IsJPEG(data) {
-		return nil, errors.New("jpegturbo: not a JPEG")
+		return nil, cfg, errors.New("jpegturbo: not a JPEG")
 	}
 	h, err := getHandle()
 	if err != nil {
-		return nil, err
+		return nil, cfg, err
 	}
 	defer putHandle(h)
 
 	w, ht, err := header(h, data)
 	if err != nil {
-		return nil, err
+		return nil, cfg, err
 	}
+	cfg = Config{Width: w, Height: ht}
 	// libjpeg-turbo can't convert CMYK/YCCK to RGB; let image/jpeg handle it.
 	if cs := C.tj3Get(h, C.TJPARAM_COLORSPACE); cs == C.TJCS_CMYK || cs == C.TJCS_YCCK {
-		return nil, errors.New("jpegturbo: CMYK JPEG")
+		return nil, cfg, errors.New("jpegturbo: CMYK JPEG")
+	}
+	minW, minH := 0, 0
+	if fit != nil {
+		minW, minH = fit(w, ht)
 	}
 	num, denom := pickScale(scalingFactors(), w, ht, minW, minH)
 	sf := C.tjscalingfactor{num: C.int(num), denom: C.int(denom)}
 	if C.tj3SetScalingFactor(h, sf) != 0 {
-		return nil, tjError(h, "scaling factor")
+		return nil, cfg, tjError(h, "scaling factor")
 	}
 	ow, oh := scaledSize(w, num, denom), scaledSize(ht, num, denom)
 
@@ -135,9 +141,9 @@ func decode(data []byte, minW, minH int) (*image.RGBA, error) {
 		(*C.uchar)(unsafe.Pointer(&data[0])), C.size_t(len(data)),
 		(*C.uchar)(unsafe.Pointer(&img.Pix[0])), C.int(img.Stride), C.TJPF_RGBA)
 	if rc != 0 && C.tj3GetErrorCode(h) != C.TJERR_WARNING {
-		return nil, tjError(h, "decompress")
+		return nil, cfg, tjError(h, "decompress")
 	}
 	// A TJERR_WARNING (for example a truncated scan) still produces a usable
 	// image, as image/jpeg would reject it; keep it, like most viewers do.
-	return img, nil
+	return img, cfg, nil
 }

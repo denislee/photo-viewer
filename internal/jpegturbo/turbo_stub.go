@@ -6,6 +6,8 @@ import "image"
 
 const available = false
 
-func decode([]byte, int, int) (*image.RGBA, error) { return nil, ErrUnavailable }
+func decodeFit([]byte, func(w, h int) (minW, minH int)) (*image.RGBA, Config, error) {
+	return nil, Config{}, ErrUnavailable
+}
 
 func decodeConfig([]byte) (Config, error) { return Config{}, ErrUnavailable }

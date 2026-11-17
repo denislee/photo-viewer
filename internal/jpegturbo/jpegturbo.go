@@ -62,7 +62,13 @@ func pickScale(factors [][2]int, w, h, minW, minH int) (num, denom int) {
 // without libjpeg-turbo, and an error for anything libjpeg-turbo can't convert
 // to RGBA (for example CMYK JPEGs); callers then fall back to image/jpeg.
 func Decode(data []byte, minW, minH int) (*image.RGBA, error) {
-	return decode(data, minW, minH)
+	img, _, err := decodeFit(data, func(int, int) (int, int) { return minW, minH })
+	return img, err
+}
+
+// DecodeFit decodes a JPEG like Decode, but chooses the DCT downscale from the image's own stored size with a single header parse: fit receives the stored width and height and returns the minimum output size (zero or a nil fit means full size). The returned Config is the stored size whenever the header could be read, even when the decode itself then fails (for example a CMYK JPEG), so a caller falling back to image/jpeg still knows the native size.
+func DecodeFit(data []byte, fit func(w, h int) (minW, minH int)) (*image.RGBA, Config, error) {
+	return decodeFit(data, fit)
 }
 
 // DecodeConfig reads only the JPEG header.

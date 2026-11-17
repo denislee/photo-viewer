@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 
+	"github.com/dns/photo-viewer/internal/fsutil"
 	"github.com/dns/photo-viewer/internal/imgfit"
 	"github.com/dns/photo-viewer/internal/jpegturbo"
 )
@@ -19,31 +20,38 @@ import (
 // image.Decode at full size, reading through a context-aware reader so a
 // cancelled ctx aborts the decode early instead of running it to completion.
 func DecodeScaled(ctx context.Context, data []byte, minW, minH int) (image.Image, error) {
-	if jpegturbo.Available() && jpegturbo.IsJPEG(data) {
-		if img, err := jpegturbo.Decode(data, minW, minH); err == nil {
-			return img, nil
-		}
-	}
-	img, _, err := image.Decode(NewContextReader(ctx, bytes.NewReader(data)))
-	if err != nil {
-		if cerr := ctx.Err(); cerr != nil {
-			return nil, cerr
-		}
-		return nil, err
-	}
-	return img, nil
+	img, _, err := DecodeFitFunc(ctx, data, func(int, int) (int, int) { return minW, minH })
+	return img, err
 }
 
-// decodeFit decodes data just large enough to be resampled to fit a size×size
-// box: the DCT scale only ever reduces to the fitted size, never below it.
-func decodeFit(ctx context.Context, data []byte, size int) (image.Image, error) {
-	minW, minH := 0, 0
+// DecodeFitFunc is DecodeScaled with the DCT minimum chosen by fit from the
+// JPEG's stored size, in one header parse (jpegturbo.DecodeFit). cfg is the
+// stored size whenever the JPEG header could be read (also when libjpeg-turbo
+// then failed and image.Decode took over), zero otherwise.
+func DecodeFitFunc(ctx context.Context, data []byte, fit func(w, h int) (minW, minH int)) (image.Image, jpegturbo.Config, error) {
+	var cfg jpegturbo.Config
 	if jpegturbo.Available() && jpegturbo.IsJPEG(data) {
-		if cfg, err := jpegturbo.DecodeConfig(data); err == nil {
-			minW, minH = imgfit.Within(cfg.Width, cfg.Height, size)
+		img, c, err := jpegturbo.DecodeFit(data, fit)
+		if err == nil {
+			return img, c, nil
 		}
+		cfg = c
 	}
-	return DecodeScaled(ctx, data, minW, minH)
+	img, _, err := image.Decode(fsutil.NewContextReader(ctx, bytes.NewReader(data)))
+	if err != nil {
+		if cerr := ctx.Err(); cerr != nil {
+			return nil, cfg, cerr
+		}
+		return nil, cfg, err
+	}
+	return img, cfg, nil
+}
+
+// DecodeFit decodes data just large enough to be resampled to fit a size×size
+// box: the DCT scale only ever reduces to the fitted size, never below it.
+func DecodeFit(ctx context.Context, data []byte, size int) (image.Image, error) {
+	img, _, err := DecodeFitFunc(ctx, data, func(w, h int) (int, int) { return imgfit.Within(w, h, size) })
+	return img, err
 }
 
 // readJPEG returns src's contents when it starts with a JPEG SOI marker, and
@@ -63,7 +71,7 @@ func readJPEG(ctx context.Context, src string) ([]byte, error) {
 		buf.Grow(int(info.Size()))
 	}
 	buf.Write(head[:])
-	if _, err := buf.ReadFrom(NewContextReader(ctx, f)); err != nil {
+	if _, err := buf.ReadFrom(fsutil.NewContextReader(ctx, f)); err != nil {
 		return nil, err
 	}
 	return buf.Bytes(), nil
@@ -80,28 +88,8 @@ func ReadFile(ctx context.Context, path string) ([]byte, error) {
 	if info, err := f.Stat(); err == nil {
 		buf.Grow(int(info.Size()))
 	}
-	if _, err := buf.ReadFrom(NewContextReader(ctx, f)); err != nil {
+	if _, err := buf.ReadFrom(fsutil.NewContextReader(ctx, f)); err != nil {
 		return nil, err
 	}
 	return buf.Bytes(), nil
-}
-
-// contextReader fails reads with ctx.Err() once ctx is done. Go's image
-// decoders pull their input in small chunks, so wrapping their source in one
-// turns a cancelled context into an early decode error.
-type contextReader struct {
-	ctx context.Context
-	r   io.Reader
-}
-
-// NewContextReader wraps r so reads fail once ctx is cancelled.
-func NewContextReader(ctx context.Context, r io.Reader) io.Reader {
-	return &contextReader{ctx: ctx, r: r}
-}
-
-func (c *contextReader) Read(p []byte) (int, error) {
-	if err := c.ctx.Err(); err != nil {
-		return 0, err
-	}
-	return c.r.Read(p)
 }

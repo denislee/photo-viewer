@@ -30,8 +30,8 @@ import (
 	_ "golang.org/x/image/webp"
 
 	"github.com/dns/photo-viewer/internal/cache"
+	"github.com/dns/photo-viewer/internal/fsutil"
 	"github.com/dns/photo-viewer/internal/imgorient"
-	"github.com/dns/photo-viewer/internal/jpegturbo"
 	"github.com/dns/photo-viewer/internal/scan"
 	"github.com/dns/photo-viewer/internal/thumb"
 	"github.com/dns/photo-viewer/internal/video"
@@ -1208,7 +1208,7 @@ func (v *Viewer) prefetchVideo(e cache.Entry, idx int) {
 			return
 		}
 		defer f.Close()
-		_, _ = io.CopyN(io.Discard, thumb.NewContextReader(ctx, f), videoPrefetchBytes)
+		_, _ = io.CopyN(io.Discard, fsutil.NewContextReader(ctx, f), videoPrefetchBytes)
 	})
 }
 
@@ -1302,23 +1302,32 @@ func decodeOriginal(ctx context.Context, e cache.Entry, target image.Point, disp
 // no less than what fits target once oriented. native is the image's full
 // upright size when the header could be read, zero otherwise.
 func decodeFitted(ctx context.Context, data []byte, orientation int, target image.Point) (image.Image, image.Point, error) {
-	minW, minH := 0, 0
+	img, cfg, err := thumb.DecodeFitFunc(ctx, data, func(w, h int) (int, int) {
+		return fitMinimum(w, h, orientation, target)
+	})
 	native := image.Point{}
-	if jpegturbo.Available() && jpegturbo.IsJPEG(data) {
-		if cfg, err := jpegturbo.DecodeConfig(data); err == nil {
-			native = image.Pt(cfg.Width, cfg.Height)
-			if orientation >= 5 {
-				native = image.Pt(cfg.Height, cfg.Width)
-			}
-			need := fitInside(native, target)
-			minW, minH = need.X, need.Y
-			if orientation >= 5 {
-				minW, minH = need.Y, need.X
-			}
+	if cfg.Width > 0 {
+		native = image.Pt(cfg.Width, cfg.Height)
+		if orientation >= 5 {
+			native = image.Pt(cfg.Height, cfg.Width)
 		}
 	}
-	img, err := thumb.DecodeScaled(ctx, data, minW, minH)
 	return img, native, err
+}
+
+// fitMinimum returns the smallest stored-orientation size a w×h JPEG can be
+// DCT-scaled to and still cover what fits target once the orientation is
+// applied.
+func fitMinimum(w, h, orientation int, target image.Point) (int, int) {
+	native := image.Pt(w, h)
+	if orientation >= 5 {
+		native = image.Pt(h, w)
+	}
+	need := fitInside(native, target)
+	if orientation >= 5 {
+		return need.Y, need.X
+	}
+	return need.X, need.Y
 }
 
 // decodeDisplayRendition serves HEIC/RAW from the display store, generating
