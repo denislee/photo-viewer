@@ -4,6 +4,7 @@ import (
 	"gioui.org/app"
 	"gioui.org/io/key"
 
+	"github.com/dns/photo-viewer/internal/cache"
 	"github.com/dns/photo-viewer/internal/scan"
 )
 
@@ -30,14 +31,10 @@ func handleViewerKey(ke key.Event, viewer *Viewer, grid *Grid, ctrl *Controller,
 
 	syncGrid := func() {
 		if viewer.Index >= 0 && viewer.Index < len(viewer.entries) {
-			e := viewer.entries[viewer.Index]
 			_, _, currentEntries, _ := ctrl.Snapshot()
-			for i, cur := range currentEntries {
-				if cur.Path == e.Path {
-					grid.Selected = i
-					grid.pendingScroll = true
-					break
-				}
+			if i := gridIndexFor(currentEntries, viewer.Index, viewer.entries[viewer.Index].Path); i >= 0 {
+				grid.Selected = i
+				grid.pendingScroll = true
 			}
 		}
 	}
@@ -84,7 +81,9 @@ func handleViewerKey(ke key.Event, viewer *Viewer, grid *Grid, ctrl *Controller,
 		}
 	case "F":
 		if viewer.Index >= 0 && viewer.Index < len(viewer.entries) {
-			e := &viewer.entries[viewer.Index]
+			// Write through the viewer's private copy, never the slice it
+			// shares with the controller and grid (G4-03).
+			e := &viewer.mutableEntries()[viewer.Index]
 			e.Favorite = ctrl.ToggleFavorite(e.Path, e.Favorite)
 			w.Invalidate()
 		}
@@ -113,6 +112,22 @@ func handleViewerKey(ke key.Event, viewer *Viewer, grid *Grid, ctrl *Controller,
 			}
 		}
 	}
+}
+
+// gridIndexFor returns the index of path in entries, or -1. hint is where it
+// probably is: the viewer's index, which matches the grid's whenever nothing
+// changed the list while the viewer was open, so the common close costs one
+// comparison instead of an O(N) scan (G3-04).
+func gridIndexFor(entries []cache.Entry, hint int, path string) int {
+	if hint >= 0 && hint < len(entries) && entries[hint].Path == path {
+		return hint
+	}
+	for i := range entries {
+		if entries[i].Path == path {
+			return i
+		}
+	}
+	return -1
 }
 
 // isViewerVideo reports whether the viewer's current entry is a video.

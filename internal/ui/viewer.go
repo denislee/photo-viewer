@@ -13,6 +13,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -55,7 +56,11 @@ type Viewer struct {
 	// keybind as Restore for trash items.
 	InTrash bool
 
-	entries []cache.Entry
+	// entries is the list being paged through. Show stores the caller's
+	// slice as is (G4-03); entriesOwned turns true once mutableEntries has
+	// replaced it with a private copy. UI goroutine only.
+	entries      []cache.Entry
+	entriesOwned bool
 
 	// loadingPath/loadingTarget identify the main (visible-image) decode in
 	// flight, so Layout doesn't restart it every frame. UI goroutine only.
@@ -293,13 +298,14 @@ func (v *Viewer) navigated() {
 }
 
 func (v *Viewer) Show(entries []cache.Entry, idx int) {
-	// Copy the slice: the caller hands us the controller's live entries
-	// (via Snapshot), whose backing array the grid keeps reading. ConfirmDelete
-	// shifts elements in place and the 'F' favorite toggle writes through
-	// &v.entries[i]; both would corrupt the array shared with the grid, so the
-	// viewer owns its own copy instead.
+	// Share the slice (G4-03): the caller hands us the controller's published
+	// entries (via Snapshot), which the controller never mutates and the grid
+	// keeps reading. Copying it cost 1.9 ms and 8.8 MB per Enter at 100k
+	// entries. The viewer's own writers (ConfirmDelete, the 'F' toggle,
+	// SetFavorite) go through mutableEntries, which clones on first write.
 	v.init()
-	v.entries = append([]cache.Entry(nil), entries...)
+	v.entries = entries
+	v.entriesOwned = false
 	v.Index = idx
 	v.syncIndex()
 	v.Open = true
@@ -316,10 +322,32 @@ func (v *Viewer) Show(entries []cache.Entry, idx int) {
 // when the controller undoes a toggle whose write failed.
 func (v *Viewer) SetFavorite(path string, fav bool) {
 	for i := range v.entries {
-		if v.entries[i].Path == path {
-			v.entries[i].Favorite = fav
+		if v.entries[i].Path == path && v.entries[i].Favorite != fav {
+			v.mutableEntries()[i].Favorite = fav
 		}
 	}
+}
+
+// mutableEntries returns v.entries, first replacing a slice still shared with
+// the controller by a private copy. Every write to the viewer's entries goes
+// through it.
+func (v *Viewer) mutableEntries() []cache.Entry {
+	if !v.entriesOwned {
+		v.entries = slices.Clone(v.entries)
+		v.entriesOwned = true
+	}
+	return v.entries
+}
+
+// removeEntry drops entries[i], copying a shared slice rather than shifting
+// the controller's array in place.
+func (v *Viewer) removeEntry(i int) {
+	if v.entriesOwned {
+		v.entries = slices.Delete(v.entries, i, i+1)
+		return
+	}
+	v.entries = slices.Concat(v.entries[:i], v.entries[i+1:])
+	v.entriesOwned = true
 }
 
 func (v *Viewer) Close() {
@@ -473,7 +501,7 @@ func (v *Viewer) ConfirmDelete(deleter func(path string) error) {
 	if err := deleter(e.Path); err != nil {
 		return
 	}
-	v.entries = append(v.entries[:v.Index], v.entries[v.Index+1:]...)
+	v.removeEntry(v.Index)
 	if len(v.entries) == 0 {
 		v.Close()
 		return
