@@ -11,6 +11,7 @@ import (
 	"strings"
 
 	"github.com/dns/photo-viewer/internal/imgorient"
+	"github.com/dns/photo-viewer/internal/jpegturbo"
 	"github.com/dns/photo-viewer/internal/scan"
 )
 
@@ -19,6 +20,14 @@ import (
 func RAW(ctx context.Context, src, dst string, size int) error {
 	data, previewErr := LoadRAWPreview(ctx, src)
 	if previewErr == nil && len(data) > 0 {
+		// libjpeg-turbo in process: DCT-scaled decode of the preview with no
+		// fork, and the RAW's own orientation tag applied (the ffmpeg path
+		// below can only honour a tag inside the preview itself).
+		if jpegturbo.Available() && jpegturbo.IsJPEG(data) {
+			if img, err := decodeFit(ctx, data, size); err == nil {
+				return writeThumb(img, dst, size, imgorient.ReadOrientation(src))
+			}
+		}
 		// A full-resolution embedded preview (often 10–45 MP) is far cheaper to
 		// DCT-scale through ffmpeg than to expand into a huge RGBA in Go — the
 		// same >=imageFfmpegThreshold watershed the plain-image path uses. On
@@ -66,7 +75,7 @@ func RAW(ctx context.Context, src, dst string, size int) error {
 func LoadRAWImage(ctx context.Context, src string) (img image.Image, orientation int, err error) {
 	data, err := LoadRAWPreview(ctx, src)
 	if err == nil {
-		img, _, derr := image.Decode(bytes.NewReader(data))
+		img, derr := DecodeScaled(ctx, data, 0, 0)
 		if derr == nil {
 			return img, imgorient.ReadOrientation(src), nil
 		}

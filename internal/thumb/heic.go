@@ -5,7 +5,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"image"
 	_ "image/jpeg"
 	"os"
 	"os/exec"
@@ -59,12 +58,11 @@ func HEIC(ctx context.Context, src, dst string, size int) error {
 	// ffmpeg-threshold branch inside Image() (we know exactly where the
 	// file came from) and just decode + writeThumb directly. heif-convert /
 	// ffmpeg already baked in the HEIF rotation, so it's upright (orientation 1).
-	in, err := os.Open(jpg)
+	data, err := ReadFile(ctx, jpg)
 	if err != nil {
 		return err
 	}
-	defer in.Close()
-	img, _, err := image.Decode(in)
+	img, err := decodeFit(ctx, data, size)
 	if err != nil {
 		return err
 	}

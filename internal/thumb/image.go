@@ -21,6 +21,7 @@ import (
 
 	"github.com/dns/photo-viewer/internal/imgfit"
 	"github.com/dns/photo-viewer/internal/imgorient"
+	"github.com/dns/photo-viewer/internal/jpegturbo"
 )
 
 // imageFfmpegThreshold is the source-size watershed above which we shell out
@@ -48,6 +49,16 @@ var errFfmpegNotInstalled = errors.New("ffmpeg not installed")
 // Image decodes src, resamples it to fit within size×size, and writes a JPEG
 // to dst. Aspect ratio is preserved.
 func Image(ctx context.Context, src, dst string, size int) error {
+	// In-process libjpeg-turbo with DCT scaling is the fastest path for JPEGs
+	// (a 12 MP photo decodes at 1/8 scale in ~15 ms) and needs no fork. It
+	// also reads the EXIF orientation from the same bytes.
+	if jpegturbo.Available() {
+		if data, err := readJPEG(ctx, src); err == nil && data != nil {
+			if img, err := decodeFit(ctx, data, size); err == nil {
+				return writeThumb(img, dst, size, imgorient.ReadOrientationFrom(bytes.NewReader(data)))
+			}
+		}
+	}
 	if info, err := os.Stat(src); err == nil && info.Size() >= imageFfmpegThreshold {
 		if haveFfmpeg() {
 			if err := imageViaFfmpeg(ctx, src, dst, size); err == nil {

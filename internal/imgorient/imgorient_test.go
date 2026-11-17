@@ -152,3 +152,77 @@ func TestApplyFastPathMatchesGeneric(t *testing.T) {
 		}
 	}
 }
+
+// makeYCbCr builds a w×h 4:2:0 YCbCr image with a gradient, the layout
+// image/jpeg returns for a typical photo.
+func makeYCbCr(w, h int) *image.YCbCr {
+	img := image.NewYCbCr(image.Rect(0, 0, w, h), image.YCbCrSubsampleRatio420)
+	for y := range h {
+		for x := range w {
+			img.Y[img.YOffset(x, y)] = uint8(x*7 + y*3)
+			ci := img.COffset(x, y)
+			img.Cb[ci] = uint8(x * 5)
+			img.Cr[ci] = uint8(y * 11)
+		}
+	}
+	return img
+}
+
+// TestApplyYCbCrFastPath is the V1 guard: an orientation-6 YCbCr input (what
+// image/jpeg returns for a portrait phone photo under the preview cap) must come
+// out as an *image.RGBA with swapped dimensions and the same pixels the generic
+// At/Set remap produces.
+func TestApplyYCbCrFastPath(t *testing.T) {
+	src := makeYCbCr(37, 21)
+	for o := 2; o <= 8; o++ {
+		got := Apply(src, o)
+		rgba, ok := got.(*image.RGBA)
+		if !ok {
+			t.Fatalf("orientation %d: got %T, want *image.RGBA", o, got)
+		}
+		want := image.NewRGBA(orientedRect(src.Bounds(), o))
+		for y := range 21 {
+			for x := range 37 {
+				dx, dy := destXY(o, x, y, 37, 21)
+				want.Set(dx, dy, src.At(x, y))
+			}
+		}
+		if rgba.Rect != want.Rect {
+			t.Fatalf("orientation %d: bounds %v, want %v", o, rgba.Rect, want.Rect)
+		}
+		for i := range want.Pix {
+			if rgba.Pix[i] != want.Pix[i] {
+				t.Fatalf("orientation %d: pixel byte %d = %d, want %d", o, i, rgba.Pix[i], want.Pix[i])
+			}
+		}
+	}
+	if got := Apply(src, 6).Bounds(); got.Dx() != 21 || got.Dy() != 37 {
+		t.Fatalf("orientation 6 bounds = %v, want 21x37", got)
+	}
+}
+
+// TestToRGBA checks that an origin RGBA passes through and a YCbCr converts.
+func TestToRGBA(t *testing.T) {
+	r := makeImage(3, 2)
+	if ToRGBA(r) != r {
+		t.Fatal("origin-anchored RGBA was copied")
+	}
+	y := makeYCbCr(5, 4)
+	got := ToRGBA(y)
+	if got.Bounds() != y.Bounds() {
+		t.Fatalf("bounds %v, want %v", got.Bounds(), y.Bounds())
+	}
+	if color.RGBAModel.Convert(y.At(3, 2)) != got.At(3, 2) {
+		t.Fatal("pixel mismatch after conversion")
+	}
+}
+
+// BenchmarkOrientPortrait measures orienting a 12 MP (4032×3024) YCbCr decode
+// for EXIF orientation 6, the portrait phone-photo case from the V1 review.
+func BenchmarkOrientPortrait(b *testing.B) {
+	src := image.NewYCbCr(image.Rect(0, 0, 4032, 3024), image.YCbCrSubsampleRatio420)
+	b.ResetTimer()
+	for b.Loop() {
+		_ = Apply(src, 6)
+	}
+}
