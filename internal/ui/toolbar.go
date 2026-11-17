@@ -73,6 +73,23 @@ type Toolbar struct {
 	// the window code so the tooltip can be drawn as an overlay below the
 	// toolbar (which would otherwise be clipped by the body region).
 	tooltipText string
+
+	// itemsCount/itemsLabel memoize the "N items" label (G4-12): the count
+	// changes only when the library does, so formatting it every frame is
+	// wasted work.
+	itemsCount int
+	itemsLabel string
+}
+
+// itemsText returns the "N items" label, formatting it only when the count
+// differs from the one the memoized label was built from.
+func (t *Toolbar) itemsText(count int) string {
+	if t.itemsLabel != "" && t.itemsCount == count {
+		return t.itemsLabel
+	}
+	t.itemsCount = count
+	t.itemsLabel = fmt.Sprintf("%d items", count)
+	return t.itemsLabel
 }
 
 func NewToolbar() *Toolbar { return &Toolbar{Filter: "All"} }
@@ -147,6 +164,7 @@ func (t *Toolbar) Layout(gtx layout.Context, th *Theme, path string, count int) 
 
 	h := gtx.Dp(unit.Dp(toolbarHeightDp))
 	w := gtx.Constraints.Max.X
+	items := t.itemsText(count)
 
 	bg := image.Rect(0, 0, w, h)
 	clipArea := clip.Rect(bg).Push(gtx.Ops)
@@ -184,7 +202,7 @@ func (t *Toolbar) Layout(gtx layout.Context, th *Theme, path string, count int) 
 			}),
 			layout.Rigid(func(gtx layout.Context) layout.Dimensions {
 				gtx.Constraints.Min.Y = 0
-				lbl := material.Label(th.Theme, unit.Sp(12), fmt.Sprintf("%d items", count))
+				lbl := material.Label(th.Theme, unit.Sp(12), items)
 				lbl.Color = th.Muted
 				return lbl.Layout(gtx)
 			}),

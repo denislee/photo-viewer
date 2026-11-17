@@ -101,6 +101,29 @@ type searchCandidate struct {
 	isDir     bool
 	baseLower string // strings.ToLower(base), precomputed
 	relLower  string // strings.ToLower(rel), precomputed
+	// title is the row title, folder glyph or two-space indent plus base,
+	// precomputed.
+	title string
+}
+
+// newSearchCandidate builds a candidate from a path and its root-relative form,
+// precomputing the lowercased match keys and the display title so the row
+// renderer never formats them per frame.
+func newSearchCandidate(path, rel string, isDir bool) searchCandidate {
+	base := filepath.Base(path)
+	title := "  " + base
+	if isDir {
+		title = "📁 " + base
+	}
+	return searchCandidate{
+		path:      path,
+		rel:       rel,
+		base:      base,
+		isDir:     isDir,
+		baseLower: strings.ToLower(base),
+		relLower:  strings.ToLower(rel),
+		title:     title,
+	}
 }
 
 // searchResultCap bounds the palette's result list.
@@ -281,26 +304,10 @@ func (v *FuzzySearchView) rebuildCandidates(libraryRoot string) {
 		if _, ok := seenDirs[dir]; !ok {
 			seenDirs[dir] = struct{}{}
 			rel := relTo(libraryRoot, dir)
-			base := filepath.Base(dir)
-			cand = append(cand, searchCandidate{
-				path:      dir,
-				rel:       rel,
-				base:      base,
-				isDir:     true,
-				baseLower: strings.ToLower(base),
-				relLower:  strings.ToLower(rel),
-			})
+			cand = append(cand, newSearchCandidate(dir, rel, true))
 		}
 		rel := relTo(libraryRoot, e.Path)
-		base := filepath.Base(e.Path)
-		cand = append(cand, searchCandidate{
-			path:      e.Path,
-			rel:       rel,
-			base:      base,
-			isDir:     false,
-			baseLower: strings.ToLower(base),
-			relLower:  strings.ToLower(rel),
-		})
+		cand = append(cand, newSearchCandidate(e.Path, rel, false))
 	}
 	alpha := &alphaRanking{cands: cand, top: alphaTopResults(cand, searchResultCap)}
 	v.mu.Lock()
@@ -691,11 +698,7 @@ func (v *FuzzySearchView) drawResultRow(gtx layout.Context, th *Theme, c searchC
 	dims := pad.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
 		return layout.Flex{Axis: layout.Vertical}.Layout(gtx,
 			layout.Rigid(func(gtx layout.Context) layout.Dimensions {
-				prefix := "  "
-				if c.isDir {
-					prefix = "📁 "
-				}
-				lbl := material.Label(th.Theme, unit.Sp(13), prefix+c.base)
+				lbl := material.Label(th.Theme, unit.Sp(13), c.title)
 				lbl.Color = th.Foreground
 				lbl.Font.Weight = 600
 				lbl.MaxLines = 1

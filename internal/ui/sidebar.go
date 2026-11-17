@@ -140,6 +140,9 @@ type sidebarRow struct {
 	// map at draw time (year totals are summed across child date folders).
 	hasCount bool
 	count    int
+	// countLabel is strconv.Itoa(count) when hasCount, built once per
+	// buildRows slow path so the renderer doesn't format per row per frame.
+	countLabel string
 	// yearDirs lists the date subdirs grouped under a rowYear header,
 	// sorted ascending. Used by Preview to load the year's union of photos
 	// into the grid without expanding the bucket.
@@ -214,7 +217,7 @@ func (s *Sidebar) Layout(gtx layout.Context, th *Theme, root, treeDir, highlight
 		focused := s.KeyboardFocus && i == s.Selected
 		r := rows[i]
 		active := r.kind == rowPath && r.path == highlight
-		return drawSidebarRow(gtx, th, r.label, r.count, r.hasCount, active, focused, r.indent, r.favorite, r.trash, s.tags[i])
+		return drawSidebarRow(gtx, th, r.label, r.countLabel, active, focused, r.indent, r.favorite, r.trash, s.tags[i])
 	})
 }
 
@@ -247,6 +250,11 @@ func (s *Sidebar) buildRows(root, treeDir string, subdirs []string, counts map[s
 	// Store a clone of subdirs (the caller may mutate/reuse its backing array)
 	// so the stored key reflects exactly the input that produced these rows.
 	defer func() {
+		for i := range rows {
+			if rows[i].hasCount {
+				rows[i].countLabel = strconv.Itoa(rows[i].count)
+			}
+		}
 		s.memoRoot, s.memoTreeDir = root, treeDir
 		s.memoSubdirs = slices.Clone(subdirs)
 		s.memoCountsVer = countsVer
@@ -486,7 +494,7 @@ func (s *Sidebar) Activate() bool {
 	}
 }
 
-func drawSidebarRow(gtx layout.Context, th *Theme, label string, count int, hasCount, active, focused bool, indent int, favorite, trash bool, tag *sidebarTag) layout.Dimensions {
+func drawSidebarRow(gtx layout.Context, th *Theme, label, countLabel string, active, focused bool, indent int, favorite, trash bool, tag *sidebarTag) layout.Dimensions {
 	leftDp := 10 + indent*14
 	pad := layout.Inset{Top: unit.Dp(6), Bottom: unit.Dp(6), Left: unit.Dp(float32(leftDp)), Right: unit.Dp(10)}
 
@@ -532,11 +540,11 @@ func drawSidebarRow(gtx layout.Context, th *Theme, label string, count int, hasC
 				return lbl.Layout(gtx)
 			}),
 			layout.Rigid(func(gtx layout.Context) layout.Dimensions {
-				if !hasCount {
+				if countLabel == "" {
 					return layout.Dimensions{}
 				}
 				return layout.Inset{Left: unit.Dp(8)}.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
-					lbl := material.Label(th.Theme, unit.Sp(11), strconv.Itoa(count))
+					lbl := material.Label(th.Theme, unit.Sp(11), countLabel)
 					lbl.Color = th.Muted
 					return lbl.Layout(gtx)
 				})

@@ -4,7 +4,6 @@ import (
 	"fmt"
 	"path/filepath"
 	"reflect"
-	"strings"
 	"testing"
 	"time"
 
@@ -160,15 +159,7 @@ func TestFuzzySearchRebuildsAfterTTL(t *testing.T) {
 // mkCand builds a searchCandidate the way rebuildCandidates would, so tests can
 // assemble a fixture list without touching SQLite.
 func mkCand(root, rel string, isDir bool) searchCandidate {
-	base := filepath.Base(rel)
-	return searchCandidate{
-		path:      filepath.Join(root, rel),
-		rel:       rel,
-		base:      base,
-		isDir:     isDir,
-		baseLower: strings.ToLower(base),
-		relLower:  strings.ToLower(rel),
-	}
+	return newSearchCandidate(filepath.Join(root, rel), rel, isDir)
 }
 
 // setCandidates installs a fixed candidate slice as if the background build had
