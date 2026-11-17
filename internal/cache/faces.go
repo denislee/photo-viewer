@@ -95,14 +95,21 @@ type FaceOpResult struct {
 }
 
 // faceStatements lazily prepares the long-lived statements used by
-// WriteFacesForPath. The four statements are reused for the life of the
-// *Index; each face-detection scan would otherwise reprepare them per call.
-func (i *Index) faceStatements() (ins, updCluster, newCluster, setCluster *sql.Stmt, err error) {
+// WriteFacesForPath. The statements are reused for the life of the *Index; each
+// face-detection scan would otherwise reprepare them per call.
+func (i *Index) faceStatements() (del, ins, updCluster, newCluster, setCluster *sql.Stmt, err error) {
 	i.stmtMu.Lock()
 	defer i.stmtMu.Unlock()
+	if i.faceDelStmt == nil {
+		if i.faceDelStmt, err = i.db.Prepare(
+			"DELETE FROM faces WHERE path = ?",
+		); err != nil {
+			return
+		}
+	}
 	if i.faceInsStmt == nil {
 		if i.faceInsStmt, err = i.db.Prepare(
-			`INSERT INTO faces (path, thumb_mtime, bbox_x, bbox_y, bbox_w, bbox_h, embedding) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+			`INSERT INTO faces (path, thumb_mtime, bbox_x, bbox_y, bbox_w, bbox_h, embedding, cluster_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
 		); err != nil {
 			return
 		}
@@ -128,7 +135,7 @@ func (i *Index) faceStatements() (ins, updCluster, newCluster, setCluster *sql.S
 			return
 		}
 	}
-	return i.faceInsStmt, i.faceUpdClusterStmt, i.faceNewClusterStmt, i.faceSetClusterStmt, nil
+	return i.faceDelStmt, i.faceInsStmt, i.faceUpdClusterStmt, i.faceNewClusterStmt, i.faceSetClusterStmt, nil
 }
 
 // WriteFacesForPath wipes existing face rows for path and writes the given
@@ -146,7 +153,7 @@ func (i *Index) WriteFacesForPath(path string, ops []FaceOp) ([]FaceOpResult, er
 			return nil, fmt.Errorf("WriteFacesForPath(%q): op %d has Face.Path %q", path, k, op.Face.Path)
 		}
 	}
-	insStmt, updClusterStmt, newClusterStmt, setClusterStmt, err := i.faceStatements()
+	delStmt, insStmt, updClusterStmt, newClusterStmt, setClusterStmt, err := i.faceStatements()
 	if err != nil {
 		return nil, err
 	}
@@ -157,7 +164,9 @@ func (i *Index) WriteFacesForPath(path string, ops []FaceOp) ([]FaceOpResult, er
 	}
 	defer tx.Rollback()
 
-	if _, err := tx.Exec("DELETE FROM faces WHERE path = ?", path); err != nil {
+	del := tx.Stmt(delStmt)
+	defer del.Close()
+	if _, err := del.Exec(path); err != nil {
 		return nil, err
 	}
 
@@ -173,8 +182,32 @@ func (i *Index) WriteFacesForPath(path string, ops []FaceOp) ([]FaceOpResult, er
 	results := make([]FaceOpResult, len(ops))
 	for k, op := range ops {
 		f := op.Face
+		// A face joining an existing cluster already knows its cluster id, so
+		// it is written with a single INSERT carrying cluster_id. Only a new
+		// cluster needs the face id first — it becomes the cluster's
+		// sample_face_id — which is why that path inserts the face unclustered,
+		// creates the cluster, then points the face at it.
+		if op.ExistingClusterID > 0 {
+			clusterID := op.ExistingClusterID
+			if _, err := updCluster.Exec(EncodeEmbedding(op.UpdatedCentroid), clusterID); err != nil {
+				return nil, err
+			}
+			res, err := ins.Exec(
+				f.Path, f.ThumbMtime, f.BBox[0], f.BBox[1], f.BBox[2], f.BBox[3], EncodeEmbedding(f.Embedding), clusterID,
+			)
+			if err != nil {
+				return nil, err
+			}
+			faceID, err := res.LastInsertId()
+			if err != nil {
+				return nil, err
+			}
+			results[k] = FaceOpResult{FaceID: faceID, ClusterID: clusterID}
+			continue
+		}
+
 		res, err := ins.Exec(
-			f.Path, f.ThumbMtime, f.BBox[0], f.BBox[1], f.BBox[2], f.BBox[3], EncodeEmbedding(f.Embedding),
+			f.Path, f.ThumbMtime, f.BBox[0], f.BBox[1], f.BBox[2], f.BBox[3], EncodeEmbedding(f.Embedding), nil,
 		)
 		if err != nil {
 			return nil, err
@@ -183,27 +216,19 @@ func (i *Index) WriteFacesForPath(path string, ops []FaceOp) ([]FaceOpResult, er
 		if err != nil {
 			return nil, err
 		}
-		results[k].FaceID = faceID
 
-		clusterID := op.ExistingClusterID
-		if clusterID > 0 {
-			if _, err := updCluster.Exec(EncodeEmbedding(op.UpdatedCentroid), clusterID); err != nil {
-				return nil, err
-			}
-		} else {
-			cres, err := newCluster.Exec(EncodeEmbedding(op.NewClusterCentroid), faceID)
-			if err != nil {
-				return nil, err
-			}
-			clusterID, err = cres.LastInsertId()
-			if err != nil {
-				return nil, err
-			}
+		cres, err := newCluster.Exec(EncodeEmbedding(op.NewClusterCentroid), faceID)
+		if err != nil {
+			return nil, err
+		}
+		clusterID, err := cres.LastInsertId()
+		if err != nil {
+			return nil, err
 		}
 		if _, err := setCluster.Exec(clusterID, faceID); err != nil {
 			return nil, err
 		}
-		results[k].ClusterID = clusterID
+		results[k] = FaceOpResult{FaceID: faceID, ClusterID: clusterID}
 	}
 
 	if err := tx.Commit(); err != nil {

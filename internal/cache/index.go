@@ -111,6 +111,7 @@ type Index struct {
 	// burning a Prepare per call.
 	stmtMu             sync.Mutex
 	reconcileStmt      *sql.Stmt
+	faceDelStmt        *sql.Stmt
 	faceInsStmt        *sql.Stmt
 	faceUpdClusterStmt *sql.Stmt
 	faceNewClusterStmt *sql.Stmt
@@ -567,34 +568,20 @@ func pathYear(path string) int {
 	if len(dir) != 10 || dir[4] != '-' || dir[7] != '-' {
 		return 0
 	}
-	d := func(i int) (int, bool) {
-		c := dir[i]
-		if c < '0' || c > '9' {
-			return 0, false
+	y := 0
+	for k := 0; k < len(dir); k++ {
+		if k == 4 || k == 7 {
+			continue
 		}
-		return int(c - '0'), true
+		c := dir[k]
+		if c < '0' || c > '9' {
+			return 0
+		}
+		if k < 4 {
+			y = y*10 + int(c-'0')
+		}
 	}
-	y3, ok3 := d(0)
-	y2, ok2 := d(1)
-	y1, ok1 := d(2)
-	y0, ok0 := d(3)
-	if !(ok3 && ok2 && ok1 && ok0) {
-		return 0
-	}
-	y := y3*1000 + y2*100 + y1*10 + y0
-	if y < 1900 || y > 9999 {
-		return 0
-	}
-	if _, ok := d(5); !ok {
-		return 0
-	}
-	if _, ok := d(6); !ok {
-		return 0
-	}
-	if _, ok := d(8); !ok {
-		return 0
-	}
-	if _, ok := d(9); !ok {
+	if y < 1900 {
 		return 0
 	}
 	return y
@@ -1051,6 +1038,7 @@ func (i *Index) Close() error {
 	i.stmtMu.Lock()
 	for _, s := range []**sql.Stmt{
 		&i.reconcileStmt,
+		&i.faceDelStmt,
 		&i.faceInsStmt,
 		&i.faceUpdClusterStmt,
 		&i.faceNewClusterStmt,
