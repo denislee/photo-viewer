@@ -39,6 +39,10 @@ type Server struct {
 	sidebar ttlCache[sidebarKey, *sidebarAgg]
 	// viewCounts caches CountView per View for the gallery header and sidebar.
 	viewCounts ttlCache[cache.View, int]
+	// hlsDurations memoises probed HLS source durations per file version, so a
+	// trashed or probe-failed entry doesn't fork ffprobe on every playlist and
+	// segment request (W4-06). See hlsDuration.
+	hlsDurations ttlCache[hlsDurKey, float64]
 
 	mu      sync.Mutex
 	srv     *http.Server
@@ -79,6 +83,9 @@ func New(index *cache.Index, store, display *cache.ThumbStore, libraryRoot, tras
 		trash:      ttlCache[struct{}, trashSnapshot]{ttl: trashEntriesTTL},
 		sidebar:    ttlCache[sidebarKey, *sidebarAgg]{ttl: sidebarCacheTTL},
 		viewCounts: ttlCache[cache.View, int]{ttl: viewCountTTL, sweepAt: viewCountCacheCap},
+		hlsDurations: ttlCache[hlsDurKey, float64]{
+			ttl: hlsDurationTTL, sweepAt: hlsDurationCacheCap,
+		},
 	}
 }
 

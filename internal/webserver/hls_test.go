@@ -11,6 +11,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -404,7 +405,9 @@ func TestHLSDurationPersistsProbe(t *testing.T) {
 
 // TestHLSDurationSkipsPersistForTrash guards the trash case: a trashed video
 // has no index row, so a probed duration must not be persisted (there's nothing
-// to UPDATE) and every request stays probe-only.
+// to UPDATE). It is probed once and then served from the duration memo, so the
+// playthrough never persists it and never re-forks ffprobe — until the file
+// version (the memo key) changes.
 func TestHLSDurationSkipsPersistForTrash(t *testing.T) {
 	s, _, cleanup := indexedVideoServer(t, 0)
 	defer cleanup()
@@ -435,12 +438,82 @@ func TestHLSDurationSkipsPersistForTrash(t *testing.T) {
 	if _, ok := s.index.GetEntryByThumbID(cache.ThumbIDFor(trashEntry.Path)); ok {
 		t.Error("trash entry unexpectedly written to the index")
 	}
-	// With nothing persisted to short-circuit it, a second call must re-probe.
+	// With nothing persisted to short-circuit it, the second call is served from
+	// the duration memo rather than re-forking ffprobe.
 	if got := s.hlsDuration(context.Background(), trashEntry); got != 9.0 {
 		t.Fatalf("second hlsDuration = %v, want 9", got)
 	}
+	if probes != 1 {
+		t.Errorf("probe forks = %d, want 1 (trash entry is probed once and then served from the duration memo, never persisted)", probes)
+	}
+
+	// A changed file version (here a newer mtime) is a different memo key, so it
+	// must be probed afresh instead of inheriting the stale duration.
+	editedEntry := trashEntry
+	editedEntry.ModTime = trashEntry.ModTime.Add(time.Second)
+	if got := s.hlsDuration(context.Background(), editedEntry); got != 9.0 {
+		t.Fatalf("edited hlsDuration = %v, want 9", got)
+	}
 	if probes != 2 {
-		t.Errorf("probe forks = %d, want 2 (trash entry must stay probe-only)", probes)
+		t.Errorf("probe forks after edit = %d, want 2 (a changed key must re-probe)", probes)
+	}
+}
+
+// TestHLSTrashPlaylistAndSegmentsProbeOnce is the W4-06 guard: a trashed video
+// used to fork ffprobe on every playlist and segment request, because a trash
+// entry has no index row to persist the probed duration to. The duration memo
+// keeps a whole playthrough to a single probe.
+func TestHLSTrashPlaylistAndSegmentsProbeOnce(t *testing.T) {
+	s, _, cleanup := indexedVideoServer(t, 0) // duration-less: the trash entry has no row at all
+	defer cleanup()
+
+	src := filepath.Join(t.TempDir(), "gone.mkv")
+	if err := os.WriteFile(src, []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	dst, err := cache.MoveToTrash(src, s.trashDir)
+	if err != nil {
+		t.Fatalf("MoveToTrash: %v", err)
+	}
+
+	// Requests may run concurrently, so count with an atomic.
+	var probes atomic.Int32
+	orig := probeDurationFn
+	probeDurationFn = func(_ context.Context, _ string) (float64, error) {
+		probes.Add(1)
+		return 14.0, nil
+	}
+	defer func() { probeDurationFn = orig }()
+
+	// ListTrash is what assigns the id /hls/<id>/… is addressed by; it equals
+	// ThumbIDFor(dst), but assert it so the test tracks the real lookup path.
+	id := cache.ThumbIDFor(dst)
+	if list := cache.ListTrash(s.trashDir); len(list) != 1 || list[0].ThumbID != id {
+		t.Fatalf("trash listing = %+v, want one entry with id %s", list, id)
+	}
+
+	get := func(name string) *httptest.ResponseRecorder {
+		t.Helper()
+		rec := httptest.NewRecorder()
+		s.handleHLS(rec, httptest.NewRequest(http.MethodGet, "/hls/"+id+"/"+name, nil))
+		return rec
+	}
+
+	pl := get("index.m3u8")
+	if pl.Code != http.StatusOK {
+		t.Fatalf("playlist status = %d, want 200", pl.Code)
+	}
+	// 14s / 6s per segment → seg0..seg2.
+	if !strings.Contains(pl.Body.String(), "seg2.ts") {
+		t.Errorf("playlist missing seg2.ts:\n%s", pl.Body.String())
+	}
+	// Status is irrelevant for the segments: there is no real video, so the
+	// transcode fails. Only the probe count is under test.
+	get("seg0.ts")
+	get("seg1.ts")
+
+	if n := probes.Load(); n != 1 {
+		t.Errorf("probe forks = %d, want 1 (playlist + segments must share one memoised duration)", n)
 	}
 }
 

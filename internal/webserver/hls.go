@@ -68,6 +68,24 @@ const (
 	hlsMaxSegments = 10000
 )
 
+// hlsDurationTTL and hlsDurationCacheCap bound the duration memo. The memo is a
+// fallback for entries the index can't hold a duration for (trash) or whose
+// probe failed, so a playthrough doesn't fork ffprobe on every playlist/segment
+// request (W4-06). A file edit changes the key, and failures expire with the TTL.
+const (
+	hlsDurationTTL      = 5 * time.Minute
+	hlsDurationCacheCap = 256
+)
+
+// hlsDurKey identifies one version of a source file. An edit (mtime) or a
+// replacement (size) yields a different key, so a memoised duration is never
+// served for bytes that have since changed.
+type hlsDurKey struct {
+	path  string
+	mtime int64
+	size  int64
+}
+
 // hlsSegCount is the number of segments the playlist lists for a video of
 // dur seconds; serveHLSSegment rejects any index at or past it.
 func hlsSegCount(dur float64) int {
@@ -323,32 +341,41 @@ var probeDurationFn = probeDuration
 
 // hlsDuration returns the source video's duration in seconds. It prefers the
 // DurationMs the scanner already recorded on the index row (no fork) and only
-// falls back to an ffprobe for entries indexed without one (e.g. via a walk
-// that skipped the duration probe). Returns 0 when the duration can't be found.
+// falls back to a probe for entries indexed without one (e.g. via a walk that
+// skipped the duration probe), memoised per file version in hlsDurations.
+// Returns 0 when the duration can't be found.
 //
 // On a successful fallback probe of an *indexed* entry it persists the result
 // via Index.SetDurationMs, so subsequent playlist and segment requests for the
 // same file read the duration off the row instead of re-forking ffprobe.
-// Trash entries have no index row and stay probe-only, so
-// they're excluded from the write. The persistence is a pure side effect: the
-// return value is identical to what a probe-only implementation would yield.
+// Trash entries have no index row, so the duration memo is what keeps them to
+// one probe per playthrough; a failed probe is memoised too, until the TTL
+// expires. The persistence is a pure side effect: the return value is identical
+// to what a probe-only implementation would yield.
 func (s *Server) hlsDuration(ctx context.Context, e cache.Entry) float64 {
 	if e.DurationMs > 0 {
 		return float64(e.DurationMs) / 1000.0
 	}
-	dur, err := probeDurationFn(ctx, e.Path)
-	if err != nil {
-		return 0
-	}
-	// Persist only a real, positive duration for an indexed (non-trash) entry.
-	// A non-positive probe result is left unpersisted (SetDurationMs would
-	// ignore it anyway) so the "unknown" sentinel is never cemented.
-	if dur > 0 && !s.isTrashPath(e.Path) {
-		if perr := s.index.SetDurationMs(e.Path, int64(math.Round(dur*1000))); perr != nil {
-			log.Printf("webserver: HLS: persist probed duration for %s: %v", e.Path, perr)
+	key := hlsDurKey{path: e.Path, mtime: e.ModTime.UnixNano(), size: e.Size}
+	return s.hlsDurations.get(key, 0, func() float64 {
+		// The probe is shared by every request waiting on this key, so one
+		// requester's disconnect must not cancel it (or memoize a cancellation
+		// as a failure); hlsProbeTimeout still bounds it.
+		dur, err := probeDurationFn(context.WithoutCancel(ctx), e.Path)
+		if err != nil {
+			return 0
 		}
-	}
-	return dur
+		// Persist only a real, positive duration for an indexed (non-trash)
+		// entry. A non-positive probe result is left unpersisted
+		// (SetDurationMs would ignore it anyway) so the "unknown" sentinel is
+		// never cemented.
+		if dur > 0 && !s.isTrashPath(e.Path) {
+			if perr := s.index.SetDurationMs(e.Path, int64(math.Round(dur*1000))); perr != nil {
+				log.Printf("webserver: HLS: persist probed duration for %s: %v", e.Path, perr)
+			}
+		}
+		return dur
+	})
 }
 
 // isTrashPath reports whether path lives inside the server's trash directory.
