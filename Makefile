@@ -23,11 +23,12 @@ GOVULNCHECK   ?= go run golang.org/x/vuln/cmd/govulncheck@v1.8.0
 
 all: build
 
+# One go build for every binary so they compile and link in parallel. With
+# -o pointing at a directory, each main package is written there under its
+# directory name: photo-viewer (the module root), pv-scan, pv-organize and
+# pv-export-favorites — the *_BIN names above.
 build:
-	go build -o $(APP_BIN) .
-	go build -o $(SCAN_BIN) ./cmd/pv-scan
-	go build -o $(ORGANIZE_BIN) ./cmd/pv-organize
-	go build -o $(EXPORT_FAV_BIN) ./cmd/pv-export-favorites
+	go build -o . . ./cmd/...
 	@if [ -f "./scripts/pv-face-detect.py" ]; then install -m 0755 ./scripts/pv-face-detect.py ./$(FACE_BIN); fi
 
 # Rebuilds from the current tree, then copies every binary into $(BINDIR).
