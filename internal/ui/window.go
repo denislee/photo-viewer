@@ -278,6 +278,9 @@ func drawRoot(gtx layout.Context, th *Theme, ctrl *Controller, tb *Toolbar, sb *
 	}
 	drawProcBar := func() {
 		if pbH == 0 {
+			// Layout never runs for an empty bar, so release the finished
+			// processes' row buttons here (G4-13).
+			processBar.Prune(procSnap)
 			return
 		}
 		gtx2 := gtx

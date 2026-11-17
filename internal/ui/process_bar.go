@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"image"
 	"image/color"
+	"slices"
 	"strings"
 
 	"gioui.org/layout"
@@ -65,23 +66,24 @@ func (pb *ProcessBar) HeightDp(snap []ProcessSnapshot) int {
 	return processBarHeaderDp + len(snap)*processBarRowDp
 }
 
+// Prune drops the row buttons of processes no longer in snap. Layout calls
+// it, but the window skips Layout entirely while the bar has no height, so
+// the window also calls it when snap is empty; otherwise the last rows'
+// buttons would never be released (G4-13). snap holds a handful of entries,
+// so a linear search beats building a set every frame.
+func (pb *ProcessBar) Prune(snap []ProcessSnapshot) {
+	for id := range pb.row {
+		if !slices.ContainsFunc(snap, func(s ProcessSnapshot) bool { return s.ID == id }) {
+			delete(pb.row, id)
+		}
+	}
+}
+
 // Layout draws the bar. Returns its dimensions so the caller knows how
 // much vertical space it consumed. Pass an already-taken snapshot so
 // height and content agree within a frame.
 func (pb *ProcessBar) Layout(gtx layout.Context, th *Theme, snap []ProcessSnapshot) layout.Dimensions {
-	// Prune stale row-button entries. Runs before the early return so that
-	// when the last process finishes (snap becomes empty) any leftover row
-	// entries are cleaned up rather than accumulating indefinitely.
-	live := make(map[int64]bool, len(snap))
-	for _, s := range snap {
-		live[s.ID] = true
-	}
-	for id := range pb.row {
-		if !live[id] {
-			delete(pb.row, id)
-		}
-	}
-
+	pb.Prune(snap)
 	if len(snap) == 0 {
 		return layout.Dimensions{Size: image.Pt(gtx.Constraints.Max.X, 0)}
 	}
@@ -219,6 +221,7 @@ func (pb *ProcessBar) layoutRow(gtx layout.Context, th *Theme, s ProcessSnapshot
 	if s.Paused {
 		pauseBG = th.Accent
 	}
+	countText := processCountText(s) // used twice below; format it once (G4-12)
 
 	return layout.Inset{Left: unit.Dp(10), Right: unit.Dp(10), Top: unit.Dp(4), Bottom: unit.Dp(4)}.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
 		return layout.Flex{Axis: layout.Horizontal, Alignment: layout.Middle}.Layout(gtx,
@@ -244,7 +247,7 @@ func (pb *ProcessBar) layoutRow(gtx layout.Context, th *Theme, s ProcessSnapshot
 					layout.Rigid(func(gtx layout.Context) layout.Dimensions {
 						st := s.Status
 						if st == "" {
-							st = processCountText(s)
+							st = countText
 						}
 						lbl := material.Label(th.Theme, unit.Sp(10), st)
 						lbl.Color = th.Muted
@@ -262,7 +265,7 @@ func (pb *ProcessBar) layoutRow(gtx layout.Context, th *Theme, s ProcessSnapshot
 					}),
 					layout.Rigid(layout.Spacer{Height: unit.Dp(2)}.Layout),
 					layout.Rigid(func(gtx layout.Context) layout.Dimensions {
-						lbl := material.Label(th.Theme, unit.Sp(10), processCountText(s))
+						lbl := material.Label(th.Theme, unit.Sp(10), countText)
 						lbl.Color = th.Muted
 						return lbl.Layout(gtx)
 					}),
