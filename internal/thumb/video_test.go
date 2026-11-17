@@ -10,26 +10,40 @@ import (
 	"testing"
 )
 
-// TestFfmpegVideoFrameArgsThreadCap pins C-06: the single-frame grab must carry
+// TestFfmpegThumbArgsThreadCap pins C-06: every single-frame grab must carry
 // `-threads 1` and place it before `-i` so it caps the *decoder* thread count
 // (a decoder-context option). Placed after -i it would size only the trivial
 // single-frame encoder and leave decode uncapped — the whole point being to keep
-// a video-heavy warm-up from spawning NumCPU decode threads per concurrent
-// ffmpeg. Both the fast-seek and the shorter-than-1s retry paths must cap.
-func TestFfmpegVideoFrameArgsThreadCap(t *testing.T) {
-	for _, seek := range []bool{true, false} {
-		args := ffmpegVideoFrameArgs(seek, "in.mp4", "out.jpg", "scale=w:h")
+// a warm-up from spawning NumCPU decode threads per concurrent ffmpeg. All
+// callers' input args are covered: the video fast-seek and shorter-than-1s
+// retry paths, the image/HEIC path, RAW, and the preview pipe.
+func TestFfmpegThumbArgsThreadCap(t *testing.T) {
+	cases := []struct {
+		name   string
+		inArgs []string
+	}{
+		{"video-seek", []string{"-ss", "1", "-i", "in.mp4"}},
+		{"video-retry", []string{"-i", "in.mp4"}},
+		{"image/HEIC", []string{"-i", "in.heic"}},
+		{"RAW", []string{"-i", "in.cr2"}},
+		{"preview-pipe", []string{"-f", "image2pipe", "-i", "pipe:0"}},
+	}
+	for _, tc := range cases {
+		args := ffmpegThumbArgs("out.jpg", 256, tc.inArgs...)
 
 		ti := indexOfThreadsOne(args)
 		if ti < 0 {
-			t.Fatalf("seek=%v: args missing `-threads 1`: %v", seek, args)
+			t.Fatalf("%s: args missing `-threads 1`: %v", tc.name, args)
 		}
 		ii := indexOf(args, "-i")
 		if ii < 0 {
-			t.Fatalf("seek=%v: args missing `-i`: %v", seek, args)
+			t.Fatalf("%s: args missing `-i`: %v", tc.name, args)
 		}
 		if ti > ii {
-			t.Errorf("seek=%v: `-threads 1` at %d must precede `-i` at %d to cap decode: %v", seek, ti, ii, args)
+			t.Errorf("%s: `-threads 1` at %d must precede `-i` at %d to cap decode: %v", tc.name, ti, ii, args)
+		}
+		if last := args[len(args)-1]; last != "out.jpg" {
+			t.Errorf("%s: last arg = %q, want %q: %v", tc.name, last, "out.jpg", args)
 		}
 	}
 }

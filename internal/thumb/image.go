@@ -9,6 +9,7 @@ import (
 	_ "image/gif"
 	"image/jpeg"
 	_ "image/png"
+	"io"
 	"os"
 	"os/exec"
 	"strings"
@@ -86,8 +87,8 @@ func Image(ctx context.Context, src, dst string, size int) error {
 }
 
 // ffmpegScaleFilter builds the `-vf` scale expression that fits the longest
-// edge to size while preserving aspect ratio. Shared by the image and RAW
-// ffmpeg fast paths (video.go keeps its own copy for its two-stage seek run).
+// edge to size while preserving aspect ratio. Shared by every ffmpeg
+// thumbnail run (see ffmpegThumbArgs).
 func ffmpegScaleFilter(size int) string {
 	return fmt.Sprintf("scale='if(gt(iw,ih),%d,-2)':'if(gt(iw,ih),-2,%d)'", size, size)
 }
@@ -101,30 +102,47 @@ func ffmpegError(err error, stderr *bytes.Buffer) error {
 	return err
 }
 
-// imageViaFfmpeg uses ffmpeg's hardware-accelerated decoder + scale filter to
-// produce a JPEG thumbnail directly, sidestepping a full pixel-buffer decode
-// in Go. The scale filter matches the one used for video thumbs. ffmpeg
-// auto-applies EXIF orientation, so the output is already upright.
-func imageViaFfmpeg(ctx context.Context, src, dst string, size int) error {
-	cmd := exec.CommandContext(ctx, "ffmpeg",
-		"-loglevel", "error",
-		"-y",
-		"-i", src,
+// ffmpegThumbArgs builds the argument list of a single-frame thumbnail run:
+// inArgs (input options ending in -i <input>) followed by a one-frame
+// scale-to-size JPEG written to dst. -threads 1 sits before the input so it caps
+// the *decoder* (C-06): a one-frame grab needs no parallel decode, yet without
+// the cap each child defaults to ~NumCPU threads, and the store runs an
+// extSem-worth (3×NumCPU) of these at once — HEIC's HEVC decoder included.
+func ffmpegThumbArgs(dst string, size int, inArgs ...string) []string {
+	args := []string{"-loglevel", "error", "-y", "-threads", "1"}
+	args = append(args, inArgs...)
+	return append(args,
 		"-frames:v", "1",
 		"-vf", ffmpegScaleFilter(size),
 		"-f", "image2",
 		dst,
 	)
+}
+
+// runFfmpegThumb runs ffmpeg with ffmpegThumbArgs, feeding stdin when non-nil.
+// On failure it removes any partial dst and returns ffmpeg's stderr as the
+// error; on success it confirms dst exists.
+func runFfmpegThumb(ctx context.Context, dst string, size int, stdin io.Reader, inArgs ...string) error {
+	cmd := exec.CommandContext(ctx, "ffmpeg", ffmpegThumbArgs(dst, size, inArgs...)...)
+	if stdin != nil {
+		cmd.Stdin = stdin
+	}
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
 	if err := cmd.Run(); err != nil {
 		os.Remove(dst)
 		return ffmpegError(err, &stderr)
 	}
-	if _, err := os.Stat(dst); err != nil {
-		return err
-	}
-	return nil
+	_, err := os.Stat(dst)
+	return err
+}
+
+// imageViaFfmpeg uses ffmpeg's hardware-accelerated decoder + scale filter to
+// produce a JPEG thumbnail directly, sidestepping a full pixel-buffer decode
+// in Go. The scale filter matches the one used for video thumbs. ffmpeg
+// auto-applies EXIF orientation, so the output is already upright.
+func imageViaFfmpeg(ctx context.Context, src, dst string, size int) error {
+	return runFfmpegThumb(ctx, dst, size, nil, "-i", src)
 }
 
 // imageBytesViaFfmpeg DCT-scales an in-memory JPEG straight to dst, streaming
@@ -135,27 +153,7 @@ func imageViaFfmpeg(ctx context.Context, src, dst string, size int) error {
 // ffmpeg error the caller falls back to the Go decoder, so a build that can't
 // read from a pipe degrades to (slower) correctness rather than failure.
 func imageBytesViaFfmpeg(ctx context.Context, data []byte, dst string, size int) error {
-	cmd := exec.CommandContext(ctx, "ffmpeg",
-		"-loglevel", "error",
-		"-y",
-		"-f", "image2pipe",
-		"-i", "pipe:0",
-		"-frames:v", "1",
-		"-vf", ffmpegScaleFilter(size),
-		"-f", "image2",
-		dst,
-	)
-	cmd.Stdin = bytes.NewReader(data)
-	var stderr bytes.Buffer
-	cmd.Stderr = &stderr
-	if err := cmd.Run(); err != nil {
-		os.Remove(dst)
-		return ffmpegError(err, &stderr)
-	}
-	if _, err := os.Stat(dst); err != nil {
-		return err
-	}
-	return nil
+	return runFfmpegThumb(ctx, dst, size, bytes.NewReader(data), "-f", "image2pipe", "-i", "pipe:0")
 }
 
 // rgbaPool recycles the destination RGBA used by writeThumb. The thumbnail
