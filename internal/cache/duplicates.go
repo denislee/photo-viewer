@@ -1,6 +1,7 @@
 package cache
 
 import (
+	"cmp"
 	"context"
 	"crypto/sha256"
 	"encoding/binary"
@@ -11,6 +12,7 @@ import (
 	"log"
 	"os"
 	"runtime"
+	"slices"
 	"sync"
 	"time"
 )
@@ -360,12 +362,16 @@ func (i *Index) EnsureHashes(ctx context.Context, progress func(done, total int)
 	return ctx.Err()
 }
 
-// FindDuplicates returns groups of entries (size >= 2) that share content
-// hash. Within each group, entries are ordered by ModTime ascending (oldest
-// first).
-func (i *Index) FindDuplicates() []DuplicateGroup {
-
-	rows, err := i.db.Query(`
+// findDuplicatesSQL selects every entry that shares its content hash with at
+// least one other. It is a package const so plan tests can EXPLAIN the exact
+// statement.
+//
+// There is deliberately no ORDER BY: the only ordering callers need is
+// "groups by hash, entries by mtime/path", and FindDuplicates establishes that
+// in memory with two sorts over the (small) result set. An ORDER BY here forced
+// SQLite to build a temp b-tree over every duplicate row before returning the
+// first one.
+const findDuplicatesSQL = `
 		SELECT path, type, size, mtime, thumb_id, content_hash
 		FROM entries
 		WHERE content_hash IS NOT NULL AND content_hash != ''
@@ -374,8 +380,18 @@ func (i *Index) FindDuplicates() []DuplicateGroup {
 			WHERE content_hash IS NOT NULL AND content_hash != ''
 			GROUP BY content_hash HAVING COUNT(*) > 1
 		)
-		ORDER BY content_hash, mtime ASC, path ASC
-	`)
+	`
+
+// FindDuplicates returns groups of entries (size >= 2) that share content
+// hash. Groups are ordered by content hash; within each group, entries are
+// ordered by ModTime ascending (oldest first), ties broken by Path.
+//
+// The ordering is done here rather than in SQL (see findDuplicatesSQL): the
+// SQLite query would otherwise pay for a temp b-tree across the whole result
+// set just to return rows the caller re-reads into groups anyway.
+func (i *Index) FindDuplicates() []DuplicateGroup {
+
+	rows, err := i.db.Query(findDuplicatesSQL)
 	if err != nil {
 		return nil
 	}
@@ -403,9 +419,17 @@ func (i *Index) FindDuplicates() []DuplicateGroup {
 		log.Printf("cache: FindDuplicates: %v", err)
 	}
 
+	slices.Sort(order)
 	out := make([]DuplicateGroup, 0, len(order))
 	for _, h := range order {
-		out = append(out, *groupsByHash[h])
+		g := groupsByHash[h]
+		slices.SortFunc(g.Entries, func(a, b Entry) int {
+			if c := a.ModTime.Compare(b.ModTime); c != 0 {
+				return c
+			}
+			return cmp.Compare(a.Path, b.Path)
+		})
+		out = append(out, *g)
 	}
 	return out
 }
