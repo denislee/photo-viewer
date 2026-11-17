@@ -30,16 +30,8 @@ func (s *Server) handleThumb(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
-	etag := fmt.Sprintf(`"%s-%d"`, id, e.ModTime.Unix())
-	// Cacheable for a day but no longer "immutable": immutable told browsers to
-	// skip revalidation entirely within max-age, which — combined with the
-	// static ETag — is what pinned stale thumbs. Dropping it lets a reload
-	// revalidate against the mtime-keyed ETag and pick up edits.
-	const thumbCacheControl = "public, max-age=86400"
-	if etagMatches(r.Header.Get("If-None-Match"), etag) {
-		w.Header().Set("ETag", etag)
-		w.Header().Set("Cache-Control", thumbCacheControl)
-		w.WriteHeader(http.StatusNotModified)
+	etag := mtimeETag(id, e)
+	if notModified(w, r, etag, thumbCacheControl) {
 		return
 	}
 	thumbPath, err := s.store.Path(e)
@@ -92,9 +84,37 @@ var displayPassThroughExts = map[string]bool{
 // JPEGs.
 const displayPassThroughMaxBytes = 3 << 20
 
+// thumbCacheControl is handleThumb's Cache-Control. Cacheable for a day but no
+// longer "immutable": immutable told browsers to skip revalidation entirely
+// within max-age, which — combined with the static ETag — is what pinned stale
+// thumbs. Dropping it lets a reload revalidate against the mtime-keyed ETag and
+// pick up edits.
+const thumbCacheControl = "public, max-age=86400"
+
 // displayCacheControl matches handleThumb's: cacheable for a day but revalidated
 // against the mtime-keyed ETag, so an in-place source edit is picked up.
 const displayCacheControl = "private, max-age=86400"
+
+// mtimeETag is the validator for responses derived from one version of an
+// entry: the thumb id plus the source mtime, so an in-place edit yields a new
+// tag.
+func mtimeETag(id string, e cache.Entry) string {
+	return fmt.Sprintf(`"%s-%d"`, id, e.ModTime.Unix())
+}
+
+// notModified answers a conditional GET: when If-None-Match matches etag it
+// writes a 304 carrying etag and cacheControl and returns true. On a miss it
+// writes nothing, leaving the caller to set the same headers on its 200 (so an
+// error response never carries cache headers).
+func notModified(w http.ResponseWriter, r *http.Request, etag, cacheControl string) bool {
+	if !etagMatches(r.Header.Get("If-None-Match"), etag) {
+		return false
+	}
+	w.Header().Set("ETag", etag)
+	w.Header().Set("Cache-Control", cacheControl)
+	w.WriteHeader(http.StatusNotModified)
+	return true
+}
 
 // etagMatches reports whether an If-None-Match header value matches etag,
 // per RFC 7232 §3.2: a comma-separated list of entity tags compared weakly
@@ -131,11 +151,8 @@ func (s *Server) handleDisplay(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
-	etag := fmt.Sprintf(`"%s-%d"`, id, e.ModTime.Unix())
-	if etagMatches(r.Header.Get("If-None-Match"), etag) {
-		w.Header().Set("ETag", etag)
-		w.Header().Set("Cache-Control", displayCacheControl)
-		w.WriteHeader(http.StatusNotModified)
+	etag := mtimeETag(id, e)
+	if notModified(w, r, etag, displayCacheControl) {
 		return
 	}
 

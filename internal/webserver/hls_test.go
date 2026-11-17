@@ -232,6 +232,72 @@ func TestHLSPlaylistUsesIndexDuration(t *testing.T) {
 	}
 }
 
+// TestHLSPlaylistETag is the W3-03 guard: the playlist body is a pure function
+// of one version of the source, so it carries an mtime-keyed ETag and answers a
+// matching If-None-Match with a bodiless 304 instead of rebuilding. An in-place
+// edit moves the source mtime, which yields a new validator and a fresh 200.
+func TestHLSPlaylistETag(t *testing.T) {
+	s, id, cleanup := indexedVideoServer(t, 14000)
+	defer cleanup()
+
+	get := func(ifNoneMatch string) *httptest.ResponseRecorder {
+		t.Helper()
+		req := httptest.NewRequest(http.MethodGet, "/hls/"+id+"/index.m3u8", nil)
+		if ifNoneMatch != "" {
+			req.Header.Set("If-None-Match", ifNoneMatch)
+		}
+		rec := httptest.NewRecorder()
+		s.handleHLS(rec, req)
+		return rec
+	}
+
+	first := get("")
+	if first.Code != http.StatusOK {
+		t.Fatalf("playlist status = %d, want 200", first.Code)
+	}
+	etag := first.Header().Get("ETag")
+	if etag == "" {
+		t.Fatal("playlist response carries no ETag")
+	}
+	if cc := first.Header().Get("Cache-Control"); cc != hlsPlaylistCacheControl {
+		t.Errorf("cache-control = %q, want %q", cc, hlsPlaylistCacheControl)
+	}
+
+	revalidated := get(etag)
+	if revalidated.Code != http.StatusNotModified {
+		t.Fatalf("revalidation status = %d, want 304", revalidated.Code)
+	}
+	if body := revalidated.Body.String(); body != "" {
+		t.Errorf("304 body = %q, want empty", body)
+	}
+
+	// Bump the source version: touch the file and reconcile the index row with
+	// the new mtime. A different ETag means the old validator must now miss.
+	e, ok := s.lookupEntry(id)
+	if !ok {
+		t.Fatal("video entry not found")
+	}
+	newT := e.ModTime.Add(time.Hour)
+	if err := os.Chtimes(e.Path, newT, newT); err != nil {
+		t.Fatal(err)
+	}
+	s.index.ReconcileBatch([]scan.Result{{
+		Path:       e.Path,
+		Type:       scan.TypeVideo,
+		Size:       e.Size,
+		ModTime:    newT,
+		DurationMs: 14000,
+	}})
+
+	edited := get(etag)
+	if edited.Code != http.StatusOK {
+		t.Fatalf("edited playlist status = %d, want 200", edited.Code)
+	}
+	if newETag := edited.Header().Get("ETag"); newETag == "" || newETag == etag {
+		t.Errorf("edited ETag = %q, want non-empty and different from %q", newETag, etag)
+	}
+}
+
 func TestHLSSegmentRejectsOutOfRange(t *testing.T) {
 	// 8s indexed → ceil(8/6) = 2 segments (seg0, seg1). seg2+ is past EOF and
 	// must 404 rather than spawn an ffmpeg seek past the end and cache junk.

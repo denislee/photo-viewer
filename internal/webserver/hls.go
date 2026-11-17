@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"io"
 	"io/fs"
 	"log"
 	"math"
@@ -39,6 +40,12 @@ const (
 	hlsMaxW    = 1280 // cap width so per-segment transcode keeps up on the fly
 	hlsSegMime = "video/mp2t"
 	hlsM3UMime = "application/vnd.apple.mpegurl"
+
+	// hlsPlaylistCacheControl keeps the synthesized playlist privately
+	// cacheable for a minute but revalidatable against its mtime ETag, so a
+	// source edit is picked up on the next reload without a full refetch each
+	// time.
+	hlsPlaylistCacheControl = "private, max-age=60"
 
 	// hlsSegTimeout caps one on-the-fly segment transcode and hlsProbeTimeout
 	// caps the playlist duration probe. Both guard the same wedge: ffmpeg /
@@ -128,6 +135,12 @@ func (s *Server) handleHLS(w http.ResponseWriter, r *http.Request) {
 // hlsDuration), so the common path costs no ffprobe fork — only videos indexed
 // without a duration fall back to probing.
 func (s *Server) serveHLSPlaylist(w http.ResponseWriter, r *http.Request, e cache.Entry) {
+	// The body is a pure function of the source version, so a revalidation
+	// skips both the duration lookup and the rebuild below.
+	etag := mtimeETag(e.ThumbID, e)
+	if notModified(w, r, etag, hlsPlaylistCacheControl) {
+		return
+	}
 	dur := s.hlsDuration(r.Context(), e)
 	if dur <= 0 {
 		http.Error(w, "cannot probe video duration", http.StatusInternalServerError)
@@ -151,8 +164,9 @@ func (s *Server) serveHLSPlaylist(w http.ResponseWriter, r *http.Request, e cach
 	b.WriteString("#EXT-X-ENDLIST\n")
 
 	w.Header().Set("Content-Type", hlsM3UMime)
-	w.Header().Set("Cache-Control", "private, max-age=60")
-	_, _ = w.Write([]byte(b.String()))
+	w.Header().Set("Cache-Control", hlsPlaylistCacheControl)
+	w.Header().Set("ETag", etag)
+	_, _ = io.WriteString(w, b.String())
 }
 
 // serveHLSSegment serves segment k, transcoding (and caching) it on first
