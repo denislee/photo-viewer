@@ -10,7 +10,10 @@ import (
 	"github.com/dns/photo-viewer/internal/cache"
 )
 
-func handleGridKey(ke key.Event, grid *Grid, _ *Sidebar, sidebarFocus *bool, viewer *Viewer, total int, ctrl *Controller, w *app.Window) {
+// handleGridKey handles one key event for the grid. entries is the
+// controller's current entry snapshot, taken by the caller for this event.
+func handleGridKey(ke key.Event, grid *Grid, sidebarFocus *bool, viewer *Viewer, entries []cache.Entry, ctrl *Controller, w *app.Window) {
+	total := len(entries)
 	// While the delete-confirmation modal is up, only Enter / Esc / Ctrl+[
 	// are meaningful — all other grid navigation is suppressed so a stray
 	// j/k can't move the selection out from under the prompt.
@@ -85,9 +88,8 @@ func handleGridKey(ke key.Event, grid *Grid, _ *Sidebar, sidebarFocus *bool, vie
 		} else {
 			ctrl.SetSelectionMode(true)
 			if total > 0 {
-				_, _, entries, _ := ctrl.Snapshot()
-				idx := grid.SelectedIndex(len(entries))
-				if idx >= 0 && idx < len(entries) {
+				idx := grid.SelectedIndex(total)
+				if idx >= 0 && idx < total {
 					ctrl.ToggleSelection(entries[idx].Path)
 				}
 			}
@@ -115,21 +117,13 @@ func handleGridKey(ke key.Event, grid *Grid, _ *Sidebar, sidebarFocus *bool, vie
 		moved = grid.PageMove(-1, total)
 	case key.NameReturn, key.NameSpace:
 		if ctrl.SelectionMode() {
-			_, _, entries, _ := ctrl.Snapshot()
-			var selected []cache.Entry
-			for _, e := range entries {
-				if ctrl.IsSelected(e.Path) {
-					selected = append(selected, e)
-				}
-			}
-			openExternally(selected)
+			openExternally(ctrl.SelectedEntries(entries))
 			ctrl.ClearSelection()
 			w.Invalidate()
 			return
 		}
 		if total > 0 {
-			_, _, entries, _ := ctrl.Snapshot()
-			viewer.Show(entries, grid.SelectedIndex(len(entries)))
+			viewer.Show(entries, grid.SelectedIndex(total))
 			w.Invalidate()
 		}
 	case "E":
@@ -138,12 +132,9 @@ func handleGridKey(ke key.Event, grid *Grid, _ *Sidebar, sidebarFocus *bool, vie
 			return
 		}
 		if ctrl.SelectionMode() {
-			_, _, entries, _ := ctrl.Snapshot()
 			var selected []string
-			for _, e := range entries {
-				if ctrl.IsSelected(e.Path) {
-					selected = append(selected, e.Path)
-				}
+			for _, e := range ctrl.SelectedEntries(entries) {
+				selected = append(selected, e.Path)
 			}
 			if len(selected) > 0 {
 				go func() {
@@ -168,9 +159,8 @@ func handleGridKey(ke key.Event, grid *Grid, _ *Sidebar, sidebarFocus *bool, vie
 		}
 	case "F":
 		if total > 0 {
-			_, _, entries, _ := ctrl.Snapshot()
-			idx := grid.SelectedIndex(len(entries))
-			if idx >= 0 && idx < len(entries) {
+			idx := grid.SelectedIndex(total)
+			if idx >= 0 && idx < total {
 				ctrl.ToggleFavorite(entries[idx].Path, entries[idx].Favorite)
 				w.Invalidate()
 			}
@@ -180,25 +170,18 @@ func handleGridKey(ke key.Event, grid *Grid, _ *Sidebar, sidebarFocus *bool, vie
 			return
 		}
 		if total > 0 {
-			_, _, entries, _ := ctrl.Snapshot()
-			idx := grid.SelectedIndex(len(entries))
-			grid.RequestDelete(entries, idx)
+			grid.RequestDelete(entries, grid.SelectedIndex(total))
 			w.Invalidate()
 		}
 	case "O", "o":
 		if total > 0 {
-			_, _, entries, _ := ctrl.Snapshot()
 			var selected []cache.Entry
 			if ctrl.SelectionMode() {
-				for _, e := range entries {
-					if ctrl.IsSelected(e.Path) {
-						selected = append(selected, e)
-					}
-				}
+				selected = ctrl.SelectedEntries(entries)
 			}
 			if len(selected) == 0 {
-				idx := grid.SelectedIndex(len(entries))
-				if idx >= 0 && idx < len(entries) {
+				idx := grid.SelectedIndex(total)
+				if idx >= 0 && idx < total {
 					selected = append(selected, entries[idx])
 				}
 			}
@@ -216,9 +199,8 @@ func handleGridKey(ke key.Event, grid *Grid, _ *Sidebar, sidebarFocus *bool, vie
 	}
 	if moved {
 		if ctrl.SelectionMode() {
-			_, _, entries, _ := ctrl.Snapshot()
 			idx := grid.SelectedIndex(total)
-			if idx >= 0 && idx < len(entries) {
+			if idx >= 0 && idx < total {
 				ctrl.Select(entries[idx].Path)
 			}
 		}

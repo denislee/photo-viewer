@@ -72,9 +72,6 @@ var (
 )
 
 func handleKeys(gtx layout.Context, ctrl *Controller, grid *Grid, sidebar *Sidebar, viewer *Viewer, dups *DuplicatesView, imports *ImportView, organize *OrganizeView, settings *SettingsView, indexInfo *IndexInfoView, search *FuzzySearchView, sdPrompt *SDPromptView, webView *WebServerView, sidebarFocus *bool, focusSearch *bool, w *app.Window) {
-	_, _, entries, _ := ctrl.Snapshot()
-	total := len(entries)
-
 	// Select the pre-built static filter set (see baseKeyFilters /
 	// fullKeyFilters). The palette needs printable keys, so it uses the base
 	// set only.
@@ -244,7 +241,11 @@ func handleKeys(gtx layout.Context, ctrl *Controller, grid *Grid, sidebar *Sideb
 			handleSidebarKey(ke, sidebar, sidebarFocus, w)
 			continue
 		}
-		handleGridKey(ke, grid, sidebar, sidebarFocus, viewer, total, ctrl, w)
+		// Snapshot per event (it is just a locked read of the slice header):
+		// an earlier key in the same batch may have changed the entries, e.g.
+		// F patching a favorite.
+		_, _, entries, _ := ctrl.Snapshot()
+		handleGridKey(ke, grid, sidebarFocus, viewer, entries, ctrl, w)
 	}
 }
 

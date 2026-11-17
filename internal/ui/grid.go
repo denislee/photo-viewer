@@ -362,12 +362,10 @@ func (g *Grid) Layout(gtx layout.Context, th *Theme, entries []cache.Entry, ctrl
 		resident *= 2
 	}
 	thumbs.EnsureCapacity(resident)
-	// Snapshot the selected-path set once per frame rather than acquiring
-	// Controller.mu per visible cell. Only meaningful in selection mode.
-	var selectedSnap map[string]bool
-	if ctrl.SelectionMode() {
-		selectedSnap = ctrl.SnapshotSelected()
-	}
+	// Read selection mode and the selected-path set once per frame rather
+	// than acquiring Controller.mu per row or cell. The set is the
+	// controller's copy-on-write snapshot, so this costs no copy (G4-02).
+	selectionMode, selectedSnap := ctrl.SelectionState()
 	rowCount := (len(entries) + cols - 1) / cols
 	g.SelectedIndex(len(entries))
 
@@ -395,7 +393,7 @@ func (g *Grid) Layout(gtx layout.Context, th *Theme, entries []cache.Entry, ctrl
 
 	g.missing = 0
 	dims := g.list.Layout(gtx, rowCount, func(gtx layout.Context, row int) layout.Dimensions {
-		return g.layoutRow(gtx, th, entries, ctrl, selectedSnap, row, cols, cellPx, gapPx)
+		return g.layoutRow(gtx, th, entries, thumbs, selectionMode, selectedSnap, row, cols, cellPx, gapPx)
 	})
 	g.prefetchBeyondViewport(thumbs, entries, cols, rowCount, cellPx > LargeThumbCellPx)
 	g.logFill()
@@ -448,12 +446,12 @@ func (g *Grid) logFill() {
 	}
 }
 
-func (g *Grid) layoutRow(gtx layout.Context, th *Theme, entries []cache.Entry, ctrl *Controller, selectedSnap map[string]bool, row, cols, cellPx, gapPx int) layout.Dimensions {
+func (g *Grid) layoutRow(gtx layout.Context, th *Theme, entries []cache.Entry, thumbs *thumbCache, selectionMode bool, selectedSnap map[string]bool, row, cols, cellPx, gapPx int) layout.Dimensions {
 	start := row * cols
 	end := min(start+cols, len(entries))
 	// Hoist loop-invariants so the inner loop only does per-cell work.
-	// selectedSnap is pre-captured once per frame by the caller, avoiding
-	// per-cell Controller.mu acquisitions during selection mode.
+	// thumbs, selectionMode and selectedSnap are read once per frame by the
+	// caller, so a row takes no Controller.mu at all.
 	rowH := cellPx + gapPx
 	stride := cellPx + gapPx
 	yOff := gapPx / 2
@@ -461,8 +459,6 @@ func (g *Grid) layoutRow(gtx layout.Context, th *Theme, entries []cache.Entry, c
 	cellGtx := gtx
 	cellGtx.Constraints.Max = cellSize
 	cellGtx.Constraints.Min = cellSize
-	thumbs := ctrl.Thumbs()
-	selectionMode := ctrl.SelectionMode()
 	selected := g.Selected
 	for i := start; i < end; i++ {
 		x := (i - start) * stride
