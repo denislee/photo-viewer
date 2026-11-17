@@ -1087,6 +1087,55 @@ func (i *Index) ToggleFavorite(path string) (bool, error) {
 	return v != 0, nil
 }
 
+// MovePath relocates the row for oldPath to newPath after the file was renamed
+// on disk (the organize move flow), in one transaction: the entries row gets
+// the new path, thumb_id and year (re-derived from the new parent dir), and the
+// file's face rows follow it. Everything else on the row — favorite,
+// duration_ms, the cached quick/content hashes and media_date — is carried over
+// untouched, because a rename changes neither size nor mtime, so those values
+// are still valid for the bytes now at newPath (U4-03). Re-inserting the row
+// via ReconcileBatch would NULL them and force Organize to re-fork exiftool for
+// exactly the files it just moved.
+//
+// A stale row already sitting at newPath (e.g. an in-flight scan observed the
+// moved file first) is replaced, so the UPDATE can't trip the path primary
+// key. Returns sql.ErrNoRows, writing nothing, when oldPath has no row; the
+// caller then falls back to indexing newPath from a fresh stat.
+func (i *Index) MovePath(oldPath, newPath string) error {
+	if oldPath == newPath {
+		return nil
+	}
+	tx, err := i.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if _, err := tx.Exec(
+		"DELETE FROM entries WHERE path = ? AND EXISTS (SELECT 1 FROM entries WHERE path = ?)",
+		newPath, oldPath,
+	); err != nil {
+		return err
+	}
+	var yearArg any
+	if y := pathYear(newPath); y != 0 {
+		yearArg = y
+	}
+	res, err := tx.Exec("UPDATE entries SET path = ?, thumb_id = ?, year = ? WHERE path = ?",
+		newPath, ThumbIDFor(newPath), yearArg, oldPath)
+	if err != nil {
+		return err
+	}
+	if n, err := res.RowsAffected(); err != nil {
+		return err
+	} else if n == 0 {
+		return sql.ErrNoRows
+	}
+	if _, err := tx.Exec("UPDATE faces SET path = ? WHERE path = ?", newPath, oldPath); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
 // Clear empties the index in place — every entry, face, and face cluster is
 // deleted in a single transaction while the database file and connection stay
 // open. This is the "Rebuild index" primitive.

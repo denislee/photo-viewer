@@ -4,6 +4,8 @@ package ui
 
 import (
 	"context"
+	"database/sql"
+	"errors"
 	"log"
 	"os"
 	"path/filepath"
@@ -417,8 +419,8 @@ func (c *Controller) PreviewYear(year string, dirs []string) {
 // scratch at the new path (an expensive video decode) on the next scan.
 //
 // Mirrors performDeletion's index+thumb bookkeeping, but for a move rather than
-// a delete: the row is relocated (favorite flag + already-probed video duration
-// preserved) instead of dropped. Deliberately does NOT refresh the grid — the
+// a delete: the row is relocated (favorite flag, probed duration, cached hashes
+// and media_date preserved) instead of dropped. Deliberately does NOT refresh the grid — the
 // caller fires a single RefreshActive once the whole batch of moves is done so
 // a long organize pass doesn't trigger one grid refresh per file.
 func (c *Controller) ApplyMove(oldPath, newPath string) error {
@@ -431,38 +433,29 @@ func (c *Controller) ApplyMove(oldPath, newPath string) error {
 	if c.store != nil {
 		_ = c.store.Rename(cache.ThumbIDFor(oldPath), cache.ThumbIDFor(newPath))
 	}
-	// Read the old row before we drop it so we can carry over the favorite flag
-	// and the already-probed duration: newPath is a brand-new row, so a fresh
-	// reconcile would default favorite to false and (with duration 0) force a
-	// re-probe of the video on the next scan.
-	old, hadOld := c.index.GetEntry(oldPath)
+	// Relocate the row (and its face rows) in one transaction. A rename keeps
+	// size and mtime, so the favorite flag, probed duration, cached hashes and
+	// media_date all stay valid and are carried over as-is (U4-03).
+	err := c.index.MovePath(oldPath, newPath)
+	if !errors.Is(err, sql.ErrNoRows) {
+		return err
+	}
+	// No row for oldPath (never indexed, or already dropped): index newPath
+	// from a fresh stat instead.
 	if info, err := os.Stat(newPath); err == nil {
-		var durationMs int64
-		if hadOld {
-			durationMs = old.DurationMs
-		}
 		c.index.ReconcileBatch([]scan.Result{{
-			Path:       newPath,
-			Type:       scan.DetectType(newPath),
-			Size:       info.Size(),
-			ModTime:    info.ModTime(),
-			DurationMs: durationMs,
+			Path:    newPath,
+			Type:    scan.DetectType(newPath),
+			Size:    info.Size(),
+			ModTime: info.ModTime(),
 		}})
-		if hadOld && old.Favorite {
-			_ = c.index.SetFavorite(newPath, true)
-		}
-		// Relocate the file's face rows to the new path rather than let them
-		// orphan. The thumbnail was renamed (not regenerated), so the embeddings
-		// and thumb_mtime stay valid — this also spares the pipeline from
-		// re-detecting the moved file from scratch. After this, no faces remain
-		// under oldPath, so RemoveEntry's own face cleanup below is a no-op.
+		// Relocate any face rows still keyed to oldPath. The thumbnail was
+		// renamed (not regenerated), so the embeddings and thumb_mtime stay
+		// valid.
 		_ = c.index.MoveFaces(oldPath, newPath)
 	}
-	// Drop the stale row last so an in-flight scan can't re-observe the old path
-	// after we've already relocated its row (the file itself is already gone
-	// from the old path on disk, so the scan won't re-add it). RemoveEntry also
-	// clears any face rows still under oldPath — the safety net when the newPath
-	// stat above failed and MoveFaces was skipped.
+	// RemoveEntry clears any face rows still under oldPath — the safety net
+	// when the newPath stat above failed and MoveFaces was skipped.
 	return c.index.RemoveEntry(oldPath)
 }
 
