@@ -14,7 +14,6 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
-	"sync"
 
 	_ "golang.org/x/image/bmp"
 	"golang.org/x/image/draw"
@@ -25,16 +24,15 @@ import (
 	"github.com/dns/photo-viewer/internal/imgorient"
 	"github.com/dns/photo-viewer/internal/scan"
 	"github.com/dns/photo-viewer/internal/thumb"
+	"github.com/dns/photo-viewer/internal/tools"
 )
 
-// External-tool availability is probed once via exec.LookPath and cached, the
-// same S-06 pattern the thumbnail pipeline uses (internal/thumb/image.go):
-// LookPath stats every $PATH entry, so probing per favorite in a large export
-// would waste thousands of stats. Tool presence can't change meaningfully
-// mid-run; a process restart re-probes.
+// External-tool availability probes are cached in internal/tools: a LookPath
+// stats every $PATH entry, so probing per favorite in a large export would
+// waste thousands of stats. Kept as vars so tests can reassign them.
 var (
-	haveFfmpeg      = sync.OnceValue(func() bool { _, err := exec.LookPath("ffmpeg"); return err == nil })
-	haveHeifConvert = sync.OnceValue(func() bool { _, err := exec.LookPath("heif-convert"); return err == nil })
+	haveFfmpeg      = tools.Ffmpeg
+	haveHeifConvert = tools.HeifConvert
 )
 
 // recompressOutputPath rewrites dst's extension when the encoder we're

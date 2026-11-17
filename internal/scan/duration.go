@@ -5,8 +5,9 @@ import (
 	"os/exec"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
+
+	"github.com/dns/photo-viewer/internal/tools"
 )
 
 // probeTimeout bounds a single ffprobe call. Derived per-probe from the scan
@@ -16,10 +17,10 @@ import (
 // cancelled.
 const probeTimeout = 10 * time.Second
 
-// haveFFprobe caches whether ffprobe is available on PATH. We probe a lot of
-// files per scan, so a per-call exec.LookPath would dominate when the binary
-// is missing.
-var haveFFprobe = sync.OnceValue(func() bool { _, err := exec.LookPath("ffprobe"); return err == nil })
+// haveFFprobe reports whether ffprobe is available on PATH, cached in
+// internal/tools. We probe a lot of files per scan, so a per-call
+// exec.LookPath would dominate when the binary is missing.
+var haveFFprobe = tools.FFprobe
 
 // probeVideoDurationMs returns the playback length of path in milliseconds,
 // or 0 if ffprobe is missing or fails. Stream-level duration is preferred

@@ -12,6 +12,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/dns/photo-viewer/internal/tools"
 )
 
 // exiftoolDaemon is a long-running exiftool process used by metadata readers
@@ -111,17 +113,13 @@ var exiftoolReqTimeout = 15 * time.Second
 // back to the one-shot exec, and the next caller transparently respawns it.
 var errExiftoolTimeout = errors.New("exiftool: request timed out")
 
-// haveExiftool caches whether exiftool is on PATH. runExiftool gates the daemon
-// pool on it so a never-installed tool short-circuits straight to the one-shot
-// path instead of retrying a doomed spawn every backoff window (S-05), and
-// SetMediaDate — which execs exiftool directly, not through the pooled daemon —
-// reuses it rather than re-walking $PATH per file in the "fix dates" loop.
-// Presence can't change meaningfully mid-run; a process restart re-probes.
-// Mirrors haveFFprobe in duration.go.
-var haveExiftool = sync.OnceValue(func() bool {
-	_, err := exec.LookPath("exiftool")
-	return err == nil
-})
+// haveExiftool reports whether exiftool is on PATH, cached in internal/tools.
+// runExiftool gates the daemon pool on it so a never-installed tool
+// short-circuits straight to the one-shot path instead of retrying a doomed
+// spawn every backoff window (S-05), and SetMediaDate — which execs exiftool
+// directly, not through the pooled daemon — reuses it rather than re-walking
+// $PATH per file in the "fix dates" loop.
+var haveExiftool = tools.Exiftool
 
 // RunExiftool runs an exiftool request through this package's shared
 // -stay_open daemon and returns its stdout, so callers outside the package
@@ -189,8 +187,8 @@ func runExiftool(args ...string) ([]byte, error) {
 }
 
 func spawnExiftoolDaemon() (*exiftoolDaemon, error) {
-	if _, err := exec.LookPath("exiftool"); err != nil {
-		return nil, err
+	if !haveExiftool() {
+		return nil, exec.ErrNotFound
 	}
 	cmd := exec.Command("exiftool", "-stay_open", "True", "-@", "-")
 	stdin, err := cmd.StdinPipe()
@@ -298,7 +296,7 @@ func (d *exiftoolDaemon) close() error {
 // of GetMediaInfo / GetMediaDate intact in environments where the long-
 // running exiftool can't run.
 func runExiftoolOneShot(args ...string) ([]byte, error) {
-	if _, err := exec.LookPath("exiftool"); err != nil {
+	if !haveExiftool() {
 		return nil, errors.New("exiftool not installed")
 	}
 	cmd := exec.Command("exiftool", args...)

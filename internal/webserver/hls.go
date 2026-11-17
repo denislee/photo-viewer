@@ -20,6 +20,7 @@ import (
 
 	"github.com/dns/photo-viewer/internal/cache"
 	"github.com/dns/photo-viewer/internal/scan"
+	"github.com/dns/photo-viewer/internal/tools"
 )
 
 // HLS on-the-fly transcoding.
@@ -281,7 +282,7 @@ func (s *Server) transcodeSegment(ctx context.Context, e cache.Entry, k int, dst
 	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
 		return err
 	}
-	if _, err := exec.LookPath("ffmpeg"); err != nil {
+	if !tools.Ffmpeg() {
 		return fmt.Errorf("ffmpeg not installed")
 	}
 
@@ -492,7 +493,7 @@ func sweepHLSDir(root string, maxBytes int64, tmpMaxAge time.Duration, now time.
 // disconnects) so a wedged ffprobe can't hang the playlist request or hold a
 // worker; on failure the caller returns a 500, exactly as before.
 func probeDuration(ctx context.Context, path string) (float64, error) {
-	if _, err := exec.LookPath("ffprobe"); err != nil {
+	if !tools.FFprobe() {
 		return 0, fmt.Errorf("ffprobe not installed")
 	}
 	pctx, cancel := context.WithTimeout(ctx, hlsProbeTimeout)

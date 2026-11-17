@@ -7,6 +7,8 @@ import (
 	"os/exec"
 	"strings"
 	"sync"
+
+	"github.com/dns/photo-viewer/internal/tools"
 )
 
 // blockDevice mirrors the relevant subset of `lsblk -J` output. lsblk reports
@@ -158,7 +160,7 @@ func coalesce(a, b string) string {
 // mountDevice mounts dev via udisksctl (uses PolicyKit, no su) and returns the
 // mount path.
 func mountDevice(ctx context.Context, devPath string) (string, error) {
-	if _, err := exec.LookPath("udisksctl"); err != nil {
+	if !tools.Udisksctl() {
 		return "", fmt.Errorf("udisksctl not available — install udisks2 to mount removable media without root")
 	}
 	cmd := exec.CommandContext(ctx, "udisksctl", "mount", "-b", devPath, "--no-user-interaction")
@@ -179,7 +181,7 @@ func mountDevice(ctx context.Context, devPath string) (string, error) {
 }
 
 func unmountDevice(ctx context.Context, devPath string) error {
-	if _, err := exec.LookPath("udisksctl"); err != nil {
+	if !tools.Udisksctl() {
 		return fmt.Errorf("udisksctl not available")
 	}
 	cmd := exec.CommandContext(ctx, "udisksctl", "unmount", "-b", devPath, "--no-user-interaction")

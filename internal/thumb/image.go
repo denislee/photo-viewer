@@ -23,6 +23,7 @@ import (
 	"github.com/dns/photo-viewer/internal/imgfit"
 	"github.com/dns/photo-viewer/internal/imgorient"
 	"github.com/dns/photo-viewer/internal/jpegturbo"
+	"github.com/dns/photo-viewer/internal/tools"
 )
 
 // imageFfmpegThreshold is the source-size watershed above which we shell out
@@ -31,16 +32,13 @@ import (
 // in-process decoder to avoid the fork+exec overhead.
 const imageFfmpegThreshold = 2 * 1024 * 1024
 
-// External-tool availability is probed once via exec.LookPath and the result
-// cached: LookPath stats every $PATH entry, and the thumbnail pipeline runs
-// these guards on every file, so a 50k-file warm-up would otherwise waste
-// hundreds of thousands of stats. Tool presence can't change meaningfully
-// mid-run. Mirrors haveFFprobe in internal/scan/duration.go; a process restart
-// re-probes.
+// External-tool availability probes are cached in internal/tools, since a
+// LookPath stats every $PATH entry and this pipeline runs the guards on every
+// file. Kept as vars so tests can reassign them.
 var (
-	haveFfmpeg      = sync.OnceValue(func() bool { _, err := exec.LookPath("ffmpeg"); return err == nil })
-	haveExiftool    = sync.OnceValue(func() bool { _, err := exec.LookPath("exiftool"); return err == nil })
-	haveHeifConvert = sync.OnceValue(func() bool { _, err := exec.LookPath("heif-convert"); return err == nil })
+	haveFfmpeg      = tools.Ffmpeg
+	haveExiftool    = tools.Exiftool
+	haveHeifConvert = tools.HeifConvert
 )
 
 // errFfmpegNotInstalled is returned by the ffmpeg-dependent paths when the

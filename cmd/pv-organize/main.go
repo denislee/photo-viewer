@@ -7,7 +7,6 @@ import (
 	"io"
 	"log"
 	"os"
-	"os/exec"
 	"os/signal"
 	"path/filepath"
 	"slices"
@@ -18,6 +17,7 @@ import (
 
 	"github.com/dns/photo-viewer/internal/fsutil"
 	"github.com/dns/photo-viewer/internal/scan"
+	"github.com/dns/photo-viewer/internal/tools"
 )
 
 func main() {
@@ -32,7 +32,7 @@ func main() {
 		os.Exit(1)
 	}
 
-	if _, err := exec.LookPath("exiftool"); err != nil {
+	if !tools.Exiftool() {
 		log.Fatal("Error: exiftool not found on PATH. It is required for metadata extraction.")
 	}
 
