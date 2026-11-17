@@ -66,7 +66,7 @@ func TestAPIInfoCachesMetadata(t *testing.T) {
 	}
 	defer func() { mediaInfoFn = orig }()
 
-	s := New(idx, store, nil, tmp)
+	s := New(idx, store, nil, tmp, filepath.Join(tmp, ".photo-viewer-trash"))
 	ts := httptest.NewServer(http.HandlerFunc(s.handleAPIInfo))
 	defer ts.Close()
 	get := func() infoJSON {

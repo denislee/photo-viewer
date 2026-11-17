@@ -63,7 +63,7 @@ func fixture(t *testing.T, n int) (*Server, *httptest.Server, func()) {
 	}
 	idx.ReconcileBatch(results)
 
-	s := New(idx, store, display, libRoot)
+	s := New(idx, store, display, libRoot, filepath.Join(libRoot, ".photo-viewer-trash"))
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", s.handleIndex)
 	mux.HandleFunc("/favorites", s.handleFavorites)
@@ -426,7 +426,7 @@ func apiFixture(t *testing.T) (*httptest.Server, func()) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	s := New(idx, store, nil, tmp)
+	s := New(idx, store, nil, tmp, filepath.Join(tmp, ".photo-viewer-trash"))
 	mux := http.NewServeMux()
 	mux.HandleFunc("/api/favorite", s.handleAPIFavorite)
 	ts := httptest.NewServer(mux)
@@ -520,7 +520,7 @@ func TestAPIFavoriteAcceptsSameOrigin(t *testing.T) {
 	}})
 	id := cache.ThumbIDFor(mediaPath)
 
-	s := New(idx, store, nil, tmp)
+	s := New(idx, store, nil, tmp, filepath.Join(tmp, ".photo-viewer-trash"))
 	mux := http.NewServeMux()
 	mux.HandleFunc("/api/favorite", s.handleAPIFavorite)
 	ts := httptest.NewServer(mux)
@@ -607,7 +607,7 @@ func TestGalleryPageScansSubdirsOnce(t *testing.T) {
 	}
 	idx.ReconcileBatch(results)
 
-	s := New(idx, store, nil, libRoot)
+	s := New(idx, store, nil, libRoot, filepath.Join(libRoot, ".photo-viewer-trash"))
 	mux := http.NewServeMux()
 	mux.HandleFunc("/dir", s.handleDir)
 	ts := httptest.NewServer(mux)
@@ -791,7 +791,7 @@ func trashFixture(t *testing.T, n int) (*httptest.Server, func()) {
 	}
 	idx.ReconcileBatch(results)
 
-	s := New(idx, store, nil, libRoot)
+	s := New(idx, store, nil, libRoot, filepath.Join(libRoot, ".photo-viewer-trash"))
 	mux := http.NewServeMux()
 	mux.HandleFunc("/trash", s.handleTrash)
 	ts := httptest.NewServer(mux)
@@ -919,7 +919,7 @@ func TestContentDispositionEscapesQuote(t *testing.T) {
 		ModTime: time.Now(),
 	}})
 
-	s := New(idx, store, nil, tmp)
+	s := New(idx, store, nil, tmp, filepath.Join(tmp, ".photo-viewer-trash"))
 	mux := http.NewServeMux()
 	mux.HandleFunc("/media/", s.handleMedia)
 	ts := httptest.NewServer(mux)
@@ -1144,7 +1144,7 @@ func TestVideoViewerPosterAndTranscodeFallback(t *testing.T) {
 		{Path: mp4Path, Type: scan.TypeVideo, Size: 10, ModTime: time.Now()},
 	})
 
-	s := New(idx, store, nil, tmp)
+	s := New(idx, store, nil, tmp, filepath.Join(tmp, ".photo-viewer-trash"))
 	mux := http.NewServeMux()
 	mux.HandleFunc("/view/", s.handleView)
 	ts := httptest.NewServer(mux)
@@ -1277,7 +1277,7 @@ func displayFixture(t *testing.T) (ts *httptest.Server, ids map[string]string, j
 	}
 	idx.ReconcileBatch(results)
 
-	s := New(idx, store, display, libRoot)
+	s := New(idx, store, display, libRoot, filepath.Join(libRoot, ".photo-viewer-trash"))
 	mux := http.NewServeMux()
 	mux.HandleFunc("/display/", s.handleDisplay)
 	ts = httptest.NewServer(mux)
@@ -1442,7 +1442,7 @@ func TestNoAbsolutePathsExposed(t *testing.T) {
 	}
 	idx.ReconcileBatch(results)
 
-	s := New(idx, store, nil, libRoot)
+	s := New(idx, store, nil, libRoot, filepath.Join(libRoot, ".photo-viewer-trash"))
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", s.handleIndex)
 	mux.HandleFunc("/dir", s.handleDir)
@@ -1495,5 +1495,75 @@ func TestNoAbsolutePathsExposed(t *testing.T) {
 	}
 	if code, _ := get("/dir?path="); code != http.StatusBadRequest {
 		t.Errorf("empty /dir path = %d, want 400", code)
+	}
+}
+
+// TestTrashUsesResolvedDirOnReadOnlyRoot covers W4-13: the web trash must list
+// the GUI's trash when the library root is read-only and cache.TrashDir fell
+// back to the cache dir.
+func TestTrashUsesResolvedDirOnReadOnlyRoot(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root ignores directory permission bits")
+	}
+	tmp := t.TempDir()
+	libRoot := filepath.Join(tmp, "lib")
+	cacheDir := filepath.Join(tmp, "cache")
+	if err := os.MkdirAll(libRoot, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(cacheDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(libRoot, "a.jpg"), []byte("libfile"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	src := filepath.Join(tmp, "src")
+	if err := os.MkdirAll(src, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(src, "b.jpg"), []byte("trashme"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := os.Chmod(libRoot, 0o555); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.Chmod(libRoot, 0o755) })
+
+	td, err := cache.TrashDir(libRoot, cacheDir)
+	if err != nil {
+		t.Fatalf("TrashDir: %v", err)
+	}
+	if want := filepath.Join(cacheDir, "trash"); td != want {
+		t.Fatalf("TrashDir = %q, want %q", td, want)
+	}
+	if _, err := cache.MoveToTrash(filepath.Join(src, "b.jpg"), td); err != nil {
+		t.Fatalf("MoveToTrash: %v", err)
+	}
+
+	idx, err := cache.Load(filepath.Join(tmp, "index.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer idx.Close()
+	store, err := cache.NewThumbStore(cacheDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	s := New(idx, store, nil, libRoot, td)
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/trash", nil)
+	s.handleTrash(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("GET /trash = %d, want 200", rec.Code)
+	}
+	body := rec.Body.String()
+	if !strings.Contains(body, "b.jpg") {
+		t.Errorf("trash page does not list b.jpg: %s", body)
+	}
+	if !strings.Contains(body, "1 items") {
+		t.Errorf("trash page does not show 1 item: %s", body)
 	}
 }

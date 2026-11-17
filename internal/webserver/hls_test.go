@@ -69,7 +69,7 @@ func hlsFixture(t *testing.T, videoName string, seconds int) (string, *httptest.
 		ModTime: info.ModTime(),
 	}})
 
-	s := New(idx, store, nil, libRoot)
+	s := New(idx, store, nil, libRoot, filepath.Join(libRoot, ".photo-viewer-trash"))
 	mux := http.NewServeMux()
 	mux.HandleFunc("/hls/", s.handleHLS)
 	ts := httptest.NewServer(mux)
@@ -198,7 +198,7 @@ func indexedVideoServer(t *testing.T, durationMs int64) (*Server, string, func()
 		ModTime:    info.ModTime(),
 		DurationMs: durationMs,
 	}})
-	s := New(idx, store, nil, libRoot)
+	s := New(idx, store, nil, libRoot, filepath.Join(libRoot, ".photo-viewer-trash"))
 	return s, cache.ThumbIDFor(vid), func() {
 		idx.Close()
 		os.RemoveAll(tmp)

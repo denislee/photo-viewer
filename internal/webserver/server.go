@@ -17,7 +17,6 @@ import (
 	"fmt"
 	"net"
 	"net/http"
-	"path/filepath"
 	"sync"
 	"time"
 
@@ -31,7 +30,7 @@ type Server struct {
 	store       *cache.ThumbStore
 	display     *cache.ThumbStore // larger renditions for /display; may be nil
 	libraryRoot string
-	trashDir    string // resolved once at New; "" when no writable location
+	trashDir    string // resolved by the caller (cache.TrashDir); "" when no trash
 
 	// trashMu guards the cached trash entry list. ListTrash re-scans the
 	// directory; cache it for a short window so /trash, /thumb/<trash id>,
@@ -85,15 +84,10 @@ type Server struct {
 // <cacheDir>/display that produces the larger browser-viewer renditions the
 // /display route serves for RAW/HEIC/TIFF/oversized originals (W-03); it may be
 // nil, in which case /display serves every original untouched (correct for
-// JPEG/PNG, no rendition for RAW/HEIC). Call Start to bind a port.
-func New(index *cache.Index, store, display *cache.ThumbStore, libraryRoot string) *Server {
-	trashDir := ""
-	if libraryRoot != "" {
-		// Match cache.TrashDir's preferred location; if the dir doesn't
-		// exist yet there's simply nothing in trash, and the sidebar entry
-		// renders with count 0.
-		trashDir = filepath.Join(libraryRoot, ".photo-viewer-trash")
-	}
+// JPEG/PNG, no rendition for RAW/HEIC). trashDir is the soft-delete directory
+// the caller resolved with cache.TrashDir (which falls back to <cacheDir>/trash
+// on a read-only library, W4-13); "" means no trash. Call Start to bind a port.
+func New(index *cache.Index, store, display *cache.ThumbStore, libraryRoot, trashDir string) *Server {
 	return &Server{index: index, store: store, display: display, libraryRoot: libraryRoot, trashDir: trashDir}
 }
 
