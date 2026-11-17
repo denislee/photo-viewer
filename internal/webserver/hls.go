@@ -13,7 +13,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
-	"sort"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -73,6 +73,10 @@ const (
 	// It bounds seg<k>.ts before any duration lookup, so a flood of distinct
 	// huge k values can't each claim a singleflight key and an hlsSem slot.
 	hlsMaxSegments = 10000
+
+	// ffmpeg -vf for transcodeSegment; the literal 1280 must equal hlsMaxW
+	// (TestHLSScaleFilterMatchesMaxW).
+	hlsScaleFilter = "scale='min(1280,iw)':-2"
 )
 
 // hlsDurationTTL and hlsDurationCacheCap bound the duration memo. The memo is a
@@ -292,7 +296,7 @@ func (s *Server) transcodeSegment(ctx context.Context, e cache.Entry, k int, dst
 		"-ss", strconv.FormatFloat(start, 'f', 3, 64),
 		"-t", strconv.FormatFloat(hlsSegDur, 'f', 3, 64),
 		"-i", e.Path,
-		"-vf", fmt.Sprintf("scale='min(%d,iw)':-2", hlsMaxW),
+		"-vf", hlsScaleFilter,
 		"-c:v", "libx264", "-preset", "veryfast", "-profile:v", "high",
 		"-level", "4.0", "-pix_fmt", "yuv420p",
 		"-c:a", "aac", "-ac", "2", "-b:a", "128k",
@@ -472,7 +476,7 @@ func sweepHLSDir(root string, maxBytes int64, tmpMaxAge time.Duration, now time.
 	// left in place — pruning them would race a concurrent transcode that has
 	// just MkdirAll'd its segment dir but not yet written the file, and an empty
 	// dir costs one inode (the whole tree is dropped on Rebuild regardless).
-	sort.Slice(segs, func(i, j int) bool { return segs[i].mod.Before(segs[j].mod) })
+	slices.SortFunc(segs, func(a, b segFile) int { return a.mod.Compare(b.mod) })
 	for _, f := range segs {
 		if total <= maxBytes {
 			break

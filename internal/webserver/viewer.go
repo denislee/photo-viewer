@@ -182,6 +182,6 @@ func (s *Server) renderViewer(w http.ResponseWriter,
 
 	// Inline the keybinding + favorite + info JS so the viewer doesn't
 	// require an external script file.
-	fmt.Fprint(w, viewerScript(prevHref, nextHref, vi.backHref))
+	writeViewerScript(w, prevHref, nextHref, vi.backHref)
 	fmt.Fprint(w, `</body></html>`)
 }

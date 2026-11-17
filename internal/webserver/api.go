@@ -1,6 +1,7 @@
 package webserver
 
 import (
+	"cmp"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -209,12 +210,12 @@ func (s *Server) handleAPIInfo(w http.ResponseWriter, r *http.Request) {
 		Type:         titleCase(e.Type.String()),
 		Size:         formatBytes(e.Size),
 		Modified:     e.ModTime.Local().Format("2006-01-02 15:04:05"),
-		Camera:       fallback(mi.Camera, "—"),
-		Lens:         fallback(mi.Lens, "—"),
-		Aperture:     fallback(mi.Aperture, "—"),
-		ShutterSpeed: fallback(mi.ShutterSpeed, "—"),
-		ISO:          fallback(mi.ISO, "—"),
-		FocalLength:  fallback(mi.FocalLength, "—"),
+		Camera:       cmp.Or(mi.Camera, "—"),
+		Lens:         cmp.Or(mi.Lens, "—"),
+		Aperture:     cmp.Or(mi.Aperture, "—"),
+		ShutterSpeed: cmp.Or(mi.ShutterSpeed, "—"),
+		ISO:          cmp.Or(mi.ISO, "—"),
+		FocalLength:  cmp.Or(mi.FocalLength, "—"),
 		Favorite:     e.Favorite,
 	}
 	if !mi.Created.IsZero() {
@@ -232,9 +233,7 @@ func (s *Server) handleAPIInfo(w http.ResponseWriter, r *http.Request) {
 // need a heavier decoder and aren't worth the cost for an info panel; they
 // get "—".
 func decodeDimensions(e cache.Entry) string {
-	switch e.Type {
-	case scan.TypePhoto:
-	default:
+	if e.Type != scan.TypePhoto {
 		return "—"
 	}
 	f, err := os.Open(e.Path)
@@ -247,15 +246,6 @@ func decodeDimensions(e cache.Entry) string {
 		return "—"
 	}
 	return fmt.Sprintf("%d × %d", cfg.Width, cfg.Height)
-}
-
-// fallback returns alt when s is empty. Keeps info-panel cells readable
-// when an exif tag isn't present.
-func fallback(s, alt string) string {
-	if s == "" {
-		return alt
-	}
-	return s
 }
 
 // titleCase upper-cases the first byte of s. Trivial helper that mirrors

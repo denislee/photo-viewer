@@ -1,12 +1,13 @@
 package webserver
 
 import (
+	"cmp"
 	"fmt"
 	"html"
 	"net/http"
 	"path/filepath"
 	"regexp"
-	"sort"
+	"slices"
 	"strconv"
 	"time"
 
@@ -223,11 +224,11 @@ func (s *Server) renderSubdirChips(w http.ResponseWriter, vi viewInfo, children 
 	}
 	// Heaviest subfolders first so the user sees the chunkiest drill-downs
 	// without scrolling the chip strip.
-	sort.Slice(chips, func(i, j int) bool {
-		if chips[i].count != chips[j].count {
-			return chips[i].count > chips[j].count
+	slices.SortFunc(chips, func(a, b chip) int {
+		if c := cmp.Compare(b.count, a.count); c != 0 {
+			return c
 		}
-		return chips[i].name < chips[j].name
+		return cmp.Compare(a.name, b.name)
 	})
 	fmt.Fprint(w, `<div class="chips">`)
 	for _, c := range chips {
