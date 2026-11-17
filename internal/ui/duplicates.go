@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"image"
 	"image/color"
+	"log"
 	"os"
 	"sync"
 
@@ -40,6 +41,11 @@ type DuplicatesView struct {
 	// to deleter (or removeOne) so tests can exercise the view without
 	// a Controller.
 	batchDeleter func(paths []string) error
+	// removeEntries is the index-side bulk removal used by pruneMissing to
+	// drop vanished rows in one transaction. Nil falls back to
+	// idx.RemoveEntries; tests swap it in to count how many batches a prune
+	// actually issues (U3-05).
+	removeEntries func(paths []string) error
 
 	mu      sync.Mutex
 	hashing bool
@@ -290,7 +296,16 @@ func (d *DuplicatesView) hashAndScan(ctx context.Context, gen int) {
 // have at least two surviving copies. This is what prevents phantom groups
 // composed of stale rows from sticking around after files are deleted or
 // moved outside the app.
+//
+// The vanished rows are collected across every group and dropped with a
+// single batched RemoveEntries transaction instead of one commit per vanished
+// file (U3-05), so pruning a large stale result set costs one round-trip.
 func (d *DuplicatesView) pruneMissing(groups []cache.DuplicateGroup) []cache.DuplicateGroup {
+	remove := d.idx.RemoveEntries
+	if d.removeEntries != nil {
+		remove = d.removeEntries
+	}
+	var gone []string
 	out := make([]cache.DuplicateGroup, 0, len(groups))
 	for _, g := range groups {
 		live := make([]cache.Entry, 0, len(g.Entries))
@@ -301,7 +316,7 @@ func (d *DuplicatesView) pruneMissing(groups []cache.DuplicateGroup) []cache.Dup
 				continue
 			}
 			if os.IsNotExist(err) {
-				_ = d.idx.RemoveEntry(e.Path)
+				gone = append(gone, e.Path)
 				if d.store != nil {
 					d.store.Forget(cache.ThumbIDFor(e.Path))
 				}
@@ -314,6 +329,11 @@ func (d *DuplicatesView) pruneMissing(groups []cache.DuplicateGroup) []cache.Dup
 		if len(live) >= 2 {
 			g.Entries = live
 			out = append(out, g)
+		}
+	}
+	if len(gone) > 0 {
+		if err := remove(gone); err != nil {
+			log.Printf("duplicates: prune %d missing row(s): %v", len(gone), err)
 		}
 	}
 	return out
@@ -554,7 +574,14 @@ func (d *DuplicatesView) Layout(gtx layout.Context, th *Theme) layout.Dimensions
 			d.groupClicks[i] = &widget.Clickable{}
 		}
 	}
-	for i, c := range d.groupClicks {
+	// Only rows laid out last frame can have received a click, so drain just
+	// that window (+1 for a partly visible trailing row) instead of every
+	// group's Clickable each frame (U4-13). With thousands of groups the old
+	// full sweep burned a gesture update per row per frame.
+	first := max(d.groupList.Position.First, 0)
+	last := min(first+d.groupList.Position.Count+1, len(d.groupClicks))
+	for i := first; i < last; i++ {
+		c := d.groupClicks[i]
 		if c.Clicked(gtx) {
 			d.mu.Lock()
 			if d.selected != i {
