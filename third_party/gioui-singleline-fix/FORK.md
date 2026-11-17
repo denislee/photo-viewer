@@ -1,6 +1,6 @@
 # Local Gio fork
 
-This directory is an unmodified copy of upstream Gio plus one patch. `go.mod`
+This directory is an unmodified copy of upstream Gio plus two patches. `go.mod`
 points `gioui.org` here with a `replace` directive.
 
 - **Base:** `gioui.org v0.9.0`, commit `3f4f8ba7c1fae349f97621f1f623ef47e4da3e25`
@@ -11,15 +11,22 @@ points `gioui.org` here with a `replace` directive.
   `LineWrapper` turns that into `fixed.I(maxWidth)`, which overflows `fixed.Int26_6` into a
   small negative width, so every single-line editor wraps each glyph onto its own line. The
   patch caps the width at `1 << 24`.
+- **Patch:** [`texture-retention.patch`](texture-retention.patch), which touches only
+  `gpu/caches.go`. Upstream's `textureCache.frame` releases any texture not used in the
+  previous frame, so closing the full-screen viewer re-uploads every visible grid thumbnail in
+  one frame, and scrolling back re-uploads rows that just left the screen. The patch keeps
+  unused textures for up to 120 frames, and only while the unused ones total at most 128 MB of
+  pixels, releasing the least recently used first. This is a performance patch, not a fix, so
+  it can be dropped at any time; see G6 in `PLAN.md`.
 
 ## Checking the fork
 
-The fork should differ from the base only by the patch. To confirm:
+The fork should differ from the base only by the patches. To confirm:
 
 ```sh
 go mod download gioui.org@v0.9.0   # run outside this module, e.g. in a temp dir
 diff -ru "$(go env GOMODCACHE)/gioui.org@v0.9.0" third_party/gioui-singleline-fix \
-  -x .builds -x .gitattributes -x FORK.md -x singleline-fix.patch
+  -x .builds -x .gitattributes -x FORK.md -x singleline-fix.patch -x texture-retention.patch
 ```
 
 ## Can the fork be dropped?
@@ -33,4 +40,8 @@ As of 2026-09-28, upstream `v0.10.2` still sets `maxWidth = math.MaxInt` in
    Check that single-line editors, such as the settings fields, render on one line, then
    delete this directory.
 3. If it hasn't, rebase the fork: copy the new release in, apply
-   `patch -p1 < singleline-fix.patch`, and update the base line above.
+   `patch -p1 < singleline-fix.patch` and `patch -p1 < texture-retention.patch`, and update
+   the base line above.
+
+If the singleline fix lands upstream, the texture-retention patch alone doesn't justify
+keeping the fork: drop it along with the fork.
