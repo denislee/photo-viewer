@@ -3,10 +3,12 @@ package ui
 import (
 	"bytes"
 	"context"
+	"errors"
 	"io/fs"
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -496,6 +498,200 @@ func TestProcessBatchWorkerPoolCapped(t *testing.T) {
 	}
 	if done, max := v.progress.load(); done != 2*nFiles || max != 2*nFiles {
 		t.Errorf("progress = %d/%d, want %d/%d", done, max, 2*nFiles, 2*nFiles)
+	}
+}
+
+// stubSyncDir swaps the Inbox fsync hook for the duration of the test and
+// restores it on cleanup.
+func stubSyncDir(t *testing.T, fn func(string) error) {
+	t.Helper()
+	orig := syncDir
+	syncDir = fn
+	t.Cleanup(func() { syncDir = orig })
+}
+
+// TestCopyToInboxSyncsOnceThenRemovesSources is the U4-05 regression: copying a
+// batch with deleteSrc used to fsync the Inbox directory once per file. It must
+// fsync exactly once, after every copy is in place and before any source is
+// removed.
+func TestCopyToInboxSyncsOnceThenRemovesSources(t *testing.T) {
+	const nFiles = 5
+	srcDir := t.TempDir()
+	inbox := t.TempDir()
+	var files []string
+	for i := range nFiles {
+		p := filepath.Join(srcDir, "IMG_000"+strconv.Itoa(i)+".jpg")
+		if err := os.WriteFile(p, []byte("bytes-"+strconv.Itoa(i)), 0o644); err != nil {
+			t.Fatalf("write %s: %v", p, err)
+		}
+		files = append(files, p)
+	}
+
+	var syncCalls atomic.Int64
+	sourcesExistedAtSync := true
+	stubSyncDir(t, func(dir string) error {
+		syncCalls.Add(1)
+		for _, p := range files {
+			if _, err := os.Stat(p); err != nil {
+				sourcesExistedAtSync = false
+			}
+		}
+		return nil
+	})
+
+	v := &ImportView{}
+	batch := v.copyToInbox(context.Background(), files, inbox, true)
+
+	if len(batch) != nFiles {
+		t.Fatalf("len(batch) = %d, want %d", len(batch), nFiles)
+	}
+	if got := syncCalls.Load(); got != 1 {
+		t.Errorf("syncDir calls = %d, want 1", got)
+	}
+	if !sourcesExistedAtSync {
+		t.Error("a source was removed before the Inbox fsync")
+	}
+	for _, p := range files {
+		if _, err := os.Stat(p); !os.IsNotExist(err) {
+			t.Errorf("source %s should be gone, stat err = %v", p, err)
+		}
+	}
+	for _, p := range batch {
+		if _, err := os.Stat(p); err != nil {
+			t.Errorf("batch copy %s should exist: %v", p, err)
+		}
+	}
+}
+
+// TestCopyToInboxKeepsSourcesWhenSyncFails pins the safety rule: if the Inbox
+// fsync fails, no source is deleted — the copies are still returned in the
+// batch, so nothing is lost either way.
+func TestCopyToInboxKeepsSourcesWhenSyncFails(t *testing.T) {
+	srcDir := t.TempDir()
+	inbox := t.TempDir()
+	var files []string
+	for i := range 3 {
+		p := filepath.Join(srcDir, "IMG_000"+strconv.Itoa(i)+".jpg")
+		if err := os.WriteFile(p, []byte("x"), 0o644); err != nil {
+			t.Fatalf("write %s: %v", p, err)
+		}
+		files = append(files, p)
+	}
+
+	stubSyncDir(t, func(string) error { return errors.New("eio") })
+
+	v := &ImportView{}
+	batch := v.copyToInbox(context.Background(), files, inbox, true)
+
+	for _, p := range files {
+		if _, err := os.Stat(p); err != nil {
+			t.Errorf("source %s should be kept after a failed fsync: %v", p, err)
+		}
+	}
+	if e := atomic.LoadInt64(&v.statErrors); e != 1 {
+		t.Errorf("statErrors = %d, want 1", e)
+	}
+	if len(batch) != 3 {
+		t.Errorf("len(batch) = %d, want 3", len(batch))
+	}
+}
+
+// TestCopyToInboxNoDeleteNoSync pins that a non-deleting copy never fsyncs the
+// Inbox directory and always leaves the sources alone.
+func TestCopyToInboxNoDeleteNoSync(t *testing.T) {
+	srcDir := t.TempDir()
+	inbox := t.TempDir()
+	var files []string
+	for i := range 3 {
+		p := filepath.Join(srcDir, "IMG_000"+strconv.Itoa(i)+".jpg")
+		if err := os.WriteFile(p, []byte("x"), 0o644); err != nil {
+			t.Fatalf("write %s: %v", p, err)
+		}
+		files = append(files, p)
+	}
+
+	var syncCalls atomic.Int64
+	stubSyncDir(t, func(string) error {
+		syncCalls.Add(1)
+		return nil
+	})
+
+	v := &ImportView{}
+	batch := v.copyToInbox(context.Background(), files, inbox, false)
+
+	if got := syncCalls.Load(); got != 0 {
+		t.Errorf("syncDir calls = %d, want 0", got)
+	}
+	if len(batch) != len(files) {
+		t.Errorf("len(batch) = %d, want %d", len(batch), len(files))
+	}
+	for _, p := range files {
+		if _, err := os.Stat(p); err != nil {
+			t.Errorf("source %s should still exist: %v", p, err)
+		}
+	}
+}
+
+// TestStartClickDoesNotBlockOnSlowInboxProbe is the U3-06 regression: the Start
+// click used to run the inbox walk on the frame goroutine, so a media-free tree
+// or a slow mount froze the UI. The click must return at once, show
+// "Checking…" (starting == true), ignore further clicks while the probe is in
+// flight, and then settle on the "nothing to import" explanation.
+func TestStartClickDoesNotBlockOnSlowInboxProbe(t *testing.T) {
+	resetConfigForTest(t)
+	inbox := t.TempDir()
+	outbox := t.TempDir()
+	UpdateConfig(func(c *Config) {
+		c.InboxDir = inbox
+		c.OutboxDir = outbox
+	})
+
+	release := make(chan struct{})
+	origProbe := inboxProbe
+	inboxProbe = func(string) bool {
+		<-release
+		return false
+	}
+	t.Cleanup(func() { inboxProbe = origProbe })
+
+	v := NewImportView(func() {})
+
+	start := time.Now()
+	v.onStartClicked()
+	if elapsed := time.Since(start); elapsed > 100*time.Millisecond {
+		t.Fatalf("onStartClicked blocked for %v, want < 100ms", elapsed)
+	}
+	v.mu.Lock()
+	starting := v.starting
+	v.mu.Unlock()
+	if !starting {
+		t.Fatal("starting = false right after a click, want true while the probe runs")
+	}
+
+	start = time.Now()
+	v.onStartClicked()
+	if elapsed := time.Since(start); elapsed > 100*time.Millisecond {
+		t.Fatalf("second onStartClicked blocked for %v, want it ignored", elapsed)
+	}
+
+	close(release)
+
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		v.mu.Lock()
+		starting = v.starting
+		msg := v.statusMsg
+		v.mu.Unlock()
+		if !starting {
+			if !strings.Contains(msg, "Nothing to import") {
+				t.Fatalf("statusMsg = %q, want it to mention \"Nothing to import\"", msg)
+			}
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("starting stayed true for 5s after the probe was released")
+		}
+		time.Sleep(5 * time.Millisecond)
 	}
 }
 

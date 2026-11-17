@@ -28,7 +28,14 @@ import (
 var (
 	importDateProber   = scan.GetOldestMediaDate
 	importSetMediaDate = scan.SetMediaDate
+	// syncDir fsyncs a directory so its entries are durable; indirected so
+	// tests can count Inbox fsyncs.
+	syncDir = fsutil.SyncDir
 )
+
+// inboxProbe reports whether the Inbox holds at least one importable file,
+// indirected so tests can stall the probe.
+var inboxProbe = inboxHasFiles
 
 // ImportView is the modal "import media" overlay. It mirrors the Fyne
 // Controller.runImportFromDirs flow:
@@ -52,6 +59,7 @@ type ImportView struct {
 	statSkipped  int64
 	statErrors   int64
 	running      bool
+	starting     bool // a Start click's background inbox probe is in flight.
 	finished     bool // at least one import has completed since the overlay opened
 	deleteSource bool
 	cancelImport context.CancelFunc
@@ -291,19 +299,8 @@ func (v *ImportView) Layout(gtx layout.Context, th *Theme) layout.Dimensions {
 	if v.closeBtn.Clicked(gtx) {
 		v.Close()
 	}
-	if v.startBtn.Clicked(gtx) && !v.runningSnapshot() {
-		// Probe the inbox once, cheaply: inboxHasFiles short-circuits on the
-		// first media file instead of counting every leftover (U-10 — this runs
-		// on the frame goroutine). Only meaningful once Inbox is configured; both
-		// callees gate on that first. Thread the result into both so a Start on
-		// an empty inbox doesn't walk it twice.
-		cfg := GetConfig()
-		inboxHas := cfg.InboxDir != "" && inboxHasFiles(cfg.InboxDir)
-		if v.haveSomethingToImport(cfg, inboxHas) {
-			v.startImport()
-		} else {
-			v.explainCantStart(cfg, inboxHas)
-		}
+	if v.startBtn.Clicked(gtx) {
+		v.onStartClicked()
 	}
 	if v.cancelBtn.Clicked(gtx) {
 		v.mu.Lock()
@@ -389,6 +386,7 @@ func (v *ImportView) Layout(gtx layout.Context, th *Theme) layout.Dimensions {
 	skipped := atomic.LoadInt64(&v.statSkipped)
 	errs := atomic.LoadInt64(&v.statErrors)
 	running := v.running
+	starting := v.starting
 	finished := v.finished
 	sdShown := v.sdShown
 	sdError := v.sdError
@@ -440,7 +438,7 @@ func (v *ImportView) Layout(gtx layout.Context, th *Theme) layout.Dimensions {
 			}),
 			layout.Rigid(layout.Spacer{Height: unit.Dp(8)}.Layout),
 			layout.Rigid(func(gtx layout.Context) layout.Dimensions {
-				return v.layoutButtons(gtx, th, running)
+				return v.layoutButtons(gtx, th, running, starting)
 			}),
 			layout.Rigid(layout.Spacer{Height: unit.Dp(10)}.Layout),
 			layout.Flexed(1, func(gtx layout.Context) layout.Dimensions {
@@ -550,19 +548,21 @@ func (v *ImportView) layoutSources(gtx layout.Context, th *Theme, dirs, zips []s
 	return layout.Flex{Axis: layout.Vertical}.Layout(gtx, rows...)
 }
 
-func (v *ImportView) layoutButtons(gtx layout.Context, th *Theme, running bool) layout.Dimensions {
+func (v *ImportView) layoutButtons(gtx layout.Context, th *Theme, running, starting bool) layout.Dimensions {
 	startLabel := "Start Import"
 	if running {
 		startLabel = "Running…"
+	} else if starting {
+		startLabel = "Checking…"
 	}
 	return layout.Flex{Axis: layout.Horizontal, Alignment: layout.Middle}.Layout(gtx,
 		layout.Rigid(material.Button(th.Theme, &v.closeBtn, "Close (esc)").Layout),
 		layout.Rigid(layout.Spacer{Width: unit.Dp(6)}.Layout),
 		layout.Rigid(func(gtx layout.Context) layout.Dimensions {
 			b := material.Button(th.Theme, &v.startBtn, startLabel)
-			if running {
-				// Visually subdue the button while a run is in flight; the
-				// click handler in Layout already gates on runningSnapshot.
+			if running || starting {
+				// Visually subdue the button while a run or a Start click's
+				// probe is in flight; onStartClicked gates the click.
 				b.Background = th.CellBG
 				b.Color = th.Muted
 			}
@@ -714,26 +714,61 @@ func (v *ImportView) commitAddPath(asDir bool) {
 	addSources(dst, text)
 }
 
-func (v *ImportView) runningSnapshot() bool {
+// onStartClicked handles a Start Import click without blocking the frame
+// goroutine: the inbox probe (a WalkDir that can cover a whole media-free tree
+// or a slow mount) and importDirsProblem's EvalSymlinks run on a goroutine, and
+// the button shows "Checking…" meanwhile (U3-06). A click while a probe or an
+// import is in flight is ignored.
+func (v *ImportView) onStartClicked() {
 	v.mu.Lock()
-	defer v.mu.Unlock()
-	return v.running
+	if v.running || v.starting {
+		v.mu.Unlock()
+		return
+	}
+	v.starting = true
+	v.mu.Unlock()
+	if v.invalidate != nil {
+		v.invalidate()
+	}
+	go func() {
+		v.requestStart()
+		v.mu.Lock()
+		v.starting = false
+		v.mu.Unlock()
+		if v.invalidate != nil {
+			v.invalidate()
+		}
+	}()
+}
+
+// requestStart decides a Start click: resolve importDirsProblem once, probe the
+// inbox only when it is configured and valid, then start or explain why not.
+func (v *ImportView) requestStart() {
+	cfg := GetConfig()
+	problem := importDirsProblem(cfg.InboxDir, cfg.OutboxDir)
+	inboxHas := cfg.InboxDir != "" && cfg.OutboxDir != "" && problem == "" && inboxProbe(cfg.InboxDir)
+	if v.haveSomethingToImport(cfg, problem, inboxHas) {
+		v.startImport(cfg)
+	} else {
+		v.explainCantStart(cfg, problem, inboxHas)
+	}
 }
 
 // explainCantStart logs (and posts to the status line) why a Start Import
 // click had no effect — usually because inbox/outbox are not configured, or
 // no sources have been added. Without this feedback the button looks broken.
-// cfg and inboxHas are computed once by the Start-click handler and threaded in
-// so this never re-reads config or re-walks the inbox (U-10).
-func (v *ImportView) explainCantStart(cfg Config, inboxHas bool) {
+// cfg, problem and inboxHas are computed once by the Start-click handler and
+// threaded in so this never re-reads config, re-runs importDirsProblem or
+// re-walks the inbox (U3-06).
+func (v *ImportView) explainCantStart(cfg Config, problem string, inboxHas bool) {
 	if cfg.InboxDir == "" || cfg.OutboxDir == "" {
 		msg := "Set Inbox and Outbox directories in Settings first (config: " + configPath() + ")."
 		v.setStatus(msg)
 		v.appendLog("[ERROR] " + msg)
 		return
 	}
-	if p := importDirsProblem(cfg.InboxDir, cfg.OutboxDir); p != "" {
-		msg := p + " Fix it in Settings before importing."
+	if problem != "" {
+		msg := problem + " Fix it in Settings before importing."
 		v.setStatus(msg)
 		v.appendLog("[ERROR] " + msg)
 		return
@@ -750,13 +785,14 @@ func (v *ImportView) explainCantStart(cfg Config, inboxHas bool) {
 }
 
 // haveSomethingToImport reports whether a Start Import click has anything to
-// act on. cfg and inboxHas are supplied by the caller (which already probed the
-// inbox once via inboxHasFiles) so the ≥1-file decision costs no extra walk.
-func (v *ImportView) haveSomethingToImport(cfg Config, inboxHas bool) bool {
+// act on. problem and inboxHas are supplied by the caller (which already ran
+// importDirsProblem and probed the inbox once) so the decision costs no extra
+// walk or symlink resolution.
+func (v *ImportView) haveSomethingToImport(cfg Config, problem string, inboxHas bool) bool {
 	if cfg.InboxDir == "" || cfg.OutboxDir == "" {
 		return false
 	}
-	if importDirsProblem(cfg.InboxDir, cfg.OutboxDir) != "" {
+	if problem != "" {
 		return false
 	}
 	v.mu.Lock()
@@ -785,18 +821,9 @@ func inboxHasFiles(dir string) bool {
 
 // startImport kicks off a background goroutine that runs the same three-phase
 // flow as the Fyne import. Updates progressDone/progressMax/log atomically;
-// the UI polls them at frame time.
-func (v *ImportView) startImport() {
-	cfg := GetConfig()
-	if cfg.InboxDir == "" || cfg.OutboxDir == "" {
-		v.appendLog("[ERROR] InboxDir/OutboxDir not configured.")
-		return
-	}
-	if p := importDirsProblem(cfg.InboxDir, cfg.OutboxDir); p != "" {
-		v.appendLog("[ERROR] " + p)
-		return
-	}
-
+// the UI polls them at frame time. cfg is the already-validated config from the
+// Start-click handler (requestStart), so no inbox/outbox checks run here.
+func (v *ImportView) startImport(cfg Config) {
 	v.mu.Lock()
 	if v.running {
 		v.mu.Unlock()
@@ -978,36 +1005,7 @@ func (v *ImportView) runImport(ctx context.Context, cfg Config, importDirs, zipF
 			// runs once per file (success or copy error) so the bar climbs
 			// monotonically to len(files); processBatch re-owns the bar below.
 			v.setProgress(0, int64(len(files)))
-			var batch []string
-			for _, srcFile := range files {
-				v.waitIfPaused()
-				if ctx.Err() != nil {
-					break
-				}
-				dest, err := fsutil.CopyUnique(ctx, srcFile, cfg.InboxDir, filepath.Base(srcFile))
-				if err != nil {
-					atomic.AddInt64(&v.statErrors, 1)
-					v.appendLog("[ERROR] Copy failed for " + srcFile + ": " + err.Error())
-					v.bumpProgress()
-					continue
-				}
-				batch = append(batch, dest)
-				if deleteSrc {
-					// CopyUnique fsynced the Inbox copy's data; fsync the Inbox
-					// directory too so its entry is durable before we delete the
-					// source (the only other copy). On sync failure, keep the
-					// source rather than risk zero copies — the Inbox copy is
-					// already queued in batch, so no bytes are lost either way.
-					if err := fsutil.SyncDir(filepath.Dir(dest)); err != nil {
-						atomic.AddInt64(&v.statErrors, 1)
-						v.appendLog("[ERROR] Failed to fsync Inbox before deleting source " + srcFile + ": " + err.Error())
-					} else if err := os.Remove(srcFile); err != nil {
-						atomic.AddInt64(&v.statErrors, 1)
-						v.appendLog("[ERROR] Failed to delete source " + srcFile + ": " + err.Error())
-					}
-				}
-				v.bumpProgress()
-			}
+			batch := v.copyToInbox(ctx, files, cfg.InboxDir, deleteSrc)
 			if len(batch) == 0 {
 				continue
 			}
@@ -1034,6 +1032,50 @@ func (v *ImportView) runImport(ctx context.Context, cfg Config, importDirs, zipF
 		v.appendLog(summary)
 		v.setStatus(summary)
 	}
+}
+
+// copyToInbox copies files into inboxDir and returns the Inbox copies. With
+// deleteSrc the sources are removed only after ONE fsync of the Inbox directory
+// makes every copy's entry durable (U4-05: it used to fsync the same directory
+// once per file). The tail also runs after a cancel, for the files already
+// copied; if the fsync fails every source is kept — the copies are already in
+// the batch, so nothing is lost either way.
+func (v *ImportView) copyToInbox(ctx context.Context, files []string, inboxDir string, deleteSrc bool) []string {
+	var batch []string
+	var copied []string
+	for _, srcFile := range files {
+		v.waitIfPaused()
+		if ctx.Err() != nil {
+			break
+		}
+		dest, err := fsutil.CopyUnique(ctx, srcFile, inboxDir, filepath.Base(srcFile))
+		if err != nil {
+			atomic.AddInt64(&v.statErrors, 1)
+			v.appendLog("[ERROR] Copy failed for " + srcFile + ": " + err.Error())
+			v.bumpProgress()
+			continue
+		}
+		batch = append(batch, dest)
+		copied = append(copied, srcFile)
+		v.bumpProgress()
+	}
+	if deleteSrc && len(copied) > 0 {
+		// CopyUnique fsynced each Inbox copy's data; one fsync of the Inbox
+		// directory here makes every copy's entry durable before any source
+		// (the only other copy) is removed.
+		if err := syncDir(inboxDir); err != nil {
+			atomic.AddInt64(&v.statErrors, 1)
+			v.appendLog("[ERROR] Failed to fsync Inbox before deleting sources: " + err.Error() + " (sources kept)")
+		} else {
+			for _, srcFile := range copied {
+				if err := os.Remove(srcFile); err != nil {
+					atomic.AddInt64(&v.statErrors, 1)
+					v.appendLog("[ERROR] Failed to delete source " + srcFile + ": " + err.Error())
+				}
+			}
+		}
+	}
+	return batch
 }
 
 // processBatch is the Fyne flow: read EXIF, group by base name, move into the
