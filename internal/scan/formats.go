@@ -86,28 +86,9 @@ var extensions = map[string]MediaType{
 	".mpeg": TypeVideo,
 }
 
+// DetectType classifies path by its extension alone (case-insensitive).
+// strings.ToLower returns an already-lowercase ASCII extension without
+// allocating, and a missing key yields TypeUnknown, the zero value.
 func DetectType(path string) MediaType {
-	ext := filepath.Ext(path)
-	if ext == "" {
-		return TypeUnknown
-	}
-
-	var lowerExt string
-	hasUpper := false
-	for i := 0; i < len(ext); i++ {
-		if ext[i] >= 'A' && ext[i] <= 'Z' {
-			hasUpper = true
-			break
-		}
-	}
-	if hasUpper {
-		lowerExt = strings.ToLower(ext)
-	} else {
-		lowerExt = ext
-	}
-
-	if t, ok := extensions[lowerExt]; ok {
-		return t
-	}
-	return TypeUnknown
+	return extensions[strings.ToLower(filepath.Ext(path))]
 }
