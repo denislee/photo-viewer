@@ -9,10 +9,10 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
-	"slices"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -239,7 +239,7 @@ func (c *Controller) DisplayStore() *cache.ThumbStore {
 		// and its generation shares the store's CPU / external-tool bound.
 		if c.store == nil {
 			c.display, _ = cache.NewDisplayStore(c.cacheDir)
-		} else if d, err := c.store.Tier("display", cache.DisplaySize); err == nil {
+		} else if d, err := c.store.Tier(cache.DisplayDir, cache.DisplaySize); err == nil {
 			c.display = d
 		}
 	})

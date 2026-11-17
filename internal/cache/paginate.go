@@ -137,21 +137,12 @@ func (i *Index) ListPage(v View, offset, limit int) []Entry {
 	return out
 }
 
-// Neighbors returns (prev, next) entries adjacent to path within v, plus a
-// 1-based position and total. prev or next are nil at the list edges; pos is
-// 0 when path isn't part of v.
-//
-// It self-counts the view total via CountView, then defers to
-// NeighborsWithTotal. Callers that already hold the view total (e.g. the web
-// server's cachedCountView, generation-checked with a short TTL) should call
-// NeighborsWithTotal directly so a navigation burst amortizes the O(view) count
-// and each keystroke only pays the bounded position probe.
-func (i *Index) Neighbors(v View, path string) (prev, next *Entry, pos, total int) {
-	return i.NeighborsWithTotal(v, path, i.CountView(v))
-}
-
-// NeighborsWithTotal is Neighbors with the view total supplied by the caller
-// (it is returned verbatim, never recomputed). Only the bounded work runs here:
+// NeighborsWithTotal returns (prev, next) entries adjacent to path within v,
+// plus a 1-based position; prev or next are nil at the list edges and pos is 0
+// when path isn't part of v. The view total is supplied by the caller (the web
+// server's cachedCountView, generation-checked with a short TTL) and returned
+// verbatim, never recomputed, so a navigation burst amortizes the O(view)
+// count. Only the bounded work runs here:
 //
 //   - prev/next use the path index directly — "biggest path strictly less than
 //     X within the view" for prev, "smallest strictly greater" for next — so

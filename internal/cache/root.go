@@ -2,7 +2,6 @@ package cache
 
 import (
 	"crypto/sha1"
-	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -107,5 +106,3 @@ func writable(dir string) bool {
 	os.Remove(probe)
 	return true
 }
-
-var ErrNoRoot = errors.New("no library root configured")

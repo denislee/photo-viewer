@@ -33,6 +33,9 @@ const LargeThumbDir = "thumbs-512"
 // smaller over the wire.
 const DisplaySize = 2048
 
+// DisplayDir is the cache subdirectory of the DisplaySize tier.
+const DisplayDir = "display"
+
 // thumbGenTimeout bounds a single thumbnail generation. Each of the four
 // thumbnailers shells out under exec.CommandContext, but nothing ever fed
 // them a deadline — so a hung ffmpeg/exiftool/heif-convert would block its
@@ -92,7 +95,7 @@ func NewThumbStore(cacheDir string) (*ThumbStore, error) {
 // originals for free (W-03). Wipe <cacheDir>/display alongside thumbs/ and hls/
 // on a rebuild.
 func NewDisplayStore(cacheDir string) (*ThumbStore, error) {
-	return newStore(cacheDir, "display", DisplaySize)
+	return newStore(cacheDir, DisplayDir, DisplaySize)
 }
 
 // newStore builds a store rooted at <cacheDir>/<subdir> whose generated

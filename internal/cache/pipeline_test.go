@@ -58,9 +58,6 @@ func TestPipeline(t *testing.T) {
 		}
 	}
 
-	if err := idx.Save(); err != nil {
-		t.Fatalf("save: %v", err)
-	}
 	if _, err := os.Stat(dbPath); err != nil {
 		t.Fatalf("index.db missing: %v", err)
 	}

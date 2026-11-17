@@ -363,11 +363,6 @@ func Load(dbPath string) (*Index, error) {
 	return &Index{db: db}, nil
 }
 
-// Save is a no-op for SQLite as transactions handle persistence.
-func (i *Index) Save() error {
-	return nil
-}
-
 // reconcileChunkSize is the maximum number of rows per transaction in
 // ReconcileBatch. Large rebuild scans accumulate tens of thousands of files;
 // keeping each transaction bounded lets concurrent readers (the UI sidebar,
@@ -538,11 +533,6 @@ func dirRange(dir string) (string, string) {
 // no-temp-b-tree ordering and the `path = dir` case in one place.
 func (i *Index) ListDir(dir string) []Entry {
 	return i.ListPage(View{Kind: "dir", Dir: dir, Filter: "All", ShowRAW: true}, 0, 0)
-}
-
-// CountDir returns the number of entries under the specific directory prefix.
-func (i *Index) CountDir(dir string) int {
-	return i.CountDirFiltered(dir, "All", true)
 }
 
 // CountDirFiltered returns the number of entries under dir that match the

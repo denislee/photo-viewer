@@ -144,9 +144,6 @@ func main() {
 	// No more entries: let the thumb workers drain, then finalise the index.
 	close(thumbJobs)
 	wg.Wait()
-	if err := idx.Save(); err != nil {
-		log.Printf("pv-scan: save index: %v", err)
-	}
 	fmt.Println(prog.line())
 
 	// Drain any face jobs still queued and wait for the workers to exit.

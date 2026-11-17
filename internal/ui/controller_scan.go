@@ -112,7 +112,7 @@ func (c *Controller) cachedTotalRows(idx *cache.Index, root string) int {
 	if root == c.idxStatusRoot && now.Before(c.idxStatusExpiry) {
 		return c.idxStatusRows
 	}
-	n := idx.CountDir(root)
+	n := idx.CountDirFiltered(root, "All", true)
 	c.idxStatusRows = n
 	c.idxStatusRoot = root
 	c.idxStatusExpiry = now.Add(indexStatusTTL)
@@ -169,7 +169,7 @@ func (c *Controller) Rebuild() error {
 	// wipe failure here is best-effort: log and press on to the rescan rather
 	// than aborting with a cleared index and no rebuild in flight. Each dir may
 	// also simply not exist if the webserver never ran (RemoveAll no-ops then).
-	for _, sub := range []string{"hls", "display", cache.LargeThumbDir} {
+	for _, sub := range []string{"hls", cache.DisplayDir, cache.LargeThumbDir} {
 		if err := os.RemoveAll(filepath.Join(c.cacheDir, sub)); err != nil {
 			log.Printf("rebuild: clear %s cache: %v", sub, err)
 		}
@@ -303,12 +303,6 @@ func (c *Controller) scanInto(ctx context.Context, dir string) {
 		}
 	}
 	flush()
-	if err := c.index.Save(); err != nil {
-		log.Printf("save index: %v", err)
-		c.mu.Lock()
-		c.scanLastErr = err.Error()
-		c.mu.Unlock()
-	}
 }
 
 // WarmUp iterates over every entry in the index and ensures its thumbnail

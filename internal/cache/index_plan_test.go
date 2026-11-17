@@ -417,7 +417,7 @@ func TestCountDirFiltered(t *testing.T) {
 			t.Errorf("CountDirFiltered(%q, %q, %v) = %d, want %d", tc.dir, tc.filter, tc.showRAW, got, tc.want)
 		}
 	}
-	if got := idx.CountDir("/lib"); got != 5 {
-		t.Errorf("CountDir(/lib) = %d, want 5", got)
+	if got := idx.CountDirFiltered("/lib", "All", true); got != 5 {
+		t.Errorf("CountDirFiltered(/lib) = %d, want 5", got)
 	}
 }
