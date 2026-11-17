@@ -7,11 +7,17 @@
   var from     = grid.dataset.from || '';
   var loading  = false;
   var selected = -1;
+  var gPending = false;
 
-  function cells() { return grid.querySelectorAll('a.cell'); }
+  function makeStar() {
+    var star = document.createElement('span');
+    star.className = 'star';
+    star.title = 'Favorite';
+    star.textContent = '★';
+    return star;
+  }
 
-  function setSelected(i) {
-    var all = cells();
+  function setSelected(all, i) {
     if (all.length === 0) return;
     if (i < 0) i = 0;
     if (i >= all.length) i = all.length - 1;
@@ -22,8 +28,7 @@
     all[i].focus({preventScroll: true});
   }
 
-  function colsPerRow() {
-    var all = cells();
+  function colsPerRow(all) {
     if (all.length < 2) return 1;
     var firstTop = all[0].getBoundingClientRect().top;
     for (var i = 1; i < all.length; i++) {
@@ -53,11 +58,7 @@
       a.appendChild(badge);
     }
     if (item.favorite) {
-      var star = document.createElement('span');
-      star.className = 'star';
-      star.title = 'Favorite';
-      star.textContent = '★';
-      a.appendChild(star);
+      a.appendChild(makeStar());
     }
 
     var name = document.createElement('span');
@@ -108,19 +109,21 @@
   document.addEventListener('keydown', function(e){
     if (e.target && /^(input|textarea|select)$/i.test(e.target.tagName)) return;
     if (e.ctrlKey || e.metaKey || e.altKey) return;
-    var all = cells();
+    // One live HTMLCollection per keypress instead of three querySelectorAll
+    // walks; the grid holds only cells.
+    var all = grid.children;
     if (all.length === 0) return;
-    var cols = colsPerRow();
+    var cols = colsPerRow(all);
     var key = e.key;
-    if (key === 'j' || key === 'ArrowDown') { setSelected((selected < 0 ? 0 : selected + cols)); e.preventDefault(); return; }
-    if (key === 'k' || key === 'ArrowUp')   { setSelected((selected < 0 ? 0 : selected - cols)); e.preventDefault(); return; }
-    if (key === 'l' || key === 'ArrowRight'){ setSelected((selected < 0 ? 0 : selected + 1));    e.preventDefault(); return; }
-    if (key === 'h' || key === 'ArrowLeft') { setSelected((selected < 0 ? 0 : selected - 1));    e.preventDefault(); return; }
-    if (key === 'G') { setSelected(all.length - 1); e.preventDefault(); return; }
+    if (key === 'j' || key === 'ArrowDown') { setSelected(all, (selected < 0 ? 0 : selected + cols)); e.preventDefault(); return; }
+    if (key === 'k' || key === 'ArrowUp')   { setSelected(all, (selected < 0 ? 0 : selected - cols)); e.preventDefault(); return; }
+    if (key === 'l' || key === 'ArrowRight'){ setSelected(all, (selected < 0 ? 0 : selected + 1));    e.preventDefault(); return; }
+    if (key === 'h' || key === 'ArrowLeft') { setSelected(all, (selected < 0 ? 0 : selected - 1));    e.preventDefault(); return; }
+    if (key === 'G') { setSelected(all, all.length - 1); e.preventDefault(); return; }
     if (key === 'g') {
-      if (window._gPending) { setSelected(0); window._gPending = false; e.preventDefault(); return; }
-      window._gPending = true;
-      setTimeout(function(){ window._gPending = false; }, 600);
+      if (gPending) { setSelected(all, 0); gPending = false; e.preventDefault(); return; }
+      gPending = true;
+      setTimeout(function(){ gPending = false; }, 600);
       return;
     }
     if (key === 'Enter' && selected >= 0) { all[selected].click(); e.preventDefault(); return; }
@@ -145,10 +148,7 @@
         var star = cell.querySelector('.star');
         if (d.favorite) {
           if (!star) {
-            star = document.createElement('span');
-            star.className = 'star';
-            star.title = 'Favorite';
-            star.textContent = '★';
+            star = makeStar();
             cell.appendChild(star);
           }
         } else if (star) {

@@ -46,11 +46,10 @@
           border-radius: 999px; color: #ddd; text-decoration: none; font-size: 12px; }
   .chip:hover { background: #243046; }
   .chip-count { color: #888; font-size: 11px; }
-  .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(180px, 1fr)); gap: 8px; padding: 12px;
-          content-visibility: auto; contain-intrinsic-size: 1px 600px; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(180px, 1fr)); gap: 8px; padding: 12px; }
   .cell { position: relative; display: flex; flex-direction: column; align-items: center;
           background: #1c1c1c; border-radius: 6px; overflow: hidden; text-decoration: none; color: inherit;
-          contain: content; }
+          contain: content; content-visibility: auto; contain-intrinsic-size: auto 210px; }
   .cell img { width: 100%; aspect-ratio: 1 / 1; object-fit: cover; background: #000; display: block; }
   .cell .name { width: 100%; padding: 6px 8px; font-size: 11px; overflow: hidden;
                 text-overflow: ellipsis; white-space: nowrap; }
@@ -82,8 +81,7 @@
             opacity: 0.35; transition: opacity 0.15s; }
   .varrow:hover, .varrow:focus { opacity: 1; background: linear-gradient(to right, rgba(0,0,0,0.4), transparent); }
   .vprev { left: 0; justify-content: flex-start; padding-left: 16px; }
-  .vnext { right: 0; justify-content: flex-end; padding-right: 16px;
-           background: linear-gradient(to left, rgba(0,0,0,0.0), transparent); }
+  .vnext { right: 0; justify-content: flex-end; padding-right: 16px; }
   .vnext:hover, .vnext:focus { background: linear-gradient(to left, rgba(0,0,0,0.4), transparent); }
 
   .vnote { position: absolute; bottom: 14px; left: 50%; transform: translateX(-50%); z-index: 6;
