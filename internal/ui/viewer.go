@@ -337,6 +337,15 @@ func (v *Viewer) Close() {
 	if p := v.player.Load(); p != nil {
 		p.Stop()
 	}
+	// Stop released the player's frame buffer; drop our op too, or it keeps
+	// the window-sized RGBA (8–33 MB) alive until the next video (G4-06).
+	v.dropVideoFrame()
+}
+
+// dropVideoFrame forgets the last video frame handed to Gio. The op aliases
+// the player's frame buffer, so it must go whenever playback stops.
+func (v *Viewer) dropVideoFrame() {
+	v.lastVideoOp, v.lastVideoPath, v.lastVideoSize = paint.ImageOp{}, "", image.Point{}
 }
 
 // stopVideoIfRunning halts mpv playback whenever the current entry isn't a
@@ -349,7 +358,7 @@ func (v *Viewer) stopVideoIfRunning() {
 	}
 	if v.Index < 0 || v.Index >= len(v.entries) || v.entries[v.Index].Type != scan.TypeVideo {
 		p.Stop()
-		v.lastVideoOp, v.lastVideoPath = paint.ImageOp{}, ""
+		v.dropVideoFrame()
 	}
 }
 
