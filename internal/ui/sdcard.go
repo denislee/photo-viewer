@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os/exec"
 	"strings"
+	"sync"
 )
 
 // blockDevice mirrors the relevant subset of `lsblk -J` output. lsblk reports
@@ -72,13 +73,17 @@ func (d removableDevice) Display() string {
 	return strings.Join(parts, "  ")
 }
 
+// lsblkPath resolves lsblk once; the watcher may call listRemovableDevices on every uevent burst or poll tick (U4-10).
+var lsblkPath = sync.OnceValues(func() (string, error) { return exec.LookPath("lsblk") })
+
 // listRemovableDevices returns every partition (or whole-disk filesystem) that
 // looks removable: rm=1, hotplug=1, or transport in {usb, mmc, sd, usbas}.
 func listRemovableDevices() ([]removableDevice, error) {
-	if _, err := exec.LookPath("lsblk"); err != nil {
+	path, err := lsblkPath()
+	if err != nil {
 		return nil, fmt.Errorf("lsblk not found: %w", err)
 	}
-	cmd := exec.Command("lsblk", "-J", "-o", "NAME,PATH,SIZE,TYPE,FSTYPE,MOUNTPOINT,LABEL,VENDOR,MODEL,RM,HOTPLUG,TRAN")
+	cmd := exec.Command(path, "-J", "-o", "NAME,PATH,SIZE,TYPE,FSTYPE,MOUNTPOINT,LABEL,VENDOR,MODEL,RM,HOTPLUG,TRAN")
 	out, err := cmd.Output()
 	if err != nil {
 		return nil, fmt.Errorf("lsblk: %w", err)

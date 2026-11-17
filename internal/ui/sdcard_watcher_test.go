@@ -98,6 +98,7 @@ func TestWatcherPollsWithoutEvents(t *testing.T) {
 	w.Start()
 	defer w.Stop()
 
+	waitFor(t, "the startup seed", func() bool { return f.calls.Load() >= 1 })
 	f.set("/dev/sdc1")
 	waitFor(t, "a polled prompt", func() bool { _, ok := w.Pending(); return ok })
 }
@@ -114,12 +115,13 @@ func TestWatcherFallsBackWhenEventsStop(t *testing.T) {
 	defer w.Stop()
 
 	close(events)
+	waitFor(t, "the startup seed", func() bool { return f.calls.Load() >= 1 })
 	f.set("/dev/sdd1")
 	waitFor(t, "a polled prompt after the event source closed", func() bool { _, ok := w.Pending(); return ok })
 }
 
 // TestWatcherToggleReseeds: devices already attached when auto-detect is
-// turned on don't prompt, and while it is off events cost nothing.
+// turned on don't prompt, and while it is off the watcher never forks lsblk.
 func TestWatcherToggleReseeds(t *testing.T) {
 	f := &fakeDevices{}
 	events := make(chan struct{}, 1)
@@ -131,12 +133,12 @@ func TestWatcherToggleReseeds(t *testing.T) {
 	f.set("/dev/sde1") // plugged in while auto-detect is off
 	events <- struct{}{}
 	time.Sleep(30 * time.Millisecond)
-	if n := f.calls.Load(); n != 1 {
-		t.Fatalf("lsblk ran %d times while disabled, want 1 (the startup seed)", n)
+	if n := f.calls.Load(); n != 0 {
+		t.Fatalf("lsblk ran %d times while disabled, want 0 (no seed while auto-detect is off)", n)
 	}
 
 	enabled.Store(true)
-	waitFor(t, "the re-seed scan", func() bool { return f.calls.Load() == 2 })
+	waitFor(t, "the re-seed scan", func() bool { return f.calls.Load() == 1 })
 	time.Sleep(20 * time.Millisecond)
 	if d, ok := w.Pending(); ok {
 		t.Fatalf("already-attached %s prompted after enabling", d.Path)
@@ -147,6 +149,27 @@ func TestWatcherToggleReseeds(t *testing.T) {
 	waitFor(t, "a prompt for the card inserted after enabling", func() bool { _, ok := w.Pending(); return ok })
 	if d, _ := w.Pending(); d.Path != "/dev/sdf1" {
 		t.Errorf("pending = %q, want /dev/sdf1", d.Path)
+	}
+}
+
+// TestWatcherStartDisabledSkipsSeed: with auto-detect off at Start the watcher
+// must not fork lsblk at all — the seed is skipped and ticks only watch the
+// toggle (U4-10).
+func TestWatcherStartDisabledSkipsSeed(t *testing.T) {
+	f := &fakeDevices{}
+	f.set("/dev/sdg1")
+	never := make(chan struct{})
+	var enabled atomic.Bool
+	w := newTestWatcher(f, func(<-chan struct{}) (<-chan struct{}, error) { return never, nil }, &enabled)
+	w.Start()
+	defer w.Stop()
+
+	if n := f.calls.Load(); n != 0 {
+		t.Fatalf("lsblk ran %d times right after Start, want 0 (no seed while auto-detect is off)", n)
+	}
+	time.Sleep(30 * time.Millisecond)
+	if n := f.calls.Load(); n != 0 {
+		t.Fatalf("lsblk ran %d times after ticking disabled, want 0 (no seed while auto-detect is off)", n)
 	}
 }
 

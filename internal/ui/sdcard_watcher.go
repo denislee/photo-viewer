@@ -62,9 +62,10 @@ func NewSDCardWatcher(invalidate func()) *SDCardWatcher {
 	}
 }
 
-// Start kicks off the watcher goroutine. Seeds `known` with devices currently
-// attached so the watcher only fires on subsequent insertions. Safe to call
-// more than once — extra calls are no-ops.
+// Start kicks off the watcher goroutine, which first seeds `known` with the
+// devices currently attached (when auto-detect is on) so the watcher only
+// fires on subsequent insertions. Safe to call more than once — extra calls
+// are no-ops.
 func (w *SDCardWatcher) Start() {
 	w.mu.Lock()
 	if w.running {
@@ -76,15 +77,6 @@ func (w *SDCardWatcher) Start() {
 	stop := w.stopCh
 	w.mu.Unlock()
 
-	if devs, err := w.list(); err == nil {
-		w.mu.Lock()
-		for _, d := range devs {
-			w.known[d.Path] = true
-		}
-		w.prevEnabled = true // seeding done; the next scan may enqueue
-		w.mu.Unlock()
-	}
-
 	events, err := w.events(stop)
 	poll := err != nil
 	if poll {
@@ -92,6 +84,13 @@ func (w *SDCardWatcher) Start() {
 	}
 
 	go func() {
+		// Seed here, not in Start, so the lsblk fork never delays the first
+		// frame, and only when auto-detect is on: with it off (the default)
+		// the seed is useless, and the first tick after it is enabled
+		// re-seeds anyway (prevEnabled stays false) (U4-10).
+		if w.enabled() {
+			w.seed()
+		}
 		t := time.NewTicker(w.interval)
 		defer t.Stop()
 		var settled <-chan time.Time
@@ -116,6 +115,21 @@ func (w *SDCardWatcher) Start() {
 			}
 		}
 	}()
+}
+
+// seed records the devices attached right now as known, so only later
+// insertions prompt.
+func (w *SDCardWatcher) seed() {
+	devs, err := w.list()
+	if err != nil {
+		return
+	}
+	w.mu.Lock()
+	for _, d := range devs {
+		w.known[d.Path] = true
+	}
+	w.prevEnabled = true // seeding done; the next scan may enqueue
+	w.mu.Unlock()
 }
 
 // Stop terminates the watcher goroutine and its event source.
