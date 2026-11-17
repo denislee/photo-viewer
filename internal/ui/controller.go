@@ -10,7 +10,9 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"slices"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/dns/photo-viewer/internal/cache"
@@ -132,6 +134,9 @@ type Controller struct {
 	refreshRunning bool
 	refreshPending bool
 	refreshDir     string
+	// refreshCalls counts refreshFromIndex runs. A test seam: it lets tests
+	// assert that a scan flush which changed no rows schedules no refresh.
+	refreshCalls atomic.Uint64
 
 	// trashCount mirrors what cache.TrashStats would report. Seeded lazily
 	// (on first read) so startup doesn't pay for a directory walk; bumped
@@ -501,6 +506,7 @@ func (c *Controller) scheduleRefresh(dir string) {
 }
 
 func (c *Controller) refreshFromIndex(dir string) {
+	c.refreshCalls.Add(1)
 	// Snapshot the controller state this refresh reads once, up front, so the
 	// year-preview branch below can scope its query to a treeDir consistent with
 	// the yearPreviewDirs read in the same lock.
@@ -540,22 +546,24 @@ func (c *Controller) refreshFromIndex(dir string) {
 		entries = c.index.ListDir(dir)
 	}
 
-	var filtered []cache.Entry
-	for _, e := range entries {
-		if !showRAW && e.Type == scan.TypeRAW {
-			continue
-		}
-		switch filter {
-		case "Photos":
-			if e.Type == scan.TypeVideo {
-				continue
+	// Filter in place: every branch above returns a freshly allocated slice,
+	// so reusing its backing array avoids a second full-size copy per refresh
+	// (~9 MB at 100k entries). "All" with RAW shown keeps everything, so the
+	// pass is skipped outright.
+	filtered := entries
+	if filter != "All" || !showRAW {
+		filtered = slices.DeleteFunc(entries, func(e cache.Entry) bool {
+			if !showRAW && e.Type == scan.TypeRAW {
+				return true
 			}
-		case "Videos":
-			if e.Type != scan.TypeVideo {
-				continue
+			switch filter {
+			case "Photos":
+				return e.Type == scan.TypeVideo
+			case "Videos":
+				return e.Type != scan.TypeVideo
 			}
-		}
-		filtered = append(filtered, e)
+			return false
+		})
 	}
 	sortEntries(filtered, sortMode)
 

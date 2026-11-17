@@ -375,6 +375,15 @@ func (i *Index) Save() error {
 // fsync, at the cost of one extra fsync per chunk.
 const reconcileChunkSize = 5000
 
+// reconcileInsertSQL is the scan upsert. The trailing WHERE skips the UPDATE
+// arm entirely when the incoming row matches the stored one (C4-01): an
+// incremental rescan of an unchanged library would otherwise rewrite every row,
+// maintaining four indexes and writing ~10 MB of WAL per 100k files while
+// holding the write lock. The guard lists exactly the columns the SET writes;
+// an incoming duration_ms of 0 never counts as a change because the CASE below
+// preserves the stored value in that case. The hash/media_date CASEs only fire
+// on a size or mtime change, which the guard also admits, so semantics are
+// unchanged — a skipped row reports 0 changes, which ReconcileBatchChanged sums.
 const reconcileInsertSQL = `INSERT INTO entries (path, type, size, mtime, thumb_id, year, duration_ms) VALUES (?, ?, ?, ?, ?, ?, ?)
 	ON CONFLICT(path) DO UPDATE SET
 		type = excluded.type,
@@ -393,25 +402,44 @@ const reconcileInsertSQL = `INSERT INTO entries (path, type, size, mtime, thumb_
 			THEN NULL ELSE entries.content_hash END,
 		media_date = CASE
 			WHEN entries.size != excluded.size OR entries.mtime != excluded.mtime
-			THEN NULL ELSE entries.media_date END`
+			THEN NULL ELSE entries.media_date END
+	WHERE entries.size IS NOT excluded.size OR entries.mtime IS NOT excluded.mtime
+		OR entries.type IS NOT excluded.type OR entries.year IS NOT excluded.year
+		OR entries.thumb_id IS NOT excluded.thumb_id
+		OR (excluded.duration_ms > 0 AND entries.duration_ms IS NOT excluded.duration_ms)`
 
 // ReconcileBatch inserts or updates a slice of scan results, chunking the
 // work into bounded transactions so readers aren't blocked for the whole
 // run on very large scans.
 func (i *Index) ReconcileBatch(results []scan.Result) []Entry {
-
 	out := make([]Entry, 0, len(results))
-	if len(results) == 0 {
-		return out
-	}
+	i.reconcile(results, &out)
+	return out
+}
 
+// ReconcileBatchChanged is ReconcileBatch for callers that only need to know
+// whether the index changed: it returns the number of rows actually inserted
+// or updated. Unchanged rows are skipped by the upsert's WHERE guard and count
+// 0, so an incremental rescan of an untouched library reports 0 and the caller
+// can skip its grid refresh (C4-01).
+func (i *Index) ReconcileBatchChanged(results []scan.Result) int {
+	return i.reconcile(results, nil)
+}
+
+// reconcile runs the chunked upsert, appending committed entries to out when it
+// is non-nil, and returns the summed changed-row count of committed chunks.
+func (i *Index) reconcile(results []scan.Result, out *[]Entry) int {
+	changed := 0
 	for start := 0; start < len(results); start += reconcileChunkSize {
 		end := min(start+reconcileChunkSize, len(results))
-		if err := i.reconcileChunk(results[start:end], &out); err != nil {
+		n, err := i.reconcileChunk(results[start:end], out)
+		if err != nil {
 			log.Printf("cache: ReconcileBatch: %v", err)
+			continue
 		}
+		changed += n
 	}
-	return out
+	return changed
 }
 
 // reconcileStatement lazily prepares the long-lived reconcile upsert. The
@@ -431,18 +459,19 @@ func (i *Index) reconcileStatement() (*sql.Stmt, error) {
 	return s, nil
 }
 
-// reconcileChunk writes one bounded transaction's worth of results and
-// appends the corresponding Entries to out. Returns an error if the
-// statement prepare, transaction begin, any row exec, or commit fails;
-// entries are only appended to out when the transaction commits successfully.
-func (i *Index) reconcileChunk(chunk []scan.Result, out *[]Entry) error {
+// reconcileChunk writes one bounded transaction's worth of results, appends
+// the corresponding Entries to out (when non-nil) and returns how many rows the
+// upsert actually inserted or updated. Returns an error if the statement
+// prepare, transaction begin, any row exec, or commit fails; entries are only
+// appended to out, and the count only returned, when the transaction commits.
+func (i *Index) reconcileChunk(chunk []scan.Result, out *[]Entry) (int, error) {
 	stmt, err := i.reconcileStatement()
 	if err != nil {
-		return err
+		return 0, err
 	}
 	tx, err := i.db.Begin()
 	if err != nil {
-		return err
+		return 0, err
 	}
 	defer tx.Rollback()
 
@@ -454,7 +483,11 @@ func (i *Index) reconcileChunk(chunk []scan.Result, out *[]Entry) error {
 
 	// Build entries locally; only append to *out after a successful Commit
 	// so the caller never sees entries that weren't actually persisted.
-	local := make([]Entry, 0, len(chunk))
+	var local []Entry
+	if out != nil {
+		local = make([]Entry, 0, len(chunk))
+	}
+	changed := 0
 	for _, r := range chunk {
 		e := Entry{
 			Path:       r.Path,
@@ -468,16 +501,24 @@ func (i *Index) reconcileChunk(chunk []scan.Result, out *[]Entry) error {
 		if y := pathYear(r.Path); y != 0 {
 			yearArg = y
 		}
-		if _, err := txStmt.Exec(e.Path, e.Type, e.Size, e.ModTime.Unix(), e.ThumbID, yearArg, e.DurationMs); err != nil {
-			return err
+		res, err := txStmt.Exec(e.Path, e.Type, e.Size, e.ModTime.Unix(), e.ThumbID, yearArg, e.DurationMs)
+		if err != nil {
+			return 0, err
 		}
-		local = append(local, e)
+		if n, err := res.RowsAffected(); err == nil {
+			changed += int(n)
+		}
+		if out != nil {
+			local = append(local, e)
+		}
 	}
 	if err := tx.Commit(); err != nil {
-		return err
+		return 0, err
 	}
-	*out = append(*out, local...)
-	return nil
+	if out != nil {
+		*out = append(*out, local...)
+	}
+	return changed, nil
 }
 
 // dirRange returns the [lower, upper) string range that captures every path

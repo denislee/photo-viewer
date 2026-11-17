@@ -273,7 +273,7 @@ func (c *Controller) scanInto(ctx context.Context, dir string) {
 			return
 		}
 		n := len(batch)
-		c.index.ReconcileBatch(batch)
+		changed := c.index.ReconcileBatchChanged(batch)
 		batch = batch[:0]
 		flushAt = time.Now().Add(time.Second)
 		c.mu.Lock()
@@ -282,7 +282,13 @@ func (c *Controller) scanInto(ctx context.Context, dir string) {
 		if proc != nil {
 			proc.AddDone(int64(n))
 		}
-		c.scheduleRefresh(c.activeDir())
+		// An incremental rescan of an unchanged library reconciles every file
+		// but changes no row (the upsert's WHERE guard skips them); refreshing
+		// the grid then would re-run ListDir + the sidebar counts for nothing,
+		// back to back for the whole scan (C4-01).
+		if changed > 0 {
+			c.scheduleRefresh(c.activeDir())
+		}
 	}
 	for r := range results {
 		if proc != nil {
