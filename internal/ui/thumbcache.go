@@ -66,6 +66,14 @@ const (
 	tierLarge
 )
 
+// thumbKey is the thumbnail cache key: a path plus the tier it is cached at.
+// A struct key avoids the path+"\x00large" string allocation that every
+// GetLarge and Prefetch call used to pay (G4-07).
+type thumbKey struct {
+	path string
+	tier thumbTier
+}
+
 type thumbPrio uint8
 
 const (
@@ -76,7 +84,7 @@ const (
 // thumbJob is one queued thumbnail request.
 type thumbJob struct {
 	e    cache.Entry
-	key  string
+	key  thumbKey
 	tier thumbTier
 	prio thumbPrio
 }
@@ -170,12 +178,12 @@ type thumbCache struct {
 
 type thumbCacheShard struct {
 	mu      sync.Mutex
-	entries map[string]*list.Element // value: *thumbEntry, list ordered MRU→LRU
+	entries map[thumbKey]*list.Element // value: *thumbEntry, list ordered MRU→LRU
 	lru     *list.List
 }
 
 type thumbEntry struct {
-	key    string
+	key    thumbKey
 	ready  bool
 	op     paint.ImageOp
 	size   image.Point
@@ -209,7 +217,7 @@ func newThumbCache(store *cache.ThumbStore, invalidate func()) *thumbCache {
 	}
 	tc.capPerShard.Store((thumbCacheCapacity + thumbCacheShards - 1) / thumbCacheShards)
 	for i := range tc.shards {
-		tc.shards[i].entries = make(map[string]*list.Element)
+		tc.shards[i].entries = make(map[thumbKey]*list.Element)
 		tc.shards[i].lru = list.New()
 	}
 	for range max(runtime.NumCPU()/2, 2) {
@@ -238,25 +246,24 @@ func (tc *thumbCache) EnsureCapacity(working int) {
 	tc.capPerShard.Store(per)
 }
 
-// shardFor returns the shard responsible for key. FNV-1a is cheap and
-// produces good distribution for filesystem-path strings, which share long
-// directory prefixes that a naive hash would bunch into one shard.
-func (tc *thumbCache) shardFor(key string) *thumbCacheShard {
+// shardFor returns the shard responsible for key. FNV-1a over the path is
+// cheap and produces good distribution for filesystem-path strings, which
+// share long directory prefixes that a naive hash would bunch into one shard;
+// the tier is then mixed in so the two tiers of one path land independently.
+func (tc *thumbCache) shardFor(key thumbKey) *thumbCacheShard {
 	var h uint32 = 2166136261
-	for i := 0; i < len(key); i++ {
-		h ^= uint32(key[i])
+	for i := 0; i < len(key.path); i++ {
+		h ^= uint32(key.path[i])
 		h *= 16777619
 	}
+	h ^= uint32(key.tier)
+	h *= 16777619
 	return &tc.shards[h%thumbCacheShards]
 }
 
-// tierKey is the cache key for path at tier. The small tier uses the bare
-// path.
-func tierKey(path string, tier thumbTier) string {
-	if tier == tierLarge {
-		return path + "\x00large"
-	}
-	return path
+// tierKey is the cache key for path at tier.
+func tierKey(path string, tier thumbTier) thumbKey {
+	return thumbKey{path, tier}
 }
 
 func (tc *thumbCache) storeFor(tier thumbTier) *cache.ThumbStore {
@@ -395,7 +402,7 @@ func (tc *thumbCache) release(j thumbJob) {
 // (creating it if missing). Caller must hold sh.mu. When the entry is
 // already at the front the MoveToFront call is skipped — common on the
 // hot path where the same cell is re-fetched every frame.
-func (tc *thumbCache) touchOrCreate(sh *thumbCacheShard, key string) *thumbEntry {
+func (tc *thumbCache) touchOrCreate(sh *thumbCacheShard, key thumbKey) *thumbEntry {
 	if el, ok := sh.entries[key]; ok {
 		if sh.lru.Front() != el {
 			sh.lru.MoveToFront(el)
