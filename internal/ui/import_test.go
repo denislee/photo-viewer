@@ -24,7 +24,8 @@ import (
 func TestImportCopyProgressInstrumentation(t *testing.T) {
 	const nFiles = 7
 	var invalidations int
-	v := &ImportView{invalidate: func() { invalidations++ }}
+	v := &ImportView{}
+	v.invalidate = func() { invalidations++ }
 
 	v.setProgress(0, int64(nFiles))
 	if done, max := v.progress.load(); max != nFiles {

@@ -9,6 +9,8 @@ import (
 	"gioui.org/op/clip"
 	"gioui.org/op/paint"
 	"gioui.org/unit"
+	"gioui.org/widget"
+	"gioui.org/widget/material"
 )
 
 // This file holds the plumbing the three modal task views (Import, Organize,
@@ -190,4 +192,140 @@ func (s *procScope) detachLocked(keep func() bool) {
 // the view mutex.
 func (s *procScope) currentLocked() *Process {
 	return s.proc
+}
+
+// taskView is the plumbing the Import and Organize modals share: the view
+// mutex, the status line, the log buffer + widget, the progress model, the
+// live-Process slot and the invalidate callback, plus the methods both views
+// used to hand-copy (U4-06). Each view embeds it, so v.mu, v.statusMsg, v.scope
+// … resolve to these fields. mu is THE view mutex: it guards statusMsg and
+// scope.proc (procScope's "caller holds the view mutex" contract) as well as the
+// embedding view's own fields, so there is exactly one lock and no ordering to
+// get wrong.
+type taskView struct {
+	mu         sync.Mutex
+	statusMsg  string
+	log        taskLog
+	progress   progressModel
+	scope      procScope
+	invalidate func()
+	logList    widget.List
+}
+
+// initTaskView wires the shared plumbing: the invalidate callback and the log
+// list's vertical, pinned-to-bottom layout.
+func (t *taskView) initTaskView(invalidate func()) {
+	t.invalidate = invalidate
+	t.logList.Axis = layout.Vertical
+	// Stick the log to the bottom so newly-appended lines stay visible. Once
+	// the user manually scrolls up, BeforeEnd flips and Gio stops auto-pinning.
+	t.logList.ScrollToEnd = true
+}
+
+// SetProcessRegistry wires the view to the main-screen process bar so each run
+// publishes progress, pause, and cancel controls outside the modal.
+func (t *taskView) SetProcessRegistry(r *ProcessRegistry) { t.scope.reg = r }
+
+// currentProc returns the live process for this view, or nil when none is
+// registered (e.g. tests). Safe to call from any goroutine.
+func (t *taskView) currentProc() *Process {
+	t.mu.Lock()
+	proc := t.scope.currentLocked()
+	t.mu.Unlock()
+	return proc
+}
+
+// setStatus replaces the status line shown above the progress bar. Safe to
+// call from any goroutine; the UI redraws on the next frame. When a process is
+// live the status rides the registry's coalescer and returns early instead of
+// also invalidating directly — that early return is what fixes U3-03 for
+// Organize, whose copy used to fire both paths.
+func (t *taskView) setStatus(msg string) {
+	t.mu.Lock()
+	t.statusMsg = msg
+	proc := t.scope.currentLocked()
+	t.mu.Unlock()
+	if proc != nil {
+		// SetStatus notifies through the registry coalescer; skip the direct
+		// invalidate to avoid a redundant second wakeup for the same change.
+		proc.SetStatus(msg)
+		return
+	}
+	t.scheduleInvalidate()
+}
+
+// waitIfPaused blocks while the running task is paused via the process bar.
+// Workers call this at loop boundaries; if no process is registered (e.g.
+// tests) it's a no-op.
+func (t *taskView) waitIfPaused() {
+	if proc := t.currentProc(); proc != nil {
+		proc.Wait()
+	}
+}
+
+// scheduleInvalidate wakes the Gio frame loop through the process registry's
+// ~30Hz coalescer when one is wired up. The task views' per-file paths
+// (appendLog, setProgress, bumpProgress) fire once per file — thousands/sec
+// during a same-device rename — so calling v.invalidate directly from them
+// would peg a core repainting a log that scrolls far faster than the eye can
+// read. The registry coalesces to ~30Hz with a guaranteed trailing flush, so the
+// final log line / progress value still lands. Falls back to the raw invalidate
+// when no registry is set (e.g. tests, or one-shot messages before a run
+// starts) — those paths aren't in a per-file storm.
+func (t *taskView) scheduleInvalidate() {
+	if t.scope.reg != nil {
+		t.scope.reg.notify()
+		return
+	}
+	if t.invalidate != nil {
+		t.invalidate()
+	}
+}
+
+// appendLog adds one line to the bounded log and asks for a repaint.
+func (t *taskView) appendLog(msg string) {
+	t.log.append(msg)
+	t.scheduleInvalidate()
+}
+
+// setProgress stores an absolute done/max pair and drives the process bar. With
+// no live process it falls back to the coalesced invalidate.
+func (t *taskView) setProgress(done, max int64) {
+	t.progress.set(done, max)
+	if proc := t.currentProc(); proc != nil {
+		// proc.SetDone/SetTotal already route through the registry's ~30Hz
+		// coalescer, so no direct v.invalidate() here — that would re-add the
+		// per-file storm this initiative removes.
+		proc.SetDone(done)
+		proc.SetTotal(max)
+		return
+	}
+	t.scheduleInvalidate()
+}
+
+// bumpProgress advances done by one and drives the process bar.
+func (t *taskView) bumpProgress() {
+	t.progress.bump()
+	if proc := t.currentProc(); proc != nil {
+		// proc.AddDone already coalesces the redraw through the registry; a
+		// direct v.invalidate() per file is exactly the storm we're killing.
+		proc.AddDone(1)
+		return
+	}
+	t.scheduleInvalidate()
+}
+
+// layoutLog paints the shared log pane: a CellBG fill, then the scrolled lines
+// at the caller's font size (Import 14sp, Organize 12sp).
+func (t *taskView) layoutLog(gtx layout.Context, th *Theme, lines []string, size unit.Sp) layout.Dimensions {
+	drawBackground(gtx, th.CellBG)
+	pad := layout.Inset{Top: unit.Dp(6), Bottom: unit.Dp(6), Left: unit.Dp(8), Right: unit.Dp(8)}
+	return pad.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
+		return t.logList.Layout(gtx, len(lines), func(gtx layout.Context, i int) layout.Dimensions {
+			lbl := material.Label(th.Theme, size, lines[i])
+			lbl.Color = th.Foreground
+			lbl.MaxLines = 1
+			return lbl.Layout(gtx)
+		})
+	})
 }

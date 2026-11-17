@@ -4,7 +4,6 @@ import (
 	"archive/zip"
 	"context"
 	"fmt"
-	"image"
 	"io/fs"
 	"os"
 	"os/exec"
@@ -17,8 +16,6 @@ import (
 	"time"
 
 	"gioui.org/layout"
-	"gioui.org/op/clip"
-	"gioui.org/op/paint"
 	"gioui.org/unit"
 	"gioui.org/widget"
 	"gioui.org/widget/material"
@@ -40,10 +37,11 @@ type ImportView struct {
 	Open    bool
 	OnClose func()
 
-	mu           sync.Mutex
+	// Shared task plumbing (taskui.go): mu, statusMsg, log, progress, scope, invalidate, logList.
+	taskView
+
 	importDirs   []string
 	zipFiles     []string
-	statusMsg    string
 	statMoved    int64
 	statSkipped  int64
 	statErrors   int64
@@ -51,11 +49,6 @@ type ImportView struct {
 	finished     bool // at least one import has completed since the overlay opened
 	deleteSource bool
 	cancelImport context.CancelFunc
-
-	// Shared modal plumbing (see taskui.go): the bounded worker→UI log buffer
-	// and the done/max progress state that used to be hand-rolled fields here.
-	log      taskLog
-	progress progressModel
 
 	// SD-card picker state. sdShown toggles the inline device list under the
 	// add row; sdDevices is the last lsblk snapshot; sdError surfaces a
@@ -81,14 +74,6 @@ type ImportView struct {
 	sdHideBtn     widget.Clickable
 	deleteCheck   widget.Bool
 	addPathEditor widget.Editor
-	logList       widget.List
-
-	invalidate func()
-
-	// scope lets the import publish progress to the main-screen process bar so
-	// the user can pause / resume / cancel without opening the modal. It owns the
-	// registry pointer and the live-Process slot (see taskui.go).
-	scope procScope
 }
 
 // sdMount tracks a removable device that the import view mounted itself.
@@ -99,18 +84,10 @@ type sdMount struct {
 	MountPath  string
 }
 
-// SetProcessRegistry wires the import view to the main-screen process
-// bar so each Start Import publishes progress, pause, and cancel
-// controls outside the modal.
-func (v *ImportView) SetProcessRegistry(r *ProcessRegistry) { v.scope.reg = r }
-
 // NewImportView wires the import overlay.
 func NewImportView(invalidate func()) *ImportView {
-	v := &ImportView{invalidate: invalidate}
-	v.logList.Axis = layout.Vertical
-	// Stick the log to the bottom so newly-appended lines stay visible. Once
-	// the user manually scrolls up, BeforeEnd flips and Gio stops auto-pinning.
-	v.logList.ScrollToEnd = true
+	v := &ImportView{}
+	v.initTaskView(invalidate)
 	v.addPathEditor.SingleLine = true
 	v.addPathEditor.Submit = true
 	return v
@@ -301,58 +278,6 @@ func (v *ImportView) handleSDDeviceClick(dev removableDevice) {
 	}
 }
 
-// setStatus replaces the status line shown above the progress bar. Safe to
-// call from any goroutine; the UI redraws on the next frame.
-func (v *ImportView) setStatus(msg string) {
-	v.mu.Lock()
-	v.statusMsg = msg
-	proc := v.scope.currentLocked()
-	v.mu.Unlock()
-	if proc != nil {
-		// SetStatus notifies through the registry coalescer; skip the direct
-		// invalidate to avoid a redundant second wakeup for the same change.
-		proc.SetStatus(msg)
-		return
-	}
-	v.scheduleInvalidate()
-}
-
-// waitIfPaused blocks while the import is paused via the process bar.
-// Workers call this at loop boundaries; if no process is registered
-// (e.g. tests) it's a no-op.
-func (v *ImportView) waitIfPaused() {
-	v.mu.Lock()
-	proc := v.scope.currentLocked()
-	v.mu.Unlock()
-	if proc != nil {
-		proc.Wait()
-	}
-}
-
-// scheduleInvalidate wakes the Gio frame loop through the process registry's
-// ~30Hz coalescer when one is wired up. Import's per-file paths (appendLog,
-// setProgress, bumpProgress) fire once per file — thousands/sec during a
-// same-device rename — so calling v.invalidate directly from them would peg a
-// core repainting a log that scrolls far faster than the eye can read. The
-// registry coalesces to ~30Hz with a guaranteed trailing flush, so the final
-// log line / progress value still lands. Falls back to the raw invalidate when
-// no registry is set (e.g. tests, or one-shot messages before an import
-// starts) — those paths aren't in a per-file storm.
-func (v *ImportView) scheduleInvalidate() {
-	if v.scope.reg != nil {
-		v.scope.reg.notify()
-		return
-	}
-	if v.invalidate != nil {
-		v.invalidate()
-	}
-}
-
-func (v *ImportView) appendLog(msg string) {
-	v.log.append(msg)
-	v.scheduleInvalidate()
-}
-
 // Layout draws the overlay.
 func (v *ImportView) Layout(gtx layout.Context, th *Theme) layout.Dimensions {
 	v.log.drain()
@@ -446,13 +371,7 @@ func (v *ImportView) Layout(gtx layout.Context, th *Theme) layout.Dimensions {
 	}
 
 	// Background.
-	totalW := gtx.Constraints.Max.X
-	totalH := gtx.Constraints.Max.Y
-	bg := image.Rectangle{Max: image.Pt(totalW, totalH)}
-	clipArea := clip.Rect(bg).Push(gtx.Ops)
-	paint.ColorOp{Color: th.Background}.Add(gtx.Ops)
-	paint.PaintOp{}.Add(gtx.Ops)
-	clipArea.Pop()
+	drawBackground(gtx, th.Background)
 
 	logVisible := v.log.lines()
 	progressDone, progressMax := v.progress.load()
@@ -519,7 +438,7 @@ func (v *ImportView) Layout(gtx layout.Context, th *Theme) layout.Dimensions {
 			}),
 			layout.Rigid(layout.Spacer{Height: unit.Dp(10)}.Layout),
 			layout.Flexed(1, func(gtx layout.Context) layout.Dimensions {
-				return v.layoutLog(gtx, th, logVisible)
+				return v.layoutLog(gtx, th, logVisible, unit.Sp(14))
 			}),
 		)
 	})
@@ -710,25 +629,6 @@ func (v *ImportView) layoutCounters(gtx layout.Context, th *Theme, done, max, mo
 		lbl.Color = th.Muted
 	}
 	return lbl.Layout(gtx)
-}
-
-func (v *ImportView) layoutLog(gtx layout.Context, th *Theme, lines []string) layout.Dimensions {
-	w := gtx.Constraints.Max.X
-	h := gtx.Constraints.Max.Y
-	bg := image.Rect(0, 0, w, h)
-	ca := clip.Rect(bg).Push(gtx.Ops)
-	paint.ColorOp{Color: th.CellBG}.Add(gtx.Ops)
-	paint.PaintOp{}.Add(gtx.Ops)
-	ca.Pop()
-	pad := layout.Inset{Top: unit.Dp(6), Bottom: unit.Dp(6), Left: unit.Dp(8), Right: unit.Dp(8)}
-	return pad.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
-		return v.logList.Layout(gtx, len(lines), func(gtx layout.Context, i int) layout.Dimensions {
-			lbl := material.Label(th.Theme, unit.Sp(14), lines[i])
-			lbl.Color = th.Foreground
-			lbl.MaxLines = 1
-			return lbl.Layout(gtx)
-		})
-	})
 }
 
 // pickFolder shells out to zenity for a folder picker, then adds the result
@@ -1351,34 +1251,4 @@ func zipJunkName(name string) bool {
 		}
 	}
 	return false
-}
-
-func (v *ImportView) setProgress(done, max int64) {
-	v.progress.set(done, max)
-	v.mu.Lock()
-	proc := v.scope.currentLocked()
-	v.mu.Unlock()
-	if proc != nil {
-		// proc.SetDone/SetTotal already route through the registry's ~30Hz
-		// coalescer, so no direct v.invalidate() here — that would re-add the
-		// per-file storm this initiative removes.
-		proc.SetDone(done)
-		proc.SetTotal(max)
-		return
-	}
-	v.scheduleInvalidate()
-}
-
-func (v *ImportView) bumpProgress() {
-	v.progress.bump()
-	v.mu.Lock()
-	proc := v.scope.currentLocked()
-	v.mu.Unlock()
-	if proc != nil {
-		// proc.AddDone already coalesces the redraw through the registry; a
-		// direct v.invalidate() per file is exactly the storm we're killing.
-		proc.AddDone(1)
-		return
-	}
-	v.scheduleInvalidate()
 }

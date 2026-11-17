@@ -3,7 +3,6 @@ package ui
 import (
 	"context"
 	"fmt"
-	"image"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -11,8 +10,6 @@ import (
 	"time"
 
 	"gioui.org/layout"
-	"gioui.org/op/clip"
-	"gioui.org/op/paint"
 	"gioui.org/unit"
 	"gioui.org/widget"
 	"gioui.org/widget/material"
@@ -37,15 +34,12 @@ type OrganizeView struct {
 	Open    bool
 	OnClose func()
 
-	mu         sync.Mutex
+	// Shared task plumbing (taskui.go): mu, statusMsg, log, progress, scope, invalidate, logList.
+	taskView
+
 	mismatched []MismatchedVideo
 	scanning   bool
 	running    bool
-	statusMsg  string
-	// Shared modal plumbing (see taskui.go): the bounded worker→UI log buffer
-	// and the done/max progress state that used to be hand-rolled fields here.
-	log      taskLog
-	progress progressModel
 	// Separate cancel funcs for the two passes: the metadata scan and the move.
 	// Keeping them apart guarantees the Cancel button (and the process bar)
 	// aborts the pass that is actually running — a re-entrant scan can never
@@ -56,9 +50,6 @@ type OrganizeView struct {
 	closeBtn    widget.Clickable
 	cancelBtn   widget.Clickable
 	organizeBtn widget.Clickable
-	logList     widget.List
-
-	invalidate func()
 
 	// applyMove keeps the index + thumbnail store consistent after each on-disk
 	// rename in the move pass; refreshActive repaints the grid once at the end.
@@ -66,22 +57,13 @@ type OrganizeView struct {
 	// duplicates view is wired to the delete path).
 	applyMove     func(old, new string) error
 	refreshActive func()
-
-	// scope owns the registry pointer and the live-Process slot published to the
-	// main-screen process bar for the scan and move passes (see taskui.go).
-	scope procScope
 }
 
 func NewOrganizeView(invalidate func()) *OrganizeView {
-	v := &OrganizeView{invalidate: invalidate}
-	v.logList.Axis = layout.Vertical
-	v.logList.ScrollToEnd = true
+	v := &OrganizeView{}
+	v.initTaskView(invalidate)
 	return v
 }
-
-// SetProcessRegistry wires the organize view to the main-screen process
-// bar so the scan + move passes show up with pause / cancel controls.
-func (v *OrganizeView) SetProcessRegistry(r *ProcessRegistry) { v.scope.reg = r }
 
 // SetMover wires the per-rename index/thumbnail bookkeeping callback. Without
 // it the move pass would still rename files, but the grid would show broken
@@ -199,16 +181,9 @@ func (v *OrganizeView) scanForMismatched(ctx context.Context, idx *cache.Index, 
 				if !scan.SameDateFolder(e.Path, date) {
 					results <- MismatchedVideo{Entry: e, ExpectedDate: date}
 				}
-				v.progress.bump()
-				if proc != nil {
-					// proc.AddDone already coalesces the redraw through the
-					// registry's ~30Hz throttle (trailing flush included), so no
-					// modulo-10 direct v.invalidate() here — that per-item tick was
-					// exactly the storm import's coalescer removed (U-11).
-					proc.AddDone(1)
-				} else {
-					v.scheduleInvalidate()
-				}
+				// One tick per item; bumpProgress coalesces the redraw through
+				// the registry's ~30Hz throttle (trailing flush included).
+				v.bumpProgress()
 			}
 		})
 	}
@@ -251,19 +226,6 @@ func (v *OrganizeView) scanForMismatched(ctx context.Context, idx *cache.Index, 
 		v.statusMsg = "No mismatched videos found."
 	} else {
 		v.statusMsg = fmt.Sprintf("Found %d videos with mismatched dates.", len(mismatched))
-	}
-	if v.invalidate != nil {
-		v.invalidate()
-	}
-}
-
-func (v *OrganizeView) setStatus(msg string) {
-	v.mu.Lock()
-	v.statusMsg = msg
-	proc := v.scope.currentLocked()
-	v.mu.Unlock()
-	if proc != nil {
-		proc.SetStatus(msg)
 	}
 	if v.invalidate != nil {
 		v.invalidate()
@@ -402,45 +364,6 @@ func organizeSummary(moved, errs, warns int) string {
 	}
 }
 
-// scheduleInvalidate wakes the Gio frame loop through the process registry's
-// ~30Hz coalescer when one is wired up. Organize's per-file paths (appendLog,
-// bumpProgress, the scan-pass tick) fire once per file — thousands/sec during a
-// few-thousand-file move — so calling v.invalidate directly from them would peg
-// a core repainting a log that scrolls far faster than the eye can read. The
-// registry coalesces to ~30Hz with a guaranteed trailing flush, so the final
-// log line / progress value still lands. Falls back to the raw invalidate when
-// no registry is set (e.g. tests) — those paths aren't in a per-file storm.
-// Mirrors ImportView.scheduleInvalidate.
-func (v *OrganizeView) scheduleInvalidate() {
-	if v.scope.reg != nil {
-		v.scope.reg.notify()
-		return
-	}
-	if v.invalidate != nil {
-		v.invalidate()
-	}
-}
-
-func (v *OrganizeView) appendLog(msg string) {
-	v.log.append(msg)
-	v.scheduleInvalidate()
-}
-
-func (v *OrganizeView) bumpProgress() {
-	v.progress.bump()
-	v.mu.Lock()
-	proc := v.scope.currentLocked()
-	v.mu.Unlock()
-	if proc != nil {
-		// proc.AddDone already coalesces the redraw through the registry; a
-		// direct v.invalidate() per file is exactly the storm we're killing
-		// (mirrors ImportView.bumpProgress, U-11).
-		proc.AddDone(1)
-		return
-	}
-	v.scheduleInvalidate()
-}
-
 func (v *OrganizeView) Layout(gtx layout.Context, th *Theme, root string) layout.Dimensions {
 	v.log.drain()
 
@@ -472,13 +395,7 @@ func (v *OrganizeView) Layout(gtx layout.Context, th *Theme, root string) layout
 	v.mu.Unlock()
 
 	// Background.
-	totalW := gtx.Constraints.Max.X
-	totalH := gtx.Constraints.Max.Y
-	bg := image.Rectangle{Max: image.Pt(totalW, totalH)}
-	clipArea := clip.Rect(bg).Push(gtx.Ops)
-	paint.ColorOp{Color: th.Background}.Add(gtx.Ops)
-	paint.PaintOp{}.Add(gtx.Ops)
-	clipArea.Pop()
+	drawBackground(gtx, th.Background)
 
 	pad := layout.Inset{Top: unit.Dp(12), Bottom: unit.Dp(12), Left: unit.Dp(12), Right: unit.Dp(12)}
 	return pad.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
@@ -523,27 +440,8 @@ func (v *OrganizeView) Layout(gtx layout.Context, th *Theme, root string) layout
 			}),
 			layout.Rigid(layout.Spacer{Height: unit.Dp(16)}.Layout),
 			layout.Flexed(1, func(gtx layout.Context) layout.Dimensions {
-				return v.layoutLog(gtx, th, logVisible)
+				return v.layoutLog(gtx, th, logVisible, unit.Sp(12))
 			}),
 		)
-	})
-}
-
-func (v *OrganizeView) layoutLog(gtx layout.Context, th *Theme, lines []string) layout.Dimensions {
-	w := gtx.Constraints.Max.X
-	h := gtx.Constraints.Max.Y
-	bg := image.Rect(0, 0, w, h)
-	ca := clip.Rect(bg).Push(gtx.Ops)
-	paint.ColorOp{Color: th.CellBG}.Add(gtx.Ops)
-	paint.PaintOp{}.Add(gtx.Ops)
-	ca.Pop()
-	pad := layout.Inset{Top: unit.Dp(6), Bottom: unit.Dp(6), Left: unit.Dp(8), Right: unit.Dp(8)}
-	return pad.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
-		return v.logList.Layout(gtx, len(lines), func(gtx layout.Context, i int) layout.Dimensions {
-			lbl := material.Label(th.Theme, unit.Sp(12), lines[i])
-			lbl.Color = th.Foreground
-			lbl.MaxLines = 1
-			return lbl.Layout(gtx)
-		})
 	})
 }

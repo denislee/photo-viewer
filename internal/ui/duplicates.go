@@ -566,15 +566,8 @@ func (d *DuplicatesView) Layout(gtx layout.Context, th *Theme) layout.Dimensions
 		}
 	}
 
-	totalW := gtx.Constraints.Max.X
-	totalH := gtx.Constraints.Max.Y
-
 	// Background fill.
-	bg := image.Rectangle{Max: image.Pt(totalW, totalH)}
-	clipArea := clip.Rect(bg).Push(gtx.Ops)
-	paint.ColorOp{Color: th.Background}.Add(gtx.Ops)
-	paint.PaintOp{}.Add(gtx.Ops)
-	clipArea.Pop()
+	drawBackground(gtx, th.Background)
 
 	pad := layout.Inset{Top: unit.Dp(12), Bottom: unit.Dp(12), Left: unit.Dp(12), Right: unit.Dp(12)}
 	return pad.Layout(gtx, func(gtx layout.Context) layout.Dimensions {

@@ -1,14 +1,11 @@
 package ui
 
 import (
-	"image"
 	"log"
 	"sync"
 	"time"
 
 	"gioui.org/layout"
-	"gioui.org/op/clip"
-	"gioui.org/op/paint"
 	"gioui.org/unit"
 	"gioui.org/widget"
 	"gioui.org/widget/material"
@@ -276,13 +273,7 @@ func (v *SDPromptView) Layout(gtx layout.Context, th *Theme) layout.Dimensions {
 	}
 
 	// Dim the background so it reads as a modal.
-	totalW := gtx.Constraints.Max.X
-	totalH := gtx.Constraints.Max.Y
-	bg := image.Rectangle{Max: image.Pt(totalW, totalH)}
-	clipArea := clip.Rect(bg).Push(gtx.Ops)
-	paint.ColorOp{Color: th.Background}.Add(gtx.Ops)
-	paint.PaintOp{}.Add(gtx.Ops)
-	clipArea.Pop()
+	drawBackground(gtx, th.Background)
 
 	pad := layout.UniformInset(unit.Dp(24))
 	return pad.Layout(gtx, func(gtx layout.Context) layout.Dimensions {

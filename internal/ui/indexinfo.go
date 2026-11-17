@@ -2,12 +2,9 @@ package ui
 
 import (
 	"fmt"
-	"image"
 	"time"
 
 	"gioui.org/layout"
-	"gioui.org/op/clip"
-	"gioui.org/op/paint"
 	"gioui.org/unit"
 	"gioui.org/widget"
 	"gioui.org/widget/material"
@@ -43,13 +40,7 @@ func (v *IndexInfoView) Layout(gtx layout.Context, th *Theme) layout.Dimensions 
 		v.Close()
 	}
 
-	totalW := gtx.Constraints.Max.X
-	totalH := gtx.Constraints.Max.Y
-	rect := image.Rectangle{Max: image.Pt(totalW, totalH)}
-	bg := clip.Rect(rect).Push(gtx.Ops)
-	paint.ColorOp{Color: th.Background}.Add(gtx.Ops)
-	paint.PaintOp{}.Add(gtx.Ops)
-	bg.Pop()
+	drawBackground(gtx, th.Background)
 
 	st := v.source()
 
