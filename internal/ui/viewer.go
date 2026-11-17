@@ -1,6 +1,7 @@
 package ui
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"image"
@@ -9,10 +10,12 @@ import (
 	_ "image/jpeg"
 	_ "image/png"
 	"io"
+	"log"
 	"os"
 	"path/filepath"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"gioui.org/layout"
 	"gioui.org/op"
@@ -28,6 +31,7 @@ import (
 
 	"github.com/dns/photo-viewer/internal/cache"
 	"github.com/dns/photo-viewer/internal/imgorient"
+	"github.com/dns/photo-viewer/internal/jpegturbo"
 	"github.com/dns/photo-viewer/internal/scan"
 	"github.com/dns/photo-viewer/internal/thumb"
 	"github.com/dns/photo-viewer/internal/video"
@@ -53,23 +57,49 @@ type Viewer struct {
 
 	entries []cache.Entry
 
-	loadedPath       string
+	// loadingPath/loadingTarget identify the main (visible-image) decode in
+	// flight, so Layout doesn't restart it every frame. UI goroutine only.
 	loadingPath      string
+	loadingTarget    image.Point
 	loadingCtxCancel context.CancelFunc
-	loadedOp         paint.ImageOp
-	loadedSz         image.Point
 
-	// recent caches up to viewerRecentCap previously-decoded paint.ImageOps
-	// so navigating back to a recently viewed entry avoids re-decoding the
-	// original. Ordered MRU→LRU; LRU is dropped when the cap is reached.
+	// recent caches up to viewerRecentCap decoded images, the visible one
+	// included, so paging back and forth and reopening the viewer don't
+	// re-decode. Ordered MRU→LRU. It survives Close: entries are keyed by path
+	// and source mtime, so a changed file is never served stale.
 	//
 	// Touched both from the layout goroutine and from background decode
 	// goroutines (main load + neighbour prefetch), so all access goes
-	// through recentMu.
-	recentMu    sync.Mutex
-	recent      []recentImage
-	prefetching map[string]bool
-	prefetchSem chan struct{} // 2-slot semaphore; limits concurrent full-res decodes
+	// through recentMu, as does inflight.
+	recentMu sync.Mutex
+	recent   []recentImage
+	// inflight holds every running prefetch / warm decode by path. A main
+	// load for the same path adopts the job instead of decoding it twice (V4).
+	inflight map[string]*decodeJob
+
+	initOnce    sync.Once
+	prefetchSem chan struct{} // limits concurrent prefetch decodes; waiters queue
+	mainSem     chan struct{} // limits concurrent main decodes (cancelled ones drain)
+
+	// target is the image area of the last Layout (packed by setTarget), the
+	// box decodes fit to (V2). Read by background prefetches.
+	target atomic.Uint64
+
+	// lastNav / rapidNav detect key repeat: when two navigations land within
+	// viewerRepeatWindow, decodes wait viewerSettleDelay for the index to
+	// settle and the thumbnail stays up meanwhile (V5). navAt is when the
+	// current image was requested, for the debug timing log. UI goroutine only.
+	lastNav  time.Time
+	rapidNav bool
+	navAt    time.Time
+
+	// warmPath / warmJob track the grid-selection warm-up decode (V7).
+	warmPath string
+	warmJob  *decodeJob
+
+	// display is the on-disk ~2048 px rendition store used for HEIC and RAW
+	// (V8). Set once at startup before any decode; nil disables it.
+	display *cache.ThumbStore
 
 	// curIdx mirrors Index for cross-goroutine reads. Index itself is only
 	// written on the UI goroutine (lock-free), so background prefetch
@@ -114,12 +144,38 @@ type Viewer struct {
 	invalidate func()
 }
 
-// viewerRecentCap is the size of the recently-decoded paint.ImageOp LRU. Each
-// entry is one decoded original, capped to viewerMaxPreviewSide on the long
-// side, so the worst case is ~viewerRecentCap × (side² × 4 bytes) of pixel
-// memory — for 3 × 4096px that's roughly 200 MB, acceptable for an image
-// viewer running interactively.
-const viewerRecentCap = 3
+// viewerRecentCap is the size of the recently-decoded image LRU. Entries are
+// decoded to fit the viewer's image area (at most 2× it per axis, usually
+// within 15 %), so on a 1440p window each is ~10–15 MB and six of them stay
+// well under 100 MB. Six holds the current image, the +1/+2/−1 prefetches and
+// two more of history.
+const viewerRecentCap = 6
+
+// viewerPrefetchSlots bounds concurrent prefetch decodes. Excess requests wait
+// for a slot rather than being dropped; stale ones are cancelled.
+const viewerPrefetchSlots = 2
+
+// viewerMainSlots bounds concurrent main decodes. A cancelled libjpeg-turbo
+// decode can't be interrupted and may hold a slot for ~100 ms; two slots let
+// the newest request start right away in that case.
+const viewerMainSlots = 2
+
+// viewerRepeatWindow and viewerSettleDelay implement the key-repeat debounce:
+// a navigation within viewerRepeatWindow of the previous one waits
+// viewerSettleDelay before decoding, and is cancelled if another arrives.
+const (
+	viewerRepeatWindow = 150 * time.Millisecond
+	viewerSettleDelay  = 50 * time.Millisecond
+	// viewerResizeDelay debounces re-decodes when the window grows.
+	viewerResizeDelay = 120 * time.Millisecond
+	// viewerWarmDelay is how long the grid selection must rest on an entry
+	// before it is decoded ahead of Enter.
+	viewerWarmDelay = 250 * time.Millisecond
+)
+
+// viewerStaleDistance is how far (in entries) a prefetch target may fall
+// behind the current index before the prefetch is cancelled.
+const viewerStaleDistance = 2
 
 // viewerMetaCap is the soft cap on entries in dimCache/infoCache (and their
 // "already asked" sidecars). The maps are bulk-cleared when they exceed the
@@ -128,16 +184,43 @@ const viewerRecentCap = 3
 // header read) so a periodic clear is preferable to running a full LRU.
 const viewerMetaCap = 1024
 
-// viewerMaxPreviewSide caps the long side of the decoded preview. RAW/HEIC
-// originals can exceed 8000 px on one side; rendering them at full res
-// creates an enormous GPU texture for no visible benefit on a typical
-// display. The slow path is reserved for an explicit zoom mode (TODO).
+// viewerMaxPreviewSide caps the long side of any decoded image, and is the
+// square fit target used before the first layout reports the real image area.
+// Decodes normally fit the window (see decodeOriginal); full resolution is
+// reserved for a future zoom mode.
 const viewerMaxPreviewSide = 4096
 
+// recentImage is one decoded image in the recent cache.
 type recentImage struct {
 	path string
+	mod  time.Time // source mtime when decoded; a mismatch is a miss
 	op   paint.ImageOp
-	sz   image.Point
+	sz   image.Point // decoded (upright) size
+	// native is the upright size of the best source available, or zero when
+	// unknown (a display-store rendition). full means sz already is the
+	// source's full resolution, so a larger window can't gain anything.
+	native image.Point
+	full   bool
+}
+
+// decodedImage is what decodeOriginal returns.
+type decodedImage struct {
+	op     paint.ImageOp
+	sz     image.Point
+	native image.Point
+	full   bool
+}
+
+// decodeJob is one background prefetch / warm decode.
+type decodeJob struct {
+	done   chan struct{} // closed when the job finishes, successful or not
+	cancel context.CancelFunc
+	idx    int // entry index it was started for; -1 when not index-bound
+	// adopted is set when a main load waits on this job; such a job is
+	// never cancelled as stale.
+	adopted atomic.Bool
+	// started is set once the job holds a slot and is decoding.
+	started atomic.Bool
 }
 
 type cachedInfo struct {
@@ -159,19 +242,74 @@ func (v *Viewer) SetInvalidate(f func()) { v.invalidate = f }
 // without racing. Call it from every site that writes Index.
 func (v *Viewer) syncIndex() { v.curIdx.Store(int64(v.Index)) }
 
+// init lazily allocates the semaphores and maps, so a zero Viewer works.
+func (v *Viewer) init() {
+	v.initOnce.Do(func() {
+		v.prefetchSem = make(chan struct{}, viewerPrefetchSlots)
+		v.mainSem = make(chan struct{}, viewerMainSlots)
+		v.recentMu.Lock()
+		v.inflight = map[string]*decodeJob{}
+		v.recentMu.Unlock()
+	})
+}
+
+// SetDisplayStore wires the on-disk display-rendition store used to cache
+// HEIC and RAW decodes. Call before the viewer is first shown.
+func (v *Viewer) SetDisplayStore(s *cache.ThumbStore) { v.display = s }
+
+// setTarget records the image area decodes should fit to.
+func (v *Viewer) setTarget(sz image.Point) {
+	if sz.X <= 0 || sz.Y <= 0 {
+		return
+	}
+	v.target.Store(uint64(uint32(sz.X))<<32 | uint64(uint32(sz.Y)))
+}
+
+// targetSize returns the last image area, or a viewerMaxPreviewSide square
+// before the first layout.
+func (v *Viewer) targetSize() image.Point {
+	t := v.target.Load()
+	if t == 0 {
+		return image.Pt(viewerMaxPreviewSide, viewerMaxPreviewSide)
+	}
+	return image.Pt(int(uint32(t>>32)), int(uint32(t)))
+}
+
+// NoteWindowSize lets the window report the viewer's would-be area while the
+// viewer is closed, so warm-up decodes before the first open fit the window.
+func (v *Viewer) NoteWindowSize(gtx layout.Context, size image.Point) {
+	if v.ShowInfo {
+		size.X -= min(gtx.Dp(unit.Dp(300)), size.X/2)
+	}
+	v.setTarget(size)
+}
+
+// navigated records a navigation for the key-repeat debounce.
+func (v *Viewer) navigated() {
+	now := time.Now()
+	v.rapidNav = !v.lastNav.IsZero() && now.Sub(v.lastNav) < viewerRepeatWindow
+	v.lastNav = now
+	v.navAt = now
+}
+
 func (v *Viewer) Show(entries []cache.Entry, idx int) {
 	// Copy the slice: the caller hands us the controller's live entries
 	// (via Snapshot), whose backing array the grid keeps reading. ConfirmDelete
 	// shifts elements in place and the 'F' favorite toggle writes through
 	// &v.entries[i]; both would corrupt the array shared with the grid, so the
 	// viewer owns its own copy instead.
+	v.init()
 	v.entries = append([]cache.Entry(nil), entries...)
 	v.Index = idx
 	v.syncIndex()
 	v.Open = true
+	v.rapidNav = false
+	v.navAt = time.Now()
+	v.cancelLoading()
+	v.loadingPath = ""
+	v.warmPath = ""
 	v.preloadVideoIfNeeded()
-	v.prefetchAt(idx + 1)
-	v.prefetchAt(idx - 1)
+	v.prefetchNeighbours(1)
 }
 
 // SetFavorite updates the viewer's own copy of path's favorite flag — used
@@ -187,16 +325,14 @@ func (v *Viewer) SetFavorite(path string, fav bool) {
 func (v *Viewer) Close() {
 	v.Open = false
 	v.Confirming = false
-	v.loadedPath = ""
 	v.loadingPath = ""
-	if v.loadingCtxCancel != nil {
-		v.loadingCtxCancel()
-		v.loadingCtxCancel = nil
-	}
-	v.loadedOp = paint.ImageOp{}
+	v.cancelLoading()
+	// Keep v.recent (V7): reopening a photo just viewed is instant. Cancel
+	// the prefetches, which would otherwise decode images nobody will see.
 	v.recentMu.Lock()
-	v.recent = nil
-	v.prefetching = nil
+	for _, j := range v.inflight {
+		j.cancel()
+	}
 	v.recentMu.Unlock()
 	if p := v.player.Load(); p != nil {
 		p.Stop()
@@ -242,55 +378,57 @@ func (v *Viewer) preloadVideoIfNeeded() {
 	}(e.Path)
 }
 
-// parkLoaded moves the current loadedOp into the MRU position of the recent
-// cache if there is one. Called whenever loadedPath is about to be cleared
-// (Next/Prev/Delete/Close-ish) so we can rehydrate without re-decoding when
-// the user navigates back.
-func (v *Viewer) parkLoaded() {
-	if v.loadedPath == "" || v.loadedSz == (image.Point{}) {
-		return
-	}
-	v.cachePut(v.loadedPath, v.loadedOp, v.loadedSz)
-}
-
-// cachePut inserts (path, op) at the MRU end of v.recent, evicting the
-// oldest entry past viewerRecentCap.
-func (v *Viewer) cachePut(path string, op paint.ImageOp, sz image.Point) {
+// cachePut inserts img for e at the MRU end of v.recent, replacing any older
+// decode of the same path and evicting the oldest entry past viewerRecentCap.
+// A smaller decode never replaces a larger one of the same source version (a
+// late prefetch landing after an upgrade).
+func (v *Viewer) cachePut(e cache.Entry, d decodedImage) {
 	v.recentMu.Lock()
 	defer v.recentMu.Unlock()
 	for i, r := range v.recent {
-		if r.path == path {
+		if r.path == e.Path {
+			if r.mod.Equal(e.ModTime) && r.sz.X > d.sz.X {
+				return
+			}
 			v.recent = append(v.recent[:i], v.recent[i+1:]...)
 			break
 		}
 	}
-	v.recent = append([]recentImage{{path: path, op: op, sz: sz}}, v.recent...)
+	r := recentImage{path: e.Path, mod: e.ModTime, op: d.op, sz: d.sz, native: d.native, full: d.full}
+	v.recent = append([]recentImage{r}, v.recent...)
 	if len(v.recent) > viewerRecentCap {
 		v.recent = v.recent[:viewerRecentCap]
 	}
 }
 
-// cacheGet returns the cached image op for path and moves the entry to MRU.
-func (v *Viewer) cacheGet(path string) (paint.ImageOp, image.Point, bool) {
+// cacheGet returns the cached image for e and moves it to MRU. An entry for
+// the same path but a different source mtime is dropped and reported missing.
+func (v *Viewer) cacheGet(e cache.Entry) (recentImage, bool) {
 	v.recentMu.Lock()
 	defer v.recentMu.Unlock()
 	for i, r := range v.recent {
-		if r.path == path {
-			if i != 0 {
-				v.recent = append([]recentImage{r}, append(v.recent[:i], v.recent[i+1:]...)...)
-			}
-			return r.op, r.sz, true
+		if r.path != e.Path {
+			continue
 		}
+		if !r.mod.Equal(e.ModTime) {
+			v.recent = append(v.recent[:i], v.recent[i+1:]...)
+			return recentImage{}, false
+		}
+		if i != 0 {
+			copy(v.recent[1:i+1], v.recent[:i])
+			v.recent[0] = r
+		}
+		return r, true
 	}
-	return paint.ImageOp{}, image.Point{}, false
+	return recentImage{}, false
 }
 
-// cacheHas reports whether path is in the recent cache without promoting it.
-func (v *Viewer) cacheHas(path string) bool {
+// cacheHasEntry is cacheHas that also requires the source mtime to match.
+func (v *Viewer) cacheHasEntry(e cache.Entry) bool {
 	v.recentMu.Lock()
 	defer v.recentMu.Unlock()
 	for _, r := range v.recent {
-		if r.path == path {
+		if r.path == e.Path && r.mod.Equal(e.ModTime) {
 			return true
 		}
 	}
@@ -342,18 +480,17 @@ func (v *Viewer) ConfirmDelete(deleter func(path string) error) {
 	}
 	v.recentMu.Unlock()
 	v.cancelLoading()
-	v.loadedPath = ""
 	v.loadingPath = ""
-	v.loadedOp = paint.ImageOp{}
+	v.navAt = time.Now()
 	// Same hand-off as Next/Prev: stop a video that is no longer current
 	// (Layout only drives the player for a video entry, so a deleted clip
 	// followed by a photo would keep playing), preload the new current
-	// video, and warm both neighbours so the next step isn't a blurry
+	// video, and warm the neighbours so the next step isn't a blurry
 	// thumbnail fallback.
 	v.stopVideoIfRunning()
 	v.preloadVideoIfNeeded()
-	v.prefetchAt(v.Index + 1)
-	v.prefetchAt(v.Index - 1)
+	v.cancelStalePrefetches()
+	v.prefetchNeighbours(1)
 }
 
 func (v *Viewer) cancelLoading() {
@@ -365,31 +502,53 @@ func (v *Viewer) cancelLoading() {
 
 func (v *Viewer) Next() {
 	if v.Index < len(v.entries)-1 {
-		v.Index++
-		v.syncIndex()
-		v.parkLoaded()
-		v.cancelLoading()
-		v.loadedPath = ""
-		v.loadingPath = ""
-		v.loadedOp = paint.ImageOp{}
-		v.stopVideoIfRunning()
-		v.preloadVideoIfNeeded()
-		v.prefetchAt(v.Index + 1)
+		v.step(1)
 	}
 }
 
 func (v *Viewer) Prev() {
 	if v.Index > 0 {
-		v.Index--
-		v.syncIndex()
-		v.parkLoaded()
-		v.cancelLoading()
-		v.loadedPath = ""
-		v.loadingPath = ""
-		v.loadedOp = paint.ImageOp{}
-		v.stopVideoIfRunning()
-		v.preloadVideoIfNeeded()
-		v.prefetchAt(v.Index - 1)
+		v.step(-1)
+	}
+}
+
+// step moves the index by dir (±1) and hands off loading: the old main decode
+// is cancelled, prefetches that fell out of range are cancelled, and the next
+// two entries in the direction of travel plus the one behind are prefetched.
+func (v *Viewer) step(dir int) {
+	v.init()
+	v.Index += dir
+	v.syncIndex()
+	v.navigated()
+	v.cancelLoading()
+	v.loadingPath = ""
+	v.stopVideoIfRunning()
+	v.preloadVideoIfNeeded()
+	v.cancelStalePrefetches()
+	v.prefetchNeighbours(dir)
+}
+
+// prefetchNeighbours prefetches +1 and +2 in direction dir and −1 behind,
+// nearest first so the queue serves them in that order.
+func (v *Viewer) prefetchNeighbours(dir int) {
+	v.prefetchAt(v.Index + dir)
+	v.prefetchAt(v.Index - dir)
+	v.prefetchAt(v.Index + 2*dir)
+}
+
+// cancelStalePrefetches cancels index-bound prefetches that are now more than
+// viewerStaleDistance away, unless a main load adopted them.
+func (v *Viewer) cancelStalePrefetches() {
+	cur := v.Index
+	v.recentMu.Lock()
+	defer v.recentMu.Unlock()
+	for _, j := range v.inflight {
+		if j.idx < 0 || j.adopted.Load() {
+			continue
+		}
+		if d := j.idx - cur; d < -viewerStaleDistance || d > viewerStaleDistance {
+			j.cancel()
+		}
 	}
 }
 
@@ -473,7 +632,8 @@ func (v *Viewer) Layout(gtx layout.Context, th *Theme, tc *thumbCache) layout.Di
 			drawFitted(gtx, imgOp, imgSz, imgArea)
 		}
 	} else {
-		imgOp, imgSz, ok := v.imageFor(e, tc)
+		v.setTarget(imgArea.Size())
+		imgOp, imgSz, ok := v.imageFor(e, tc, v.targetSize())
 		if ok {
 			drawFitted(gtx, imgOp, imgSz, imgArea)
 		}
@@ -776,67 +936,134 @@ func titleCaseGio(s string) string {
 	return string(b)
 }
 
-// imageFor decodes the original photo on demand for photo/HEIC/RAW types and
-// caches a small LRU of recent decodes; for videos and decode failures it
-// falls back to the thumbnail.
-func (v *Viewer) imageFor(e cache.Entry, tc *thumbCache) (paint.ImageOp, image.Point, bool) {
+// imageFor returns the image to paint for photo/HEIC/RAW entries: the decoded
+// original from the recent cache, or the grid thumbnail while the decode runs.
+// It starts the main decode when needed and a re-decode when the window grew
+// past what the cached decode can show sharply (V2). Videos and decode
+// failures fall back to the thumbnail. UI goroutine only.
+func (v *Viewer) imageFor(e cache.Entry, tc *thumbCache, target image.Point) (paint.ImageOp, image.Point, bool) {
 	switch e.Type {
 	case scan.TypePhoto, scan.TypeRAW, scan.TypeHEIC:
-		if v.loadedPath == e.Path {
-			return v.loadedOp, v.loadedSz, true
-		}
-		// Rehydrate from the recent LRU so back-and-forth navigation is
-		// instant. Promote into the live slot so the next frame paints
-		// from it without falling back to the thumbnail.
-		if op, sz, ok := v.cacheGet(e.Path); ok {
-			v.loadedPath = e.Path
-			v.loadedOp = op
-			v.loadedSz = sz
-			v.loadingPath = ""
-			return op, sz, true
+		v.init()
+		if r, ok := v.cacheGet(e); ok {
+			if r.needsUpgrade(target) && (v.loadingPath != e.Path || v.loadingTarget != target) {
+				v.kickDecode(e, target, viewerResizeDelay)
+			}
+			return r.op, r.sz, true
 		}
 		if v.loadingPath != e.Path {
-			v.loadingPath = e.Path
-			v.kickDecode(e)
+			var delay time.Duration
+			if v.rapidNav {
+				delay = viewerSettleDelay
+			}
+			v.kickDecode(e, target, delay)
 		}
 	}
 	// Fall back to the cached thumbnail (always JPEG).
-	op, sz, ok := tc.Get(e)
-	return op, sz, ok
+	return tc.Get(e)
 }
 
-// kickDecode launches a background decode for the given entry,
-// then assigns the result to the viewer's loaded* fields and invalidates so
-// the next frame paints the full-resolution image.
-func (v *Viewer) kickDecode(e cache.Entry) {
+// needsUpgrade reports whether a window of size target would show r
+// noticeably softer than a fresh decode could.
+func (r recentImage) needsUpgrade(target image.Point) bool {
+	if r.full {
+		return false
+	}
+	if r.native == (image.Point{}) {
+		// A display rendition: only a window too big for one gains anything.
+		return !displayEnough(target)
+	}
+	want := fitInside(r.native, target)
+	return want.X*100 > r.sz.X*102 || want.Y*100 > r.sz.Y*102
+}
+
+// kickDecode starts the main decode of e for the given image area, after an
+// optional settle delay, and cancels any previous main decode. If a prefetch
+// of the same path is already running, it waits for that instead of decoding
+// twice (V4). The result goes into the recent cache, where the next frame's
+// imageFor finds it.
+func (v *Viewer) kickDecode(e cache.Entry, target image.Point, delay time.Duration) {
 	v.cancelLoading()
 	ctx, cancel := context.WithCancel(context.Background())
 	v.loadingCtxCancel = cancel
+	v.loadingPath = e.Path
+	v.loadingTarget = target
+	navAt := v.navAt
+
+	// Adopt a prefetch of this path only if it is already decoding. One still
+	// queued for a prefetch slot would make the visible image wait behind
+	// other prefetches, so cancel it and decode here instead.
+	v.recentMu.Lock()
+	job := v.inflight[e.Path]
+	if job != nil {
+		if job.started.Load() {
+			job.adopted.Store(true)
+		} else {
+			job.cancel()
+			job = nil
+		}
+	}
+	v.recentMu.Unlock()
 
 	go func() {
 		defer cancel()
-		op, sz, ok := decodeOriginal(ctx, e)
+		if job != nil {
+			select {
+			case <-job.done:
+			case <-ctx.Done():
+				return
+			}
+			if v.cacheHasEntry(e) {
+				v.logTiming(e, navAt, "prefetch")
+				if v.invalidate != nil {
+					v.invalidate()
+				}
+				return
+			}
+			// The prefetch failed or was cancelled: decode it ourselves.
+		}
+		if delay > 0 {
+			t := time.NewTimer(delay)
+			select {
+			case <-t.C:
+			case <-ctx.Done():
+				t.Stop()
+				return
+			}
+		}
+		select {
+		case v.mainSem <- struct{}{}:
+		case <-ctx.Done():
+			return
+		}
+		defer func() { <-v.mainSem }()
+		if ctx.Err() != nil {
+			return
+		}
+		d, ok := decodeOriginal(ctx, e, target, v.display)
 		if !ok || ctx.Err() != nil {
 			return
 		}
-		// Don't mutate v.loadedPath/Op/Sz from here — those fields are
-		// read by the UI goroutine in Layout and writing them off-thread
-		// is a data race (string headers and paint.ImageOp aren't atomic
-		// to copy). cachePut is mutex-guarded; the next Layout will see
-		// the result via imageFor's cacheGet path, which promotes into
-		// the live slot on the UI goroutine.
-		v.cachePut(e.Path, op, sz)
+		v.cachePut(e, d)
+		v.logTiming(e, navAt, "decode")
 		if v.invalidate != nil {
 			v.invalidate()
 		}
 	}()
 }
 
+// logTiming logs time-to-full-resolution when PV_DEBUG_TIMING is set.
+func (v *Viewer) logTiming(e cache.Entry, since time.Time, how string) {
+	if debugTiming && !since.IsZero() {
+		log.Printf("timing: viewer %s full-res in %v (%s)", filepath.Base(e.Path), time.Since(since).Round(time.Millisecond), how)
+	}
+}
+
 // prefetchAt decodes the entry at idx in the background and parks the result
-// in the recent cache so a subsequent Next/Prev to it is instant. It does
-// not touch loadedPath/Op/Sz — only the LRU. No-op if idx is out of range,
-// the entry is already cached, currently loading, or already being
-// prefetched.
+// in the recent cache so a subsequent Next/Prev to it is instant. No-op if idx
+// is out of range, the entry is already cached, or it is already in flight.
+// Requests beyond viewerPrefetchSlots queue for a slot rather than being
+// dropped; ones that go stale while queued are cancelled.
 //
 // For video entries we don't decode anything — mpv owns playback — but we
 // do warm the OS page cache by streaming the first few MB so that when the
@@ -855,54 +1082,108 @@ func (v *Viewer) prefetchAt(idx int) {
 	default:
 		return
 	}
-	if v.loadingPath == e.Path || v.loadedPath == e.Path {
+	if v.loadingPath == e.Path || v.cacheHasEntry(e) {
 		return
 	}
-	if v.cacheHas(e.Path) {
+	var delay time.Duration
+	if v.rapidNav {
+		delay = viewerSettleDelay
+	}
+	v.startPrefetch(e, idx, delay, func(ctx context.Context) {
+		d, ok := decodeOriginal(ctx, e, v.targetSize(), v.display)
+		if ok && ctx.Err() == nil {
+			v.cachePut(e, d)
+		}
+	})
+}
+
+// Warm decodes e ahead of time while the grid has it selected, so Enter opens
+// it at full resolution immediately (V7). The decode starts only after the
+// selection has rested on e for viewerWarmDelay; moving on cancels it. Call it
+// from the UI goroutine whenever the grid selection may have changed.
+func (v *Viewer) Warm(e cache.Entry) {
+	if e.Path == v.warmPath {
 		return
 	}
+	v.init()
+	v.warmPath = e.Path
+	if v.warmJob != nil && !v.warmJob.adopted.Load() {
+		v.warmJob.cancel()
+	}
+	v.warmJob = nil
+	switch e.Type {
+	case scan.TypePhoto, scan.TypeRAW, scan.TypeHEIC:
+	default:
+		return
+	}
+	if v.cacheHasEntry(e) {
+		return
+	}
+	v.warmJob = v.startPrefetch(e, -1, viewerWarmDelay, func(ctx context.Context) {
+		d, ok := decodeOriginal(ctx, e, v.targetSize(), v.display)
+		if ok && ctx.Err() == nil {
+			v.cachePut(e, d)
+		}
+	})
+}
+
+// startPrefetch runs work for e as a background job under prefetchSem and
+// registers it in inflight. idx ≥ 0 makes the job index-bound: it is skipped
+// if the current index has moved more than viewerStaleDistance away by the
+// time it gets a slot. Returns nil if a job for e is already in flight.
+func (v *Viewer) startPrefetch(e cache.Entry, idx int, delay time.Duration, work func(ctx context.Context)) *decodeJob {
+	ctx, cancel := context.WithCancel(context.Background())
+	job := &decodeJob{done: make(chan struct{}), cancel: cancel, idx: idx}
 	v.recentMu.Lock()
-	if v.prefetching == nil {
-		v.prefetching = map[string]bool{}
-	}
-	if v.prefetching[e.Path] {
+	if v.inflight[e.Path] != nil {
 		v.recentMu.Unlock()
-		return
+		cancel()
+		return nil
 	}
-	v.prefetching[e.Path] = true
+	v.inflight[e.Path] = job
 	v.recentMu.Unlock()
 
-	if v.prefetchSem == nil {
-		v.prefetchSem = make(chan struct{}, 2)
-	}
-	go func(e cache.Entry, idx int) {
+	go func() {
 		defer func() {
 			v.recentMu.Lock()
-			delete(v.prefetching, e.Path)
+			if v.inflight[e.Path] == job {
+				delete(v.inflight, e.Path)
+			}
 			v.recentMu.Unlock()
+			cancel()
+			close(job.done)
 		}()
-		// Non-blocking acquire: if both slots are taken, skip this prefetch.
+		if delay > 0 {
+			t := time.NewTimer(delay)
+			select {
+			case <-t.C:
+			case <-ctx.Done():
+				t.Stop()
+				return
+			}
+		}
 		select {
 		case v.prefetchSem <- struct{}{}:
-		default:
+		case <-ctx.Done():
 			return
 		}
 		defer func() { <-v.prefetchSem }()
 
-		// Stale check: abort if we've navigated far away. curIdx is the
-		// atomic mirror of Index; reading it here avoids racing the
-		// UI-goroutine writers of Index.
-		dist := int(v.curIdx.Load()) - idx
-		if dist < -2 || dist > 2 {
+		// Stale check: abort if we've navigated far away while queued.
+		// curIdx is the atomic mirror of Index; reading it here avoids
+		// racing the UI-goroutine writers of Index.
+		if idx >= 0 && !job.adopted.Load() {
+			if d := int(v.curIdx.Load()) - idx; d < -viewerStaleDistance || d > viewerStaleDistance {
+				return
+			}
+		}
+		if ctx.Err() != nil {
 			return
 		}
-
-		op, sz, ok := decodeOriginal(context.Background(), e)
-		if !ok {
-			return
-		}
-		v.cachePut(e.Path, op, sz)
-	}(e, idx)
+		job.started.Store(true)
+		work(ctx)
+	}()
+	return job
 }
 
 // videoPrefetchBytes is the head-of-file window we read into the OS page
@@ -916,132 +1197,191 @@ const videoPrefetchBytes = 16 << 20
 // one file at a time — but on a cold cache this is the difference between
 // mpv blocking on disk seeks and the first frame appearing instantly.
 //
-// Like the photo prefetch path it is bounded by the 2-slot prefetchSem
-// (acquired non-blocking, so rapid paging can't stack N concurrent 16 MB
-// reads into a seek storm) and short-circuits via the ±2 stale check when
-// the user has already paged away from idx.
+// Like the photo prefetch path it shares the prefetchSem bound (so rapid
+// paging can't stack N concurrent 16 MB reads into a seek storm) and is
+// skipped via the stale check when the user has already paged away from idx.
 func (v *Viewer) prefetchVideo(e cache.Entry, idx int) {
-	v.recentMu.Lock()
-	if v.prefetching == nil {
-		v.prefetching = map[string]bool{}
-	}
-	if v.prefetching[e.Path] {
-		v.recentMu.Unlock()
-		return
-	}
-	v.prefetching[e.Path] = true
-	v.recentMu.Unlock()
-
-	if v.prefetchSem == nil {
-		v.prefetchSem = make(chan struct{}, 2)
-	}
-	go func(path string, idx int) {
-		defer func() {
-			v.recentMu.Lock()
-			delete(v.prefetching, path)
-			v.recentMu.Unlock()
-		}()
-		// Non-blocking acquire: if both slots are taken, skip this prefetch
-		// rather than spawning an unbounded read.
-		select {
-		case v.prefetchSem <- struct{}{}:
-		default:
-			return
-		}
-		defer func() { <-v.prefetchSem }()
-
-		// Stale check: abort if we've navigated far away. curIdx is the
-		// atomic mirror of Index; reading it here avoids racing the
-		// UI-goroutine writers of Index.
-		dist := int(v.curIdx.Load()) - idx
-		if dist < -2 || dist > 2 {
-			return
-		}
-
-		f, err := os.Open(path)
+	v.init()
+	v.startPrefetch(e, idx, 0, func(ctx context.Context) {
+		f, err := os.Open(e.Path)
 		if err != nil {
 			return
 		}
 		defer f.Close()
-		_, _ = io.CopyN(io.Discard, f, videoPrefetchBytes)
-	}(e.Path, idx)
+		_, _ = io.CopyN(io.Discard, thumb.NewContextReader(ctx, f), videoPrefetchBytes)
+	})
 }
 
-// decodeOriginal decodes an entry's full-resolution image into a paint.ImageOp,
-// downscaled to viewerMaxPreviewSide. Returns (op, size, true) on success or
-// the zero value with false on any error / cancellation.
-func decodeOriginal(ctx context.Context, e cache.Entry) (paint.ImageOp, image.Point, bool) {
+// fitInside returns sz scaled down (never up) to fit inside box, rounding up so
+// the result never falls short of the box on the limiting axis.
+func fitInside(sz, box image.Point) image.Point {
+	if sz.X <= 0 || sz.Y <= 0 || box.X <= 0 || box.Y <= 0 {
+		return sz
+	}
+	if sz.X <= box.X && sz.Y <= box.Y {
+		return sz
+	}
+	// Compare sz.X/box.X against sz.Y/box.Y without floating point.
+	if sz.X*box.Y >= sz.Y*box.X { // width-limited
+		return image.Pt(box.X, max((sz.Y*box.X+sz.X-1)/sz.X, 1))
+	}
+	return image.Pt(max((sz.X*box.Y+sz.Y-1)/sz.Y, 1), box.Y)
+}
+
+// displayEnough reports whether a cache.DisplaySize rendition is sharp enough
+// for an image area of size target. The photo's aspect isn't known up front,
+// so assume a 3:2 landscape: it fits target at min(long side, 1.5 × short side).
+// A 10 % margin lets a 2048 px rendition serve 1080p and 1440p windows.
+func displayEnough(target image.Point) bool {
+	long, short := max(target.X, target.Y), min(target.X, target.Y)
+	return min(long, short*3/2) <= cache.DisplaySize*11/10
+}
+
+// decodeOriginal decodes an entry's original image to fit an image area of
+// size target (V2). JPEGs go through libjpeg-turbo with DCT scaling (V3);
+// HEIC and RAW come from the on-disk display rendition when display is set
+// and the window is small enough for it (V8). The result is an upright,
+// origin-anchored RGBA, so Gio uploads it without another copy. Returns false
+// on any error or cancellation.
+func decodeOriginal(ctx context.Context, e cache.Entry, target image.Point, display *cache.ThumbStore) (decodedImage, bool) {
+	if target.X <= 0 || target.Y <= 0 {
+		target = image.Pt(viewerMaxPreviewSide, viewerMaxPreviewSide)
+	}
+	switch e.Type {
+	case scan.TypeHEIC, scan.TypeRAW:
+		if display != nil && displayEnough(target) {
+			if d, ok := decodeDisplayRendition(ctx, e, target, display); ok {
+				return d, true
+			}
+			if ctx.Err() != nil {
+				return decodedImage{}, false
+			}
+		}
+	}
+
 	var img image.Image
 	var err error
 	orientation := 1
+	native := image.Point{}
 	switch e.Type {
 	case scan.TypeHEIC:
 		tmpDir, err2 := os.MkdirTemp("", "photo-viewer-heicview-")
 		if err2 != nil {
-			return paint.ImageOp{}, image.Point{}, false
+			return decodedImage{}, false
 		}
 		defer os.RemoveAll(tmpDir)
 		jpgPath, err2 := thumb.HEICToJPEG(ctx, e.Path, tmpDir)
 		if err2 != nil {
-			return paint.ImageOp{}, image.Point{}, false
+			return decodedImage{}, false
 		}
-		f, err2 := os.Open(jpgPath)
+		data, err2 := thumb.ReadFile(ctx, jpgPath)
 		if err2 != nil {
-			return paint.ImageOp{}, image.Point{}, false
+			return decodedImage{}, false
 		}
-		img, _, err = image.Decode(f)
-		f.Close()
+		// heif-convert / ffmpeg bake in the HEIF rotation: orientation 1.
+		img, native, err = decodeFitted(ctx, data, 1, target)
 	case scan.TypeRAW:
 		img, orientation, err = thumb.LoadRAWImage(ctx, e.Path)
 	case scan.TypePhoto:
-		f, err2 := os.Open(e.Path)
-		if err2 == nil {
-			img, _, err = image.Decode(f)
-			f.Close()
-			orientation = imgorient.ReadOrientation(e.Path)
+		data, err2 := thumb.ReadFile(ctx, e.Path)
+		if err2 != nil {
+			return decodedImage{}, false
 		}
+		orientation = imgorient.ReadOrientationFrom(bytes.NewReader(data))
+		img, native, err = decodeFitted(ctx, data, orientation, target)
+	default:
+		return decodedImage{}, false
 	}
-	if err != nil || img == nil {
-		return paint.ImageOp{}, image.Point{}, false
+	if err != nil || img == nil || ctx.Err() != nil {
+		return decodedImage{}, false
 	}
-	if ctx.Err() != nil {
-		return paint.ImageOp{}, image.Point{}, false
-	}
-	img = downscalePreview(img, viewerMaxPreviewSide)
-	// The HEIC branch already delivers an upright image (heif-convert/ffmpeg
-	// bake in the HEIF rotation), but Go's JPEG/TIFF/PNG decoders ignore EXIF
-	// Orientation, so a portrait photo — or a RAW's embedded preview, which is
-	// stored in sensor orientation (S-21) — would render sideways here; the same
-	// fix thumb.Image and export/recompress already carry. Apply it *after* the
-	// downscale: rotation is a lossless remap that commutes with scaling, and
-	// imgorient.Apply is per-pixel At/Set, so orienting the small preview costs
-	// ~1 ms where full-res would cost seconds on a 24 MP source.
-	img = imgorient.Apply(img, orientation)
-	op := paint.NewImageOp(img)
-	op.Filter = paint.FilterLinear
-	return op, img.Bounds().Size(), true
+	return finishDecode(img, orientation, target, native, false), true
 }
 
-// downscalePreview returns img resized so its long side is at most maxSide.
-// Images already within the cap are returned unchanged so the common case
-// (already-small JPEGs) avoids an extra allocation and resample.
-func downscalePreview(img image.Image, maxSide int) image.Image {
+// decodeFitted decodes data, letting libjpeg-turbo DCT-scale a JPEG down to
+// no less than what fits target once oriented. native is the image's full
+// upright size when the header could be read, zero otherwise.
+func decodeFitted(ctx context.Context, data []byte, orientation int, target image.Point) (image.Image, image.Point, error) {
+	minW, minH := 0, 0
+	native := image.Point{}
+	if jpegturbo.Available() && jpegturbo.IsJPEG(data) {
+		if cfg, err := jpegturbo.DecodeConfig(data); err == nil {
+			native = image.Pt(cfg.Width, cfg.Height)
+			if orientation >= 5 {
+				native = image.Pt(cfg.Height, cfg.Width)
+			}
+			need := fitInside(native, target)
+			minW, minH = need.X, need.Y
+			if orientation >= 5 {
+				minW, minH = need.Y, need.X
+			}
+		}
+	}
+	img, err := thumb.DecodeScaled(ctx, data, minW, minH)
+	return img, native, err
+}
+
+// decodeDisplayRendition serves HEIC/RAW from the display store, generating
+// the rendition on first view (one heif-convert/ffmpeg/exiftool run) so later
+// views decode a ~300 KB JPEG instead. Renditions are already upright.
+func decodeDisplayRendition(ctx context.Context, e cache.Entry, target image.Point, display *cache.ThumbStore) (decodedImage, bool) {
+	path, err := display.Path(e)
+	if err != nil || ctx.Err() != nil {
+		return decodedImage{}, false
+	}
+	data, err := thumb.ReadFile(ctx, path)
+	if err != nil {
+		return decodedImage{}, false
+	}
+	img, _, err := decodeFitted(ctx, data, 1, target)
+	if err != nil || ctx.Err() != nil {
+		// An unreadable rendition is regenerated on the next view.
+		if ctx.Err() == nil {
+			display.Forget(e.ThumbID)
+		}
+		return decodedImage{}, false
+	}
+	// native stays unknown: the original may be larger than the rendition.
+	return finishDecode(img, 1, target, image.Point{}, true), true
+}
+
+// finishDecode turns a decoded image into an upright RGBA op. An image more
+// than twice the fitted size per axis (only the image/jpeg and non-JPEG paths
+// produce one) is downscaled to the fit; anything up to 2× is left for the
+// GPU, whose mipmapped linear filter minifies it well and far faster than a
+// CPU resample (300 ms for 12 MP). native is the upright full size if known;
+// rendition marks a display-store decode, whose source size stays unknown.
+func finishDecode(img image.Image, orientation int, target, native image.Point, rendition bool) decodedImage {
 	b := img.Bounds()
-	w, h := b.Dx(), b.Dy()
-	longSide := max(w, h)
-	if longSide <= maxSide {
-		return img
+	stored := b.Size()
+	upright := stored
+	if orientation >= 5 {
+		upright = image.Pt(stored.Y, stored.X)
 	}
-	s := float64(maxSide) / float64(longSide)
-	dstW := int(float64(w) * s)
-	dstH := int(float64(h) * s)
-	if dstW < 1 {
-		dstW = 1
+	if native == (image.Point{}) && !rendition {
+		// No header size (not a JPEG): nothing DCT-scaled it, so the decode
+		// is the full size.
+		native = upright
 	}
-	if dstH < 1 {
-		dstH = 1
+	fit := fitInside(upright, target)
+	limit := image.Pt(min(2*fit.X, viewerMaxPreviewSide), min(2*fit.Y, viewerMaxPreviewSide))
+	var rgba *image.RGBA
+	if upright.X > limit.X || upright.Y > limit.Y {
+		fit = fitInside(fit, image.Pt(viewerMaxPreviewSide, viewerMaxPreviewSide))
+		dw, dh := fit.X, fit.Y
+		if orientation >= 5 {
+			dw, dh = fit.Y, fit.X
+		}
+		rgba = image.NewRGBA(image.Rect(0, 0, dw, dh))
+		draw.ApproxBiLinear.Scale(rgba, rgba.Rect, img, b, draw.Src, nil)
+	} else {
+		rgba = imgorient.ToRGBA(img)
 	}
-	dst := image.NewRGBA(image.Rect(0, 0, dstW, dstH))
-	draw.ApproxBiLinear.Scale(dst, dst.Bounds(), img, b, draw.Over, nil)
-	return dst
+	// Rotation is a lossless remap that commutes with scaling, so it runs
+	// after the downscale, on the RGBA fast path (V1).
+	out := imgorient.Apply(rgba, orientation)
+	op := paint.NewImageOp(out)
+	op.Filter = paint.FilterLinear
+	sz := out.Bounds().Size()
+	return decodedImage{op: op, sz: sz, native: native, full: native != (image.Point{}) && sz == native}
 }

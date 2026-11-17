@@ -167,6 +167,9 @@ type Controller struct {
 	// browser. Lazily constructed when the user first opens the webserver
 	// modal so headless / unused sessions don't allocate it.
 	webserver *webserver.Server
+
+	displayOnce sync.Once
+	display     *cache.ThumbStore
 }
 
 // dbPath is the on-disk index path idx was loaded from (see cache.Locate).
@@ -215,10 +218,25 @@ func (c *Controller) WebServer() *webserver.Server {
 		// always-writable root the primary thumb store already resolved, so this
 		// only fails in pathological cases; a nil store degrades /display to
 		// serving originals (fine for JPEG/PNG, no RAW/HEIC rendition).
-		display, _ := cache.NewDisplayStore(c.cacheDir)
-		c.webserver = webserver.New(c.index, c.store, display, c.libraryRoot)
+		c.webserver = webserver.New(c.index, c.store, c.DisplayStore(), c.libraryRoot)
 	}
 	return c.webserver
+}
+
+// DisplayStore returns the shared <cacheDir>/display rendition store, creating
+// it on first use. The webserver serves its renditions to browsers (W-03) and
+// the viewer decodes HEIC/RAW from it (V8). Returns nil if it can't be created.
+func (c *Controller) DisplayStore() *cache.ThumbStore {
+	c.displayOnce.Do(func() {
+		// A tier of the thumb store, so trash/delete/rename keep it in step
+		// and its generation shares the store's CPU / external-tool bound.
+		if c.store == nil {
+			c.display, _ = cache.NewDisplayStore(c.cacheDir)
+		} else if d, err := c.store.Tier("display", cache.DisplaySize); err == nil {
+			c.display = d
+		}
+	})
+	return c.display
 }
 
 // Snapshot returns a stable view of the current directory's entries and the

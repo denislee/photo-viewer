@@ -9,9 +9,12 @@ import (
 	"image/jpeg"
 	"os"
 	"path/filepath"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
+
+	"gioui.org/op/paint"
 
 	"github.com/dns/photo-viewer/internal/cache"
 	"github.com/dns/photo-viewer/internal/scan"
@@ -44,6 +47,11 @@ func exifAPP1(orientation byte) []byte {
 // Orientation spliced in right after the SOI marker.
 func writeJPEGWithOrientation(t *testing.T, path string, w, h int, orientation byte) {
 	t.Helper()
+	writeJPEGWithOrientationTB(t, path, w, h, orientation)
+}
+
+func writeJPEGWithOrientationTB(t testing.TB, path string, w, h int, orientation byte) {
+	t.Helper()
 	img := image.NewRGBA(image.Rect(0, 0, w, h))
 	for y := range h {
 		for x := range w {
@@ -71,23 +79,29 @@ func writeJPEGWithOrientation(t *testing.T, path string, w, h int, orientation b
 // portrait photo stored landscape with Orientation=6 (rotate 90° CW) must come
 // out of decodeOriginal transposed, matching the grid thumbnail instead of
 // rendering sideways.
+// decodeOriginalSize runs decodeOriginal for a large window, the old
+// fixed-cap behaviour these orientation tests were written against.
+func decodeOriginalSize(ctx context.Context, e cache.Entry) (paint.ImageOp, image.Point, bool) {
+	d, ok := decodeOriginal(ctx, e, image.Pt(4096, 4096), nil)
+	return d.op, d.sz, ok
+}
+
 func TestDecodeOriginalAppliesOrientation(t *testing.T) {
 	dir := t.TempDir()
 
 	upright := filepath.Join(dir, "upright.jpg")
 	writeJPEGWithOrientation(t, upright, 40, 20, 1)
-	op, size, ok := decodeOriginal(context.Background(), cache.Entry{Path: upright, Type: scan.TypePhoto})
+	_, size, ok := decodeOriginalSize(context.Background(), cache.Entry{Path: upright, Type: scan.TypePhoto})
 	if !ok {
 		t.Fatal("decodeOriginal failed on upright fixture")
 	}
 	if size.X != 40 || size.Y != 20 {
 		t.Fatalf("upright size = %dx%d, want 40x20", size.X, size.Y)
 	}
-	_ = op
 
 	rotated := filepath.Join(dir, "rotated.jpg")
 	writeJPEGWithOrientation(t, rotated, 40, 20, 6)
-	_, size, ok = decodeOriginal(context.Background(), cache.Entry{Path: rotated, Type: scan.TypePhoto})
+	_, size, ok = decodeOriginalSize(context.Background(), cache.Entry{Path: rotated, Type: scan.TypePhoto})
 	if !ok {
 		t.Fatal("decodeOriginal failed on rotated fixture")
 	}
@@ -104,7 +118,7 @@ func TestDecodeOriginalAppliesOrientation(t *testing.T) {
 func TestDecodeOriginalOrientsRAWPreview(t *testing.T) {
 	raw := filepath.Join(t.TempDir(), "portrait.nef")
 	writeJPEGWithOrientation(t, raw, 40, 20, 6)
-	_, size, ok := decodeOriginal(context.Background(), cache.Entry{Path: raw, Type: scan.TypeRAW})
+	_, size, ok := decodeOriginalSize(context.Background(), cache.Entry{Path: raw, Type: scan.TypeRAW})
 	if !ok {
 		t.Fatal("decodeOriginal failed on RAW fixture")
 	}
@@ -146,7 +160,7 @@ func TestPrefetchIndexNoRace(t *testing.T) {
 	deadline := time.Now().Add(2 * time.Second)
 	for {
 		v.recentMu.Lock()
-		inflight := len(v.prefetching)
+		inflight := len(v.inflight)
 		v.recentMu.Unlock()
 		if inflight == 0 || time.Now().After(deadline) {
 			break
@@ -185,19 +199,31 @@ func mkfifo(t *testing.T, dir string, i int) string {
 	return p
 }
 
+// cacheHas reports whether path is in the recent cache without promoting it.
+func (v *Viewer) cacheHas(path string) bool {
+	v.recentMu.Lock()
+	defer v.recentMu.Unlock()
+	for _, r := range v.recent {
+		if r.path == path {
+			return true
+		}
+	}
+	return false
+}
+
 func prefetchingLen(v *Viewer) int {
 	v.recentMu.Lock()
 	defer v.recentMu.Unlock()
-	return len(v.prefetching)
+	return len(v.inflight)
 }
 
 // TestPrefetchVideoBoundedConcurrency is the G-10 guard: neighbour-video
-// prefetch must respect the 2-slot prefetchSem instead of spawning one 16 MB
-// read per neighbour. Each entry is a FIFO whose reader blocks in os.Open
-// until a writer appears, so a goroutine that acquires a slot stays parked
-// (its prefetching entry lingers) while goroutines that can't acquire return
-// immediately and clear theirs. At steady state exactly two entries remain —
-// the semaphore's capacity. Without the bound all five would block.
+// prefetch must respect the prefetchSem bound instead of running one 16 MB
+// read per neighbour at once. Each entry is a FIFO whose reader blocks in
+// os.Open until a writer appears, so a goroutine that acquires a slot stays
+// parked holding it. Requests past the bound queue (V6: they used to be
+// dropped) rather than reading, so exactly viewerPrefetchSlots slots are held
+// while every request stays registered.
 func TestPrefetchVideoBoundedConcurrency(t *testing.T) {
 	dir := t.TempDir()
 	const n = 5
@@ -211,7 +237,7 @@ func TestPrefetchVideoBoundedConcurrency(t *testing.T) {
 
 	// Unblock parked readers on the way out so no goroutine leaks past the test.
 	t.Cleanup(func() {
-		deadline := time.Now().Add(2 * time.Second)
+		deadline := time.Now().Add(5 * time.Second)
 		for prefetchingLen(&v) > 0 && time.Now().Before(deadline) {
 			for _, p := range fifos {
 				if w, err := os.OpenFile(p, os.O_WRONLY|syscall.O_NONBLOCK, 0); err == nil {
@@ -223,18 +249,17 @@ func TestPrefetchVideoBoundedConcurrency(t *testing.T) {
 		}
 	})
 
-	// Wait for the three losers to clear; the two slot-holders stay parked.
 	deadline := time.Now().Add(2 * time.Second)
-	for prefetchingLen(&v) > 2 && time.Now().Before(deadline) {
+	for len(v.prefetchSem) < viewerPrefetchSlots && time.Now().Before(deadline) {
 		time.Sleep(time.Millisecond)
 	}
-	if got := prefetchingLen(&v); got != 2 {
-		t.Fatalf("parked video prefetches = %d, want 2 (prefetchSem cap)", got)
-	}
-	// Confirm the bound is stable rather than still draining toward 0.
+	// Confirm the bound is stable and nothing was dropped.
 	time.Sleep(30 * time.Millisecond)
-	if got := prefetchingLen(&v); got != 2 {
-		t.Fatalf("parked video prefetches = %d after settle, want a stable 2", got)
+	if got := len(v.prefetchSem); got != viewerPrefetchSlots {
+		t.Fatalf("held prefetch slots = %d, want %d", got, viewerPrefetchSlots)
+	}
+	if got := prefetchingLen(&v); got != n {
+		t.Fatalf("registered video prefetches = %d, want all %d (queued, not dropped)", got, n)
 	}
 }
 
@@ -261,12 +286,12 @@ func TestPrefetchVideoStaleAborts(t *testing.T) {
 
 // TestConfirmDeletePrefetchesNeighbours is the G-15 regression: after a
 // delete the viewer lands on a new entry whose neighbours were never
-// prefetched (Show only warmed the old ±1), so the next step fell back to the
-// blurry thumbnail. ConfirmDelete now prefetches ±1 like Show.
+// prefetched, so the next step fell back to the blurry thumbnail.
+// ConfirmDelete now prefetches around the new position like Show (+1, −1, +2).
 func TestConfirmDeletePrefetchesNeighbours(t *testing.T) {
 	dir := t.TempDir()
 	var entries []cache.Entry
-	for _, name := range []string{"a.jpg", "b.jpg", "c.jpg", "d.jpg"} {
+	for _, name := range []string{"a.jpg", "b.jpg", "c.jpg", "d.jpg", "e.jpg"} {
 		p := filepath.Join(dir, name)
 		writeJPEGWithOrientation(t, p, 8, 8, 1)
 		entries = append(entries, cache.Entry{Path: p, Type: scan.TypePhoto})
@@ -283,20 +308,144 @@ func TestConfirmDeletePrefetchesNeighbours(t *testing.T) {
 		return false
 	}
 
-	v.Show(entries, 1) // on b: prefetches a and c
-	if !waitCached(entries[0].Path) || !waitCached(entries[2].Path) {
+	v.Show(entries, 1) // on b: prefetches c, a and d
+	if !waitCached(entries[0].Path) || !waitCached(entries[2].Path) || !waitCached(entries[3].Path) {
 		t.Fatal("Show did not prefetch its neighbours")
 	}
-	if v.cacheHas(entries[3].Path) {
-		t.Fatal("d prefetched before the delete")
+	if v.cacheHas(entries[4].Path) {
+		t.Fatal("e prefetched before the delete")
 	}
 
 	v.Confirming = true
-	v.ConfirmDelete(func(string) error { return nil }) // now on c: next is d
+	v.ConfirmDelete(func(string) error { return nil }) // now on c: +2 is e
 	if v.Index != 1 || v.entries[v.Index].Path != entries[2].Path {
 		t.Fatalf("after delete on %d (%s), want c", v.Index, v.entries[v.Index].Path)
 	}
-	if !waitCached(entries[3].Path) {
-		t.Error("ConfirmDelete did not prefetch the new next neighbour")
+	if !waitCached(entries[4].Path) {
+		t.Error("ConfirmDelete did not prefetch the new neighbours")
+	}
+}
+
+// TestKickDecodeAdoptsInflightPrefetch is the V4 guard: a main load for a path
+// that is already being prefetched waits for that prefetch instead of starting
+// a second decode. The path doesn't exist, so an independent decode would fail
+// and never invalidate; only the adopted prefetch's result can.
+func TestKickDecodeAdoptsInflightPrefetch(t *testing.T) {
+	var v Viewer
+	v.init()
+	var invalidated atomic.Int32
+	v.SetInvalidate(func() { invalidated.Add(1) })
+	e := cache.Entry{Path: "/nonexistent/v4.jpg", Type: scan.TypePhoto}
+
+	release := make(chan struct{})
+	job := v.startPrefetch(e, -1, 0, func(context.Context) {
+		<-release
+		img := image.NewRGBA(image.Rect(0, 0, 4, 3))
+		v.cachePut(e, decodedImage{op: paint.NewImageOp(img), sz: img.Rect.Size(), native: img.Rect.Size(), full: true})
+	})
+	if job == nil {
+		t.Fatal("startPrefetch returned nil")
+	}
+	for deadline := time.Now().Add(2 * time.Second); !job.started.Load() && time.Now().Before(deadline); {
+		time.Sleep(time.Millisecond)
+	}
+	v.kickDecode(e, image.Pt(100, 100), 0)
+	if !job.adopted.Load() {
+		t.Fatal("main load did not adopt the in-flight prefetch")
+	}
+	close(release)
+	deadline := time.Now().Add(2 * time.Second)
+	for invalidated.Load() == 0 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if invalidated.Load() == 0 {
+		t.Fatal("main load never picked up the prefetch result")
+	}
+	if r, ok := v.cacheGet(e); !ok || r.sz != image.Pt(4, 3) {
+		t.Fatalf("cache = %+v, %v; want the prefetched 4x3 image", r.sz, ok)
+	}
+}
+
+// TestRecentSurvivesCloseAndTracksMtime covers V7: closing the viewer keeps
+// decoded images for an instant reopen, but a source whose mtime changed is a
+// miss rather than a stale hit.
+func TestRecentSurvivesCloseAndTracksMtime(t *testing.T) {
+	var v Viewer
+	v.init()
+	mod := time.Unix(1700000000, 0)
+	e := cache.Entry{Path: "/x/a.jpg", Type: scan.TypePhoto, ModTime: mod}
+	img := image.NewRGBA(image.Rect(0, 0, 2, 2))
+	v.cachePut(e, decodedImage{op: paint.NewImageOp(img), sz: image.Pt(2, 2)})
+	v.Open = true
+	v.Close()
+	if _, ok := v.cacheGet(e); !ok {
+		t.Fatal("Close dropped the recent cache")
+	}
+	changed := e
+	changed.ModTime = mod.Add(time.Second)
+	if _, ok := v.cacheGet(changed); ok {
+		t.Fatal("cache served an image decoded from an older version of the file")
+	}
+	if v.cacheHas(e.Path) {
+		t.Fatal("stale entry was not dropped")
+	}
+}
+
+// TestDecodeOriginalFitsWindow covers V2: the decode is sized for the image
+// area (within 2× per axis), not the 4096 px cap, and remembers the native
+// size so a bigger window can trigger a sharper re-decode.
+func TestDecodeOriginalFitsWindow(t *testing.T) {
+	p := filepath.Join(t.TempDir(), "big.jpg")
+	writeJPEGWithOrientation(t, p, 1600, 1200, 6) // upright 1200x1600
+	e := cache.Entry{Path: p, Type: scan.TypePhoto}
+	target := image.Pt(300, 200) // fit: 150x200
+	d, ok := decodeOriginal(context.Background(), e, target, nil)
+	if !ok {
+		t.Fatal("decode failed")
+	}
+	if d.sz.X < 150 || d.sz.Y < 200 || d.sz.X > 300 || d.sz.Y > 400 {
+		t.Fatalf("decoded %v for a 150x200 fit", d.sz)
+	}
+	if d.sz.Y <= d.sz.X {
+		t.Fatalf("decoded %v is not portrait (orientation lost)", d.sz)
+	}
+	r := recentImage{sz: d.sz, native: d.native, full: d.full}
+	if r.needsUpgrade(target) {
+		t.Fatal("needsUpgrade for the target it was decoded for")
+	}
+	if !r.needsUpgrade(image.Pt(1200, 1600)) {
+		t.Fatalf("no upgrade for a larger window (native %v, full %v)", d.native, d.full)
+	}
+}
+
+func TestFitInside(t *testing.T) {
+	cases := []struct{ sz, box, want image.Point }{
+		{image.Pt(4032, 3024), image.Pt(1920, 1080), image.Pt(1440, 1080)},
+		{image.Pt(3024, 4032), image.Pt(1920, 1080), image.Pt(810, 1080)},
+		{image.Pt(100, 50), image.Pt(1920, 1080), image.Pt(100, 50)},
+		{image.Pt(4000, 1000), image.Pt(1000, 1000), image.Pt(1000, 250)},
+	}
+	for _, c := range cases {
+		if got := fitInside(c.sz, c.box); got != c.want {
+			t.Errorf("fitInside(%v, %v) = %v, want %v", c.sz, c.box, got, c.want)
+		}
+	}
+}
+
+// BenchmarkDecodeOriginal measures opening a 12 MP photo in a 1440p window,
+// landscape and portrait (EXIF orientation 6).
+func BenchmarkDecodeOriginal(b *testing.B) {
+	dir := b.TempDir()
+	for _, o := range []byte{1, 6} {
+		p := filepath.Join(dir, fmt.Sprintf("o%d.jpg", o))
+		writeJPEGWithOrientationTB(b, p, 4032, 3024, o)
+		e := cache.Entry{Path: p, Type: scan.TypePhoto}
+		b.Run(fmt.Sprintf("orientation-%d", o), func(b *testing.B) {
+			for b.Loop() {
+				if _, ok := decodeOriginal(context.Background(), e, image.Pt(2560, 1440), nil); !ok {
+					b.Fatal("decode failed")
+				}
+			}
+		})
 	}
 }

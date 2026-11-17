@@ -169,7 +169,7 @@ func (c *Controller) Rebuild() error {
 	// wipe failure here is best-effort: log and press on to the rescan rather
 	// than aborting with a cleared index and no rebuild in flight. Each dir may
 	// also simply not exist if the webserver never ran (RemoveAll no-ops then).
-	for _, sub := range []string{"hls", "display"} {
+	for _, sub := range []string{"hls", "display", cache.LargeThumbDir} {
 		if err := os.RemoveAll(filepath.Join(c.cacheDir, sub)); err != nil {
 			log.Printf("rebuild: clear %s cache: %v", sub, err)
 		}

@@ -2,6 +2,7 @@ package ui
 
 import (
 	"container/list"
+	"context"
 	"image"
 	_ "image/jpeg"
 	"os"
@@ -13,6 +14,7 @@ import (
 	"gioui.org/op/paint"
 
 	"github.com/dns/photo-viewer/internal/cache"
+	"github.com/dns/photo-viewer/internal/thumb"
 )
 
 // thumbCacheCapacity is the floor on the number of decoded thumbnails kept in
@@ -43,25 +45,121 @@ const (
 	thumbRetryMax  = 5 * time.Minute
 )
 
+// thumbStaleFrames is how many grid frames a queued request may go unrequested
+// before workers drop it (G1). Cells scrolled past during a fast scroll or a
+// G/gg jump stop calling Get, so their requests go stale and are skipped
+// instead of being decoded ahead of what is on screen now.
+const thumbStaleFrames = 2
+
+// thumbStackCap bounds each request stack. Past it the oldest requests, the
+// least likely to still be wanted, are dropped (and re-requested if seen again).
+const thumbStackCap = 2048
+
+// LargeThumbCellPx is the cell size in pixels above which the grid draws the
+// LargeThumbSize tier instead of the 256 px one (G5).
+const LargeThumbCellPx = 300
+
+type thumbTier uint8
+
+const (
+	tierSmall thumbTier = iota
+	tierLarge
+)
+
+type thumbPrio uint8
+
+const (
+	prioVisible  thumbPrio = iota // on screen now
+	prioPrefetch                  // just outside the viewport (G3)
+)
+
+// thumbJob is one queued thumbnail request.
+type thumbJob struct {
+	e    cache.Entry
+	key  string
+	tier thumbTier
+	prio thumbPrio
+}
+
+// thumbLane is a pair of newest-first request stacks (visible above
+// prefetch) served by a pool of workers.
+type thumbLane struct {
+	mu     sync.Mutex
+	cond   *sync.Cond
+	stacks [2][]thumbJob
+}
+
+func newThumbLane() *thumbLane {
+	l := &thumbLane{}
+	l.cond = sync.NewCond(&l.mu)
+	return l
+}
+
+// push adds j on top of its priority's stack and returns any requests that fell
+// off the bottom of a full stack.
+func (l *thumbLane) push(j thumbJob) []thumbJob {
+	l.mu.Lock()
+	st := append(l.stacks[j.prio], j)
+	var dropped []thumbJob
+	if n := len(st) - thumbStackCap; n > 0 {
+		dropped = append(dropped, st[:n]...)
+		st = append(st[:0], st[n:]...)
+	}
+	l.stacks[j.prio] = st
+	l.mu.Unlock()
+	l.cond.Signal()
+	return dropped
+}
+
+// pop blocks until a request is available and returns the newest visible one,
+// or the newest prefetch one when no visible request is queued.
+func (l *thumbLane) pop() thumbJob {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	for {
+		for p := range l.stacks {
+			if st := l.stacks[p]; len(st) > 0 {
+				j := st[len(st)-1]
+				st[len(st)-1] = thumbJob{}
+				l.stacks[p] = st[:len(st)-1]
+				return j
+			}
+		}
+		l.cond.Wait()
+	}
+}
+
 // thumbCache lazily resolves thumbnail JPEGs into paint.ImageOp values and
 // caches them with an LRU policy. Multiple frames may request the same thumb
 // concurrently; only one decode is queued per entry. When a decode completes,
 // invalidate is fired so the next frame can paint the result.
 //
+// Requests go through two lanes (G2). The fast lane decodes thumbnails already
+// on disk (a ~2 ms JPEG decode). One that is missing or stale moves to the
+// generation lane, whose workers run ffmpeg/exiftool/heif-convert or the
+// in-process resampler under the store's semaphores, so a burst of uncached
+// files can't hold up cells whose thumbnails just need decoding. Both lanes
+// serve the newest request first and drop requests that went stale (G1).
+//
 // State is split across thumbCacheShards independent shards keyed by a
-// hash of the thumbnail path; each shard has its own mutex, map, and LRU
-// list. The decode queue and the coalescer remain singletons since they're
-// inherently global.
+// hash of the cache key; each shard has its own mutex, map, and LRU list.
 type thumbCache struct {
-	store      *cache.ThumbStore
+	store *cache.ThumbStore
+	// large is the LargeThumbSize tier, nil if it couldn't be created.
+	large      *cache.ThumbStore
 	invalidate func()
 	// capPerShard is the per-shard LRU ceiling. Read under each shard's mutex
 	// during eviction but written from the Gio layout goroutine via
 	// EnsureCapacity, so it's atomic to avoid a data race.
 	capPerShard atomic.Int64
 
+	// frame counts grid layouts (BeginFrame); requests remember the frame
+	// they were last wanted in.
+	frame atomic.Uint64
+
 	shards [thumbCacheShards]thumbCacheShard
-	queue  chan cache.Entry
+	fast   *thumbLane
+	gen    *thumbLane
 
 	// Coalescing: workers set dirty and signal wake; the coalescer goroutine
 	// wakes on the channel, sleeps 16 ms to batch concurrent completions, then
@@ -77,11 +175,17 @@ type thumbCacheShard struct {
 }
 
 type thumbEntry struct {
-	path   string
+	key    string
 	ready  bool
 	op     paint.ImageOp
 	size   image.Point
 	queued bool
+	// working is set while a worker is decoding or generating the entry, so a
+	// duplicate request (a prefetch promoted to visible) isn't run twice.
+	working bool
+	prio    thumbPrio
+	// lastWanted is the frame of the latest Get/Prefetch for the entry.
+	lastWanted uint64
 	// failed is set when the last decode attempt failed; retryAfter is the
 	// earliest time the entry may be re-queued, and failCount drives the
 	// exponential backoff. A successful decode clears all three.
@@ -94,21 +198,33 @@ func newThumbCache(store *cache.ThumbStore, invalidate func()) *thumbCache {
 	tc := &thumbCache{
 		store:      store,
 		invalidate: invalidate,
-		queue:      make(chan cache.Entry, 256),
+		fast:       newThumbLane(),
+		gen:        newThumbLane(),
 		wake:       make(chan struct{}, 1),
+	}
+	if store != nil {
+		if large, err := store.Tier(cache.LargeThumbDir, cache.LargeThumbSize); err == nil {
+			tc.large = large
+		}
 	}
 	tc.capPerShard.Store((thumbCacheCapacity + thumbCacheShards - 1) / thumbCacheShards)
 	for i := range tc.shards {
 		tc.shards[i].entries = make(map[string]*list.Element)
 		tc.shards[i].lru = list.New()
 	}
-	workers := max(runtime.NumCPU(), 4)
-	for range workers {
-		go tc.worker()
+	for range max(runtime.NumCPU()/2, 2) {
+		go tc.fastWorker()
+	}
+	for range max(runtime.NumCPU(), 4) {
+		go tc.genWorker()
 	}
 	go tc.coalescer()
 	return tc
 }
+
+// BeginFrame advances the request frame counter. The grid calls it once per
+// layout; requests not renewed within thumbStaleFrames frames are dropped.
+func (tc *thumbCache) BeginFrame() { tc.frame.Add(1) }
 
 // EnsureCapacity sets the total LRU ceiling to accommodate at least `working`
 // decoded thumbnails — the count the grid currently needs resident (visible
@@ -122,16 +238,32 @@ func (tc *thumbCache) EnsureCapacity(working int) {
 	tc.capPerShard.Store(per)
 }
 
-// shardFor returns the shard responsible for path. FNV-1a is cheap and
+// shardFor returns the shard responsible for key. FNV-1a is cheap and
 // produces good distribution for filesystem-path strings, which share long
 // directory prefixes that a naive hash would bunch into one shard.
-func (tc *thumbCache) shardFor(path string) *thumbCacheShard {
+func (tc *thumbCache) shardFor(key string) *thumbCacheShard {
 	var h uint32 = 2166136261
-	for i := 0; i < len(path); i++ {
-		h ^= uint32(path[i])
+	for i := 0; i < len(key); i++ {
+		h ^= uint32(key[i])
 		h *= 16777619
 	}
 	return &tc.shards[h%thumbCacheShards]
+}
+
+// tierKey is the cache key for path at tier. The small tier uses the bare
+// path.
+func tierKey(path string, tier thumbTier) string {
+	if tier == tierLarge {
+		return path + "\x00large"
+	}
+	return path
+}
+
+func (tc *thumbCache) storeFor(tier thumbTier) *cache.ThumbStore {
+	if tier == tierLarge && tc.large != nil {
+		return tc.large
+	}
+	return tc.store
 }
 
 // coalescer wakes the Gio frame loop when one or more thumbnail decodes have
@@ -147,13 +279,41 @@ func (tc *thumbCache) coalescer() {
 	}
 }
 
-// Get returns the cached image op for entry if available. If not, the entry is
-// queued for background decode and the bool is false. Subsequent frames after
-// invalidate fires will see the populated op.
+// Get returns the cached 256 px image op for entry if available. If not, the
+// entry is queued for background decode and the bool is false. Subsequent
+// frames after invalidate fires will see the populated op.
 func (tc *thumbCache) Get(e cache.Entry) (paint.ImageOp, image.Point, bool) {
-	sh := tc.shardFor(e.Path)
+	return tc.get(e, tierSmall, prioVisible)
+}
+
+// GetLarge is Get for big cells: it returns the LargeThumbSize thumbnail when
+// ready, and meanwhile the 256 px one (requesting both).
+func (tc *thumbCache) GetLarge(e cache.Entry) (paint.ImageOp, image.Point, bool) {
+	if tc.large == nil {
+		return tc.Get(e)
+	}
+	if op, sz, ok := tc.get(e, tierLarge, prioVisible); ok {
+		return op, sz, true
+	}
+	return tc.get(e, tierSmall, prioVisible)
+}
+
+// Prefetch requests e's thumbnail at low priority: it is decoded only when no
+// on-screen request is waiting (G3).
+func (tc *thumbCache) Prefetch(e cache.Entry, large bool) {
+	tier := tierSmall
+	if large && tc.large != nil {
+		tier = tierLarge
+	}
+	tc.get(e, tier, prioPrefetch)
+}
+
+func (tc *thumbCache) get(e cache.Entry, tier thumbTier, prio thumbPrio) (paint.ImageOp, image.Point, bool) {
+	key := tierKey(e.Path, tier)
+	sh := tc.shardFor(key)
 	sh.mu.Lock()
-	te := tc.touchOrCreate(sh, e.Path)
+	te := tc.touchOrCreate(sh, key)
+	te.lastWanted = tc.frame.Load()
 	if te.ready {
 		op, sz := te.op, te.size
 		sh.mu.Unlock()
@@ -165,37 +325,86 @@ func (tc *thumbCache) Get(e cache.Entry) (paint.ImageOp, image.Point, bool) {
 		sh.mu.Unlock()
 		return paint.ImageOp{}, image.Point{}, false
 	}
+	push := false
 	if !te.queued {
-		te.queued = true
-		sh.mu.Unlock()
-		select {
-		case tc.queue <- e:
-		default:
-			// queue full; drop and let a later frame retry by clearing queued.
-			sh.mu.Lock()
-			te.queued = false
-			sh.mu.Unlock()
-		}
-		return paint.ImageOp{}, image.Point{}, false
+		te.queued, te.prio, push = true, prio, true
+	} else if prio < te.prio && !te.working {
+		// A prefetched cell scrolled into view: queue it again on the
+		// visible stack. Whichever copy a worker pops first runs; the
+		// other is skipped.
+		te.prio, push = prio, true
 	}
 	sh.mu.Unlock()
+	if push {
+		tc.enqueue(tc.fast, thumbJob{e: e, key: key, tier: tier, prio: prio})
+	}
 	return paint.ImageOp{}, image.Point{}, false
 }
 
-// touchOrCreate returns the entry for path within sh, promoting it to MRU
+// enqueue pushes j onto lane and un-queues any requests that fell off the
+// bottom of a full stack, so a later Get re-requests them.
+func (tc *thumbCache) enqueue(lane *thumbLane, j thumbJob) {
+	for _, d := range lane.push(j) {
+		sh := tc.shardFor(d.key)
+		sh.mu.Lock()
+		if el := sh.entries[d.key]; el != nil {
+			if te := el.Value.(*thumbEntry); te.queued && !te.working && te.prio == d.prio {
+				te.queued = false
+			}
+		}
+		sh.mu.Unlock()
+	}
+}
+
+// claim checks a popped request against its entry and marks it working. It
+// returns false, and clears queued for a stale request, when the request
+// should be skipped: already done, already running, evicted, or no longer
+// wanted on screen.
+func (tc *thumbCache) claim(j thumbJob) bool {
+	sh := tc.shardFor(j.key)
+	sh.mu.Lock()
+	defer sh.mu.Unlock()
+	el := sh.entries[j.key]
+	if el == nil {
+		return false
+	}
+	te := el.Value.(*thumbEntry)
+	if !te.queued || te.ready || te.working {
+		return false
+	}
+	if tc.frame.Load()-te.lastWanted > thumbStaleFrames {
+		te.queued = false
+		return false
+	}
+	te.working = true
+	return true
+}
+
+// release clears working on an entry handed from the fast lane to the
+// generation lane, so the generation worker can claim it.
+func (tc *thumbCache) release(j thumbJob) {
+	sh := tc.shardFor(j.key)
+	sh.mu.Lock()
+	if el := sh.entries[j.key]; el != nil {
+		el.Value.(*thumbEntry).working = false
+	}
+	sh.mu.Unlock()
+}
+
+// touchOrCreate returns the entry for key within sh, promoting it to MRU
 // (creating it if missing). Caller must hold sh.mu. When the entry is
 // already at the front the MoveToFront call is skipped — common on the
 // hot path where the same cell is re-fetched every frame.
-func (tc *thumbCache) touchOrCreate(sh *thumbCacheShard, path string) *thumbEntry {
-	if el, ok := sh.entries[path]; ok {
+func (tc *thumbCache) touchOrCreate(sh *thumbCacheShard, key string) *thumbEntry {
+	if el, ok := sh.entries[key]; ok {
 		if sh.lru.Front() != el {
 			sh.lru.MoveToFront(el)
 		}
 		return el.Value.(*thumbEntry)
 	}
-	te := &thumbEntry{path: path}
+	te := &thumbEntry{key: key}
 	el := sh.lru.PushFront(te)
-	sh.entries[path] = el
+	sh.entries[key] = el
 	tc.evictIfNeeded(sh)
 	return te
 }
@@ -219,7 +428,7 @@ func (tc *thumbCache) evictIfNeeded(sh *thumbCacheShard) {
 				cand := prev.Value.(*thumbEntry)
 				if !cand.queued || cand.ready {
 					sh.lru.Remove(prev)
-					delete(sh.entries, cand.path)
+					delete(sh.entries, cand.key)
 					break
 				}
 				prev = prev.Prev()
@@ -230,48 +439,85 @@ func (tc *thumbCache) evictIfNeeded(sh *thumbCacheShard) {
 			continue
 		}
 		sh.lru.Remove(oldest)
-		delete(sh.entries, te.path)
+		delete(sh.entries, te.key)
 	}
 }
 
-func (tc *thumbCache) worker() {
-	for e := range tc.queue {
-		// Decode happens entirely outside the lock — paint.NewImageOp can
-		// be expensive (image snapshot) and must not block other Get
-		// callers on this shard.
-		op, sz, ok := tc.decode(e)
-		sh := tc.shardFor(e.Path)
-		sh.mu.Lock()
-		el := sh.entries[e.Path]
-		var te *thumbEntry
-		if el == nil {
-			// Evicted while in-flight; reinsert at MRU.
-			te = &thumbEntry{path: e.Path}
-			el = sh.lru.PushFront(te)
-			sh.entries[e.Path] = el
-			tc.evictIfNeeded(sh)
-		} else {
-			te = el.Value.(*thumbEntry)
+// fastWorker serves the fast lane: decode thumbnails already on disk, and hand
+// anything missing, stale or unreadable to the generation lane.
+func (tc *thumbCache) fastWorker() {
+	for {
+		j := tc.fast.pop()
+		if !tc.claim(j) {
+			continue
 		}
-		te.queued = false
-		if ok {
-			te.op = op
-			te.size = sz
-			te.ready = true
-			te.failed = false
-			te.failCount = 0
-		} else {
-			te.failCount++
-			te.failed = true
-			te.retryAfter = time.Now().Add(thumbBackoff(te.failCount))
-		}
-		sh.mu.Unlock()
-		if ok {
-			tc.dirty.Store(true)
-			select {
-			case tc.wake <- struct{}{}:
-			default: // coalescer already has a pending wake signal
+		store := tc.storeFor(j.tier)
+		if store.Has(j.e) {
+			if op, sz, ok := decodeThumbFile(store, j.e); ok {
+				tc.finish(j, op, sz, true)
+				continue
 			}
+		}
+		tc.release(j)
+		tc.enqueue(tc.gen, j)
+	}
+}
+
+// genWorker serves the generation lane: generate the thumbnail (bounded by the
+// store's semaphores) and decode it. A thumbnail that exists but doesn't
+// decode — a zero-byte or truncated file a crash left behind, since the store
+// no longer fsyncs (G4) — is discarded and regenerated once before the entry
+// is marked failed.
+func (tc *thumbCache) genWorker() {
+	for {
+		j := tc.gen.pop()
+		if !tc.claim(j) {
+			continue
+		}
+		store := tc.storeFor(j.tier)
+		op, sz, ok := decodeThumbFile(store, j.e)
+		if !ok && store.Has(j.e) {
+			store.Discard(j.e.ThumbID)
+			op, sz, ok = decodeThumbFile(store, j.e)
+		}
+		tc.finish(j, op, sz, ok)
+	}
+}
+
+// finish records a request's outcome on its entry.
+func (tc *thumbCache) finish(j thumbJob, op paint.ImageOp, sz image.Point, ok bool) {
+	sh := tc.shardFor(j.key)
+	sh.mu.Lock()
+	el := sh.entries[j.key]
+	var te *thumbEntry
+	if el == nil {
+		// Evicted while in-flight; reinsert at MRU.
+		te = &thumbEntry{key: j.key}
+		el = sh.lru.PushFront(te)
+		sh.entries[j.key] = el
+		tc.evictIfNeeded(sh)
+	} else {
+		te = el.Value.(*thumbEntry)
+	}
+	te.queued = false
+	te.working = false
+	if ok {
+		te.op = op
+		te.size = sz
+		te.ready = true
+		te.failed = false
+		te.failCount = 0
+	} else {
+		te.failCount++
+		te.failed = true
+		te.retryAfter = time.Now().Add(thumbBackoff(te.failCount))
+	}
+	sh.mu.Unlock()
+	if ok {
+		tc.dirty.Store(true)
+		select {
+		case tc.wake <- struct{}{}:
+		default: // coalescer already has a pending wake signal
 		}
 	}
 }
@@ -289,17 +535,19 @@ func thumbBackoff(failCount int) time.Duration {
 	return d
 }
 
-func (tc *thumbCache) decode(e cache.Entry) (paint.ImageOp, image.Point, bool) {
-	path, err := tc.store.Path(e)
+// decodeThumbFile returns e's thumbnail from store, generating it first if it
+// is missing or stale. Thumbnails are JPEGs, so libjpeg-turbo decodes them
+// straight to RGBA and Gio uploads them without another copy.
+func decodeThumbFile(store *cache.ThumbStore, e cache.Entry) (paint.ImageOp, image.Point, bool) {
+	path, err := store.Path(e)
 	if err != nil || path == "" {
 		return paint.ImageOp{}, image.Point{}, false
 	}
-	f, err := os.Open(path)
+	data, err := os.ReadFile(path)
 	if err != nil {
 		return paint.ImageOp{}, image.Point{}, false
 	}
-	defer f.Close()
-	img, _, err := image.Decode(f)
+	img, err := thumb.DecodeScaled(context.Background(), data, 0, 0)
 	if err != nil {
 		return paint.ImageOp{}, image.Point{}, false
 	}

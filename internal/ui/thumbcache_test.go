@@ -1,6 +1,7 @@
 package ui
 
 import (
+	"container/list"
 	"os"
 	"path/filepath"
 	"testing"
@@ -100,4 +101,90 @@ func TestThumbCacheFailureBackoff(t *testing.T) {
 	if !failed || queued || failCount != 1 {
 		t.Fatalf("re-queued during backoff: failed=%v queued=%v failCount=%d", failed, queued, failCount)
 	}
+}
+
+// TestThumbLaneNewestFirst covers G1/G3 ordering: the newest visible request
+// is served first, and prefetch requests only once no visible one is queued.
+func TestThumbLaneNewestFirst(t *testing.T) {
+	l := newThumbLane()
+	l.push(thumbJob{key: "p1", prio: prioPrefetch})
+	l.push(thumbJob{key: "a", prio: prioVisible})
+	l.push(thumbJob{key: "b", prio: prioVisible})
+	l.push(thumbJob{key: "p2", prio: prioPrefetch})
+	var got []string
+	for range 4 {
+		got = append(got, l.pop().key)
+	}
+	want := []string{"b", "a", "p2", "p1"}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("pop order = %v, want %v", got, want)
+		}
+	}
+}
+
+// TestThumbClaimDropsStale covers G1: a queued request whose cell hasn't been
+// requested for more than thumbStaleFrames grid frames is skipped and
+// un-queued, so a later Get re-requests it instead of it being stuck.
+func TestThumbClaimDropsStale(t *testing.T) {
+	tc := &thumbCache{fast: newThumbLane(), gen: newThumbLane()}
+	for i := range tc.shards {
+		tc.shards[i].entries = map[string]*list.Element{}
+		tc.shards[i].lru = list.New()
+	}
+	tc.capPerShard.Store(64)
+	e := cache.Entry{Path: "/x/stale.jpg"}
+	tc.get(e, tierSmall, prioVisible) // queues at frame 0
+	j := tc.fast.pop()
+	for range thumbStaleFrames + 1 {
+		tc.BeginFrame()
+	}
+	if tc.claim(j) {
+		t.Fatal("claimed a request that went stale")
+	}
+	if _, _, queued, _, _ := entrySnapshot(tc, e.Path); queued {
+		t.Fatal("stale request left queued")
+	}
+
+	tc.get(e, tierSmall, prioVisible) // re-requested this frame
+	if !tc.claim(tc.fast.pop()) {
+		t.Fatal("fresh request not claimed")
+	}
+}
+
+// TestThumbCacheRegeneratesCorruptThumb covers G4's self-healing read: a
+// thumbnail file that exists and looks fresh but doesn't decode is discarded
+// and regenerated instead of the entry being marked failed.
+func TestThumbCacheRegeneratesCorruptThumb(t *testing.T) {
+	store, err := cache.NewThumbStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	src := filepath.Join(t.TempDir(), "ok.jpg")
+	writeJPEGWithOrientation(t, src, 64, 48, 1)
+	info, _ := os.Stat(src)
+	e := cache.Entry{Path: src, Type: scan.TypePhoto, ThumbID: cache.ThumbIDFor(src), ModTime: info.ModTime()}
+	thumbPath, err := store.Path(e)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(thumbPath, []byte("truncated garbage"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	tc := newThumbCache(store, func() {})
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if _, sz, ok := tc.Get(e); ok {
+			if sz.X != 64 || sz.Y != 48 {
+				t.Fatalf("regenerated thumb is %v, want 64x48", sz)
+			}
+			return
+		}
+		if _, failed, _, _, _ := entrySnapshot(tc, src); failed {
+			t.Fatal("corrupt thumbnail marked failed instead of regenerated")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatal("thumbnail never became ready")
 }

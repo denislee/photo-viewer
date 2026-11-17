@@ -35,16 +35,20 @@ with a SQLite index, inline video playback through libmpv, and an optional web g
 
 ## Dependencies
 
-**Build time**: Go (see `go.mod`), cgo, `libmpv`, and Gio's Wayland/X11/EGL headers. On
-Debian/Ubuntu:
+**Build time**: Go (see `go.mod`), cgo, `libmpv`, `libturbojpeg` (libjpeg-turbo 3.x), and
+Gio's Wayland/X11/EGL headers. On Debian/Ubuntu:
 
 ```sh
-sudo apt-get install pkg-config libmpv-dev \
+sudo apt-get install pkg-config libmpv-dev libturbojpeg0-dev \
   libwayland-dev libx11-dev libx11-xcb-dev libxkbcommon-dev libxkbcommon-x11-dev \
   libxcursor-dev libxfixes-dev libgles2-mesa-dev libegl1-mesa-dev libffi-dev libvulkan-dev
 ```
 
-**Runtime**: `libmpv` is linked in and must be installed. The external tools below are all
+libjpeg-turbo decodes JPEGs in process (photos in the viewer, thumbnails, RAW previews),
+several times faster than Go's decoder. To build without it, use `go build -tags
+nojpegturbo`; JPEGs are then decoded with `image/jpeg`.
+
+**Runtime**: `libmpv` and `libturbojpeg` are linked in and must be installed. The external tools below are all
 optional. When a tool is missing, the feature that needs it is degraded (for example, a
 placeholder icon instead of a thumbnail).
 
@@ -114,11 +118,13 @@ Where the data goes depends on how the app is started.
 <root>/.photo-viewer-trash/             # soft-deleted files, restorable
 <root>/.photo-viewer-cache/
 ├── thumbs/ab/abc123…ef.jpg             # 256 px grid thumbnails, name = SHA-1(absolute path)
-└── display/ab/abc123…ef.jpg            # ≤2048 px web-viewer renditions (RAW/HEIC/TIFF/oversized)
+├── thumbs-512/ab/abc123…ef.jpg         # 512 px thumbnails, made on demand for large grid cells
+└── display/ab/abc123…ef.jpg            # ≤2048 px renditions: web viewer, and HEIC/RAW in the viewer
 ```
 
 **Without `--root`** (the library is the working directory), the index and cache go in this
-computer's user cache, `~/.cache/photo-viewer/` (`thumbs/`, `display/`, `index-<hash>.db`).
+computer's user cache, `~/.cache/photo-viewer/` (`thumbs/`, `thumbs-512/`, `display/`,
+`index-<hash>.db`).
 An existing `<library>/.photo-viewer.db` is still used so favorites aren't lost. The trash
 stays in `<library>/.photo-viewer-trash/` because deleting is a same-filesystem rename.
 
@@ -139,12 +145,17 @@ With `--root`, if the library isn't writable, the data moves:
 | `make vuln` | `govulncheck` (pinned, via `go run`) |
 | `make check` | everything to run before pushing: fmt-check, vet, lint, race, test-video, vuln |
 
+Set `PV_DEBUG_TIMING=1` to log perceived latency: the viewer's time to full resolution after
+opening or paging, and the grid's time to fill the viewport. `go test -bench
+'DecodeOriginal|OrientPortrait|Decode12MP' ./internal/ui/ ./internal/imgorient/
+./internal/jpegturbo/` benchmarks the decode paths.
+
 The libmpv race tests skip unless `PV_CROP_VIDEO` points at a video file, which is why
 `make test-video` exists. `PV_CROP_VIDEO=/path/to/clip go test -run TestRenderCropAssertion
 ./internal/video/` also runs the (slow) SW-render crop repro against a clip of your choice.
 
 `gioui.org` is replaced by a patched local copy in `third_party/gioui-singleline-fix/`. Its
-upstream base, the patch, and how to check whether the fork can be dropped are recorded in
+upstream base, the patches, and how to check whether the fork can be dropped are recorded in
 [`FORK.md`](third_party/gioui-singleline-fix/FORK.md).
 
 `CLAUDE.md` and `OPTIMIZATION_*.md` are gitignored, local-only working notes.

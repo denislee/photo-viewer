@@ -45,6 +45,7 @@ func Run(w *app.Window, ctrl *Controller) error {
 	grid := NewGrid()
 	viewer := &Viewer{ShowInfo: true}
 	viewer.SetInvalidate(w.Invalidate)
+	viewer.SetDisplayStore(ctrl.DisplayStore())
 	dups := NewDuplicatesView(ctrl.Index(), ctrl.Store(), ctrl.Thumbs(), w.Invalidate)
 	dups.SetDeleter(ctrl.DeletePath)
 	dups.SetBatchDeleter(ctrl.DeletePaths)
@@ -441,6 +442,12 @@ func drawRoot(gtx layout.Context, th *Theme, ctrl *Controller, tb *Toolbar, sb *
 		stack := op.Offset(image.Pt(leftW+splitW, bodyY)).Push(gtx.Ops)
 		g.Layout(gtx2, th, entries, ctrl)
 		stack.Pop()
+	}
+	// Decode the selected photo ahead of Enter while the grid rests on it,
+	// sized for the window the viewer would cover (V7).
+	v.NoteWindowSize(gtx, image.Pt(totalW, totalH-sbH))
+	if g.Selected >= 0 && g.Selected < len(entries) {
+		v.Warm(entries[g.Selected])
 	}
 
 	// Delete-confirmation overlay covers the entire window above the

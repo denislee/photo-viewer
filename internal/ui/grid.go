@@ -3,6 +3,7 @@ package ui
 import (
 	"image"
 	"image/color"
+	"log"
 	"time"
 
 	"gioui.org/f32"
@@ -64,7 +65,26 @@ type Grid struct {
 	// zoomSaveTimer debounces SaveConfig calls on zoom so rapid
 	// scroll-wheel zooming doesn't hammer the config file.
 	zoomSaveTimer *time.Timer
+
+	// lastFirst is the first visible row of the previous frame, giving the
+	// scroll direction the thumbnail prefetch leans toward (G3).
+	lastFirst int
+	scrollDir int // +1 down, -1 up, 0 unknown
+
+	// missing counts visible cells drawn without a thumbnail this frame, and
+	// fillStart is when the viewport last started missing some; together they
+	// drive the PV_DEBUG_TIMING "viewport filled" log.
+	missing   int
+	fillStart time.Time
 }
+
+// gridPrefetchRows is how many rows beyond the viewport get their thumbnails
+// prefetched in the scroll direction; gridPrefetchBackRows is the count on the
+// other side.
+const (
+	gridPrefetchRows     = 3
+	gridPrefetchBackRows = 1
+)
 
 // RequestDelete opens the delete-confirmation modal for the entry at idx.
 // No-op when the index is out of range.
@@ -322,6 +342,8 @@ func (g *Grid) Layout(gtx layout.Context, th *Theme, entries []cache.Entry, ctrl
 		}
 	}
 
+	thumbs := ctrl.Thumbs()
+	thumbs.BeginFrame()
 	cellPx := gtx.Dp(g.cellSize)
 	gapPx := gtx.Dp(cellGapDp)
 	width := gtx.Constraints.Max.X
@@ -335,7 +357,13 @@ func (g *Grid) Layout(gtx layout.Context, th *Theme, entries []cache.Entry, ctrl
 	// couple of scroll buffer rows. On a big display zoomed all the way out the
 	// visible cell count can exceed the default cap; without this the cache
 	// would evict and re-decode cells every frame.
-	ctrl.Thumbs().EnsureCapacity(cols * (g.viewportRows + 4))
+	// The prefetch band adds gridPrefetchRows+gridPrefetchBackRows rows, and big
+	// cells keep both thumbnail tiers resident.
+	resident := cols * (g.viewportRows + 4 + gridPrefetchRows + gridPrefetchBackRows)
+	if cellPx > LargeThumbCellPx {
+		resident *= 2
+	}
+	thumbs.EnsureCapacity(resident)
 	// Snapshot the selected-path set once per frame rather than acquiring
 	// Controller.mu per visible cell. Only meaningful in selection mode.
 	var selectedSnap map[string]bool
@@ -367,9 +395,59 @@ func (g *Grid) Layout(gtx layout.Context, th *Theme, entries []cache.Entry, ctrl
 		}
 	}
 
-	return g.list.Layout(gtx, rowCount, func(gtx layout.Context, row int) layout.Dimensions {
+	g.missing = 0
+	dims := g.list.Layout(gtx, rowCount, func(gtx layout.Context, row int) layout.Dimensions {
 		return g.layoutRow(gtx, th, entries, ctrl, selectedSnap, row, cols, cellPx, gapPx)
 	})
+	g.prefetchBeyondViewport(thumbs, entries, cols, rowCount, cellPx > LargeThumbCellPx)
+	g.logFill()
+	return dims
+}
+
+// prefetchBeyondViewport requests, at low priority, the thumbnails of the rows
+// just outside the viewport: gridPrefetchRows in the scroll direction and
+// gridPrefetchBackRows on the other side (G3). Visible requests always run
+// first, so this only uses otherwise idle workers.
+func (g *Grid) prefetchBeyondViewport(tc *thumbCache, entries []cache.Entry, cols, rowCount int, large bool) {
+	first, count := g.list.Position.First, g.list.Position.Count
+	switch {
+	case first > g.lastFirst:
+		g.scrollDir = 1
+	case first < g.lastFirst:
+		g.scrollDir = -1
+	}
+	g.lastFirst = first
+	if count == 0 || cols <= 0 {
+		return
+	}
+	below, above := gridPrefetchRows, gridPrefetchBackRows
+	if g.scrollDir < 0 {
+		below, above = above, below
+	}
+	prefetchRows := func(from, to int) {
+		for row := max(from, 0); row < min(to, rowCount); row++ {
+			for i := row * cols; i < min((row+1)*cols, len(entries)); i++ {
+				tc.Prefetch(entries[i], large)
+			}
+		}
+	}
+	prefetchRows(first+count, first+count+below)
+	prefetchRows(first-above, first)
+}
+
+// logFill logs, with PV_DEBUG_TIMING, how long the viewport took to fill
+// after it started missing thumbnails (a jump, a fast scroll, a new folder).
+func (g *Grid) logFill() {
+	if !debugTiming {
+		return
+	}
+	switch {
+	case g.missing > 0 && g.fillStart.IsZero():
+		g.fillStart = time.Now()
+	case g.missing == 0 && !g.fillStart.IsZero():
+		log.Printf("timing: grid viewport filled in %v", time.Since(g.fillStart).Round(time.Millisecond))
+		g.fillStart = time.Time{}
+	}
 }
 
 func (g *Grid) layoutRow(gtx layout.Context, th *Theme, entries []cache.Entry, ctrl *Controller, selectedSnap map[string]bool, row, cols, cellPx, gapPx int) layout.Dimensions {
@@ -393,24 +471,37 @@ func (g *Grid) layoutRow(gtx layout.Context, th *Theme, entries []cache.Entry, c
 		stack := op.Offset(image.Pt(x, yOff)).Push(gtx.Ops)
 		e := entries[i]
 		isSelected := selectionMode && selectedSnap[e.Path]
-		drawCell(cellGtx, th, e, thumbs, g.cellAt(i), cellPx, i == selected, isSelected, selectionMode)
+		if !drawCell(cellGtx, th, e, thumbs, g.cellAt(i), cellPx, i == selected, isSelected, selectionMode) {
+			g.missing++
+		}
 		stack.Pop()
 	}
 	return layout.Dimensions{Size: image.Pt(gtx.Constraints.Max.X, rowH)}
 }
 
-func drawCell(gtx layout.Context, th *Theme, e cache.Entry, tc *thumbCache, click *widget.Clickable, sizePx int, focused, selected, selectionMode bool) layout.Dimensions {
-	return click.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
+// drawCell draws one grid cell and reports whether its thumbnail was ready.
+// Cells above LargeThumbCellPx use the 512 px thumbnail tier (G5).
+func drawCell(gtx layout.Context, th *Theme, e cache.Entry, tc *thumbCache, click *widget.Clickable, sizePx int, focused, selected, selectionMode bool) bool {
+	haveThumb := false
+	click.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
 		rect := image.Rectangle{Max: image.Pt(sizePx, sizePx)}
 		clipArea := clip.Rect(rect).Push(gtx.Ops)
 		// background
 		paint.ColorOp{Color: th.CellBG}.Add(gtx.Ops)
 		paint.PaintOp{}.Add(gtx.Ops)
 
-		opImg, imgSz, ok := tc.Get(e)
+		var opImg paint.ImageOp
+		var imgSz image.Point
+		var ok bool
+		if sizePx > LargeThumbCellPx {
+			opImg, imgSz, ok = tc.GetLarge(e)
+		} else {
+			opImg, imgSz, ok = tc.Get(e)
+		}
 		if ok {
 			drawFitted(gtx, opImg, imgSz, rect)
 		}
+		haveThumb = ok
 
 		if selectionMode && selected {
 			// Dim the cell if selected in multi-selection mode.
@@ -437,6 +528,7 @@ func drawCell(gtx layout.Context, th *Theme, e cache.Entry, tc *thumbCache, clic
 
 		return layout.Dimensions{Size: rect.Max}
 	})
+	return haveThumb
 }
 
 // favoriteGold is the badge fill colour used to mark a favorite. Hard-coded
