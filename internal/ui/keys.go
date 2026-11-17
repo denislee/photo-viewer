@@ -71,7 +71,9 @@ var (
 	)
 )
 
-func handleKeys(gtx layout.Context, ctrl *Controller, grid *Grid, sidebar *Sidebar, viewer *Viewer, dups *DuplicatesView, imports *ImportView, organize *OrganizeView, settings *SettingsView, indexInfo *IndexInfoView, search *FuzzySearchView, sdPrompt *SDPromptView, webView *WebServerView, sidebarFocus *bool, focusSearch *bool, w *app.Window) {
+func handleKeys(gtx layout.Context, ctrl *Controller, views *appViews, sidebarFocus *bool, focusSearch *bool, w *app.Window) {
+	grid, sidebar, viewer := views.grid, views.sidebar, views.viewer
+	settings, imports, dups, search := views.settings, views.imports, views.dups, views.search
 	// Select the pre-built static filter set (see baseKeyFilters /
 	// fullKeyFilters). The palette needs printable keys, so it uses the base
 	// set only.
@@ -89,127 +91,23 @@ func handleKeys(gtx layout.Context, ctrl *Controller, grid *Grid, sidebar *Sideb
 			continue
 		}
 		// Modal overlays consume keys before the rest of the UI sees them.
-		if search.Open {
-			switch ke.Name {
-			case key.NameEscape:
-				search.Close()
+		// The top modal is re-read per event: a key may have just closed one.
+		top := views.topModal()
+		if top != nil && top.name == "search" {
+			if top.keys(ke) {
 				w.Invalidate()
-			case "[":
-				if ke.Modifiers.Contain(key.ModCtrl) {
-					search.Close()
-					w.Invalidate()
-				}
-			case key.NameDownArrow:
-				if search.Move(1) {
-					w.Invalidate()
-				}
-			case key.NameUpArrow:
-				if search.Move(-1) {
-					w.Invalidate()
-				}
-			case key.NamePageDown:
-				if search.Move(8) {
-					w.Invalidate()
-				}
-			case key.NamePageUp:
-				if search.Move(-8) {
-					w.Invalidate()
-				}
-			case key.NameReturn:
-				search.Activate()
-				w.Invalidate()
-			case "K":
-				if ke.Modifiers.Contain(key.ModCtrl) {
-					search.Close()
-					w.Invalidate()
-				}
 			}
 			continue
 		}
-		// Ctrl+K opens the fuzzy palette from anywhere outside a modal.
+		// Ctrl+K opens the fuzzy palette from anywhere, over any other modal.
 		if ke.Modifiers.Contain(key.ModCtrl) && ke.Name == "K" {
 			search.Show(ctrl.LibraryRoot())
 			*focusSearch = true
 			w.Invalidate()
 			continue
 		}
-		if dups.Open {
-			switch ke.Name {
-			case key.NameEscape, "Q":
-				if !dups.CancelConfirm() {
-					dups.Close()
-				}
-				w.Invalidate()
-			case "J", key.NameDownArrow:
-				if dups.Move(1) {
-					w.Invalidate()
-				}
-			case "K", key.NameUpArrow:
-				if dups.Move(-1) {
-					w.Invalidate()
-				}
-			case key.NameReturn:
-				dups.Activate()
-				w.Invalidate()
-			}
-			continue
-		}
-		if imports.Open {
-			switch ke.Name {
-			case key.NameEscape, "Q":
-				imports.Close()
-				w.Invalidate()
-			case "[":
-				if ke.Modifiers.Contain(key.ModCtrl) {
-					imports.Close()
-					w.Invalidate()
-				}
-			}
-			continue
-		}
-		if organize.Open {
-			switch ke.Name {
-			case key.NameEscape, "Q":
-				organize.Close()
-				w.Invalidate()
-			case "[":
-				if ke.Modifiers.Contain(key.ModCtrl) {
-					organize.Close()
-					w.Invalidate()
-				}
-			}
-			continue
-		}
-		if settings.Open {
-			if ke.Name == key.NameEscape || ke.Name == "Q" || ke.Name == "," {
-				settings.Close()
-				w.Invalidate()
-			}
-			continue
-		}
-		if indexInfo.Open {
-			if ke.Name == key.NameEscape || ke.Name == "Q" {
-				indexInfo.Close()
-				w.Invalidate()
-			}
-			continue
-		}
-		if sdPrompt.Open {
-			if ke.Name == key.NameEscape || ke.Name == "Q" {
-				sdPrompt.Close()
-				w.Invalidate()
-			}
-			continue
-		}
-		if webView.Open {
-			// Q would collide with the password editor, so only Esc /
-			// Ctrl+[ close the modal. Everything else falls through to the
-			// focused editor.
-			if ke.Name == key.NameEscape {
-				webView.Close()
-				w.Invalidate()
-			} else if ke.Name == "[" && ke.Modifiers.Contain(key.ModCtrl) {
-				webView.Close()
+		if top != nil {
+			if top.keys(ke) {
 				w.Invalidate()
 			}
 			continue

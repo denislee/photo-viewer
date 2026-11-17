@@ -194,7 +194,13 @@ func Run(w *app.Window, ctrl *Controller) error {
 	toolbar.GroupByYear = GetConfig().GroupByYear
 	toolbar.SortByLength = ctrl.Sort() == SortByDuration
 
-	splitter := &sidebarSplitter{}
+	views := &appViews{
+		toolbar: toolbar, sidebar: sidebar, grid: grid, viewer: viewer,
+		dups: dups, imports: imports, organize: organize, settings: settings,
+		indexInfo: indexInfo, search: search, sdPrompt: sdPrompt, webView: webView,
+		processBar: processBar, splitter: &sidebarSplitter{},
+	}
+	views.modals = newModals(views, ctrl.LibraryRoot)
 
 	ctrl.SetInvalidate(w.Invalidate)
 	// Kick off the initial indexing only after both the process registry and
@@ -219,12 +225,12 @@ func Run(w *app.Window, ctrl *Controller) error {
 			// If the watcher has a fresh removable device and we aren't
 			// already showing a modal, surface the prompt. The prompt only
 			// pops up when no other modal is active so it can't get buried.
-			if !sdPrompt.Open && !imports.Open && !dups.Open && !organize.Open && !settings.Open && !indexInfo.Open && !search.Open && !webView.Open {
+			if views.topModal() == nil {
 				if dev, ok := sdWatcher.Consume(); ok {
 					sdPrompt.Show(dev)
 				}
 			}
-			handleKeys(gtx, ctrl, grid, sidebar, viewer, dups, imports, organize, settings, indexInfo, search, sdPrompt, webView, &sidebarFocus, &focusSearch, w)
+			handleKeys(gtx, ctrl, views, &sidebarFocus, &focusSearch, w)
 			if focusSearch {
 				search.FocusEditor(gtx)
 				focusSearch = false
@@ -236,13 +242,15 @@ func Run(w *app.Window, ctrl *Controller) error {
 			toolbar.SortByLength = ctrl.Sort() == SortByDuration
 			toolbar.AnyProcess = processes.Count() > 0
 			toolbar.WebServerRunning = webView.Running()
-			drawRoot(gtx, th, ctrl, toolbar, sidebar, grid, viewer, dups, imports, organize, settings, indexInfo, search, sdPrompt, webView, processBar, splitter, sidebarFocus, w)
+			drawRoot(gtx, th, ctrl, views, sidebarFocus, w)
 			e.Frame(gtx.Ops)
 		}
 	}
 }
 
-func drawRoot(gtx layout.Context, th *Theme, ctrl *Controller, tb *Toolbar, sb *Sidebar, g *Grid, v *Viewer, dups *DuplicatesView, imports *ImportView, organize *OrganizeView, settings *SettingsView, indexInfo *IndexInfoView, search *FuzzySearchView, sdPrompt *SDPromptView, webView *WebServerView, processBar *ProcessBar, splitter *sidebarSplitter, sidebarFocus bool, w *app.Window) {
+func drawRoot(gtx layout.Context, th *Theme, ctrl *Controller, views *appViews, sidebarFocus bool, w *app.Window) {
+	tb, sb, g, v := views.toolbar, views.sidebar, views.grid, views.viewer
+	processBar, splitter := views.processBar, views.splitter
 	rect := image.Rectangle{Max: gtx.Constraints.Max}
 	defer clip.Rect(rect).Push(gtx.Ops).Pop()
 	paint.ColorOp{Color: th.Background}.Add(gtx.Ops)
@@ -292,68 +300,13 @@ func drawRoot(gtx layout.Context, th *Theme, ctrl *Controller, tb *Toolbar, sb *
 	}
 
 	// Modal overlays cover the window. Drawn before the shortcut bar so it
-	// stays visible at the bottom for esc/close hints.
-	if search.Open {
+	// stays visible at the bottom for esc/close hints. Only the top modal
+	// (see newModals for the order) is drawn.
+	if m := views.topModal(); m != nil {
 		gtx2 := gtx
 		gtx2.Constraints.Max = image.Pt(totalW, totalH-sbH)
 		gtx2.Constraints.Min = image.Pt(totalW, totalH-sbH)
-		search.Layout(gtx2, th)
-		drawShortcut()
-		return
-	}
-	if dups.Open {
-		gtx2 := gtx
-		gtx2.Constraints.Max = image.Pt(totalW, totalH-sbH)
-		gtx2.Constraints.Min = image.Pt(totalW, totalH-sbH)
-		dups.Layout(gtx2, th)
-		drawShortcut()
-		return
-	}
-	if imports.Open {
-		gtx2 := gtx
-		gtx2.Constraints.Max = image.Pt(totalW, totalH-sbH)
-		gtx2.Constraints.Min = image.Pt(totalW, totalH-sbH)
-		imports.Layout(gtx2, th)
-		drawShortcut()
-		return
-	}
-	if organize.Open {
-		gtx2 := gtx
-		gtx2.Constraints.Max = image.Pt(totalW, totalH-sbH)
-		gtx2.Constraints.Min = image.Pt(totalW, totalH-sbH)
-		organize.Layout(gtx2, th, ctrl.LibraryRoot())
-		drawShortcut()
-		return
-	}
-	if settings.Open {
-		gtx2 := gtx
-		gtx2.Constraints.Max = image.Pt(totalW, totalH-sbH)
-		gtx2.Constraints.Min = image.Pt(totalW, totalH-sbH)
-		settings.Layout(gtx2, th)
-		drawShortcut()
-		return
-	}
-	if indexInfo.Open {
-		gtx2 := gtx
-		gtx2.Constraints.Max = image.Pt(totalW, totalH-sbH)
-		gtx2.Constraints.Min = image.Pt(totalW, totalH-sbH)
-		indexInfo.Layout(gtx2, th)
-		drawShortcut()
-		return
-	}
-	if sdPrompt.Open {
-		gtx2 := gtx
-		gtx2.Constraints.Max = image.Pt(totalW, totalH-sbH)
-		gtx2.Constraints.Min = image.Pt(totalW, totalH-sbH)
-		sdPrompt.Layout(gtx2, th)
-		drawShortcut()
-		return
-	}
-	if webView.Open {
-		gtx2 := gtx
-		gtx2.Constraints.Max = image.Pt(totalW, totalH-sbH)
-		gtx2.Constraints.Min = image.Pt(totalW, totalH-sbH)
-		webView.Layout(gtx2, th)
+		m.layout(gtx2, th)
 		drawShortcut()
 		return
 	}
