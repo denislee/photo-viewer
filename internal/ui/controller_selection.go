@@ -67,13 +67,6 @@ func (c *Controller) ClearSelection() {
 	c.selectedPaths = make(map[string]bool)
 }
 
-// IsSelected returns whether path is in the selected set.
-func (c *Controller) IsSelected(path string) bool {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	return c.selectedPaths[path]
-}
-
 // SnapshotSelected returns the current selected-path set. The map is the
 // published copy-on-write snapshot, shared with the controller: callers must
 // treat it as read-only. It never changes after being returned, so callers

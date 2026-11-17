@@ -90,19 +90,6 @@ func header(h C.tjhandle, data []byte) (int, int, error) {
 	return w, ht, nil
 }
 
-func decodeConfig(data []byte) (Config, error) {
-	h, err := getHandle()
-	if err != nil {
-		return Config{}, err
-	}
-	defer putHandle(h)
-	w, ht, err := header(h, data)
-	if err != nil {
-		return Config{}, err
-	}
-	return Config{Width: w, Height: ht}, nil
-}
-
 func decodeFit(data []byte, fit func(w, h int) (minW, minH int)) (*image.RGBA, Config, error) {
 	var cfg Config
 	if !IsJPEG(data) {

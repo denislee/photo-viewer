@@ -159,7 +159,7 @@ type Controller struct {
 	favReverts []FavoriteRevert
 
 	// Selection state. Guarded by mu; read through SelectionMode /
-	// IsSelected / SnapshotSelected.
+	// SnapshotSelected.
 	selectionMode bool
 	selectedPaths map[string]bool
 

@@ -23,6 +23,12 @@ func encodeJPEG(t testing.TB, w, h int) []byte {
 	return buf.Bytes()
 }
 
+// decode decodes data at the smallest DCT scale that keeps at least minW×minH.
+func decode(data []byte, minW, minH int) (*image.RGBA, error) {
+	img, _, err := DecodeFit(data, func(int, int) (int, int) { return minW, minH })
+	return img, err
+}
+
 func TestPickScale(t *testing.T) {
 	factors := [][2]int{{1, 1}, {7, 8}, {3, 4}, {5, 8}, {1, 2}, {3, 8}, {1, 4}, {1, 8}, {2, 1}}
 	cases := []struct {
@@ -49,11 +55,11 @@ func TestDecode(t *testing.T) {
 		t.Skip("built without libjpeg-turbo")
 	}
 	data := encodeJPEG(t, 200, 120)
-	cfg, err := DecodeConfig(data)
+	_, cfg, err := DecodeFit(data, nil)
 	if err != nil || cfg.Width != 200 || cfg.Height != 120 {
-		t.Fatalf("DecodeConfig = %+v, %v", cfg, err)
+		t.Fatalf("DecodeFit = %+v, %v", cfg, err)
 	}
-	img, err := Decode(data, 0, 0)
+	img, err := decode(data, 0, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -67,7 +73,7 @@ func TestDecode(t *testing.T) {
 		t.Fatalf("pixel %v differs from image/jpeg (%d,%d,%d)", c, r1>>8, g1>>8, b1>>8)
 	}
 
-	small, err := Decode(data, 50, 30)
+	small, err := decode(data, 50, 30)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -75,10 +81,10 @@ func TestDecode(t *testing.T) {
 		t.Fatalf("1/4 decode bounds %v, want 50x30", small.Rect)
 	}
 
-	if _, err := Decode([]byte("not a jpeg"), 0, 0); err == nil {
+	if _, err := decode([]byte("not a jpeg"), 0, 0); err == nil {
 		t.Fatal("garbage decoded without error")
 	}
-	if _, err := Decode(data[:len(data)/3], 0, 0); err != nil {
+	if _, err := decode(data[:len(data)/3], 0, 0); err != nil {
 		t.Logf("truncated JPEG: %v (acceptable)", err)
 	}
 }
@@ -142,7 +148,7 @@ func BenchmarkDecode12MP(b *testing.B) {
 	}{{"full", 0, 0}, {"1080p", 1440, 1080}} {
 		b.Run(sc.name, func(b *testing.B) {
 			for b.Loop() {
-				if _, err := Decode(data, sc.minW, sc.minH); err != nil {
+				if _, err := decode(data, sc.minW, sc.minH); err != nil {
 					b.Fatal(err)
 				}
 			}

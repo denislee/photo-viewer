@@ -13,7 +13,7 @@ import (
 	"image"
 )
 
-// ErrUnavailable is returned by Decode when the package was built without
+// ErrUnavailable is returned by DecodeFit when the package was built without
 // libjpeg-turbo.
 var ErrUnavailable = errors.New("jpegturbo: built without libjpeg-turbo")
 
@@ -54,26 +54,23 @@ func pickScale(factors [][2]int, w, h, minW, minH int) (num, denom int) {
 	return
 }
 
-// Decode decodes a JPEG into an origin-anchored *image.RGBA. When minW or minH
-// is positive, the decoder applies the strongest DCT downscale that still keeps
-// the output at least minW×minH (in stored orientation), so a 12 MP photo shown
-// in a 1080p window decodes at 3/8 scale and costs a fraction of a full decode.
-// The output is never upscaled. Decode returns ErrUnavailable when built
-// without libjpeg-turbo, and an error for anything libjpeg-turbo can't convert
-// to RGBA (for example CMYK JPEGs); callers then fall back to image/jpeg.
-func Decode(data []byte, minW, minH int) (*image.RGBA, error) {
-	img, _, err := decodeFit(data, func(int, int) (int, int) { return minW, minH })
-	return img, err
-}
-
-// DecodeFit decodes a JPEG like Decode, but chooses the DCT downscale from the image's own stored size with a single header parse: fit receives the stored width and height and returns the minimum output size (zero or a nil fit means full size). The returned Config is the stored size whenever the header could be read, even when the decode itself then fails (for example a CMYK JPEG), so a caller falling back to image/jpeg still knows the native size.
+// DecodeFit decodes a JPEG into an origin-anchored *image.RGBA, applying the
+// strongest DCT downscale that still keeps the output at least minW×minH (in
+// stored orientation), so a 12 MP photo shown in a 1080p window decodes at 3/8
+// scale and costs a fraction of a full decode. The output is never upscaled.
+//
+// fit receives the image's stored width and height and returns the minimum
+// output size; a nil fit, or a zero minimum on both axes, means full size. The
+// scale is chosen from the image's own stored size with a single header parse.
+//
+// DecodeFit returns ErrUnavailable when built without libjpeg-turbo, and an
+// error for anything libjpeg-turbo can't convert to RGBA (for example CMYK
+// JPEGs); callers then fall back to image/jpeg. The returned Config is the
+// stored size whenever the header could be read, even when the decode itself
+// then fails (for example a CMYK JPEG), so a caller falling back to
+// image/jpeg still knows the native size.
 func DecodeFit(data []byte, fit func(w, h int) (minW, minH int)) (*image.RGBA, Config, error) {
 	return decodeFit(data, fit)
-}
-
-// DecodeConfig reads only the JPEG header.
-func DecodeConfig(data []byte) (Config, error) {
-	return decodeConfig(data)
 }
 
 // Available reports whether libjpeg-turbo was linked in.
