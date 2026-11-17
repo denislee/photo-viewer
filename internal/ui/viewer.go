@@ -123,12 +123,12 @@ type Viewer struct {
 	// It's kept alive between videos so navigation between clips doesn't
 	// pay the libmpv-init cost each time; the player itself is also a
 	// no-op when libmpv failed to load on this machine.
-	// player is stored atomically: playerOnce.Do initialises it on whichever
-	// goroutine first calls Player() (often the preload goroutine), while
-	// Close / stopVideoIfRunning read it from the UI thread. An atomic pointer
-	// lets those readers observe it without racing the Once's write.
+	// player is stored atomically: only the preload goroutine constructs it
+	// (ensurePlayer, under playerOnce), because libmpv/EGL init takes 59–86 ms
+	// and must never run on the frame goroutine (G4-01). Layout, the key
+	// handlers, Close and stopVideoIfRunning just Load it, and treat nil as
+	// "not ready yet" (or libmpv unavailable).
 	playerOnce sync.Once
-	playerErr  error
 	player     atomic.Pointer[video.Player]
 
 	// lastVideoOp is the most recent frame playVideo handed to Gio, keyed by
@@ -376,14 +376,18 @@ func (v *Viewer) preloadVideoIfNeeded() {
 		return
 	}
 	go func(path string) {
-		p := v.Player()
+		p, created := v.ensurePlayer()
 		if p == nil {
 			return
 		}
-		if p.Current() == path {
-			return
+		if p.Current() != path {
+			_ = p.Load(path)
 		}
-		_ = p.Load(path)
+		if created && v.invalidate != nil {
+			// Layout showed the thumbnail while the player was being built;
+			// wake it now so it starts drawing frames.
+			v.invalidate()
+		}
 	}(e.Path)
 }
 
@@ -561,25 +565,36 @@ func (v *Viewer) cancelStalePrefetches() {
 	}
 }
 
-// Player returns the lazily-initialised libmpv player, or nil if libmpv
-// failed to load. The first call initialises the player; subsequent calls
-// return the cached instance.
-func (v *Viewer) Player() *video.Player {
+// newPlayer constructs the libmpv player. A variable so tests can stand in a
+// slow or failing constructor.
+var newPlayer = video.New
+
+// ensurePlayer returns the lazily-initialised libmpv player, or nil if libmpv
+// failed to load, constructing it on the first call; created reports whether
+// this call did. It blocks for the whole libmpv/EGL init, so only the preload
+// goroutine may call it; everything on the frame goroutine uses player.Load.
+func (v *Viewer) ensurePlayer() (p *video.Player, created bool) {
 	v.playerOnce.Do(func() {
-		p, err := video.New(v.invalidate)
-		v.playerErr = err
+		p, err := newPlayer(v.invalidate)
+		if err != nil {
+			log.Printf("video: player unavailable: %v", err)
+			p = nil
+		}
 		v.player.Store(p)
+		created = true
 	})
-	return v.player.Load()
+	return v.player.Load(), created
 }
 
 // playVideo loads the current entry into mpv if it isn't already, renders
 // the current frame at the requested size, and returns it wrapped as a
 // paint.ImageOp. The mpv-side renderer letterboxes within (w, h) so the
 // caller can paint the result at imgArea without further fitting. Returns
-// (false) when libmpv is unavailable or no frame is ready yet.
+// (false) when libmpv is unavailable, the player is still being built by the
+// preload goroutine, or no frame is ready yet; Layout then shows the
+// thumbnail. It never constructs the player itself (G4-01).
 func (v *Viewer) playVideo(e cache.Entry, w, h int) (paint.ImageOp, bool) {
-	p := v.Player()
+	p := v.player.Load()
 	if p == nil {
 		return paint.ImageOp{}, false
 	}

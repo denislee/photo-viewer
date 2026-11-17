@@ -53,7 +53,7 @@ func handleViewerKey(ke key.Event, viewer *Viewer, grid *Grid, ctrl *Controller,
 			viewer.Close()
 			w.Invalidate()
 		} else if isViewerVideo(viewer) {
-			if p := viewer.Player(); p != nil {
+			if p := viewer.player.Load(); p != nil {
 				p.SeekRelative(-5)
 				w.Invalidate()
 			}
@@ -93,21 +93,21 @@ func handleViewerKey(ke key.Event, viewer *Viewer, grid *Grid, ctrl *Controller,
 		// anything else is a no-op so it doesn't accidentally pause a
 		// player that isn't loaded.
 		if isViewerVideo(viewer) {
-			if p := viewer.Player(); p != nil {
+			if p := viewer.player.Load(); p != nil {
 				p.TogglePause()
 				w.Invalidate()
 			}
 		}
 	case "M":
 		if isViewerVideo(viewer) {
-			if p := viewer.Player(); p != nil {
+			if p := viewer.player.Load(); p != nil {
 				p.ToggleMute()
 				w.Invalidate()
 			}
 		}
 	case "]":
 		if isViewerVideo(viewer) {
-			if p := viewer.Player(); p != nil {
+			if p := viewer.player.Load(); p != nil {
 				p.SeekRelative(5)
 				w.Invalidate()
 			}
