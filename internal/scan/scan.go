@@ -23,8 +23,7 @@ type Result struct {
 	DurationMs int64
 }
 
-// WalkOptions configures Walk. The zero value matches the historical
-// behaviour of Walk(ctx, root) — every video is probed via ffprobe.
+// WalkOptions configures WalkWith. The zero value probes every video via ffprobe.
 type WalkOptions struct {
 	// KnownDurationMs, if non-nil, is consulted before launching ffprobe
 	// against a video. Returning a non-zero value short-circuits the probe.
@@ -45,20 +44,39 @@ type WalkOptions struct {
 	OnError func(path string, err error)
 }
 
-// Walk emits a Result for each media file under root and all its subdirectories.
-// It skips hidden directories (names starting with '.') so the cache directory
-// (.photo-viewer-cache) is never picked up.
-// The channel is closed when the walk finishes or ctx is cancelled.
-func Walk(ctx context.Context, root string) <-chan Result {
-	return WalkWith(ctx, root, WalkOptions{})
+// maxProbeWorkers caps the concurrent ffprobe forks WalkWith runs for video
+// durations, matching the other subprocess pools (exiftool daemons and face
+// workers are capped at 4). ffprobe is short header I/O, so one per CPU only
+// multiplies forks on big machines (S3-04).
+const maxProbeWorkers = 4
+
+// walkWorkers returns the meta and probe worker counts for a walk.
+func walkWorkers() (meta, probe int) {
+	meta = max(runtime.NumCPU(), 4)
+	return meta, min(meta, maxProbeWorkers)
 }
 
-// WalkWith is Walk with options. Splits the pipeline into two stages so
-// the cheap d.Info()/stat work isn't blocked by the per-video ffprobe fork:
+// send delivers r on ch unless ctx is cancelled first. False means stop.
+func send(ctx context.Context, ch chan<- Result, r Result) bool {
+	select {
+	case ch <- r:
+		return true
+	case <-ctx.Done():
+		return false
+	}
+}
+
+// WalkWith emits a Result for each media file under root and all its
+// subdirectories, skipping hidden directories and files (so the
+// .photo-viewer-cache dir is never picked up). The channel is closed when the
+// walk finishes or ctx is cancelled.
+//
+// The pipeline has two stages so the cheap d.Info()/stat work isn't blocked by
+// the per-video ffprobe fork:
 //
 //	walker → metaJobs → metaWorkers (NumCPU)
 //	            ├─ non-video Result → out
-//	            └─ video → probeJobs → probeWorkers (NumCPU) → out
+//	            └─ video → probeJobs → probeWorkers (≤ maxProbeWorkers) → out
 //
 // Channel buffers are sized as a function of the worker counts so a fast
 // SSD walker doesn't stall on a full jobs queue.
@@ -68,15 +86,11 @@ func WalkWith(ctx context.Context, root string, opts WalkOptions) <-chan Result 
 		t    MediaType
 		d    fs.DirEntry
 	}
-	type vidResult struct {
-		r Result
-	}
 
-	metaWorkers := max(runtime.NumCPU(), 4)
-	probeWorkers := metaWorkers
+	metaWorkers, probeWorkers := walkWorkers()
 
 	jobs := make(chan work, metaWorkers*256)
-	probe := make(chan vidResult, probeWorkers*16)
+	probe := make(chan Result, probeWorkers*16)
 	out := make(chan Result, metaWorkers*256)
 
 	var metaWG sync.WaitGroup
@@ -104,39 +118,18 @@ func WalkWith(ctx context.Context, root string, opts WalkOptions) <-chan Result 
 					Size:    info.Size(),
 					ModTime: info.ModTime(),
 				}
-				if w.t == TypeVideo {
-					if opts.SkipDurationProbe {
-						// Caller doesn't need durations; emit straight through
-						// without forking ffprobe.
-						select {
-						case out <- r:
-						case <-ctx.Done():
-							return
-						}
-						continue
-					}
+				// SkipDurationProbe callers never need a duration, and a known
+				// (cached) duration skips the ffprobe fork.
+				dest := out
+				if w.t == TypeVideo && !opts.SkipDurationProbe {
 					if opts.KnownDurationMs != nil {
 						r.DurationMs = opts.KnownDurationMs(w.path)
 					}
-					if r.DurationMs > 0 {
-						// Already known; skip the ffprobe fork entirely.
-						select {
-						case out <- r:
-						case <-ctx.Done():
-							return
-						}
-						continue
+					if r.DurationMs <= 0 {
+						dest = probe // unknown duration: hand it to the ffprobe stage
 					}
-					select {
-					case probe <- vidResult{r: r}:
-					case <-ctx.Done():
-						return
-					}
-					continue
 				}
-				select {
-				case out <- r:
-				case <-ctx.Done():
+				if !send(ctx, dest, r) {
 					return
 				}
 			}
@@ -146,11 +139,9 @@ func WalkWith(ctx context.Context, root string, opts WalkOptions) <-chan Result 
 	var probeWG sync.WaitGroup
 	for range probeWorkers {
 		probeWG.Go(func() {
-			for vr := range probe {
-				vr.r.DurationMs = probeVideoDurationMs(ctx, vr.r.Path)
-				select {
-				case out <- vr.r:
-				case <-ctx.Done():
+			for r := range probe {
+				r.DurationMs = probeVideoDurationMs(ctx, r.Path)
+				if !send(ctx, out, r) {
 					return
 				}
 			}

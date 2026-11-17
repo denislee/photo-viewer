@@ -35,7 +35,7 @@ func TestPipeline(t *testing.T) {
 
 	ctx := context.Background()
 	var entries []cache.Entry
-	for r := range scan.Walk(ctx, root) {
+	for r := range scan.WalkWith(ctx, root, scan.WalkOptions{}) {
 		entries = append(entries, idx.ReconcileBatch([]scan.Result{r})[0])
 	}
 	if len(entries) == 0 {
@@ -71,7 +71,7 @@ func TestPipeline(t *testing.T) {
 		t.Fatal(err)
 	}
 	regen := 0
-	for r := range scan.Walk(ctx, root) {
+	for r := range scan.WalkWith(ctx, root, scan.WalkOptions{}) {
 		before := idx2.All()
 		entry := idx2.ReconcileBatch([]scan.Result{r})[0]
 		_ = entry

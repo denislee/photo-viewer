@@ -7,6 +7,23 @@ import (
 	"testing"
 )
 
+// walk is the zero-options WalkWith the tests use.
+func walk(ctx context.Context, root string) <-chan Result {
+	return WalkWith(ctx, root, WalkOptions{})
+}
+
+// TestWalkWorkersProbeCap pins S3-04: the ffprobe stage is capped at
+// maxProbeWorkers no matter how many CPUs the meta stage uses.
+func TestWalkWorkersProbeCap(t *testing.T) {
+	meta, probe := walkWorkers()
+	if meta < 4 {
+		t.Fatalf("meta = %d, want >= 4", meta)
+	}
+	if probe != min(meta, maxProbeWorkers) || probe > maxProbeWorkers {
+		t.Fatalf("probe = %d, want min(%d, %d)", probe, meta, maxProbeWorkers)
+	}
+}
+
 // TestWalkSkipDurationProbe verifies that WalkOptions.SkipDurationProbe
 // short-circuits video duration handling entirely: no ffprobe is run and the
 // emitted DurationMs is 0 even when a KnownDurationMs callback would otherwise
@@ -51,7 +68,7 @@ func TestWalkSkipsHiddenFiles(t *testing.T) {
 	}
 
 	var got []string
-	for r := range Walk(context.Background(), dir) {
+	for r := range walk(context.Background(), dir) {
 		got = append(got, filepath.Base(r.Path))
 	}
 
@@ -81,7 +98,7 @@ func TestWalkSymlinkFollowsTarget(t *testing.T) {
 	}
 
 	var got []Result
-	for r := range Walk(context.Background(), walkDir) {
+	for r := range walk(context.Background(), walkDir) {
 		got = append(got, r)
 	}
 
