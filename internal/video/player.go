@@ -423,6 +423,10 @@ type Player struct {
 	// the next successful render. It exists so callers can poll cheaply
 	// for "is there a new frame to draw?" without entering cgo.
 	updatePending atomic.Bool
+
+	// async is the dedicated GL render goroutine's state (PV_VIDEO_ASYNC=1,
+	// GL path only; see async.go), nil otherwise. Set once in New.
+	async *asyncRender
 }
 
 // hwdecMode returns the value for mpv's hwdec option; PV_HWDEC overrides
@@ -630,6 +634,13 @@ func New(invalidate func()) (*Player, error) {
 	}
 	p.ctx = ctx
 	p.gl = gl
+	// Before the callbacks are registered: goMpvRenderUpdate reads p.async
+	// from mpv's threads.
+	if gl != nil && asyncWanted() {
+		p.async = newAsyncRender()
+		go p.renderLoop(p.async)
+		log.Printf("video: rendering on a dedicated GL thread (PV_VIDEO_ASYNC)")
+	}
 	C.set_render_update_cb(ctx, user)
 	C.set_wakeup_cb(h, user)
 
@@ -667,6 +678,9 @@ func (p *Player) Load(path string) error {
 	p.current.Store(&pathCopy)
 	p.loaded.Store(true)
 	p.updatePending.Store(true)
+	if p.async != nil {
+		p.async.kick()
+	}
 	return nil
 }
 
@@ -690,6 +704,9 @@ func (p *Player) Stop() {
 	// window-sized RGBA (~33 MB for a 4K window) for the rest of the session
 	// while the user browses photos.
 	p.releaseBuf()
+	if p.async != nil {
+		p.async.reset()
+	}
 }
 
 // TogglePause toggles the pause property.
@@ -763,6 +780,12 @@ func (p *Player) Render(w, h int) (*image.RGBA, bool) {
 	if w <= 0 || h <= 0 {
 		return nil, false
 	}
+	if p.async != nil {
+		// The render goroutine does the GL work; hand out its newest
+		// finished frame without taking p.mu (it holds mu while rendering).
+		// The frame stays valid until the next Render call returns another.
+		return p.async.take(w, h)
+	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	// Re-check after acquiring mu: Close may have freed p.ctx in the window
@@ -792,6 +815,13 @@ func (p *Player) Render(w, h int) (*image.RGBA, bool) {
 		return nil, false
 	}
 	return p.buf, true
+}
+
+// renderGLInto renders the current frame into buf (w×h, tightly packed) on
+// the GL path. Caller holds p.mu and has checked p.gl/p.ctx. Used by the
+// async render goroutine (async.go), which can't see this file's C preamble.
+func (p *Player) renderGLInto(buf *image.RGBA, w, h int) int {
+	return int(C.render_gl(p.gl, p.ctx, C.int(w), C.int(h), unsafe.Pointer(&buf.Pix[0])))
 }
 
 // ensureBuf makes p.buf a w×h RGBA, reusing the existing backing array when
@@ -839,6 +869,10 @@ func (p *Player) NeedsRedraw() bool {
 	if p == nil {
 		return false
 	}
+	if p.async != nil {
+		// A new frame is "pending" once the render goroutine finished it.
+		return p.async.hasFresh()
+	}
 	return p.updatePending.Load()
 }
 
@@ -863,6 +897,11 @@ func (p *Player) Close() {
 		if p.drainDone != nil {
 			<-p.drainDone
 		}
+	}
+	if p.async != nil {
+		// Stop the render goroutine before its GL context goes away.
+		close(p.async.quit)
+		<-p.async.done
 	}
 	// Swap p.ctx out under mu so any in-progress Render either completes
 	// before we free the render context, or sees closed=true when it
@@ -978,6 +1017,12 @@ func goMpvRenderUpdate(userdata C.uintptr_t) {
 		return
 	}
 	p.updatePending.Store(true)
+	if p.async != nil {
+		// Render off the UI goroutine; the loop invalidates once the frame
+		// is finished, so waking the UI now would only draw the old one.
+		p.async.kick()
+		return
+	}
 	if p.invalidate != nil {
 		p.invalidate()
 	}
