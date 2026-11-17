@@ -127,6 +127,10 @@ func cachedProbe() Status {
 
 // refreshProbe re-runs the probe unconditionally and stores the fresh result,
 // so a helper installed or removed after startup is picked up.
+//
+// No production caller yet (only tests): kept deliberately as part of the
+// read/maintenance surface for the future People sidebar. See CLAUDE.md,
+// architecture layer 4. Do not delete it as dead code.
 func refreshProbe() Status {
 	s := Probe()
 	probeMu.Lock()

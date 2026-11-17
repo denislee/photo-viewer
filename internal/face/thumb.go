@@ -15,6 +15,11 @@ import (
 	"github.com/dns/photo-viewer/internal/imgfit"
 )
 
+// Face crop thumbnails (ThumbPath, EnsureThumb, EnsureThumbs). Nothing in
+// the GUI or webserver calls these yet (only tests): they are kept
+// deliberately as the avatar source for the future People sidebar. See
+// CLAUDE.md, architecture layer 4. Do not delete them as dead code.
+
 // FaceThumbSize is the longest edge of a cached face crop. 96px is large
 // enough for a sidebar avatar without ballooning disk use.
 const FaceThumbSize = 96

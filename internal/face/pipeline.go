@@ -102,6 +102,10 @@ func (p *Pipeline) Enabled() bool {
 // status. Caller is responsible for calling Start afterwards if the state
 // flipped from off → on; this function never starts or stops workers on
 // its own, to avoid surprising the caller.
+//
+// No production caller yet (only tests): kept deliberately as part of the
+// read/maintenance surface for the future People sidebar. See CLAUDE.md,
+// architecture layer 4. Do not delete it as dead code.
 func (p *Pipeline) Recheck() Status {
 	// refreshProbe (not cachedProbe) so a newly-installed or newly-broken helper
 	// is actually re-probed and the memoised result is refreshed for the next
@@ -172,6 +176,10 @@ func (p *Pipeline) Stop() {
 // Submit enqueues an entry for face detection. Non-photo types and entries
 // that already have fresh face rows are skipped cheaply. Never blocks: if the
 // queue is full the job is dropped (better than holding up the scan flush).
+//
+// No production caller yet (only tests): kept deliberately as part of the
+// read/maintenance surface for the future People sidebar. See CLAUDE.md,
+// architecture layer 4. Do not delete it as dead code.
 func (p *Pipeline) Submit(j Job) {
 	jobs, ok := p.acceptJob(j)
 	if !ok {
@@ -214,14 +222,23 @@ func (p *Pipeline) SubmitBlocking(ctx context.Context, j Job) bool {
 	}
 }
 
+// Candidate reports whether a media type is eligible for face detection:
+// photos, RAW and HEIC. Videos are rejected. Headless callers use it to
+// skip work (e.g. stat-ing a thumbnail) for entries the pipeline would refuse.
+func Candidate(t scan.MediaType) bool {
+	switch t {
+	case scan.TypePhoto, scan.TypeRAW, scan.TypeHEIC:
+		return true
+	}
+	return false
+}
+
 // acceptJob runs the cheap pre-checks and returns the live jobs channel.
 func (p *Pipeline) acceptJob(j Job) (chan Job, bool) {
 	if !p.enabled.Load() {
 		return nil, false
 	}
-	switch j.Entry.Type {
-	case scan.TypePhoto, scan.TypeRAW, scan.TypeHEIC:
-	default:
+	if !Candidate(j.Entry.Type) {
 		return nil, false
 	}
 	if p.hasFreshCached(j.Entry.Path, j.ThumbMod) {
@@ -404,13 +421,9 @@ func (p *Pipeline) assignAndPersist(j Job, dets []Detection) (changed bool) {
 		p.clusterCacheOK = true
 	}
 
-	// Build the running candidate list once and mutate it in lockstep with
-	// the cache — earlier faces in the same image must influence later ones.
-	cands := make([]CentroidCandidate, 0, len(p.cachedClusters)+len(dets))
-	for _, c := range p.cachedClusters {
-		cands = append(cands, CentroidCandidate{ID: c.ID, Centroid: c.Centroid, Count: c.Count})
-	}
-
+	// p.cachedClusters is updated in place below (centroid and count of a
+	// matched cluster, or a newly appended one), so a later face in the same
+	// image is compared against the just-updated state.
 	ops := make([]cache.FaceOp, 0, len(dets))
 	// cacheSlots[i] is the index into p.cachedClusters of the cluster chosen
 	// for ops[i]. Used to fix up new-cluster IDs after the DB commit.
@@ -426,7 +439,7 @@ func (p *Pipeline) assignAndPersist(j Job, dets []Detection) (changed bool) {
 			BBox:       d.BBox,
 			Embedding:  d.Embedding,
 		}
-		idx, _ := NearestCluster(d.Embedding, cands)
+		idx := NearestCluster(d.Embedding, p.cachedClusters)
 		if idx >= 0 {
 			c := p.cachedClusters[idx]
 			newCentroid := UpdatedCentroid(c.Centroid, d.Embedding, c.Count)
@@ -437,10 +450,6 @@ func (p *Pipeline) assignAndPersist(j Job, dets []Detection) (changed bool) {
 			})
 			p.cachedClusters[idx].Centroid = newCentroid
 			p.cachedClusters[idx].Count = c.Count + 1
-			// Keep the candidate centroid in lockstep so a later face in the
-			// same image compares against the just-updated cluster.
-			cands[idx].Centroid = newCentroid
-			cands[idx].Count = c.Count + 1
 			cacheSlots = append(cacheSlots, idx)
 		} else {
 			emb := append([]float32(nil), d.Embedding...)
@@ -452,7 +461,6 @@ func (p *Pipeline) assignAndPersist(j Job, dets []Detection) (changed bool) {
 				Centroid: emb,
 				Count:    1,
 			})
-			cands = append(cands, CentroidCandidate{Centroid: emb, Count: 1})
 			cacheSlots = append(cacheSlots, len(p.cachedClusters)-1)
 		}
 	}
@@ -481,6 +489,10 @@ func (p *Pipeline) assignAndPersist(j Job, dets []Detection) (changed bool) {
 // InvalidateClusters drops the in-memory cluster cache. UI paths that mutate
 // clusters out-of-band (merge, wipe) must call this so the next assign reloads
 // from the index. Rename leaves centroid+count unchanged and does not need it.
+//
+// No production caller yet (only tests): kept deliberately as part of the
+// read/maintenance surface for the future People sidebar. See CLAUDE.md,
+// architecture layer 4. Do not delete it as dead code.
 func (p *Pipeline) InvalidateClusters() {
 	p.clusterMu.Lock()
 	p.cachedClusters = nil

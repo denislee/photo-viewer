@@ -1,6 +1,10 @@
 package face
 
-import "math"
+import (
+	"math"
+
+	"github.com/dns/photo-viewer/internal/cache"
+)
 
 // MaxClusterSqDistance is the squared-Euclidean distance above which a new face
 // is treated as a new identity rather than merged into an existing cluster.
@@ -34,33 +38,21 @@ func SquaredEuclidean(a, b []float32) float64 {
 	return sum
 }
 
-// CentroidCandidate is one (id, centroid) pair the cluster step searches
-// against. The caller fills it from the index. Count is the running face count,
-// used to update the centroid mean when a face is added to the cluster.
-type CentroidCandidate struct {
-	ID       int64
-	Centroid []float32
-	Count    int
-}
-
-// NearestCluster picks the cluster whose centroid is closest to v under
-// squared-Euclidean distance. Returns (-1, MaxClusterSqDistance) when no
-// candidate is within MaxClusterSqDistance, which the caller reads as "start a
-// new cluster". The distance is squared-Euclidean throughout — see
-// MaxClusterSqDistance for why that (not cosine) is the correct metric.
-func NearestCluster(v []float32, candidates []CentroidCandidate) (int, float64) {
+// NearestCluster returns the index of the cluster whose centroid is closest
+// to v under squared-Euclidean distance, or -1 when none is within
+// MaxClusterSqDistance (the caller then starts a new cluster). See
+// MaxClusterSqDistance for why the metric is squared-Euclidean, not cosine.
+func NearestCluster(v []float32, clusters []cache.Cluster) int {
 	if len(v) == 0 {
-		return -1, math.Inf(1)
+		return -1
 	}
-	bestIdx, bestDist := -1, float64(MaxClusterSqDistance)
-	for i := range candidates {
-		d := SquaredEuclidean(v, candidates[i].Centroid)
-		if d < bestDist {
-			bestIdx = i
-			bestDist = d
+	best, bestDist := -1, float64(MaxClusterSqDistance)
+	for i := range clusters {
+		if d := SquaredEuclidean(v, clusters[i].Centroid); d < bestDist {
+			best, bestDist = i, d
 		}
 	}
-	return bestIdx, bestDist
+	return best
 }
 
 // UpdatedCentroid returns the running mean when adding `v` to a cluster of

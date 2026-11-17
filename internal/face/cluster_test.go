@@ -3,6 +3,8 @@ package face
 import (
 	"math"
 	"testing"
+
+	"github.com/dns/photo-viewer/internal/cache"
 )
 
 // unit128 builds a 128-d embedding whose first component is x and the rest 0.
@@ -34,21 +36,21 @@ func TestSquaredEuclidean(t *testing.T) {
 func TestNearestClusterMergesNearIdentical(t *testing.T) {
 	// A candidate centroid and a query 0.1 away on one axis: squared distance
 	// 0.01, well under the 0.36 threshold, so they must merge (index 0).
-	cands := []CentroidCandidate{{ID: 7, Centroid: axisVec(0), Count: 1}}
-	idx, dist := NearestCluster(axisVec(0.1), cands)
+	cands := []cache.Cluster{{ID: 7, Centroid: axisVec(0), Count: 1}}
+	idx := NearestCluster(axisVec(0.1), cands)
 	if idx != 0 {
 		t.Fatalf("near-identical vector should merge into cluster 0, got idx=%d", idx)
 	}
-	if math.Abs(dist-0.01) > 1e-6 {
-		t.Fatalf("distance: got %v, want ~0.01", dist)
+	if d := SquaredEuclidean(axisVec(0.1), axisVec(0)); math.Abs(d-0.01) > 1e-6 {
+		t.Fatalf("distance: got %v, want ~0.01", d)
 	}
 }
 
 func TestNearestClusterSeparatesDifferent(t *testing.T) {
 	// Query 0.7 away on one axis: squared distance 0.49 > 0.36, so it must NOT
 	// merge — this is exactly the pair the old cosine metric wrongly chained.
-	cands := []CentroidCandidate{{ID: 7, Centroid: axisVec(0), Count: 1}}
-	idx, _ := NearestCluster(axisVec(0.7), cands)
+	cands := []cache.Cluster{{ID: 7, Centroid: axisVec(0), Count: 1}}
+	idx := NearestCluster(axisVec(0.7), cands)
 	if idx != -1 {
 		t.Fatalf("clearly-different vector should start a new cluster, got idx=%d", idx)
 	}
@@ -58,12 +60,12 @@ func TestNearestClusterThresholdBoundary(t *testing.T) {
 	// 0.6 apart on one axis => squared distance exactly 0.36 == threshold. The
 	// comparison is strictly-less, so the boundary is treated as a new cluster,
 	// matching dlib's "distance < tolerance" convention.
-	cands := []CentroidCandidate{{ID: 1, Centroid: axisVec(0), Count: 1}}
-	if idx, _ := NearestCluster(axisVec(0.6), cands); idx != -1 {
+	cands := []cache.Cluster{{ID: 1, Centroid: axisVec(0), Count: 1}}
+	if idx := NearestCluster(axisVec(0.6), cands); idx != -1 {
 		t.Fatalf("distance == threshold must not merge, got idx=%d", idx)
 	}
 	// Just inside the threshold (0.59² = 0.3481 < 0.36) must merge.
-	if idx, _ := NearestCluster(axisVec(0.59), cands); idx != 0 {
+	if idx := NearestCluster(axisVec(0.59), cands); idx != 0 {
 		t.Fatalf("distance just under threshold must merge, got idx=%d", idx)
 	}
 }
@@ -80,15 +82,15 @@ func TestGreedyClusteringKeepsThreePeopleApart(t *testing.T) {
 		{10.0, 10.05, 9.95},
 	}
 
-	var cands []CentroidCandidate
+	var cands []cache.Cluster
 	assign := func(v []float32) {
-		idx, _ := NearestCluster(v, cands)
+		idx := NearestCluster(v, cands)
 		if idx >= 0 {
 			cands[idx].Centroid = UpdatedCentroid(cands[idx].Centroid, v, cands[idx].Count)
 			cands[idx].Count++
 			return
 		}
-		cands = append(cands, CentroidCandidate{Centroid: append([]float32(nil), v...), Count: 1})
+		cands = append(cands, cache.Cluster{Centroid: append([]float32(nil), v...), Count: 1})
 	}
 
 	for _, g := range groups {
