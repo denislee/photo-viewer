@@ -33,6 +33,23 @@ var dateLayouts = []string{
 	"2006:01:02 15:04:05Z",
 }
 
+// metaExiftool and openExifFile are seams so tests can prove a successful
+// exiftool read never opens the file for the goexif fallback; production never
+// reassigns them.
+var metaExiftool = runExiftool
+var openExifFile = os.Open
+
+// parseExifDate parses one exiftool creation-date value in any of the
+// dateLayouts. Shared by GetMediaInfo and readMetadataDate.
+func parseExifDate(s string) (time.Time, bool) {
+	for _, layout := range dateLayouts {
+		if t, err := time.Parse(layout, s); err == nil {
+			return t, true
+		}
+	}
+	return time.Time{}, false
+}
+
 // GetMediaInfo returns extended metadata found in the file's metadata.
 func GetMediaInfo(path string) MediaInfo {
 	var info MediaInfo
@@ -52,12 +69,13 @@ func GetMediaInfo(path string) MediaInfo {
 	// "-j" gives an unambiguous tag→value map that covers all those formats.
 	// (readMetadataDate below deliberately keeps the values-only short format
 	// and must not be switched — don't "fix" it to match this.)
-	out, err := runExiftool("-j",
+	out, exifErr := metaExiftool("-j",
 		"-Model", "-LensModel",
 		"-CreateDate", "-DateTimeOriginal", "-MediaCreateDate",
+		"-EXIF:ModifyDate",
 		"-FNumber", "-ExposureTime", "-ISO", "-FocalLength",
 		path)
-	if err == nil {
+	if exifErr == nil {
 		var records []map[string]json.RawMessage
 		if json.Unmarshal(out, &records) == nil && len(records) > 0 {
 			rec := records[0]
@@ -71,28 +89,27 @@ func GetMediaInfo(path string) MediaInfo {
 			}
 			info.ISO = exifJSONString(rec, "ISO")
 			info.FocalLength = exifJSONString(rec, "FocalLength")
-			for _, tag := range []string{"CreateDate", "DateTimeOriginal", "MediaCreateDate"} {
+			for _, tag := range []string{"CreateDate", "DateTimeOriginal", "MediaCreateDate", "ModifyDate"} {
 				v := exifJSONString(rec, tag)
 				if v == "" {
 					continue
 				}
-				for _, layout := range dateLayouts {
-					if t, err := time.Parse(layout, v); err == nil {
-						info.Created = t
-						dateFound = true
-						break
-					}
-				}
-				if dateFound {
+				if t, ok := parseExifDate(v); ok {
+					info.Created = t
+					dateFound = true
 					break
 				}
 			}
 		}
 	}
 
-	// Fallback 1: Manual EXIF for photos if info missing.
-	if !dateFound || info.Camera == "" || info.Aperture == "" {
-		if f, err := os.Open(path); err == nil {
+	// Fallback 1: goexif, only when exiftool itself failed (absent, or the
+	// request errored). A successful exiftool read already asked for a superset
+	// of these tags — -EXIF:ModifyDate covers goexif's DateTime fallback — so
+	// re-reading the file would only repeat the miss (every video, most PNGs)
+	// and, on TIFF-family RAWs, cost a whole-file ReadAll (S4-04).
+	if exifErr != nil {
+		if f, err := openExifFile(path); err == nil {
 			if x, err := exif.Decode(f); err == nil {
 				if !dateFound {
 					if tm, err := x.DateTime(); err == nil {
@@ -266,9 +283,11 @@ func exiftoolWriteFailed(out []byte) bool {
 // flag indicating whether one was found.
 func readMetadataDate(path string) (time.Time, bool) {
 	// No exec.LookPath guard: runExiftool errors out cleanly when exiftool is
-	// absent, so the err == nil check below already skips to the goexif
-	// fallback (S-06).
-	out, err := runExiftool("-s", "-S", "-CreateDate", "-DateTimeOriginal", "-MediaCreateDate", path)
+	// absent, so the err != nil path below skips straight to the goexif
+	// fallback (S-06), which only runs when exiftool errored. -EXIF:ModifyDate
+	// is requested last so it only wins when no capture date exists — it mirrors
+	// goexif's DateTime fallback to IFD0 DateTime.
+	out, err := metaExiftool("-s", "-S", "-CreateDate", "-DateTimeOriginal", "-MediaCreateDate", "-EXIF:ModifyDate", path)
 	if err == nil {
 		lines := strings.SplitSeq(strings.TrimSpace(string(out)), "\n")
 		for line := range lines {
@@ -276,14 +295,13 @@ func readMetadataDate(path string) (time.Time, bool) {
 			if line == "" {
 				continue
 			}
-			for _, layout := range dateLayouts {
-				if t, err := time.Parse(layout, line); err == nil {
-					return t, true
-				}
+			if t, ok := parseExifDate(line); ok {
+				return t, true
 			}
 		}
+		return time.Time{}, false
 	}
-	if f, err := os.Open(path); err == nil {
+	if f, err := openExifFile(path); err == nil {
 		defer f.Close()
 		if x, err := exif.Decode(f); err == nil {
 			if tm, err := x.DateTime(); err == nil {
@@ -296,9 +314,9 @@ func readMetadataDate(path string) (time.Time, bool) {
 
 // GetMediaDate returns the best creation date found in the file's metadata.
 // It delegates to readMetadataDate — exiftool first (for videos, RAW, and
-// photos), then manual EXIF decoding (photos) — and, when no metadata date is
-// found, falls back to the file's modification time and finally the current
-// time.
+// photos), then goexif decoding when exiftool is unavailable — and, when no
+// metadata date is found, falls back to the file's modification time and
+// finally the current time.
 func GetMediaDate(path string) time.Time {
 	if t, ok := readMetadataDate(path); ok {
 		return t

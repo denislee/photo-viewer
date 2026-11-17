@@ -2,15 +2,159 @@ package scan
 
 import (
 	"encoding/json"
+	"errors"
 	"image"
 	"image/color"
 	"image/jpeg"
+	"io/fs"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"testing"
 	"time"
 )
+
+// TestParseExifDate covers the shared date parser: every dateLayouts variant
+// parses, and empty, garbage and the all-zero exiftool placeholder do not.
+func TestParseExifDate(t *testing.T) {
+	cases := []struct {
+		in   string
+		want bool
+	}{
+		{"2024:05:04 12:34:56", true},
+		{"2024:05:04 12:34:56+02:00", true},
+		{"2024:05:04 12:34:56Z", true},
+		{"", false},
+		{"garbage", false},
+		{"0000:00:00 00:00:00", false},
+	}
+	for _, c := range cases {
+		if _, ok := parseExifDate(c.in); ok != c.want {
+			t.Errorf("parseExifDate(%q) ok = %v, want %v", c.in, ok, c.want)
+		}
+	}
+}
+
+// TestMetadataSkipsGoexifAfterExiftoolSuccess is the regression guard for
+// S4-04: once exiftool has answered — even with a record carrying no dates —
+// the goexif fallback must not open the file at all, because a re-read can only
+// repeat the miss and, on TIFF-family RAWs, costs a whole-file ReadAll.
+func TestMetadataSkipsGoexifAfterExiftoolSuccess(t *testing.T) {
+	origExiftool, origOpen := metaExiftool, openExifFile
+	t.Cleanup(func() {
+		metaExiftool, openExifFile = origExiftool, origOpen
+	})
+
+	metaExiftool = func(args ...string) ([]byte, error) {
+		if len(args) > 0 && args[0] == "-j" {
+			return []byte(`[{"SourceFile":"x","Model":""}]`), nil
+		}
+		return []byte(""), nil
+	}
+	opens := 0
+	openExifFile = func(string) (*os.File, error) {
+		opens++
+		return nil, fs.ErrNotExist
+	}
+
+	path := filepath.Join(t.TempDir(), "clip.mp4")
+	if err := os.WriteFile(path, []byte("not really a video"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	GetMediaInfo(path)
+	if _, ok := readMetadataDate(path); ok {
+		t.Errorf("readMetadataDate ok = true, want false")
+	}
+	if opens != 0 {
+		t.Errorf("openExifFile called %d times after a successful exiftool read, want 0", opens)
+	}
+}
+
+// TestMetadataFallsBackToGoexifWhenExiftoolErrors asserts the goexif fallback
+// still runs — and opens the file once per reader — when exiftool itself
+// failed (absent or errored).
+func TestMetadataFallsBackToGoexifWhenExiftoolErrors(t *testing.T) {
+	origExiftool, origOpen := metaExiftool, openExifFile
+	t.Cleanup(func() {
+		metaExiftool, openExifFile = origExiftool, origOpen
+	})
+
+	metaExiftool = func(args ...string) ([]byte, error) {
+		return nil, errors.New("exiftool not installed")
+	}
+	opens := 0
+	openExifFile = func(string) (*os.File, error) {
+		opens++
+		return nil, fs.ErrNotExist
+	}
+
+	path := filepath.Join(t.TempDir(), "clip.mp4")
+	if err := os.WriteFile(path, []byte("not really a video"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	GetMediaInfo(path)
+	readMetadataDate(path)
+	if opens != 2 {
+		t.Errorf("openExifFile called %d times when exiftool errored, want 2 (one per reader)", opens)
+	}
+}
+
+// TestReadMetadataDateUsesModifyDateLast proves -EXIF:ModifyDate is a last
+// resort: with only ModifyDate present it is returned, and a real capture date
+// (DateTimeOriginal) beats it. Gated on exiftool.
+func TestReadMetadataDateUsesModifyDateLast(t *testing.T) {
+	if _, err := exec.LookPath("exiftool"); err != nil {
+		t.Skip("exiftool not installed; skipping metadata read test")
+	}
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "fixture.jpg")
+
+	// A minimal JPEG for exiftool to graft EXIF onto.
+	img := image.NewRGBA(image.Rect(0, 0, 8, 8))
+	img.Set(0, 0, color.RGBA{1, 2, 3, 255})
+	f, err := os.Create(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := jpeg.Encode(f, img, nil); err != nil {
+		f.Close()
+		t.Fatal(err)
+	}
+	f.Close()
+
+	cmd := exec.Command("exiftool", "-overwrite_original",
+		"-ModifyDate=2019:07:08 09:10:11",
+		path)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("exiftool write failed: %v: %s", err, out)
+	}
+
+	got, ok := readMetadataDate(path)
+	if !ok {
+		t.Fatal("readMetadataDate found no date with only ModifyDate present")
+	}
+	if g := got.Format("2006-01-02 15:04:05"); g != "2019-07-08 09:10:11" {
+		t.Errorf("readMetadataDate = %q, want %q", g, "2019-07-08 09:10:11")
+	}
+
+	cmd = exec.Command("exiftool", "-overwrite_original",
+		"-DateTimeOriginal=2024:05:04 12:34:56",
+		path)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("exiftool write failed: %v: %s", err, out)
+	}
+
+	got, ok = readMetadataDate(path)
+	if !ok {
+		t.Fatal("readMetadataDate found no date after writing DateTimeOriginal")
+	}
+	if g := got.Format("2006-01-02 15:04:05"); g != "2024-05-04 12:34:56" {
+		t.Errorf("readMetadataDate = %q, want capture date %q to beat ModifyDate", g, "2024-05-04 12:34:56")
+	}
+}
 
 // TestExifJSONString covers the number/string coercion the "-j" reader relies
 // on: exiftool encodes some tags as JSON strings ("1/250", "50.0 mm") and some
