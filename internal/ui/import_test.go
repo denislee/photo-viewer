@@ -7,10 +7,29 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 )
+
+// stubImportDates swaps processBatch's date probe and metadata-rewrite hooks for
+// the duration of the test, so the batch can be exercised without exiftool. A
+// nil argument leaves that hook unchanged.
+func stubImportDates(t *testing.T, prober func(string) (time.Time, time.Time, bool), setter func(string, time.Time) error) {
+	t.Helper()
+	prober0, setter0 := importDateProber, importSetMediaDate
+	if prober != nil {
+		importDateProber = prober
+	}
+	if setter != nil {
+		importSetMediaDate = setter
+	}
+	t.Cleanup(func() {
+		importDateProber = prober0
+		importSetMediaDate = setter0
+	})
+}
 
 // TestImportCopyProgressInstrumentation locks the U-09 contract for the
 // phase-3 Inbox-copy loop: it drives the progress bar with the exact helper
@@ -392,5 +411,137 @@ func TestRunImportSkipsHiddenCardFiles(t *testing.T) {
 		if _, err := os.Stat(filepath.Join(card, name)); err != nil {
 			t.Errorf("card file %s should still exist: %v", name, err)
 		}
+	}
+}
+
+// TestProcessBatchCancelledReturnsPromptly is the U3-04 regression: an
+// already-cancelled context must stop processBatch at once — the old producer
+// filled a len(entries)-sized channel up front, so a 10000-file batch did all
+// 10000 sends (and could reach the prober) before any worker noticed the
+// cancel.
+func TestProcessBatchCancelledReturnsPromptly(t *testing.T) {
+	var calls atomic.Int64
+	stubImportDates(t, func(string) (time.Time, time.Time, bool) {
+		calls.Add(1)
+		return time.Time{}, time.Time{}, false
+	}, nil)
+
+	dir := t.TempDir()
+	outbox := t.TempDir()
+	entries := make([]string, 0, 10000)
+	for i := range 10000 {
+		// Nonexistent paths are fine: nothing may be probed at all.
+		entries = append(entries, filepath.Join(dir, "missing"+strconv.Itoa(i)+".jpg"))
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	v := &ImportView{}
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		v.processBatch(ctx, outbox, entries)
+	}()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("processBatch did not return within 1s of an already-cancelled context")
+	}
+	if n := calls.Load(); n != 0 {
+		t.Errorf("date prober called %d times, want 0", n)
+	}
+}
+
+// TestProcessBatchWorkerPoolCapped pins the bounded date-probe pool: probes run
+// concurrently (so a big card isn't serialized on exiftool latency) but the
+// exiftool forks stay capped at the pool size (≤4), and every entry still gets
+// its two progress ticks.
+func TestProcessBatchWorkerPoolCapped(t *testing.T) {
+	dir := t.TempDir()
+	outbox := t.TempDir()
+	const nFiles = 12
+	entries := make([]string, 0, nFiles)
+	for i := range nFiles {
+		p := filepath.Join(dir, "a"+strconv.Itoa(i)+".jpg")
+		if err := os.WriteFile(p, []byte("x"), 0o644); err != nil {
+			t.Fatalf("write %s: %v", p, err)
+		}
+		entries = append(entries, p)
+	}
+
+	when := time.Date(2024, 3, 5, 12, 0, 0, 0, time.Local)
+	var inFlight, maxInFlight atomic.Int64
+	stubImportDates(t, func(string) (time.Time, time.Time, bool) {
+		cur := inFlight.Add(1)
+		for {
+			prev := maxInFlight.Load()
+			if cur <= prev || maxInFlight.CompareAndSwap(prev, cur) {
+				break
+			}
+		}
+		time.Sleep(10 * time.Millisecond)
+		inFlight.Add(-1)
+		return when, time.Time{}, false
+	}, nil)
+
+	v := &ImportView{}
+	v.processBatch(context.Background(), outbox, entries)
+
+	if got := maxInFlight.Load(); got < 2 || got > 4 {
+		t.Errorf("max concurrent date probes = %d, want 2..4", got)
+	}
+	if m := atomic.LoadInt64(&v.statMoved); m != nFiles {
+		t.Errorf("statMoved = %d, want %d (errors=%d)", m, nFiles, atomic.LoadInt64(&v.statErrors))
+	}
+	if done, max := v.progress.load(); done != 2*nFiles || max != 2*nFiles {
+		t.Errorf("progress = %d/%d, want %d/%d", done, max, 2*nFiles, 2*nFiles)
+	}
+}
+
+// TestProcessBatchMtimeFixAdvancesProgress is the U3-07 regression: the
+// mtime-rewrite pass used to run with no progress movement, so a slow batch of
+// fixes looked frozen. Each fix must tick the bar, and the batch must still end
+// at done == max.
+func TestProcessBatchMtimeFixAdvancesProgress(t *testing.T) {
+	dir := t.TempDir()
+	outbox := t.TempDir()
+	when := time.Date(2024, 3, 5, 12, 0, 0, 0, time.Local)
+	var entries []string
+	for _, name := range []string{"a.jpg", "b.jpg", "c.jpg"} {
+		p := filepath.Join(dir, name)
+		if err := os.WriteFile(p, []byte(name), 0o644); err != nil {
+			t.Fatalf("write %s: %v", p, err)
+		}
+		entries = append(entries, p)
+	}
+
+	v := &ImportView{}
+	var mu sync.Mutex
+	var seen []int64
+	stubImportDates(t, func(string) (time.Time, time.Time, bool) {
+		return when, when, true // every file's mtime predates its metadata date
+	}, func(string, time.Time) error {
+		done, _ := v.progress.load()
+		mu.Lock()
+		seen = append(seen, done)
+		mu.Unlock()
+		return nil
+	})
+
+	v.processBatch(context.Background(), outbox, entries)
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(seen) != len(entries) {
+		t.Fatalf("mtime setter called %d times, want %d", len(seen), len(entries))
+	}
+	for i := 1; i < len(seen); i++ {
+		if seen[i] <= seen[i-1] {
+			t.Errorf("mtime-fix progress %v not strictly increasing at index %d", seen, i)
+		}
+	}
+	if done, max := v.progress.load(); done != 9 || max != 9 {
+		t.Errorf("progress = %d/%d, want 9/9", done, max)
 	}
 }

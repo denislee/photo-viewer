@@ -24,6 +24,12 @@ import (
 	"github.com/dns/photo-viewer/internal/scan"
 )
 
+// Date probe and rewrite used by processBatch, indirected so tests can stub exiftool.
+var (
+	importDateProber   = scan.GetOldestMediaDate
+	importSetMediaDate = scan.SetMediaDate
+)
+
 // ImportView is the modal "import media" overlay. It mirrors the Fyne
 // Controller.runImportFromDirs flow:
 //   - phase 1: extract user-supplied ZIPs into the inbox
@@ -311,14 +317,14 @@ func (v *ImportView) Layout(gtx layout.Context, th *Theme) layout.Dimensions {
 		if strings.TrimSpace(v.addPathEditor.Text()) != "" {
 			v.commitAddPath(true)
 		} else {
-			go v.pickFolder()
+			go v.pickSources(true)
 		}
 	}
 	if v.addZipBtn.Clicked(gtx) {
 		if strings.TrimSpace(v.addPathEditor.Text()) != "" {
 			v.commitAddPath(false)
 		} else {
-			go v.pickZip()
+			go v.pickSources(false)
 		}
 	}
 	if v.addSDBtn.Clicked(gtx) {
@@ -400,7 +406,7 @@ func (v *ImportView) Layout(gtx layout.Context, th *Theme) layout.Dimensions {
 			}),
 			layout.Rigid(layout.Spacer{Height: unit.Dp(4)}.Layout),
 			layout.Rigid(func(gtx layout.Context) layout.Dimensions {
-				return v.layoutStatus(gtx, th, statusMsg, running, finished, moved, skipped, errs)
+				return v.layoutStatus(gtx, th, statusMsg, running, finished, errs)
 			}),
 			layout.Rigid(layout.Spacer{Height: unit.Dp(8)}.Layout),
 			layout.Rigid(func(gtx layout.Context) layout.Dimensions {
@@ -577,7 +583,7 @@ func (v *ImportView) layoutButtons(gtx layout.Context, th *Theme, running bool) 
 // layoutStatus draws the prominent status row at the top of the overlay. It
 // shows a colored dot indicating idle/running/done state and the latest phase
 // message. Multi-line so a long path doesn't get truncated.
-func (v *ImportView) layoutStatus(gtx layout.Context, th *Theme, msg string, running, finished bool, moved, skipped, errs int64) layout.Dimensions {
+func (v *ImportView) layoutStatus(gtx layout.Context, th *Theme, msg string, running, finished bool, errs int64) layout.Dimensions {
 	prefix := "● Idle  "
 	color := th.Muted
 	if running {
@@ -591,8 +597,6 @@ func (v *ImportView) layoutStatus(gtx layout.Context, th *Theme, msg string, run
 		}
 		color = th.Foreground
 	}
-	_ = moved
-	_ = skipped
 	return layout.Flex{Axis: layout.Horizontal, Alignment: layout.Middle}.Layout(gtx,
 		layout.Rigid(func(gtx layout.Context) layout.Dimensions {
 			lbl := material.Label(th.Theme, unit.Sp(12), prefix)
@@ -631,59 +635,48 @@ func (v *ImportView) layoutCounters(gtx layout.Context, th *Theme, done, max, mo
 	return lbl.Layout(gtx)
 }
 
-// pickFolder shells out to zenity for a folder picker, then adds the result
-// to importDirs. Runs on a goroutine since zenity blocks until the user
-// dismisses the dialog. Falls back silently if zenity is missing — the user
-// can still type a path into the editor.
-func (v *ImportView) pickFolder() {
-	out, err := runZenity("--file-selection", "--multiple", "--directory", "--title=Select folder(s) to import")
-	if err != nil || out == "" {
-		if err != nil {
-			v.appendLog("[ERROR] Folder picker failed: " + err.Error() + " (type a path into the field instead)")
-		}
-		return
-	}
-	paths := strings.Split(out, "|")
-	v.mu.Lock()
+// addSources appends each trimmed, non-empty path in paths that dst doesn't
+// already hold, reporting whether anything was added. The caller holds v.mu.
+func addSources(dst *[]string, paths ...string) bool {
 	added := false
 	for _, path := range paths {
 		path = strings.TrimSpace(path)
 		if path == "" {
 			continue
 		}
-		if !slices.Contains(v.importDirs, path) {
-			v.importDirs = append(v.importDirs, path)
+		if !slices.Contains(*dst, path) {
+			*dst = append(*dst, path)
 			added = true
 		}
 	}
-	v.mu.Unlock()
-	if added && v.invalidate != nil {
-		v.invalidate()
-	}
+	return added
 }
 
-// pickZip shells out to zenity for a ZIP file picker.
-func (v *ImportView) pickZip() {
-	out, err := runZenity("--file-selection", "--multiple", "--title=Select ZIP(s) to import", "--file-filter=ZIP archives | *.zip *.ZIP")
+// pickSources shells out to zenity for a folder picker (asDir) or a ZIP file
+// picker, then adds the result to importDirs or zipFiles respectively. Runs on
+// a goroutine since zenity blocks until the user dismisses the dialog. Falls
+// back silently if zenity is missing — the user can still type a path into the
+// editor.
+func (v *ImportView) pickSources(asDir bool) {
+	args := []string{"--file-selection", "--multiple", "--directory", "--title=Select folder(s) to import"}
+	prefix := "[ERROR] Folder picker failed: "
+	if !asDir {
+		args = []string{"--file-selection", "--multiple", "--title=Select ZIP(s) to import", "--file-filter=ZIP archives | *.zip *.ZIP"}
+		prefix = "[ERROR] File picker failed: "
+	}
+	out, err := runZenity(args...)
 	if err != nil || out == "" {
 		if err != nil {
-			v.appendLog("[ERROR] File picker failed: " + err.Error() + " (type a path into the field instead)")
+			v.appendLog(prefix + err.Error() + " (type a path into the field instead)")
 		}
 		return
 	}
-	paths := strings.Split(out, "|")
 	v.mu.Lock()
-	added := false
-	for _, path := range paths {
-		path = strings.TrimSpace(path)
-		if path == "" {
-			continue
-		}
-		if !slices.Contains(v.zipFiles, path) {
-			v.zipFiles = append(v.zipFiles, path)
-			added = true
-		}
+	dst := &v.importDirs
+	if !asDir {
+		dst = &v.zipFiles
 	}
+	added := addSources(dst, strings.Split(out, "|")...)
 	v.mu.Unlock()
 	if added && v.invalidate != nil {
 		v.invalidate()
@@ -714,17 +707,11 @@ func (v *ImportView) commitAddPath(asDir bool) {
 	v.addPathEditor.SetText("")
 	v.mu.Lock()
 	defer v.mu.Unlock()
-	if asDir {
-		if slices.Contains(v.importDirs, text) {
-			return
-		}
-		v.importDirs = append(v.importDirs, text)
-	} else {
-		if slices.Contains(v.zipFiles, text) {
-			return
-		}
-		v.zipFiles = append(v.zipFiles, text)
+	dst := &v.importDirs
+	if !asDir {
+		dst = &v.zipFiles
 	}
+	addSources(dst, text)
 }
 
 func (v *ImportView) runningSnapshot() bool {
@@ -898,7 +885,6 @@ func (v *ImportView) runImport(ctx context.Context, cfg Config, importDirs, zipF
 		if len(inbox) > 0 {
 			v.setStatus(fmt.Sprintf("Processing %d files from Inbox…", len(inbox)))
 			v.appendLog(fmt.Sprintf("Processing %d files already in Inbox...", len(inbox)))
-			v.setProgress(0, int64(len(inbox)))
 			v.processBatch(ctx, cfg.OutboxDir, inbox)
 		} else {
 			v.appendLog("Inbox is empty — nothing to process.")
@@ -955,7 +941,6 @@ func (v *ImportView) runImport(ctx context.Context, cfg Config, importDirs, zipF
 				continue
 			}
 			v.setStatus(fmt.Sprintf("Processing %d files from %s…", len(extracted), filepath.Base(z)))
-			v.setProgress(0, int64(len(extracted)))
 			v.processBatch(ctx, cfg.OutboxDir, extracted)
 			if deleteSrc {
 				if err := os.Remove(z); err != nil {
@@ -1058,11 +1043,12 @@ func (v *ImportView) processBatch(ctx context.Context, outboxDir string, entries
 		return
 	}
 	// The batch is visited twice — once to read every file's date, once to move
-	// it — so the progress bar spans 2*len(entries). The date probes fork
-	// exiftool per file (~50–200 ms each); running them strictly sequentially
-	// stalled a multi-thousand-file card at 0% for minutes, so they go through a
-	// small worker pool (mirroring internal/ui/organize.go's scan pass) that
-	// bumps the bar as it reads.
+	// it — so the progress bar spans 2*len(entries), plus one extra tick per
+	// file that needs its mtime fixed (U3-07). The date probes fork exiftool per
+	// file (~50–200 ms each); running them strictly sequentially stalled a
+	// multi-thousand-file card at 0% for minutes, so they go through a small
+	// worker pool (mirroring internal/ui/organize.go's scan pass) that bumps the
+	// bar as it reads.
 	v.setProgress(0, int64(2*len(entries)))
 	v.setStatus(fmt.Sprintf("Reading dates from %d files…", len(entries)))
 
@@ -1081,12 +1067,13 @@ func (v *ImportView) processBatch(ctx context.Context, outboxDir string, entries
 	type dateResult struct {
 		oldest     time.Time
 		mtimeOlder bool
-		ok         bool
 	}
 	results := make([]dateResult, len(entries))
-	jobs := make(chan int, len(entries))
 	numWorkers := runtime.NumCPU()
 	numWorkers = min(numWorkers, 4) // cap the concurrent exiftool forks
+	// Bounded queue with a cancel-aware producer, the same shape as organize's
+	// scan pass, so a cancel stops queuing at once (U3-04).
+	jobs := make(chan int, numWorkers*2)
 	var wg sync.WaitGroup
 	for range numWorkers {
 		wg.Go(func() {
@@ -1095,16 +1082,22 @@ func (v *ImportView) processBatch(ctx context.Context, outboxDir string, entries
 				if ctx.Err() != nil {
 					return
 				}
-				oldest, _, mtimeOlder := scan.GetOldestMediaDate(entries[idx])
-				results[idx] = dateResult{oldest: oldest, mtimeOlder: mtimeOlder, ok: true}
+				oldest, _, mtimeOlder := importDateProber(entries[idx])
+				results[idx] = dateResult{oldest: oldest, mtimeOlder: mtimeOlder}
 				v.bumpProgress()
 			}
 		})
 	}
-	for i := range entries {
-		jobs <- i
-	}
-	close(jobs)
+	go func() {
+		defer close(jobs)
+		for i := range entries {
+			select {
+			case jobs <- i:
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
 	wg.Wait()
 	if ctx.Err() != nil {
 		return
@@ -1113,9 +1106,6 @@ func (v *ImportView) processBatch(ctx context.Context, outboxDir string, entries
 	// name" tie-break is deterministic.
 	for i, src := range entries {
 		r := results[i]
-		if !r.ok {
-			continue
-		}
 		if r.mtimeOlder {
 			mtimeFixes = append(mtimeFixes, mtimeFix{path: src, when: r.oldest})
 		}
@@ -1125,16 +1115,22 @@ func (v *ImportView) processBatch(ctx context.Context, outboxDir string, entries
 			baseDates[base] = r.oldest
 		}
 	}
+	if len(mtimeFixes) > 0 {
+		// The mtime-fix pass gets its own slice of the bar so it doesn't freeze
+		// mid-import while it shells out per file.
+		v.setProgress(int64(len(entries)), int64(2*len(entries)+len(mtimeFixes)))
+	}
 	v.setStatus(fmt.Sprintf("Filing %d files into %s…", len(entries), filepath.Base(outboxDir)))
 	for _, fix := range mtimeFixes {
 		if ctx.Err() != nil {
 			break
 		}
-		if err := scan.SetMediaDate(fix.path, fix.when); err != nil {
+		if err := importSetMediaDate(fix.path, fix.when); err != nil {
 			v.appendLog("[WARN] Could not rewrite creation date on " + filepath.Base(fix.path) + ": " + err.Error())
 		} else {
 			v.appendLog("Rewrote creation date on " + filepath.Base(fix.path) + " to " + fix.when.Format("2006-01-02"))
 		}
+		v.bumpProgress()
 	}
 
 	for _, src := range entries {
