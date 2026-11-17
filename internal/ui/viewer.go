@@ -2,6 +2,7 @@ package ui
 
 import (
 	"bytes"
+	"cmp"
 	"context"
 	"fmt"
 	"image"
@@ -260,7 +261,24 @@ func (v *Viewer) init() {
 
 // SetDisplayStore wires the on-disk display-rendition store used to cache
 // HEIC and RAW decodes. Call before the viewer is first shown.
-func (v *Viewer) SetDisplayStore(s *cache.ThumbStore) { v.display = s }
+// It also reaps HEIC staging dirs a crashed run left in the cache dir.
+func (v *Viewer) SetDisplayStore(s *cache.ThumbStore) {
+	v.display = s
+	if s != nil {
+		go sweepHEICStages(s.CacheDir(), time.Hour, time.Now())
+	}
+}
+
+// sweepHEICStages removes heicStageDir directories under dir older than
+// maxAge: ones a crash stranded between MkdirTemp and the deferred RemoveAll.
+func sweepHEICStages(dir string, maxAge time.Duration, now time.Time) {
+	matches, _ := filepath.Glob(filepath.Join(dir, heicStagePrefix+"*"))
+	for _, m := range matches {
+		if fi, err := os.Stat(m); err == nil && fi.IsDir() && now.Sub(fi.ModTime()) > maxAge {
+			_ = os.RemoveAll(m)
+		}
+	}
+}
 
 // setTarget records the image area decodes should fit to.
 func (v *Viewer) setTarget(sz image.Point) {
@@ -426,20 +444,34 @@ func (v *Viewer) preloadVideoIfNeeded() {
 func (v *Viewer) cachePut(e cache.Entry, d decodedImage) {
 	v.recentMu.Lock()
 	defer v.recentMu.Unlock()
-	for i, r := range v.recent {
+	// A smaller decode never replaces a larger one of the same source version
+	// (a late prefetch landing after an upgrade).
+	for _, r := range v.recent {
 		if r.path == e.Path {
 			if r.mod.Equal(e.ModTime) && r.sz.X > d.sz.X {
 				return
 			}
-			v.recent = append(v.recent[:i], v.recent[i+1:]...)
 			break
 		}
 	}
+	v.cacheDropLocked(e.Path)
 	r := recentImage{path: e.Path, mod: e.ModTime, op: d.op, sz: d.sz, native: d.native, full: d.full}
 	v.recent = append([]recentImage{r}, v.recent...)
 	if len(v.recent) > viewerRecentCap {
 		v.recent = v.recent[:viewerRecentCap]
 	}
+}
+
+// cacheDropLocked removes the first recent entry for path, reporting whether
+// there was one. The caller holds recentMu.
+func (v *Viewer) cacheDropLocked(path string) bool {
+	for i, r := range v.recent {
+		if r.path == path {
+			v.recent = append(v.recent[:i], v.recent[i+1:]...)
+			return true
+		}
+	}
+	return false
 }
 
 // cacheGet returns the cached image for e and moves it to MRU. An entry for
@@ -513,12 +545,7 @@ func (v *Viewer) ConfirmDelete(deleter func(path string) error) {
 	// Drop the deleted entry from the recent cache too — the path no
 	// longer exists, and the cache entry would never get evicted otherwise.
 	v.recentMu.Lock()
-	for i, r := range v.recent {
-		if r.path == e.Path {
-			v.recent = append(v.recent[:i], v.recent[i+1:]...)
-			break
-		}
-	}
+	v.cacheDropLocked(e.Path)
 	v.recentMu.Unlock()
 	v.cancelLoading()
 	v.loadingPath = ""
@@ -895,6 +922,12 @@ func decodeDimensions(path string) string {
 		return "—"
 	}
 	defer f.Close()
+	// One open for both the EXIF orientation and the image header (G3-02):
+	// read the orientation from the handle, rewind, then DecodeConfig.
+	orient := imgorient.ReadOrientationFrom(f)
+	if _, err := f.Seek(0, io.SeekStart); err != nil {
+		return "—"
+	}
 	cfg, _, err := image.DecodeConfig(f)
 	if err != nil {
 		return "—"
@@ -903,11 +936,14 @@ func decodeDimensions(path string) string {
 	// DecodeConfig reports the stored (unrotated) dimensions; EXIF orientations
 	// 5–8 transpose the image, so the displayed size — and what decodeOriginal
 	// now paints — has width and height swapped.
-	if imgorient.ReadOrientation(path) >= 5 {
+	if orient >= 5 {
 		w, h = h, w
 	}
 	return fmt.Sprintf("%d × %d", w, h)
 }
+
+// pendingInfo is shown while the background metadata fetch runs.
+var pendingInfo = cachedInfo{Created: "…", Camera: "…", Lens: "…", Aperture: "…", ShutterSpeed: "…", ISO: "…", FocalLength: "…"}
 
 // mediaInfoFor returns the extended metadata for the entry, or empty/placeholder
 // values while a background fetch is still running.
@@ -923,7 +959,7 @@ func (v *Viewer) mediaInfoFor(e cache.Entry) cachedInfo {
 	}
 	if v.infoAsked[e.Path] {
 		v.infoMu.Unlock()
-		return cachedInfo{Created: "…", Camera: "…", Lens: "…", Aperture: "…", ShutterSpeed: "…", ISO: "…", FocalLength: "…"}
+		return pendingInfo
 	}
 	v.infoAsked[e.Path] = true
 	v.infoMu.Unlock()
@@ -932,30 +968,12 @@ func (v *Viewer) mediaInfoFor(e cache.Entry) cachedInfo {
 		info := scan.GetMediaInfo(path)
 		c := cachedInfo{
 			Created:      info.Created.Local().Format("2006-01-02 15:04:05"),
-			Camera:       info.Camera,
-			Lens:         info.Lens,
-			Aperture:     info.Aperture,
-			ShutterSpeed: info.ShutterSpeed,
-			ISO:          info.ISO,
-			FocalLength:  info.FocalLength,
-		}
-		if c.Camera == "" {
-			c.Camera = "—"
-		}
-		if c.Lens == "" {
-			c.Lens = "—"
-		}
-		if c.Aperture == "" {
-			c.Aperture = "—"
-		}
-		if c.ShutterSpeed == "" {
-			c.ShutterSpeed = "—"
-		}
-		if c.ISO == "" {
-			c.ISO = "—"
-		}
-		if c.FocalLength == "" {
-			c.FocalLength = "—"
+			Camera:       cmp.Or(info.Camera, "—"),
+			Lens:         cmp.Or(info.Lens, "—"),
+			Aperture:     cmp.Or(info.Aperture, "—"),
+			ShutterSpeed: cmp.Or(info.ShutterSpeed, "—"),
+			ISO:          cmp.Or(info.ISO, "—"),
+			FocalLength:  cmp.Or(info.FocalLength, "—"),
 		}
 		v.infoMu.Lock()
 		if len(v.infoCache) >= viewerMetaCap {
@@ -968,7 +986,7 @@ func (v *Viewer) mediaInfoFor(e cache.Entry) cachedInfo {
 			v.invalidate()
 		}
 	}(e.Path)
-	return cachedInfo{Created: "…", Camera: "…", Lens: "…", Aperture: "…", ShutterSpeed: "…", ISO: "…", FocalLength: "…"}
+	return pendingInfo
 }
 
 // opOffset is a thin wrapper around op.Offset so defer Pop() reads cleanly
@@ -1029,6 +1047,22 @@ func (r recentImage) needsUpgrade(target image.Point) bool {
 	return want.X*100 > r.sz.X*102 || want.Y*100 > r.sz.Y*102
 }
 
+// sleepCtx waits d, or until ctx is done, and reports whether the full wait
+// elapsed. A non-positive d returns at once without sleeping.
+func sleepCtx(ctx context.Context, d time.Duration) bool {
+	if d <= 0 {
+		return ctx.Err() == nil
+	}
+	t := time.NewTimer(d)
+	defer t.Stop()
+	select {
+	case <-t.C:
+		return true
+	case <-ctx.Done():
+		return false
+	}
+}
+
 // kickDecode starts the main decode of e for the given image area, after an
 // optional settle delay, and cancels any previous main decode. If a prefetch
 // of the same path is already running, it waits for that instead of decoding
@@ -1074,14 +1108,8 @@ func (v *Viewer) kickDecode(e cache.Entry, target image.Point, delay time.Durati
 			}
 			// The prefetch failed or was cancelled: decode it ourselves.
 		}
-		if delay > 0 {
-			t := time.NewTimer(delay)
-			select {
-			case <-t.C:
-			case <-ctx.Done():
-				t.Stop()
-				return
-			}
+		if delay > 0 && !sleepCtx(ctx, delay) {
+			return
 		}
 		select {
 		case v.mainSem <- struct{}{}:
@@ -1108,6 +1136,17 @@ func (v *Viewer) kickDecode(e cache.Entry, target image.Point, delay time.Durati
 func (v *Viewer) logTiming(e cache.Entry, since time.Time, how string) {
 	if debugTiming && !since.IsZero() {
 		log.Printf("timing: viewer %s full-res in %v (%s)", filepath.Base(e.Path), time.Since(since).Round(time.Millisecond), how)
+	}
+}
+
+// decodeWork returns the background decode prefetchAt and Warm run: it decodes
+// e to fit the current target and parks the result in the recent cache.
+func (v *Viewer) decodeWork(e cache.Entry) func(context.Context) {
+	return func(ctx context.Context) {
+		d, ok := decodeOriginal(ctx, e, v.targetSize(), v.display)
+		if ok && ctx.Err() == nil {
+			v.cachePut(e, d)
+		}
 	}
 }
 
@@ -1141,12 +1180,7 @@ func (v *Viewer) prefetchAt(idx int) {
 	if v.rapidNav {
 		delay = viewerSettleDelay
 	}
-	v.startPrefetch(e, idx, delay, func(ctx context.Context) {
-		d, ok := decodeOriginal(ctx, e, v.targetSize(), v.display)
-		if ok && ctx.Err() == nil {
-			v.cachePut(e, d)
-		}
-	})
+	v.startPrefetch(e, idx, delay, v.decodeWork(e))
 }
 
 // Warm decodes e ahead of time while the grid has it selected, so Enter opens
@@ -1171,12 +1205,7 @@ func (v *Viewer) Warm(e cache.Entry) {
 	if v.cacheHasEntry(e) {
 		return
 	}
-	v.warmJob = v.startPrefetch(e, -1, viewerWarmDelay, func(ctx context.Context) {
-		d, ok := decodeOriginal(ctx, e, v.targetSize(), v.display)
-		if ok && ctx.Err() == nil {
-			v.cachePut(e, d)
-		}
-	})
+	v.warmJob = v.startPrefetch(e, -1, viewerWarmDelay, v.decodeWork(e))
 }
 
 // startPrefetch runs work for e as a background job under prefetchSem and
@@ -1205,14 +1234,8 @@ func (v *Viewer) startPrefetch(e cache.Entry, idx int, delay time.Duration, work
 			cancel()
 			close(job.done)
 		}()
-		if delay > 0 {
-			t := time.NewTimer(delay)
-			select {
-			case <-t.C:
-			case <-ctx.Done():
-				t.Stop()
-				return
-			}
+		if delay > 0 && !sleepCtx(ctx, delay) {
+			return
 		}
 		select {
 		case v.prefetchSem <- struct{}{}:
@@ -1289,6 +1312,22 @@ func displayEnough(target image.Point) bool {
 	return min(long, short*3/2) <= cache.DisplaySize*11/10
 }
 
+// heicStagePrefix names the staging directory a HEIC conversion writes into.
+const heicStagePrefix = "heicview-"
+
+// heicStageDir makes the temporary directory decodeOriginal stages
+// heif-convert output in. It is created next to the on-disk caches rather than
+// in the global temp dir, which is RAM-backed on systemd distros and never
+// swept, so a multi-megabyte conversion doesn't sit in memory. With no display
+// store it falls back to the OS temp dir.
+func heicStageDir(display *cache.ThumbStore) (string, error) {
+	parent := ""
+	if display != nil {
+		parent = display.CacheDir()
+	}
+	return os.MkdirTemp(parent, heicStagePrefix+"*")
+}
+
 // decodeOriginal decodes an entry's original image to fit an image area of
 // size target (V2). JPEGs go through libjpeg-turbo with DCT scaling (V3);
 // HEIC and RAW come from the on-disk display rendition when display is set
@@ -1317,7 +1356,7 @@ func decodeOriginal(ctx context.Context, e cache.Entry, target image.Point, disp
 	native := image.Point{}
 	switch e.Type {
 	case scan.TypeHEIC:
-		tmpDir, err2 := os.MkdirTemp("", "photo-viewer-heicview-")
+		tmpDir, err2 := heicStageDir(display)
 		if err2 != nil {
 			return decodedImage{}, false
 		}
