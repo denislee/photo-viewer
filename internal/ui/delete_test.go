@@ -78,7 +78,7 @@ func TestPerformDeletionSurfacesIndexError(t *testing.T) {
 		t.Fatal(err)
 	}
 	c := NewController(root, idx, store, cacheDir, cache.IndexPath(root, cacheDir))
-	if c.TrashDir() == "" {
+	if c.trashDir == "" {
 		t.Fatal("controller has no trash dir; the trash branch is untested")
 	}
 

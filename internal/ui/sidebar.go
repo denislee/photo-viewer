@@ -134,8 +134,6 @@ type sidebarRow struct {
 	// trash is true for the synthetic Trash row so the renderer can draw
 	// a trash-can icon instead of a star.
 	trash bool
-	// expanded is meaningful for rowYear — used to render the chevron.
-	expanded bool
 	// hasCount/count is precomputed so the renderer doesn't need the counts
 	// map at draw time (year totals are summed across child date folders).
 	hasCount bool
@@ -349,7 +347,6 @@ func (s *Sidebar) buildRows(root, treeDir string, subdirs []string, counts map[s
 			label:    marker + "  " + y,
 			kind:     rowYear,
 			year:     y,
-			expanded: expanded,
 			hasCount: b.hasAny,
 			count:    b.total,
 			yearDirs: append([]string(nil), b.dirs...),

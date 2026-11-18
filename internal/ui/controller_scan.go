@@ -14,14 +14,6 @@ import (
 	"github.com/dns/photo-viewer/internal/scan"
 )
 
-// Scanning reports whether at least one scanInto goroutine is currently
-// walking the filesystem and reconciling entries into the index.
-func (c *Controller) Scanning() bool {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	return c.scanning > 0
-}
-
 // CancelScan stops any in-flight scan or warm-up. The toolbar's Cancel
 // button is the only place that should cancel a warm-up — directory changes
 // only abort the scan context.
@@ -38,7 +30,9 @@ func (c *Controller) CancelScan() {
 	c.mu.Unlock()
 }
 
-// IndexStatus is a snapshot of the indexing pipeline state for the info modal.
+// IndexStatus is a snapshot of the indexing pipeline state. No UI reads it
+// since the index-info modal was removed; tests use it to observe scan,
+// warm-up and surfaced-error state.
 // Active/Target/StartedAt/EndedAt/Batched describe directory scans only; the
 // thumbnail warm-up, which runs independently, is reported in WarmUp.
 type IndexStatus struct {
@@ -51,7 +45,6 @@ type IndexStatus struct {
 	EndedAt     time.Time
 	Batched     int
 	ScanTotal   int // files the scan will visit (scan.Count); 0 while still counting
-	TotalRows   int
 	LastError   string
 	WarmUp      WarmUpStatus
 }
@@ -88,35 +81,8 @@ func (c *Controller) IndexStatus() IndexStatus {
 			Total:     c.warmUpTotal,
 		},
 	}
-	idx := c.index
 	c.mu.Unlock()
-	if idx != nil {
-		st.TotalRows = c.cachedTotalRows(idx, st.LibraryRoot)
-	}
 	return st
-}
-
-// indexStatusTTL bounds how stale the index-info modal's row count may be. A
-// few hundred ms is imperceptible for a status readout but collapses a
-// per-frame COUNT storm into at most one COUNT per interval.
-const indexStatusTTL = 400 * time.Millisecond
-
-// cachedTotalRows returns the index row count under st.LibraryRoot, recomputing
-// the expensive CountDir COUNT at most once per indexStatusTTL. Called only
-// from IndexStatus (the info modal); the cache is invalidated implicitly when
-// the library root changes.
-func (c *Controller) cachedTotalRows(idx *cache.Index, root string) int {
-	c.idxStatusMu.Lock()
-	defer c.idxStatusMu.Unlock()
-	now := time.Now()
-	if root == c.idxStatusRoot && now.Before(c.idxStatusExpiry) {
-		return c.idxStatusRows
-	}
-	n := idx.CountDirFiltered(root, "All", true)
-	c.idxStatusRows = n
-	c.idxStatusRoot = root
-	c.idxStatusExpiry = now.Add(indexStatusTTL)
-	return n
 }
 
 // Rebuild empties the index in place, forgets every generated thumbnail, and
@@ -375,7 +341,7 @@ func (c *Controller) WarmUp() {
 
 		// proc.SetDone already goes through the registry's ~30Hz coalescer, so
 		// no second throttle here (U4-09). Without a registry (tests) invalidate
-		// directly. warmUpDone is published every 50 items for the info modal
+		// directly. warmUpDone is published every 50 items for IndexStatus
 		// and once more, exactly, after the pool drains.
 		var done, generated int64
 		notify := func(n int64) {

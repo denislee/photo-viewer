@@ -51,12 +51,12 @@ func TestOrganizeCachesMediaDate(t *testing.T) {
 	// results synchronously, so calling it directly blocks until the pass ends.
 	v := NewOrganizeView(func() {})
 
-	v.scanForMismatched(context.Background(), idx, dir)
+	v.scanForMismatched(context.Background(), idx)
 	if got := probes.Load(); got != nVideos {
 		t.Fatalf("first pass probed %d videos, want %d (every row is a cache miss)", got, nVideos)
 	}
 
-	v.scanForMismatched(context.Background(), idx, dir)
+	v.scanForMismatched(context.Background(), idx)
 	if got := probes.Load(); got != nVideos {
 		t.Fatalf("second pass raised probe count to %d, want it stable at %d (all cache hits)", got, nVideos)
 	}

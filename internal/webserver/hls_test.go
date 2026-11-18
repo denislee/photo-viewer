@@ -19,16 +19,6 @@ import (
 	"github.com/dns/photo-viewer/internal/scan"
 )
 
-// TestHLSScaleFilterMatchesMaxW guards the duplication between the ffmpeg
-// -vf literal and hlsMaxW: they must stay in sync or segments get encoded at
-// a different width than the rest of the pipeline assumes.
-func TestHLSScaleFilterMatchesMaxW(t *testing.T) {
-	want := fmt.Sprintf("scale='min(%d,iw)':-2", hlsMaxW)
-	if hlsScaleFilter != want {
-		t.Fatalf("hlsScaleFilter = %q, want %q", hlsScaleFilter, want)
-	}
-}
-
 // makeTestVideo writes a short synthetic clip at path using ffmpeg, in
 // whatever container the extension implies. Returns the duration written.
 func makeTestVideo(t *testing.T, path string, seconds int) {

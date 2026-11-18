@@ -169,9 +169,10 @@ func (c *Controller) patchLocalDeletion(paths []string, intoTrash bool) {
 	}
 	if c.dirCounts != nil {
 		// Clone-swap rather than mutate in place: the sidebar reads the map
-		// returned by DirCounts() lock-free every frame, so decrementing the
-		// published map here would race that reader (fatal error: concurrent
-		// map read and map write). Patch a copy and swap the pointer under mu.
+		// returned by DirCountsWithVersion() lock-free every frame, so
+		// decrementing the published map here would race that reader (fatal
+		// error: concurrent map read and map write). Patch a copy and swap the
+		// pointer under mu.
 		next := maps.Clone(c.dirCounts)
 		// Walk each *actually-removed* path up its ancestor chain and
 		// decrement the matching dirCounts keys. Iterating present (not
@@ -293,10 +294,6 @@ func (c *Controller) isInTrash(path string) bool {
 	prefix := c.trashDir + string(filepath.Separator)
 	return strings.HasPrefix(abs, prefix)
 }
-
-// TrashDir returns the directory where soft-deleted files live, or "" if no
-// writable location was found at startup.
-func (c *Controller) TrashDir() string { return c.trashDir }
 
 // TrashStats reports the number of items and total bytes currently in the
 // trash. The count comes from an in-memory mirror that the delete /

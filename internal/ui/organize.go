@@ -99,7 +99,7 @@ func (v *OrganizeView) Show(idx *cache.Index, root string) {
 	v.scanCancel = cancel
 	v.mu.Unlock()
 
-	go v.scanForMismatched(ctx, idx, root)
+	go v.scanForMismatched(ctx, idx)
 }
 
 func (v *OrganizeView) Close() {
@@ -116,7 +116,7 @@ func (v *OrganizeView) Close() {
 	}
 }
 
-func (v *OrganizeView) scanForMismatched(ctx context.Context, idx *cache.Index, _ string) {
+func (v *OrganizeView) scanForMismatched(ctx context.Context, idx *cache.Index) {
 	proc := v.scope.begin(ProcOrganize, "Organize: scan", func() {
 		v.mu.Lock()
 		c := v.scanCancel

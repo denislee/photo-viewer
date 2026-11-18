@@ -100,7 +100,7 @@ func TestRestoreBatchReconcilesOnce(t *testing.T) {
 
 	root := filepath.Join(dir, "lib")
 	c := NewController(root, idx, store, cacheDir, cache.IndexPath(root, cacheDir))
-	trashDir := c.TrashDir()
+	trashDir := c.trashDir
 	if trashDir == "" {
 		t.Fatal("controller has no trash dir")
 	}
@@ -154,7 +154,7 @@ func TestDeletePathRestoresAsync(t *testing.T) {
 
 	root := filepath.Join(dir, "lib")
 	c := NewController(root, idx, store, cacheDir, cache.IndexPath(root, cacheDir))
-	trashDir := c.TrashDir()
+	trashDir := c.trashDir
 	if trashDir == "" {
 		t.Fatal("controller has no trash dir")
 	}
@@ -209,7 +209,7 @@ func TestDeletePathRestoreFailureKeepsCount(t *testing.T) {
 
 	root := filepath.Join(dir, "lib")
 	c := NewController(root, idx, store, cacheDir, cache.IndexPath(root, cacheDir))
-	trashDir := c.TrashDir()
+	trashDir := c.trashDir
 	if trashDir == "" {
 		t.Fatal("controller has no trash dir")
 	}

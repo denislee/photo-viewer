@@ -826,8 +826,8 @@ func (i *Index) SetFavorite(path string, favorite bool) error {
 	if err != nil {
 		return err
 	}
-	// No row for path: report it like ToggleFavorite does, rather than
-	// letting the caller believe a flag was stored.
+	// No row for path: report sql.ErrNoRows rather than letting the caller
+	// believe a flag was stored.
 	if n, err := res.RowsAffected(); err == nil && n == 0 {
 		return sql.ErrNoRows
 	}
@@ -902,26 +902,6 @@ func (i *Index) IsFavorite(path string) bool {
 		return false
 	}
 	return v != 0
-}
-
-// ToggleFavorite flips the favorite flag for path in one round-trip and returns
-// the new value. Collapsing the former IsFavorite (SELECT) + SetFavorite
-// (UPDATE) pair into a single `UPDATE ... RETURNING` statement halves the round
-// trips per star keystroke and makes the flip atomic against a concurrent scan
-// reconciling the same row — the SELECT-then-UPDATE pair could otherwise
-// interleave. RETURNING is supported by the embedded SQLite (>= 3.35).
-//
-// A missing path updates no rows, so QueryRow's Scan reports sql.ErrNoRows; the
-// caller treats that as "nothing toggled" and skips the in-memory patch.
-func (i *Index) ToggleFavorite(path string) (bool, error) {
-	var v int
-	if err := i.db.QueryRow(
-		"UPDATE entries SET favorite = 1 - favorite WHERE path = ? RETURNING favorite",
-		path,
-	).Scan(&v); err != nil {
-		return false, err
-	}
-	return v != 0, nil
 }
 
 // MovePath relocates the row for oldPath to newPath after the file was renamed

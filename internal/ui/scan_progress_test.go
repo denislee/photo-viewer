@@ -41,19 +41,3 @@ func TestScanIntoReportsTotal(t *testing.T) {
 		t.Fatalf("ScanTotal=%d Batched=%d, want 3 and 3", st.ScanTotal, st.Batched)
 	}
 }
-
-func TestReconciledString(t *testing.T) {
-	for _, tc := range []struct {
-		st   IndexStatus
-		want string
-	}{
-		{IndexStatus{Active: true, Batched: 120}, "120 (counting files…)"},
-		{IndexStatus{Active: true, Batched: 120, ScanTotal: 400}, "120 / 400 (30%)"},
-		{IndexStatus{Batched: 410, ScanTotal: 400}, "410 / 400 (100%)"},
-		{IndexStatus{Batched: 7}, "7"},
-	} {
-		if got := reconciledString(tc.st); got != tc.want {
-			t.Errorf("reconciledString(%+v) = %q, want %q", tc.st, got, tc.want)
-		}
-	}
-}

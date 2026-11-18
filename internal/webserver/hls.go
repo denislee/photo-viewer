@@ -37,8 +37,7 @@ import (
 // produced) and makes seeking cheap (the player just requests the segment it
 // lands in). Segments are cached on disk so a re-watch or seek-back is free.
 const (
-	hlsSegDur  = 6.0  // seconds per segment; also the playlist TARGETDURATION
-	hlsMaxW    = 1280 // cap width so per-segment transcode keeps up on the fly
+	hlsSegDur  = 6.0 // seconds per segment; also the playlist TARGETDURATION
 	hlsSegMime = "video/mp2t"
 	hlsM3UMime = "application/vnd.apple.mpegurl"
 
@@ -75,8 +74,8 @@ const (
 	// huge k values can't each claim a singleflight key and an hlsSem slot.
 	hlsMaxSegments = 10000
 
-	// ffmpeg -vf for transcodeSegment; the literal 1280 must equal hlsMaxW
-	// (TestHLSScaleFilterMatchesMaxW).
+	// hlsScaleFilter is the ffmpeg -vf for transcodeSegment: it caps the width
+	// at 1280 so the per-segment transcode keeps up on the fly.
 	hlsScaleFilter = "scale='min(1280,iw)':-2"
 )
 

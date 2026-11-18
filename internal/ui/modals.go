@@ -16,7 +16,6 @@ type appViews struct {
 	imports    *ImportView
 	organize   *OrganizeView
 	settings   *SettingsView
-	indexInfo  *IndexInfoView
 	search     *FuzzySearchView
 	sdPrompt   *SDPromptView
 	webView    *WebServerView
@@ -137,12 +136,6 @@ func newModals(v *appViews, libraryRoot func() string) []modal {
 			open:   func() bool { return v.settings.Open },
 			layout: func(gtx layout.Context, th *Theme) { v.settings.Layout(gtx, th) },
 			keys:   closeOn(v.settings.Close, key.NameEscape, "Q", ","),
-		},
-		{
-			name:   "indexInfo",
-			open:   func() bool { return v.indexInfo.Open },
-			layout: func(gtx layout.Context, th *Theme) { v.indexInfo.Layout(gtx, th) },
-			keys:   closeOn(v.indexInfo.Close, key.NameEscape, "Q"),
 		},
 		{
 			name:   "sdPrompt",

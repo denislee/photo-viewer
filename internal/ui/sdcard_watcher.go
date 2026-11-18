@@ -212,16 +212,6 @@ func (w *SDCardWatcher) scan(prev bool) {
 	}
 }
 
-// Pending returns the next pending device, or false if none.
-func (w *SDCardWatcher) Pending() (removableDevice, bool) {
-	w.mu.Lock()
-	defer w.mu.Unlock()
-	if len(w.pending) == 0 {
-		return removableDevice{}, false
-	}
-	return w.pending[0], true
-}
-
 // Consume pops and returns the front pending device. The device path is
 // suppressed until unplugged so dismissing or acting on a prompt doesn't
 // immediately re-trigger it on the next tick.

@@ -60,7 +60,7 @@ func TestApplyMoveKeepsProbedMediaDate(t *testing.T) {
 	t.Cleanup(func() { mediaDateProber = orig })
 
 	v := NewOrganizeView(func() {})
-	v.scanForMismatched(context.Background(), c.index, root)
+	v.scanForMismatched(context.Background(), c.index)
 	if got := probes.Load(); got != nClips {
 		t.Fatalf("first pass probed %d clips, want %d", got, nClips)
 	}
@@ -77,7 +77,7 @@ func TestApplyMoveKeepsProbedMediaDate(t *testing.T) {
 		}
 	}
 
-	v.scanForMismatched(context.Background(), c.index, root)
+	v.scanForMismatched(context.Background(), c.index)
 	if got := probes.Load(); got != nClips {
 		t.Fatalf("after moves probe count = %d, want %d (moved rows keep their media_date)", got, nClips)
 	}

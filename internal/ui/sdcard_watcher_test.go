@@ -216,3 +216,14 @@ func TestIsBlockUevent(t *testing.T) {
 		}
 	}
 }
+
+// Pending returns the next pending device without consuming it, or false if
+// none. Test-only peek; production code uses Consume.
+func (w *SDCardWatcher) Pending() (removableDevice, bool) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if len(w.pending) == 0 {
+		return removableDevice{}, false
+	}
+	return w.pending[0], true
+}

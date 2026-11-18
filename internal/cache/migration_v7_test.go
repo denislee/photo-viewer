@@ -64,8 +64,7 @@ func TestMigrationV7AddsMediaDate(t *testing.T) {
 	}
 
 	// Rewind to a genuine v6 layout: drop media_date, stamp user_version = 6.
-	// (DROP COLUMN needs SQLite >= 3.35, the same floor ToggleFavorite's
-	// RETURNING already relies on.)
+	// (DROP COLUMN needs SQLite >= 3.35.)
 	for _, stmt := range []string{
 		"ALTER TABLE entries DROP COLUMN media_date",
 		"PRAGMA user_version = 6",

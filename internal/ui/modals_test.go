@@ -9,7 +9,7 @@ import (
 func testAppViews() *appViews {
 	v := &appViews{
 		dups: &DuplicatesView{}, imports: &ImportView{}, organize: &OrganizeView{},
-		settings: &SettingsView{}, indexInfo: &IndexInfoView{}, search: &FuzzySearchView{},
+		settings: &SettingsView{}, search: &FuzzySearchView{},
 		sdPrompt: &SDPromptView{}, webView: &WebServerView{},
 	}
 	v.modals = newModals(v, func() string { return "/lib" })
@@ -21,9 +21,9 @@ func testAppViews() *appViews {
 // drawRoot and handleKeys used.
 func TestTopModalPriority(t *testing.T) {
 	v := testAppViews()
-	order := []string{"search", "duplicates", "imports", "organize", "settings", "indexInfo", "sdPrompt", "webServer"}
+	order := []string{"search", "duplicates", "imports", "organize", "settings", "sdPrompt", "webServer"}
 	flags := []*bool{&v.search.Open, &v.dups.Open, &v.imports.Open, &v.organize.Open,
-		&v.settings.Open, &v.indexInfo.Open, &v.sdPrompt.Open, &v.webView.Open}
+		&v.settings.Open, &v.sdPrompt.Open, &v.webView.Open}
 	if len(v.modals) != len(order) {
 		t.Fatalf("%d modals, want %d", len(v.modals), len(order))
 	}
@@ -61,7 +61,6 @@ func TestModalCloseKeys(t *testing.T) {
 		{"organize", ctrlBracket, true},
 		{"settings", key.Event{Name: ","}, true},
 		{"settings", ctrlBracket, false},
-		{"indexInfo", key.Event{Name: "Q"}, true},
 		{"sdPrompt", key.Event{Name: key.NameEscape}, true},
 		{"webServer", key.Event{Name: "Q"}, false},
 		{"webServer", ctrlBracket, true},
@@ -77,7 +76,7 @@ func TestModalCloseKeys(t *testing.T) {
 			}
 		}
 		open := map[string]*bool{"imports": &v.imports.Open, "organize": &v.organize.Open,
-			"settings": &v.settings.Open, "indexInfo": &v.indexInfo.Open, "sdPrompt": &v.sdPrompt.Open,
+			"settings": &v.settings.Open, "sdPrompt": &v.sdPrompt.Open,
 			"webServer": &v.webView.Open, "search": &v.search.Open}[c.modal]
 		*open = true
 		m.keys(c.ev)

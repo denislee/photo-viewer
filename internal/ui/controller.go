@@ -59,7 +59,7 @@ type Controller struct {
 	// indexPath is the real on-disk SQLite path, resolved once at construction
 	// via cache.Locate (which may fall back to cacheDir on a read-only
 	// library root). Stored so IndexStatus reports the true path without
-	// re-deriving or re-statting the filesystem on every modal poll.
+	// re-deriving or re-statting the filesystem.
 	indexPath string
 	index     *cache.Index
 	store     *cache.ThumbStore
@@ -92,7 +92,7 @@ type Controller struct {
 	warmUpDone      int
 	warmUpTotal     int
 
-	// Indexing status, exposed via IndexStatus for the info modal.
+	// Indexing status, exposed via IndexStatus.
 	scanTarget    string
 	scanStartedAt time.Time
 	scanEndedAt   time.Time
@@ -100,17 +100,6 @@ type Controller struct {
 	scanTotal     int // media files the current/last scan will visit; 0 while still counting
 	scanGen       int // bumped per scanInto so a stale count can't set a newer scan's total
 	scanLastErr   string
-
-	// IndexStatus is polled every frame the index-info modal is open, and its
-	// TotalRows is a LIKE-prefix COUNT over the whole index — precisely while a
-	// scan is hammering the same DB with ReconcileBatch writes. Cache the count
-	// behind a short TTL so the modal costs at most one COUNT per idxStatusTTL
-	// instead of one per frame. Slight staleness is fine for a status readout.
-	// Guarded by its own mutex (not c.mu) so a poll never blocks the scan.
-	idxStatusMu     sync.Mutex
-	idxStatusRows   int
-	idxStatusRoot   string // library root the cached count was computed for
-	idxStatusExpiry time.Time
 
 	// yearPreviewDirs holds the date subdirs whose union is shown when
 	// currentDir is a YearViewPrefix sentinel. refreshFromIndex reads this
@@ -256,20 +245,13 @@ func (c *Controller) Thumbs() *thumbCache      { return c.thumbs }
 func (c *Controller) Index() *cache.Index      { return c.index }
 func (c *Controller) Store() *cache.ThumbStore { return c.store }
 
-// DirCounts returns the cached recursive file counts for the rows the
-// sidebar is currently rendering. Keys are absolute paths; values are
-// counts under the active filter/showRAW. Returned map must not be
-// mutated by the caller.
-func (c *Controller) DirCounts() map[string]int {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	return c.dirCounts
-}
-
-// DirCountsWithVersion returns DirCounts alongside a monotonically increasing
-// version that is bumped on every clone-swap of the underlying map. Callers
-// that memoize the sidebar row list can compare the version instead of the map
-// contents to cheaply detect staleness.
+// DirCountsWithVersion returns the cached recursive file counts for the rows
+// the sidebar is currently rendering (keys are absolute paths; values are
+// counts under the active filter/showRAW; the map must not be mutated by the
+// caller), alongside a monotonically increasing version that is bumped on
+// every clone-swap of the underlying map. Callers that memoize the sidebar row
+// list can compare the version instead of the map contents to cheaply detect
+// staleness.
 func (c *Controller) DirCountsWithVersion() (map[string]int, uint64) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -347,10 +329,9 @@ func (c *Controller) SetSort(mode string) {
 	c.scheduleRefresh(dir)
 }
 
-// surfaceError records err as the controller's last error — the value the
-// index-info modal shows via IndexStatus.LastError — after logging it under
-// label, then requests a redraw so the message appears without waiting for the
-// next scan flush. Used by fire-and-forget goroutines (e.g. the Rebuild button
+// surfaceError records err as the controller's last error — reported via
+// IndexStatus.LastError — after logging it under label, then requests a redraw
+// so the message appears without waiting for the next scan flush. Used by fire-and-forget goroutines (e.g. the Rebuild button
 // handler) whose failures would otherwise vanish. Safe to call from any
 // goroutine; scanLastErr is guarded by c.mu like the other status fields.
 func (c *Controller) surfaceError(label string, err error) {

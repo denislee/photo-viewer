@@ -47,7 +47,7 @@ func TestPatchFavoriteAdjustsEntryAndCount(t *testing.T) {
 	if entries[0].Favorite || entries[2].Favorite {
 		t.Fatalf("neighbours flipped: a=%v c=%v", entries[0].Favorite, entries[2].Favorite)
 	}
-	if got := c.DirCounts()[FavoritesView]; got != 8 {
+	if got := dirCounts(c)[FavoritesView]; got != 8 {
 		t.Fatalf("FavoritesView count = %d after favoriting, want 8 (7+1)", got)
 	}
 	if c.dirCountsVer == verBefore {
@@ -71,7 +71,7 @@ func TestPatchFavoriteAdjustsEntryAndCount(t *testing.T) {
 	if entries[1].Favorite {
 		t.Fatalf("entry b.jpg still Favorite after un-favoriting")
 	}
-	if got := c.DirCounts()[FavoritesView]; got != 7 {
+	if got := dirCounts(c)[FavoritesView]; got != 7 {
 		t.Fatalf("FavoritesView count = %d after un-favoriting, want 7", got)
 	}
 }
@@ -137,7 +137,7 @@ func TestToggleFavoriteEndToEnd(t *testing.T) {
 			t.Fatalf("entry %s Favorite = %v, want %v", e.Path, e.Favorite, want)
 		}
 	}
-	if n := c.DirCounts()[FavoritesView]; n != 1 {
+	if n := dirCounts(c)[FavoritesView]; n != 1 {
 		t.Fatalf("FavoritesView count = %d after favoriting, want 1", n)
 	}
 
@@ -149,7 +149,7 @@ func TestToggleFavoriteEndToEnd(t *testing.T) {
 	if idx.IsFavorite(paths[1]) {
 		t.Fatalf("flag still set after second toggle")
 	}
-	if n := c.DirCounts()[FavoritesView]; n != 0 {
+	if n := dirCounts(c)[FavoritesView]; n != 0 {
 		t.Fatalf("FavoritesView count = %d after un-favoriting, want 0", n)
 	}
 }
@@ -197,7 +197,7 @@ func TestToggleFavoriteOrderedAndReverted(t *testing.T) {
 	if len(entries) != 1 || !entries[0].Favorite {
 		t.Errorf("grid entry not reverted to favorite: %+v", entries)
 	}
-	if n := c.DirCounts()[FavoritesView]; n != 1 {
+	if n := dirCounts(c)[FavoritesView]; n != 1 {
 		t.Errorf("FavoritesView count = %d after revert, want 1", n)
 	}
 	if r := c.TakeFavoriteReverts(); len(r) != 1 || r[0] != (FavoriteRevert{Path: path, Favorite: true}) {
@@ -219,4 +219,10 @@ func TestToggleFavoriteOrderedAndReverted(t *testing.T) {
 		}
 		time.Sleep(2 * time.Millisecond)
 	}
+}
+
+// dirCounts returns the controller's current sidebar count map.
+func dirCounts(c *Controller) map[string]int {
+	m, _ := c.DirCountsWithVersion()
+	return m
 }

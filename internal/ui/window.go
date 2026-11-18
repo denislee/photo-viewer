@@ -89,7 +89,6 @@ func Run(w *app.Window, ctrl *Controller) error {
 		imports.ShowForDevice(dev, deleteSource)
 		w.Invalidate()
 	}
-	indexInfo := NewIndexInfoView(ctrl.IndexStatus)
 	webView := NewWebServerView(ctrl.NewWebServer(), w.Invalidate)
 	search := NewFuzzySearchView(ctrl.Index())
 	search.SetInvalidate(func() { w.Invalidate() })
@@ -197,7 +196,7 @@ func Run(w *app.Window, ctrl *Controller) error {
 	views := &appViews{
 		toolbar: toolbar, sidebar: sidebar, grid: grid, viewer: viewer,
 		dups: dups, imports: imports, organize: organize, settings: settings,
-		indexInfo: indexInfo, search: search, sdPrompt: sdPrompt, webView: webView,
+		search: search, sdPrompt: sdPrompt, webView: webView,
 		processBar: processBar, splitter: &sidebarSplitter{},
 	}
 	views.modals = newModals(views, ctrl.LibraryRoot)

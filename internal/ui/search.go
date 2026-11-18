@@ -97,7 +97,6 @@ type FuzzySearchView struct {
 type searchCandidate struct {
 	path      string // absolute
 	rel       string // relative to library root, used for display+matching
-	base      string
 	isDir     bool
 	baseLower string // strings.ToLower(base), precomputed
 	relLower  string // strings.ToLower(rel), precomputed
@@ -118,7 +117,6 @@ func newSearchCandidate(path, rel string, isDir bool) searchCandidate {
 	return searchCandidate{
 		path:      path,
 		rel:       rel,
-		base:      base,
 		isDir:     isDir,
 		baseLower: strings.ToLower(base),
 		relLower:  strings.ToLower(rel),
