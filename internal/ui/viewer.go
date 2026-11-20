@@ -151,7 +151,12 @@ type Viewer struct {
 	// frame buffer, so it is dropped when playback stops. UI goroutine only.
 	lastVideoOp   paint.ImageOp
 	lastVideoPath string
-	lastVideoSize image.Point
+	lastVideoSize image.Point // render size the op was made for (cache key)
+	// lastVideoDraw is the size lastVideoOp should be painted at. It equals
+	// lastVideoSize except when a native-size render (V5-02) is painted scaled
+	// into the image area; keeping it separately means a cached frame is also
+	// drawn correctly.
+	lastVideoDraw image.Point
 
 	invalidate func()
 }
@@ -397,7 +402,17 @@ func (v *Viewer) Close() {
 // dropVideoFrame forgets the last video frame handed to Gio. The op aliases
 // the player's frame buffer, so it must go whenever playback stops.
 func (v *Viewer) dropVideoFrame() {
-	v.lastVideoOp, v.lastVideoPath, v.lastVideoSize = paint.ImageOp{}, "", image.Point{}
+	v.lastVideoOp, v.lastVideoPath, v.lastVideoSize, v.lastVideoDraw = paint.ImageOp{}, "", image.Point{}, image.Point{}
+}
+
+// SetVideoVisible tells the player whether its output is on screen. The window
+// calls it with false while a modal covers the viewer, so a playing clip stops
+// redrawing at its frame rate behind the dialog (G5-04). Layout switches it
+// back on when it draws the video. Safe with no player yet.
+func (v *Viewer) SetVideoVisible(visible bool) {
+	if p := v.player.Load(); p != nil {
+		p.SetVisible(visible)
+	}
 }
 
 // stopVideoIfRunning halts mpv playback whenever the current entry isn't a
@@ -647,38 +662,59 @@ func (v *Viewer) ensurePlayer() (p *video.Player, created bool) {
 	return v.player.Load(), created
 }
 
-// playVideo loads the current entry into mpv if it isn't already, renders
-// the current frame at the requested size, and returns it wrapped as a
-// paint.ImageOp. The mpv-side renderer letterboxes within (w, h) so the
-// caller can paint the result at imgArea without further fitting. Returns
-// (false) when libmpv is unavailable, the player is still being built by the
-// preload goroutine, or no frame is ready yet; Layout then shows the
-// thumbnail. It never constructs the player itself (G4-01).
-func (v *Viewer) playVideo(e cache.Entry, w, h int) (paint.ImageOp, bool) {
+// playVideo loads the current entry into mpv if it isn't already, renders the
+// current frame, and returns it wrapped as a paint.ImageOp together with the
+// pixel size it was rendered at, which is also the size to paint it at. A clip
+// smaller than (w, h) is rendered at its native size and the returned size is
+// that smaller rect, so the caller must scale it up to the image area (V5-02);
+// a clip at least as large as the area keeps rendering at (w, h) where mpv
+// letterboxes inside the rect itself. Returns ok false when libmpv is
+// unavailable, the player is still being built by the preload goroutine, or no
+// frame is ready yet; Layout then shows the thumbnail. It never constructs the
+// player itself (G4-01).
+func (v *Viewer) playVideo(e cache.Entry, w, h int) (op paint.ImageOp, size image.Point, ok bool) {
 	p := v.player.Load()
 	if p == nil {
-		return paint.ImageOp{}, false
+		return paint.ImageOp{}, image.Point{}, false
 	}
 	if p.Current() != e.Path {
 		if err := p.Load(e.Path); err != nil {
-			return paint.ImageOp{}, false
+			return paint.ImageOp{}, image.Point{}, false
 		}
 	}
-	sz := image.Pt(w, h)
+	// Render small clips at their native size and let the GPU magnify: mpv
+	// then does no scaling at all per frame, and the result is as sharp as the
+	// source. A clip at least as large as the area keeps the window-size render
+	// (mpv's GPU downscale is the good path there).
+	rw, rh := w, h
+	upscale := false
+	if nw, nh := p.NativeSize(); nw > 0 && nh > 0 && nw <= w && nh <= h && (nw < w || nh < h) {
+		rw, rh = nw, nh
+		upscale = true
+	}
+	sz := image.Pt(rw, rh)
 	if !p.NeedsRedraw() && v.lastVideoPath == e.Path && v.lastVideoSize == sz {
-		return v.lastVideoOp, true
+		return v.lastVideoOp, v.lastVideoDraw, true
 	}
-	frame, ok := p.Render(w, h)
+	frame, ok := p.Render(rw, rh)
 	if !ok {
-		return paint.ImageOp{}, false
+		return paint.ImageOp{}, image.Point{}, false
 	}
-	op := paint.NewImageOp(frame)
-	// mpv already rendered at imgArea pixels, so the frame is drawn 1:1:
-	// FilterLinear would make Gio build (and never sample) a full mip chain
-	// on every frame upload (V5-01).
-	op.Filter = paint.FilterNearest
-	v.lastVideoOp, v.lastVideoPath, v.lastVideoSize = op, e.Path, sz
-	return op, true
+	op = paint.NewImageOp(frame)
+	if upscale {
+		// The GPU magnifies the native-size frame, so it needs linear
+		// filtering. Gio still builds a mip chain for a FilterLinear upload,
+		// but at the clip's native size that costs less than mpv scaling,
+		// reading back and uploading a window-size frame.
+		op.Filter = paint.FilterLinear
+	} else {
+		// mpv already rendered at imgArea pixels, so the frame is drawn 1:1:
+		// FilterLinear would make Gio build (and never sample) a full mip
+		// chain on every frame upload (V5-01).
+		op.Filter = paint.FilterNearest
+	}
+	v.lastVideoOp, v.lastVideoPath, v.lastVideoSize, v.lastVideoDraw = op, e.Path, sz, sz
+	return op, sz, true
 }
 
 // Layout fills gtx.Constraints with a black background and the active
@@ -707,13 +743,21 @@ func (v *Viewer) Layout(gtx layout.Context, th *Theme, tc *thumbCache) layout.Di
 	}
 
 	if e.Type == scan.TypeVideo {
-		if op, ok := v.playVideo(e, imgArea.Dx(), imgArea.Dy()); ok {
-			// mpv already letterboxed to (Dx, Dy), so we paint at
-			// imgArea.Min with the rect's native size.
-			off := opOffset(gtx, imgArea.Min)
-			op.Add(gtx.Ops)
-			paint.PaintOp{}.Add(gtx.Ops)
-			off.Pop()
+		// Drawing the video makes it visible again after a modal hid it (G5-04).
+		v.SetVideoVisible(true)
+		if op, size, ok := v.playVideo(e, imgArea.Dx(), imgArea.Dy()); ok {
+			if size == imgArea.Size() {
+				// mpv already letterboxed to (Dx, Dy), so we paint at
+				// imgArea.Min with the rect's native size.
+				off := opOffset(gtx, imgArea.Min)
+				op.Add(gtx.Ops)
+				paint.PaintOp{}.Add(gtx.Ops)
+				off.Pop()
+			} else {
+				// A native-size render (V5-02): mpv letterboxed inside
+				// size, whose aspect is the clip's, so fit that to the area.
+				drawFitted(gtx, op, size, imgArea)
+			}
 		} else if imgOp, imgSz, fb := tc.Get(e); fb {
 			// While mpv is still warming up or libmpv is unavailable,
 			// show the cached thumbnail so the screen isn't blank.

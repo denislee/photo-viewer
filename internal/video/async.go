@@ -158,6 +158,11 @@ func (p *Player) renderLoop(a *asyncRender) {
 		case <-a.quit:
 			return
 		}
+		// Hidden behind a modal: skip the GL work entirely (G5-04). mpv keeps
+		// decoding; SetVisible kicks the loop when the player is back in view.
+		if p.hidden.Load() {
+			continue
+		}
 		if p.renderAsyncFrame(a) && p.invalidate != nil {
 			p.invalidate()
 		}
@@ -165,7 +170,9 @@ func (p *Player) renderLoop(a *asyncRender) {
 }
 
 // renderAsyncFrame renders one frame into a free slot. It holds p.mu like
-// the synchronous Render, so Load/Stop/Close never overlap a render.
+// the synchronous Render, so Load/Stop/Close never overlap a render. Holding mu
+// does not block the command helpers (TogglePause / ToggleMute / SeekRelative),
+// which only take cmdMu (V5-03).
 func (p *Player) renderAsyncFrame(a *asyncRender) bool {
 	p.mu.Lock()
 	defer p.mu.Unlock()

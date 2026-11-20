@@ -43,7 +43,7 @@ func TestPlayVideoNeverBuildsPlayer(t *testing.T) {
 
 	done := make(chan bool, 1)
 	go func() {
-		_, ok := v.playVideo(clip, 640, 360)
+		_, _, ok := v.playVideo(clip, 640, 360)
 		done <- ok
 	}()
 	select {
@@ -66,7 +66,7 @@ func TestPlayVideoNeverBuildsPlayer(t *testing.T) {
 		t.Fatalf("constructor ran %d times, want 1", n)
 	}
 	// A failed constructor leaves the viewer on the thumbnail path for good.
-	if _, ok := v.playVideo(clip, 640, 360); ok {
+	if _, _, ok := v.playVideo(clip, 640, 360); ok {
 		t.Fatal("playVideo reported a frame after the constructor failed")
 	}
 }

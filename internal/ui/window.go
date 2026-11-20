@@ -302,6 +302,11 @@ func drawRoot(gtx layout.Context, th *Theme, ctrl *Controller, views *appViews, 
 	// stays visible at the bottom for esc/close hints. Only the top modal
 	// (see newModals for the order) is drawn.
 	if m := views.topModal(); m != nil {
+		// A modal over a playing video must not leave it redrawing at the
+		// video frame rate underneath (G5-04).
+		if v.Open {
+			v.SetVideoVisible(false)
+		}
 		gtx2 := gtx
 		gtx2.Constraints.Max = image.Pt(totalW, totalH-sbH)
 		gtx2.Constraints.Min = image.Pt(totalW, totalH-sbH)

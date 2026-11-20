@@ -363,6 +363,21 @@ static int loadfile(mpv_handle *h, const char *path) {
     return mpv_command(h, cmd);
 }
 
+// seek_async issues a relative+exact seek without waiting for mpv to finish
+// it, so the UI goroutine never blocks on a slow (hr-)seek. mpv reports the
+// result as an MPV_EVENT_COMMAND_REPLY, which drainEvents ignores.
+static int seek_async(mpv_handle *h, const char *amount) {
+    const char *cmd[4];
+    cmd[0] = "seek"; cmd[1] = amount; cmd[2] = "relative+exact"; cmd[3] = NULL;
+    return mpv_command_async(h, 0, cmd);
+}
+
+// get_int64 reads an int64 mpv property. Used for the decoded frame size on
+// MPV_EVENT_VIDEO_RECONFIG.
+static int get_int64(mpv_handle *h, const char *name, int64_t *out) {
+    return mpv_get_property(h, name, MPV_FORMAT_INT64, out);
+}
+
 // request_log asks mpv to deliver log messages at min_level and above as
 // MPV_EVENT_LOG_MESSAGE events on the normal event queue, where drainEvents
 // picks them up. Used purely for crash diagnostics: an internal libmpv
@@ -380,6 +395,7 @@ import (
 	"log"
 	"os"
 	"runtime/cgo"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -402,17 +418,39 @@ type Player struct {
 
 	invalidate func()
 
-	// mu serialises every entry into libmpv from Go: Load, Stop, the
-	// command helpers, and Render all hold it, so no two of them issue mpv
-	// calls (or mutate buf / current / loaded) concurrently. The one thing
-	// that must NOT take mu is the render-update / wakeup callbacks: mpv can
-	// fire them synchronously from inside a command we're issuing under the
-	// lock, so they stay lock-free (they only touch atomics + invalidate).
+	// mu guards buf / current / loaded / ctx / gl and serialises Render (and
+	// the async render goroutine, which writes buf's sibling slots) against
+	// Load / Stop / Close. It is deliberately NOT held around mpv commands:
+	// libmpv's client API is thread-safe, and holding it there would block the
+	// frame goroutine behind a slow seek. The one thing that must NOT take mu
+	// is the render-update / wakeup callbacks: mpv can fire them synchronously
+	// from inside a command we're issuing under the lock, so they stay
+	// lock-free (they only touch atomics + invalidate).
 	mu        sync.Mutex
 	buf       *image.RGBA // reused across frames; Pix capacity reused across size changes, freed on Stop
 	closed    atomic.Bool
 	loaded    atomic.Bool
 	drainDone chan struct{} // closed when drainEvents returns
+
+	// cmdMu guards the lifetime of p.h against the command helpers. It is
+	// read-held by TogglePause, ToggleMute and SeekRelative around their mpv
+	// call so the handle can't be destroyed under them; Close takes the write
+	// side (after setting closed, before mpv_terminate_destroy) to wait them
+	// out. Load and Stop also read-hold it while they hold mu and call into
+	// p.h. Lock order is mu then cmdMu, never the other way round.
+	cmdMu sync.RWMutex
+
+	// hidden is set while the player's output is covered (a modal over the
+	// viewer). Render-update callbacks then neither wake the UI nor schedule
+	// renders, so a playing clip doesn't redraw at its frame rate behind a
+	// dialog. Zero value means visible.
+	hidden atomic.Bool
+
+	// nativeW / nativeH are the decoded frame size of the current file, as
+	// reported by MPV_EVENT_VIDEO_RECONFIG (rotated to display orientation on
+	// the GL path), or zero when unknown. The viewer renders small clips at
+	// this size and lets the GPU upscale (V5-02).
+	nativeW, nativeH atomic.Int64
 	// current holds the path of the file currently loaded. Read by the UI
 	// goroutine (Current) and written by Load/Stop on whichever goroutine
 	// called them; published via atomic.Pointer to avoid torn reads of
@@ -658,6 +696,10 @@ func (p *Player) Load(path string) error {
 	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	// Read-hold cmdMu (mu is already held, see its doc) so Close's write side
+	// waits for the loadfile below before it destroys the handle.
+	p.cmdMu.RLock()
+	defer p.cmdMu.RUnlock()
 	if p.closed.Load() {
 		return errors.New("player closed")
 	}
@@ -669,6 +711,11 @@ func (p *Player) Load(path string) error {
 	if cur := p.current.Load(); cur != nil && *cur == path {
 		return nil
 	}
+	// A new file invalidates any size learnt for the previous one. Clear it
+	// before loadfile so a late reconfig of the old clip can't make its
+	// dimensions look like the new clip's.
+	p.nativeW.Store(0)
+	p.nativeH.Store(0)
 	cp := C.CString(path)
 	defer C.free(unsafe.Pointer(cp))
 	if rc := C.loadfile(p.h, cp); rc < 0 {
@@ -692,6 +739,8 @@ func (p *Player) Stop() {
 	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	p.cmdMu.RLock()
+	defer p.cmdMu.RUnlock()
 	if p.closed.Load() || !p.loaded.Load() {
 		return
 	}
@@ -700,6 +749,8 @@ func (p *Player) Stop() {
 	C.command_str(p.h, cs)
 	p.loaded.Store(false)
 	p.current.Store(nil)
+	p.nativeW.Store(0)
+	p.nativeH.Store(0)
 	// Drop the frame buffer: after leaving a video we'd otherwise retain a
 	// window-sized RGBA (~33 MB for a 4K window) for the rest of the session
 	// while the user browses photos.
@@ -714,8 +765,8 @@ func (p *Player) TogglePause() {
 	if p == nil {
 		return
 	}
-	p.mu.Lock()
-	defer p.mu.Unlock()
+	p.cmdMu.RLock()
+	defer p.cmdMu.RUnlock()
 	if p.closed.Load() {
 		return
 	}
@@ -729,8 +780,8 @@ func (p *Player) ToggleMute() {
 	if p == nil {
 		return
 	}
-	p.mu.Lock()
-	defer p.mu.Unlock()
+	p.cmdMu.RLock()
+	defer p.cmdMu.RUnlock()
 	if p.closed.Load() {
 		return
 	}
@@ -740,20 +791,20 @@ func (p *Player) ToggleMute() {
 }
 
 // SeekRelative seeks by delta seconds relative to the current position.
-// Negative values seek backwards.
+// Negative values seek backwards. The seek is issued asynchronously so a slow
+// hr-seek never stalls the UI goroutine.
 func (p *Player) SeekRelative(delta float64) {
 	if p == nil {
 		return
 	}
-	p.mu.Lock()
-	defer p.mu.Unlock()
+	p.cmdMu.RLock()
+	defer p.cmdMu.RUnlock()
 	if p.closed.Load() {
 		return
 	}
-	cmd := fmt.Sprintf("seek %f relative+exact", delta)
-	cs := C.CString(cmd)
-	defer C.free(unsafe.Pointer(cs))
-	C.command_str(p.h, cs)
+	amount := C.CString(strconv.FormatFloat(delta, 'f', 3, 64))
+	defer C.free(unsafe.Pointer(amount))
+	C.seek_async(p.h, amount)
 }
 
 // Current returns the path of the file currently loaded into mpv, or "" if
@@ -876,6 +927,42 @@ func (p *Player) NeedsRedraw() bool {
 	return p.updatePending.Load()
 }
 
+// NativeSize returns the decoded frame size of the current video in pixels,
+// rotated to display orientation, or (0, 0) while it is not known yet (or when
+// p is nil). The viewer renders clips smaller than the window at this size and
+// lets the GPU upscale (V5-02).
+func (p *Player) NativeSize() (w, h int) {
+	if p == nil {
+		return 0, 0
+	}
+	nw, nh := p.nativeW.Load(), p.nativeH.Load()
+	if nw <= 0 || nh <= 0 {
+		return 0, 0
+	}
+	return int(nw), int(nh)
+}
+
+// SetVisible tells the player whether its frames are on screen. While hidden
+// — a modal drawn over the viewer — render-update callbacks neither wake the
+// UI nor schedule a render, so a playing clip stops redrawing at its frame
+// rate behind the dialog. Coming back into view requests one fresh frame, so
+// a clip that advanced while hidden doesn't stay on a stale one. Safe on a nil
+// Player; the zero value means visible.
+func (p *Player) SetVisible(visible bool) {
+	if p == nil {
+		return
+	}
+	wasHidden := p.hidden.Swap(!visible)
+	if !wasHidden || !visible {
+		return
+	}
+	if p.async != nil {
+		p.async.kick()
+	} else if p.updatePending.Load() && p.invalidate != nil {
+		p.invalidate()
+	}
+}
+
 // Close tears down the render context and the mpv handle.  After Close
 // the Player must not be used again.
 //
@@ -907,13 +994,21 @@ func (p *Player) Close() {
 	// before we free the render context, or sees closed=true when it
 	// re-checks under mu. Render never touches p.ctx after seeing
 	// closed=true, so no call reaches a freed pointer. Taking mu also
-	// waits out any Load/Stop/command already inside libmpv, so nothing
-	// is using p.h when it is destroyed below. libmpv requires the render
-	// context to be freed before the handle.
+	// waits out any Load/Stop already inside libmpv, and the cmdMu write
+	// lock below waits out the command helpers, so nothing is using p.h
+	// when it is destroyed. libmpv requires the render context to be freed
+	// before the handle.
 	p.mu.Lock()
 	ctx, gl := p.ctx, p.gl
 	p.ctx, p.gl = nil, nil
 	p.mu.Unlock()
+	// Wait out an in-flight command helper (TogglePause / ToggleMute /
+	// SeekRelative). Load and Stop hold cmdMu read-side under mu, so taking
+	// mu above already waited for those; this covers the ones that run
+	// without mu. Taking and immediately releasing the write side is enough:
+	// closed is already true, so no new command can start.
+	p.cmdMu.Lock()
+	p.cmdMu.Unlock()
 	if ctx != nil {
 		if gl != nil {
 			C.free_render_ctx_gl(gl, ctx)
@@ -951,8 +1046,50 @@ func (p *Player) drainEvents() {
 			if p.gl == nil {
 				p.applyRotation()
 			}
+		case C.MPV_EVENT_VIDEO_RECONFIG:
+			p.readNativeSize()
+		default:
+			// MPV_EVENT_COMMAND_REPLY (e.g. from the asynchronous seek
+			// SeekRelative issues) and every other event need no handling.
 		}
 	}
+}
+
+// readNativeSize records the decoded frame size of the current file, for the
+// viewer's native-size rendering (V5-02). mpv reports it as dwidth/dheight on
+// MPV_EVENT_VIDEO_RECONFIG. On the GL path the VO applies the container
+// rotation itself, so those properties stay unrotated and the value of
+// video-params/rotate has to be applied here; the software path bakes the
+// rotation into the pixels with a transpose filter, so its dwidth/dheight are
+// already upright. Both atomics are zeroed when a property is unavailable, so
+// the viewer falls back to window-size rendering rather than to a bogus size.
+// Runs on the drainEvents goroutine.
+func (p *Player) readNativeSize() {
+	get := func(name string) (int64, bool) {
+		cn := C.CString(name)
+		defer C.free(unsafe.Pointer(cn))
+		var v C.int64_t
+		if rc := C.get_int64(p.h, cn, &v); rc < 0 {
+			return 0, false
+		}
+		return int64(v), true
+	}
+	dw, okw := get("dwidth")
+	dh, okh := get("dheight")
+	if !okw || !okh || dw <= 0 || dh <= 0 {
+		p.nativeW.Store(0)
+		p.nativeH.Store(0)
+		return
+	}
+	if p.gl != nil {
+		if rot, ok := get("video-params/rotate"); ok {
+			if r := ((rot % 360) + 360) % 360; r%180 == 90 {
+				dw, dh = dh, dw
+			}
+		}
+	}
+	p.nativeW.Store(dw)
+	p.nativeH.Store(dh)
 }
 
 // rotationFilters maps a container rotation (degrees clockwise) to the
@@ -1017,6 +1154,11 @@ func goMpvRenderUpdate(userdata C.uintptr_t) {
 		return
 	}
 	p.updatePending.Store(true)
+	// Hidden behind a modal: leave the flag set and wake nobody. SetVisible
+	// picks it up when the player comes back into view (G5-04).
+	if p.hidden.Load() {
+		return
+	}
 	if p.async != nil {
 		// Render off the UI goroutine; the loop invalidates once the frame
 		// is finished, so waking the UI now would only draw the old one.
