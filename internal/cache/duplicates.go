@@ -30,10 +30,23 @@ func hashFile(path string) (string, error) {
 	}
 	defer f.Close()
 	h := sha256.New()
-	if _, err := io.Copy(h, f); err != nil {
+	bp := hashBufPool.Get().(*[]byte)
+	defer hashBufPool.Put(bp)
+	// Wrap f so io.CopyBuffer can't take the *os.File WriterTo fast path, which
+	// would ignore buf and stream in 32 KiB chunks again (C5-05).
+	if _, err := io.CopyBuffer(h, struct{ io.Reader }{f}, *bp); err != nil {
 		return "", err
 	}
 	return hex.EncodeToString(h.Sum(nil)), nil
+}
+
+// hashBufPool recycles hashFile's 1 MiB read buffers: SHA-256 over 32 KiB
+// io.Copy reads ran ~45% below what 1 MiB reads reach on a cached file (C5-05).
+var hashBufPool = sync.Pool{
+	New: func() any {
+		b := make([]byte, 1<<20)
+		return &b
+	},
 }
 
 // quickHashWindow is the read-window size in bytes for quickHash. 64 KiB is
