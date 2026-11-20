@@ -18,6 +18,7 @@ import (
 	"image/draw"
 	"io"
 	"os"
+	"sync"
 
 	"github.com/rwcarlsen/goexif/exif"
 )
@@ -45,8 +46,18 @@ func ReadOrientation(path string) int {
 // *bytes.Reader both qualify) has its IFD0 Orientation parsed directly (T4-01):
 // goexif would buffer the whole stream twice to reach the same 12-byte entry,
 // which on a 36 MB RAW costs ~76 ms and ~300 MB of allocation per call.
-// Everything else (JPEG, HEIC, MP4, other readers) goes through exif.Decode.
+// Everything else goes through exif.Decode.
+//
+// A JPEG is different (H5-01): goexif finds APP1 by scanning the stream byte by
+// byte, which costs ~17 ms and ~15.6 MB of allocation on a 14 MB JPEG with no
+// EXIF at all, and it stops at the *first* APP1 — so an XMP block before the
+// EXIF one makes it read no orientation. When r is an io.ReaderAt at offset 0,
+// jpegOrientation walks the marker segments and parses the EXIF APP1's TIFF
+// header in place instead; goexif is never used for a JPEG reachable that way.
 func ReadOrientationFrom(r io.Reader) int {
+	if o, ok := jpegOrientation(r); ok {
+		return o
+	}
 	if o, ok := tiffOrientation(r); ok {
 		return o
 	}
@@ -134,6 +145,92 @@ func tiffOrientation(r io.Reader) (int, bool) {
 		}
 		n -= k
 		off += int64(k * 12)
+	}
+	return 1, true
+}
+
+// jpegScratchPool holds the small buffer jpegOrientation reads its SOI marker,
+// segment markers, lengths and APP1 identifier into. A stack array would be
+// moved to the heap because it reaches io.ReaderAt through an interface, adding
+// an allocation to every orientation read — including the TIFF fast path, which
+// is guarded to a single fixed buffer (TestTIFFOrientationAllocs). The pool
+// keeps the marker walk allocation-free after the first call.
+var jpegScratchPool = sync.Pool{New: func() any { return new([6]byte) }}
+
+// jpegOrientation walks the JPEG marker segments of r looking for the EXIF APP1
+// block and parses its embedded TIFF header directly (H5-01). ok is false when r
+// is not an io.ReaderAt at offset 0 or does not start with SOI (FF D8), in which
+// case the caller falls back to tiffOrientation/goexif. Once SOI matches, every
+// failure (truncated segment, no EXIF, absent Orientation tag, out-of-range
+// value) yields (1, true): the file is a JPEG, and 1 is what goexif would
+// produce for the same bytes. Skipping non-EXIF APP1 blocks (XMP) is the point:
+// goexif stops at the first APP1 and would miss an EXIF block that follows one.
+func jpegOrientation(r io.Reader) (int, bool) {
+	ra, ok := r.(io.ReaderAt)
+	if !ok {
+		return 0, false
+	}
+	if s, ok := r.(io.Seeker); ok {
+		if pos, err := s.Seek(0, io.SeekCurrent); err != nil || pos != 0 {
+			return 0, false
+		}
+	}
+	bp := jpegScratchPool.Get().(*[6]byte)
+	defer jpegScratchPool.Put(bp)
+	buf := bp[:]
+	soi := buf[:2]
+	if _, err := ra.ReadAt(soi, 0); err != nil || soi[0] != 0xFF || soi[1] != 0xD8 {
+		return 0, false
+	}
+	off := int64(2)
+	// Cap the walk so a stream of tiny bogus segments can't spin forever.
+	for range 1024 {
+		mb := buf[:1]
+		if _, err := ra.ReadAt(mb, off); err != nil || mb[0] != 0xFF {
+			return 1, true
+		}
+		// Skip any run of 0xFF fill bytes; the byte after them is the marker.
+		for mb[0] == 0xFF {
+			off++
+			if _, err := ra.ReadAt(mb, off); err != nil {
+				return 1, true
+			}
+		}
+		// markerPos is the 0xFF that starts the segment; the marker byte is at
+		// markerPos+1 and, when present, the 2-byte length at markerPos+2.
+		// marker must be captured before reusing the shared scratch buffer.
+		markerPos := off - 1
+		marker := mb[0]
+		switch {
+		case marker == 0x01 || (marker >= 0xD0 && marker <= 0xD7):
+			// TEM and RSTn carry no length field.
+			off = markerPos + 2
+			continue
+		case marker == 0xD9 || marker == 0xDA:
+			// EOI / start of scan: no more metadata segments.
+			return 1, true
+		}
+		lb := buf[:2]
+		if _, err := ra.ReadAt(lb, off+1); err != nil {
+			return 1, true
+		}
+		l := int(binary.BigEndian.Uint16(lb))
+		if l < 2 {
+			return 1, true
+		}
+		if marker == 0xE1 && l >= 8 {
+			id := buf[:6]
+			if _, err := ra.ReadAt(id, markerPos+4); err == nil && string(id) == "Exif\x00\x00" {
+				// Payload after the length is "<ident><TIFF header>": skip the
+				// 6-byte identifier and hand the TIFF section to the same
+				// parser the RAW path uses.
+				if o, ok := tiffOrientation(io.NewSectionReader(ra, markerPos+4+6, int64(l)-8)); ok {
+					return o, true
+				}
+				return 1, true
+			}
+		}
+		off = markerPos + 2 + int64(l)
 	}
 	return 1, true
 }
