@@ -24,13 +24,9 @@ import (
 // being masked by a silent copy. Cancelling ctx aborts the copy and leaves src
 // untouched.
 func MoveUnique(ctx context.Context, src, dir, base string) (string, error) {
-	dst, err := RenameUnique(src, func(n int) string { return SuffixName(dir, base, n) })
-	if !errors.Is(err, syscall.EXDEV) {
+	dst, copied, err := MoveUniqueDeferred(ctx, src, dir, base)
+	if err != nil || !copied {
 		return dst, err
-	}
-	dst, err = CopyUnique(ctx, src, dir, base)
-	if err != nil {
-		return "", err
 	}
 	// The copy fsynced its data; without also syncing the directory a power
 	// loss could still drop the new entry after src is gone — zero copies.
@@ -41,6 +37,25 @@ func MoveUnique(ctx context.Context, src, dir, base string) (string, error) {
 		return "", fmt.Errorf("copied to %s but could not remove source %s: %w", dst, src, err)
 	}
 	return dst, nil
+}
+
+// MoveUniqueDeferred is MoveUnique with the cross-device durability work left
+// to the caller. Same-filesystem sources are renamed as usual (copied=false).
+// When a rename fails with EXDEV it copies src into dir and returns
+// copied=true — but, unlike MoveUnique, it does NOT fsync dir and does NOT
+// remove src. The caller must SyncDir(dir) once the copies in that directory
+// are in place and only then remove src, so a whole batch can share one fsync
+// (U5-09) while still never deleting the only copy.
+func MoveUniqueDeferred(ctx context.Context, src, dir, base string) (dst string, copied bool, err error) {
+	dst, err = RenameUnique(src, func(n int) string { return SuffixName(dir, base, n) })
+	if !errors.Is(err, syscall.EXDEV) {
+		return dst, false, err
+	}
+	dst, err = CopyUnique(ctx, src, dir, base)
+	if err != nil {
+		return "", false, err
+	}
+	return dst, true, nil
 }
 
 // CopyUnique copies src into dir with writeUnique and returns the path of the

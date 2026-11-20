@@ -64,6 +64,11 @@ type ImportView struct {
 	deleteSource bool
 	cancelImport context.CancelFunc
 
+	// showGen invalidates a background importDirsProblem check started by
+	// Show: a newer Show (or one with dirs unset) must not be overwritten by
+	// an older check landing late (U5-08). Guarded by mu.
+	showGen int
+
 	// SD-card picker state. sdShown toggles the inline device list under the
 	// add row; sdDevices is the last lsblk snapshot; sdError surfaces a
 	// detection or mount failure. sdMounts records devices we mounted
@@ -139,14 +144,38 @@ func (v *ImportView) Show() {
 	cfg := GetConfig()
 	v.deleteCheck.Value = cfg.ImportDeleteSource
 	v.deleteSource = v.deleteCheck.Value
+	// Invalidate any check a previous Show started, even when this one will
+	// not launch a new one (dirs unset), so a late EvalSymlinks can't replace
+	// the synchronous "Set InboxDir…" message below.
+	v.showGen++
+	gen := v.showGen
 	if cfg.InboxDir == "" || cfg.OutboxDir == "" {
 		v.statusMsg = "Set InboxDir and OutboxDir in " + configPath() + " before importing."
-	} else if p := importDirsProblem(cfg.InboxDir, cfg.OutboxDir); p != "" {
-		v.statusMsg = p + " Fix it in Settings before importing."
-	} else {
-		v.statusMsg = fmt.Sprintf("Inbox: %s   Outbox: %s", cfg.InboxDir, cfg.OutboxDir)
+		v.mu.Unlock()
+		return
 	}
+	// importDirsProblem resolves symlinks (EvalSymlinks) and can block on an
+	// autofs mount or a spun-down disk, so it must not run on the frame
+	// goroutine (U5-08). Show the checking line now and let the result land
+	// asynchronously if this show is still the current one.
+	inbox, outbox := cfg.InboxDir, cfg.OutboxDir
+	v.statusMsg = "Checking import folders…"
 	v.mu.Unlock()
+	go func() {
+		p := importDirsProblem(inbox, outbox)
+		v.mu.Lock()
+		if v.Open && v.showGen == gen && !v.running {
+			if p != "" {
+				v.statusMsg = p + " Fix it in Settings before importing."
+			} else {
+				v.statusMsg = fmt.Sprintf("Inbox: %s   Outbox: %s", inbox, outbox)
+			}
+		}
+		v.mu.Unlock()
+		if v.invalidate != nil {
+			v.invalidate()
+		}
+	}()
 }
 
 // ShowForDevice opens the overlay and queues the given removable device as
@@ -179,11 +208,13 @@ func (v *ImportView) Close() {
 		mounts = v.sdMounts
 		v.sdMounts = nil
 	}
+	// Written under mu so Show's background dir check (which reads it under
+	// mu) can't see a torn/stale value.
+	v.Open = false
 	v.mu.Unlock()
 	if len(mounts) > 0 {
 		go v.unmountAll(mounts)
 	}
-	v.Open = false
 	if v.OnClose != nil {
 		v.OnClose()
 	}
@@ -1163,17 +1194,113 @@ func (v *ImportView) processBatch(ctx context.Context, outboxDir string, entries
 		v.setProgress(int64(len(entries)), int64(2*len(entries)+len(mtimeFixes)))
 	}
 	v.setStatus(fmt.Sprintf("Filing %d files into %s…", len(entries), filepath.Base(outboxDir)))
-	for _, fix := range mtimeFixes {
+	if len(mtimeFixes) > 0 {
+		// U5-06: each fix shells out to exiftool (~9 ms), so run them through
+		// the same bounded, cancel-aware pool as the date-read pass above —
+		// scan's exiftool pool has 4 daemons, so cap there. Errors and "ran"
+		// flags are indexed by input position; the log lines are emitted in
+		// input order after the pool drains so the log stays deterministic.
+		fixErrs := make([]error, len(mtimeFixes))
+		fixRan := make([]bool, len(mtimeFixes))
+		fixWorkers := min(runtime.NumCPU(), 4)
+		if len(mtimeFixes) < 4 {
+			// A handful of fixes is cheaper serially than through the pool
+			// (and keeps their progress ticks strictly ordered).
+			fixWorkers = 1
+		}
+		fixJobs := make(chan int, fixWorkers*2)
+		var fixWG sync.WaitGroup
+		for range fixWorkers {
+			fixWG.Go(func() {
+				for idx := range fixJobs {
+					v.waitIfPaused()
+					if ctx.Err() != nil {
+						return
+					}
+					fixRan[idx] = true
+					fixErrs[idx] = importSetMediaDate(mtimeFixes[idx].path, mtimeFixes[idx].when)
+					v.bumpProgress()
+				}
+			})
+		}
+		go func() {
+			defer close(fixJobs)
+			for i := range mtimeFixes {
+				select {
+				case fixJobs <- i:
+				case <-ctx.Done():
+					return
+				}
+			}
+		}()
+		fixWG.Wait()
+		// A cancelled batch logs only the fixes that actually ran; the move
+		// pass below still returns at its own ctx check.
+		for i, fix := range mtimeFixes {
+			if !fixRan[i] {
+				continue
+			}
+			if err := fixErrs[i]; err != nil {
+				v.appendLog("[WARN] Could not rewrite creation date on " + filepath.Base(fix.path) + ": " + err.Error())
+			} else {
+				v.appendLog("Rewrote creation date on " + filepath.Base(fix.path) + " to " + fix.when.Format("2006-01-02"))
+			}
+		}
 		if ctx.Err() != nil {
-			break
+			return
 		}
-		if err := importSetMediaDate(fix.path, fix.when); err != nil {
-			v.appendLog("[WARN] Could not rewrite creation date on " + filepath.Base(fix.path) + ": " + err.Error())
-		} else {
-			v.appendLog("Rewrote creation date on " + filepath.Base(fix.path) + " to " + fix.when.Format("2006-01-02"))
-		}
-		v.bumpProgress()
 	}
+
+	// Cross-device moves are copies first: MoveUniqueDeferred fsyncs nothing
+	// and removes no source, so the copied entries are batched here and their
+	// destination directories fsynced once each before any source is unlinked
+	// (U5-09). pending is flushed every 64 files, after the loop, and by the
+	// deferred call on an early return, so a cancelled run still makes what it
+	// copied durable and removes the sources.
+	type pendingMove struct {
+		src        string
+		dest       string
+		destDir    string
+		baseName   string
+		dateFolder string
+	}
+	var pending []pendingMove
+	flush := func() {
+		if len(pending) == 0 {
+			return
+		}
+		byDir := make(map[string][]pendingMove)
+		var dirOrder []string
+		for _, pm := range pending {
+			if _, ok := byDir[pm.destDir]; !ok {
+				dirOrder = append(dirOrder, pm.destDir)
+			}
+			byDir[pm.destDir] = append(byDir[pm.destDir], pm)
+		}
+		for _, dir := range dirOrder {
+			group := byDir[dir]
+			if err := syncDir(dir); err != nil {
+				// Without the directory fsync the new entries may not survive
+				// a power loss, so keep every source of this directory.
+				for _, pm := range group {
+					atomic.AddInt64(&v.statErrors, 1)
+					v.appendLog("[ERROR] Could not move " + pm.baseName + ": " + err.Error())
+				}
+				continue
+			}
+			for _, pm := range group {
+				if err := os.Remove(pm.src); err != nil {
+					atomic.AddInt64(&v.statErrors, 1)
+					v.appendLog("[ERROR] Could not remove source " + pm.src + " after copying to " + pm.dest + ": " + err.Error())
+					continue
+				}
+				atomic.AddInt64(&v.statMoved, 1)
+				v.appendLog(fmt.Sprintf("[OK] Moved %s -> %s", pm.baseName, filepath.Join(pm.dateFolder, filepath.Base(pm.dest))))
+			}
+		}
+		pending = pending[:0]
+	}
+	defer flush()
 
 	for _, src := range entries {
 		v.waitIfPaused()
@@ -1217,16 +1344,31 @@ func (v *ImportView) processBatch(ctx context.Context, outboxDir string, entries
 				continue
 			}
 		}
-		dest, moveErr := fsutil.MoveUnique(ctx, src, destDir, baseName)
+		dest, copied, moveErr := fsutil.MoveUniqueDeferred(ctx, src, destDir, baseName)
 		if moveErr != nil {
 			atomic.AddInt64(&v.statErrors, 1)
 			v.appendLog("[ERROR] Could not move " + baseName + ": " + moveErr.Error())
+		} else if copied {
+			// Cross-device: the bytes are in destDir but its entry isn't
+			// durable yet and src is still the only other copy, so defer the
+			// fsync + remove to flush.
+			pending = append(pending, pendingMove{
+				src:        src,
+				dest:       dest,
+				destDir:    destDir,
+				baseName:   baseName,
+				dateFolder: dateFolder,
+			})
+			if len(pending) >= 64 {
+				flush()
+			}
 		} else {
 			atomic.AddInt64(&v.statMoved, 1)
 			v.appendLog(fmt.Sprintf("[OK] Moved %s -> %s", baseName, filepath.Join(dateFolder, filepath.Base(dest))))
 		}
 		v.bumpProgress()
 	}
+	flush()
 }
 
 func (v *ImportView) extractZipToInbox(ctx context.Context, zipPath, inboxDir string) []string {

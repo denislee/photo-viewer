@@ -45,6 +45,9 @@ type SettingsView struct {
 	statusMsg    string
 	trashMsg     string
 	exportFavMsg string
+	// saveGen invalidates an older Save click's background check/save so it
+	// cannot overwrite a newer one's status or config (U5-08). Guarded by mu.
+	saveGen int
 
 	// pendingInbox / pendingOutbox hold a directory the background zenity
 	// picker (pickDir) chose. The picker can't call editor.SetText itself —
@@ -163,20 +166,46 @@ func (v *SettingsView) Layout(gtx layout.Context, th *Theme) layout.Dimensions {
 		outbox := v.outboxEditor.Text()
 		sd := v.sdAutoDetect.Value
 		hints := v.showShortcuts.Value
-		msg := "Saved to " + configPath()
-		if p := importDirsProblem(inbox, outbox); p != "" {
-			msg = "Not saved: " + p
-		} else {
-			UpdateConfig(func(c *Config) {
-				c.InboxDir = inbox
-				c.OutboxDir = outbox
-				c.SDCardAutoDetect = sd
-				c.ShowShortcutHints = hints
-			})
-		}
+		// importDirsProblem EvalSymlinks (and may block on an autofs mount or
+		// spun-down disk), then UpdateConfig saves the file, so none of that
+		// runs on the frame goroutine (U5-08). Capture the editors' values
+		// here and let a goroutine resolve, save and report; saveGen keeps an
+		// older click from overwriting a newer one.
 		v.mu.Lock()
-		v.statusMsg = msg
+		v.statusMsg = "Saving…"
+		v.saveGen++
+		gen := v.saveGen
 		v.mu.Unlock()
+		if v.invalidate != nil {
+			v.invalidate()
+		}
+		go func() {
+			p := importDirsProblem(inbox, outbox)
+			v.mu.Lock()
+			if v.saveGen != gen {
+				v.mu.Unlock()
+				if v.invalidate != nil {
+					v.invalidate()
+				}
+				return
+			}
+			if p != "" {
+				v.statusMsg = "Not saved: " + p
+				v.mu.Unlock()
+			} else {
+				v.statusMsg = "Saved to " + configPath()
+				v.mu.Unlock()
+				UpdateConfig(func(c *Config) {
+					c.InboxDir = inbox
+					c.OutboxDir = outbox
+					c.SDCardAutoDetect = sd
+					c.ShowShortcutHints = hints
+				})
+			}
+			if v.invalidate != nil {
+				v.invalidate()
+			}
+		}()
 	}
 	// Persist the toggle immediately so the watcher reacts even if the user
 	// flips it and then closes without clicking Save.
