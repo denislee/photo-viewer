@@ -45,7 +45,7 @@ func (c *Controller) ExportFavorites(opts ExportFavoritesOptions, done func(res 
 			case opts.MaxLongEdge > 0:
 				title = "Export favorites: recompress"
 			}
-			proc = c.processes.Begin(ProcExportFavorites, title, cancel, false)
+			proc = c.processes.Begin(ctx, ProcExportFavorites, title, cancel, false)
 			proc.SetStatus("Starting…")
 			defer proc.End()
 		}

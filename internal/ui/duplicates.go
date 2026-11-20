@@ -199,7 +199,7 @@ func (d *DuplicatesView) Close() {
 func (d *DuplicatesView) hashAndScan(ctx context.Context, gen int) {
 	// Publish to the main-screen process bar so the user can pause /
 	// resume / cancel without keeping the modal open.
-	proc := d.scope.begin(ProcDuplicates, "Duplicates", func() {
+	proc := d.scope.begin(ctx, ProcDuplicates, "Duplicates", func() {
 		d.mu.Lock()
 		c := d.cancel
 		d.mu.Unlock()

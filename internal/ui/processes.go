@@ -1,6 +1,7 @@
 package ui
 
 import (
+	"context"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -96,8 +97,10 @@ type Process struct {
 	done   atomic.Int64
 	total  atomic.Int64
 
-	gate   *PauseGate
-	cancel func()
+	gate       *PauseGate
+	cancel     func()
+	ctx        context.Context // nil when Begin got none
+	stopResume func() bool
 
 	registry *ProcessRegistry
 }
@@ -133,7 +136,9 @@ func (p *Process) Wait() {
 }
 
 func (p *Process) Pause() {
-	if p.gate != nil {
+	// A cancelled process must not re-close the gate: its AfterFunc already
+	// fired, so nothing would ever release the worker again (U5-03).
+	if p.gate != nil && (p.ctx == nil || p.ctx.Err() == nil) {
 		p.gate.Pause()
 	}
 	// User-driven one-shot: force an immediate repaint so the paused state
@@ -171,6 +176,9 @@ func (p *Process) Cancel() {
 // End removes the process from the registry. Safe to call from any
 // goroutine, typically from a defer in the worker.
 func (p *Process) End() {
+	if p.stopResume != nil {
+		p.stopResume()
+	}
 	if p.gate != nil {
 		// Make sure no worker is stuck waiting on the gate when we
 		// drop the process — End usually means the work goroutine is
@@ -303,7 +311,11 @@ func (r *ProcessRegistry) forceNotify() {
 // the Cancel button. Returns a handle the worker calls Wait/SetStatus/
 // AddDone/End on. supportsPause=false produces a process with no gate
 // (Wait is a no-op and Pause/Resume are inert).
-func (r *ProcessRegistry) Begin(kind ProcKind, title string, cancel func(), supportsPause bool) *Process {
+//
+// When ctx is non-nil and the process has a pause gate, cancelling ctx resumes
+// the gate (context.AfterFunc), so a worker paused in Wait observes the
+// cancellation however it was cancelled — not just via Process.Cancel (U5-03).
+func (r *ProcessRegistry) Begin(ctx context.Context, kind ProcKind, title string, cancel func(), supportsPause bool) *Process {
 	r.mu.Lock()
 	r.nextID++
 	id := r.nextID
@@ -317,6 +329,10 @@ func (r *ProcessRegistry) Begin(kind ProcKind, title string, cancel func(), supp
 	}
 	if supportsPause {
 		p.gate = NewPauseGate()
+	}
+	if ctx != nil && p.gate != nil {
+		p.ctx = ctx
+		p.stopResume = context.AfterFunc(ctx, p.gate.Resume)
 	}
 	r.procs = append(r.procs, p)
 	r.mu.Unlock()

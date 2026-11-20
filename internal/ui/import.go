@@ -841,7 +841,7 @@ func (v *ImportView) startImport(cfg Config) {
 	// locks (the cancel callback runs later, on user click), so it is safe to
 	// call while holding v.mu — and attachLocked keeps the one proc-slot write
 	// guarded like every other access.
-	if proc := v.scope.begin(ProcImport, "Import", func() {
+	if proc := v.scope.begin(ctx, ProcImport, "Import", func() {
 		v.mu.Lock()
 		c := v.cancelImport
 		v.mu.Unlock()

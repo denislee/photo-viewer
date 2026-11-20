@@ -117,7 +117,7 @@ func (v *OrganizeView) Close() {
 }
 
 func (v *OrganizeView) scanForMismatched(ctx context.Context, idx *cache.Index) {
-	proc := v.scope.begin(ProcOrganize, "Organize: scan", func() {
+	proc := v.scope.begin(ctx, ProcOrganize, "Organize: scan", func() {
 		v.mu.Lock()
 		c := v.scanCancel
 		v.mu.Unlock()
@@ -248,7 +248,7 @@ func (v *OrganizeView) startOrganize(root string) {
 
 	go func() {
 		defer cancel()
-		proc := v.scope.begin(ProcOrganize, "Organize: move", func() {
+		proc := v.scope.begin(ctx, ProcOrganize, "Organize: move", func() {
 			v.mu.Lock()
 			c := v.moveCancel
 			v.mu.Unlock()

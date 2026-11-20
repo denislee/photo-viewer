@@ -196,7 +196,7 @@ func TestProgressModelConcurrentBump(t *testing.T) {
 // begin returns nil so the caller's `if proc != nil` block is skipped.
 func TestProcScopeBeginNilRegistry(t *testing.T) {
 	var s procScope
-	if proc := s.begin(ProcImport, "x", nil); proc != nil {
+	if proc := s.begin(nil, ProcImport, "x", nil); proc != nil {
 		t.Fatalf("begin with no registry = %v, want nil", proc)
 	}
 }
@@ -209,7 +209,7 @@ func TestProcScopeAttachDetach(t *testing.T) {
 	reg := NewProcessRegistry(func() {})
 	s := &procScope{reg: reg}
 
-	proc := s.begin(ProcImport, "test", nil)
+	proc := s.begin(nil, ProcImport, "test", nil)
 	if proc == nil {
 		t.Fatal("begin with a registry returned nil")
 	}
@@ -240,8 +240,8 @@ func TestProcScopeGenGuard(t *testing.T) {
 	reg := NewProcessRegistry(func() {})
 	s := &procScope{reg: reg}
 
-	live := s.begin(ProcDuplicates, "live", nil)
-	stale := s.begin(ProcDuplicates, "stale", nil)
+	live := s.begin(nil, ProcDuplicates, "live", nil)
+	stale := s.begin(nil, ProcDuplicates, "stale", nil)
 
 	// The live pass claims the slot.
 	mu.Lock()
@@ -292,7 +292,7 @@ func TestProcScopeConcurrent(t *testing.T) {
 	const goroutines = 40
 	for range goroutines {
 		wg.Go(func() {
-			proc := s.begin(ProcImport, "t", nil)
+			proc := s.begin(nil, ProcImport, "t", nil)
 			mu.Lock()
 			s.attachLocked(proc, nil)
 			mu.Unlock()

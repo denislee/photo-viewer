@@ -166,6 +166,13 @@ func (c *Controller) Rebuild() error {
 }
 
 func (c *Controller) scanInto(ctx context.Context, dir string) {
+	// Give this scan its own cancellable context so the process bar's Cancel
+	// (and the pause-gate release) only aborts this scan. Previously the row
+	// called c.CancelScan, which also cancelled the separate Thumbnails
+	// warm-up, and a stale row could cancel whatever scan was current.
+	ctx, cancelThis := context.WithCancel(ctx)
+	defer cancelThis()
+
 	c.mu.Lock()
 	c.scanning++
 	c.scanTarget = dir
@@ -182,11 +189,12 @@ func (c *Controller) scanInto(ctx context.Context, dir string) {
 	}
 
 	// Register with the process bar so the user can pause / resume /
-	// cancel from the main screen. Cancellation reuses the existing
-	// scanCancel hook so we don't need a second context.
+	// cancel from the main screen. Cancellation is scoped to this scan's
+	// own ctx (cancelThis), not c.CancelScan, so it can't take down the
+	// Thumbnails warm-up or a newer scan that has since started.
 	var proc *Process
 	if c.processes != nil {
-		proc = c.processes.Begin(ProcScan, "Indexing", c.CancelScan, true)
+		proc = c.processes.Begin(ctx, ProcScan, "Indexing", cancelThis, true)
 		proc.SetStatus("Indexing " + filepath.Base(dir))
 	}
 
@@ -296,7 +304,7 @@ func (c *Controller) WarmUp() {
 		defer cancel()
 		var proc *Process
 		if c.processes != nil {
-			proc = c.processes.Begin(ProcWarmUp, "Thumbnails", cancel, true)
+			proc = c.processes.Begin(ctx, ProcWarmUp, "Thumbnails", cancel, true)
 			proc.SetStatus("Generating thumbnails…")
 		}
 		defer func() {

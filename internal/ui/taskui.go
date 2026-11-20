@@ -1,6 +1,7 @@
 package ui
 
 import (
+	"context"
 	"image"
 	"sync"
 	"sync/atomic"
@@ -163,12 +164,14 @@ type procScope struct {
 }
 
 // begin registers a process with the bar, or returns nil when no registry is
-// wired. supportsPause is always true for the modal views. Takes no lock.
-func (s *procScope) begin(kind ProcKind, title string, cancel func()) *Process {
+// wired. ctx is the context the worker observes, so cancelling it also releases
+// the pause gate (U5-03). supportsPause is always true for the modal views.
+// Takes no lock.
+func (s *procScope) begin(ctx context.Context, kind ProcKind, title string, cancel func()) *Process {
 	if s.reg == nil {
 		return nil
 	}
-	return s.reg.Begin(kind, title, cancel, true)
+	return s.reg.Begin(ctx, kind, title, cancel, true)
 }
 
 // attachLocked publishes proc as the live process. keep, when non-nil, gates the

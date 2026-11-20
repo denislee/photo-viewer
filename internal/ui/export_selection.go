@@ -20,7 +20,7 @@ func (c *Controller) ExportSelection(paths []string, target string, done func(co
 		defer cancel()
 		var proc *Process
 		if c.processes != nil {
-			proc = c.processes.Begin(ProcExportSelection, "Export selection", cancel, false)
+			proc = c.processes.Begin(ctx, ProcExportSelection, "Export selection", cancel, false)
 			proc.SetTotal(int64(len(paths)))
 			proc.SetStatus("Copying to " + target)
 		}
