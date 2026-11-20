@@ -158,11 +158,15 @@ func TestLoadRAWImageFit(t *testing.T) {
 	if err != nil {
 		t.Fatalf("LoadRAWImage: %v", err)
 	}
-	if calls == 0 {
-		t.Fatalf("fit was never called")
-	}
-	if gotW != 400 || gotH != 200 || gotO != 6 {
-		t.Errorf("fit called with (%d, %d, %d), want (400, 200, 6)", gotW, gotH, gotO)
+	// fit only chooses a DCT scale, so a nojpegturbo build (full-size
+	// image.Decode) never needs to call it.
+	if jpegturbo.Available() {
+		if calls == 0 {
+			t.Fatalf("fit was never called")
+		}
+		if gotW != 400 || gotH != 200 || gotO != 6 {
+			t.Errorf("fit called with (%d, %d, %d), want (400, 200, 6)", gotW, gotH, gotO)
+		}
 	}
 	if orientation != 6 {
 		t.Errorf("reported orientation %d, want 6", orientation)
