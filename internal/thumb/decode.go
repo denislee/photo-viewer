@@ -68,7 +68,10 @@ func readJPEG(ctx context.Context, src string) ([]byte, error) {
 	}
 	var buf bytes.Buffer
 	if info, err := f.Stat(); err == nil {
-		buf.Grow(int(info.Size()))
+		// +MinRead: ReadFrom grows the buffer by MinRead once it is exactly
+		// full, before it sees EOF; without the slack that reallocation
+		// doubles the buffer and copies the whole file (T5-02).
+		buf.Grow(int(info.Size()) + bytes.MinRead)
 	}
 	buf.Write(head[:])
 	if _, err := buf.ReadFrom(fsutil.NewContextReader(ctx, f)); err != nil {
@@ -86,7 +89,10 @@ func ReadFile(ctx context.Context, path string) ([]byte, error) {
 	defer f.Close()
 	var buf bytes.Buffer
 	if info, err := f.Stat(); err == nil {
-		buf.Grow(int(info.Size()))
+		// +MinRead: ReadFrom grows the buffer by MinRead once it is exactly
+		// full, before it sees EOF; without the slack that reallocation
+		// doubles the buffer and copies the whole file (T5-02).
+		buf.Grow(int(info.Size()) + bytes.MinRead)
 	}
 	if _, err := buf.ReadFrom(fsutil.NewContextReader(ctx, f)); err != nil {
 		return nil, err
