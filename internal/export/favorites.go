@@ -9,6 +9,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"syscall"
 
@@ -94,35 +95,119 @@ func Favorites(ctx context.Context, idx *cache.Index, opts Options, progress Pro
 	}
 	recompress := opts.MaxLongEdge > 0
 
+	// Recompressing an image is CPU-bound (~600 ms for a 12 MP → 2048 px
+	// recompress), so only those jobs run on a small worker pool. Video
+	// transcodes, RAW fallbacks, plain copies and moves stay inline on this
+	// goroutine. Progress still has to arrive in step order, so items are
+	// queued in a FIFO and reported from the head (see pendingItem).
+	n := min(runtime.NumCPU(), 4)
+
 	favs := idx.ListFavorites()
 	total := len(favs)
 	var res Result
 
-	// claimed tracks destinations already planned this run so a dry-run's
-	// printed paths match a real run file-for-file: two favorites that map to
-	// the same name resolve to distinct destinations (base, then _1), exactly
-	// as a real run's on-disk collision check would. A real run consults only
-	// the filesystem (fsutil.Taken); the dry-run also consults claimed because it
-	// never actually creates the files, so the disk alone can't tell it a name
-	// is spoken for. Without this the old dry-run printed the same destination
-	// twice and lied about the outcome.
+	// claimed tracks destinations already planned this run so two favorites that
+	// map to the same name resolve to distinct destinations (base, then _1),
+	// exactly as a real run's on-disk collision check would. Both dry and real
+	// runs consult it: a dry run never creates the files, and in a real run a
+	// parallel recompress job may not have written its output yet when a later
+	// item is planned, so the disk alone can't tell the planner a name is spoken
+	// for. Every planned destination is reserved (claimed[dest] = true).
 	claimed := map[string]bool{}
-	taken := fsutil.Taken
-	if opts.DryRun {
-		taken = func(p string) bool { return claimed[p] || fsutil.Taken(p) }
+	taken := func(p string) bool { return claimed[p] || fsutil.Taken(p) }
+
+	sem := make(chan struct{}, n)
+	var pending []*pendingItem
+
+	// report applies one item's outcome on the calling goroutine, preserving
+	// the action/msg strings this function has always emitted.
+	report := func(it *pendingItem, out pendingOutcome) {
+		switch {
+		case out.skip:
+			res.Skipped++
+			if progress != nil {
+				progress(it.step, total, "SKIP", out.msg)
+			}
+		case out.err != nil:
+			res.Failed++
+			if progress != nil {
+				msg := out.msg
+				if msg == "" {
+					msg = fmt.Sprintf("%s -> %s: %v", it.src, it.dest, out.err)
+				}
+				progress(it.step, total, "FAIL", msg)
+			}
+		default:
+			res.Done++
+			if progress != nil {
+				progress(it.step, total, out.action, fmt.Sprintf("%s -> %s", it.src, it.dest))
+			}
+		}
+	}
+
+	// flush reports every complete item from the head of the FIFO, stopping at
+	// the first still-running parallel job so reporting never reorders.
+	flush := func() {
+		for len(pending) > 0 {
+			head := pending[0]
+			if head.ch != nil {
+				select {
+				case out := <-head.ch:
+					report(head, out)
+					pending = pending[1:]
+					continue
+				default:
+					return
+				}
+			}
+			report(head, head.out)
+			pending = pending[1:]
+		}
+	}
+
+	// blockOnHead waits for the FIFO head (whether already known or a running
+	// job) and reports it.
+	blockOnHead := func() {
+		head := pending[0]
+		out := head.out
+		if head.ch != nil {
+			out = <-head.ch
+		}
+		report(head, out)
+		pending = pending[1:]
+	}
+
+	// enqueue appends one planned item in step order, reports everything that is
+	// already complete, and — when the FIFO grows past 2*n — waits for its head
+	// so at most 2*n items are ever outstanding.
+	enqueue := func(it *pendingItem) {
+		pending = append(pending, it)
+		flush()
+		for len(pending) > 2*n {
+			blockOnHead()
+		}
+	}
+
+	// drain waits for every outstanding item and reports it in step order.
+	drain := func() {
+		for len(pending) > 0 {
+			blockOnHead()
+		}
 	}
 
 	for i, e := range favs {
 		if ctx.Err() != nil {
+			drain()
 			return res, ctx.Err()
 		}
 		step := i + 1
 		src := e.Path
 		if _, err := os.Stat(src); err != nil {
-			res.Skipped++
-			if progress != nil {
-				progress(step, total, "SKIP", fmt.Sprintf("%s: %v", src, err))
-			}
+			enqueue(&pendingItem{
+				step: step,
+				src:  src,
+				out:  pendingOutcome{msg: fmt.Sprintf("%s: %v", src, err), skip: true},
+			})
 			continue
 		}
 
@@ -139,12 +224,16 @@ func Favorites(ctx context.Context, idx *cache.Index, opts Options, progress Pro
 		}
 		dest, err := avoidCollision(dest, taken)
 		if err != nil {
-			res.Failed++
-			if progress != nil {
-				progress(step, total, "FAIL", fmt.Sprintf("%s: %v", src, err))
-			}
+			enqueue(&pendingItem{
+				step: step,
+				src:  src,
+				out:  pendingOutcome{msg: fmt.Sprintf("%s: %v", src, err), err: err},
+			})
 			continue
 		}
+		// Reserve the planned destination before any worker can write it, so a
+		// later same-named favorite advances to _1 instead of racing onto it.
+		claimed[dest] = true
 
 		action := "COPY"
 		switch {
@@ -156,21 +245,43 @@ func Favorites(ctx context.Context, idx *cache.Index, opts Options, progress Pro
 			action = "RECOMPRESS"
 		}
 		if opts.DryRun {
-			// Reserve the planned destination so a later same-named favorite
-			// advances to _1 instead of printing the same path twice.
-			claimed[dest] = true
-			res.Done++
-			if progress != nil {
-				progress(step, total, action, fmt.Sprintf("%s -> %s", src, dest))
-			}
+			enqueue(&pendingItem{
+				step:   step,
+				action: action,
+				src:    src,
+				dest:   dest,
+				out:    pendingOutcome{action: action},
+			})
 			continue
 		}
 
 		if err := os.MkdirAll(filepath.Dir(dest), 0o755); err != nil {
-			res.Failed++
-			if progress != nil {
-				progress(step, total, "FAIL", fmt.Sprintf("mkdir %s: %v", filepath.Dir(dest), err))
-			}
+			enqueue(&pendingItem{
+				step: step,
+				src:  src,
+				dest: dest,
+				out:  pendingOutcome{msg: fmt.Sprintf("mkdir %s: %v", filepath.Dir(dest), err), err: err},
+			})
+			continue
+		}
+
+		if willRecompress && (e.Type == scan.TypePhoto || e.Type == scan.TypeHEIC) {
+			// Only image recompresses are parallel: every other action would
+			// either fork a tool, stream a whole file, or mutate the source, and
+			// keeping those inline makes their progress ordering obvious.
+			it := &pendingItem{step: step, action: action, src: src, dest: dest, ch: make(chan pendingOutcome, 1)}
+			go func(it *pendingItem, typ scan.MediaType, src, dest, action string) {
+				sem <- struct{}{}
+				handled, err := recompressFile(ctx, typ, src, dest, opts.MaxLongEdge, jpegQ, crf)
+				if !handled {
+					// RAW (or required tool missing) — fall back to plain copy.
+					err = copyFile(src, dest)
+					action = "COPY"
+				}
+				<-sem
+				it.ch <- pendingOutcome{action: action, err: err}
+			}(it, e.Type, src, dest, action)
+			enqueue(it)
 			continue
 		}
 
@@ -190,19 +301,38 @@ func Favorites(ctx context.Context, idx *cache.Index, opts Options, progress Pro
 		default:
 			opErr = copyFile(src, dest)
 		}
-		if opErr != nil {
-			res.Failed++
-			if progress != nil {
-				progress(step, total, "FAIL", fmt.Sprintf("%s -> %s: %v", src, dest, opErr))
-			}
-			continue
-		}
-		res.Done++
-		if progress != nil {
-			progress(step, total, action, fmt.Sprintf("%s -> %s", src, dest))
-		}
+		enqueue(&pendingItem{
+			step:   step,
+			action: action,
+			src:    src,
+			dest:   dest,
+			out:    pendingOutcome{action: action, err: opErr},
+		})
 	}
+	drain()
 	return res, nil
+}
+
+// pendingItem is one favorite's place in the ordered progress FIFO. A parallel
+// recompress carries its outcome on ch; every other item (copy, move,
+// transcode, skip, planning failure) is already complete and stores it in out.
+type pendingItem struct {
+	step   int
+	action string
+	src    string
+	dest   string
+	out    pendingOutcome
+	ch     chan pendingOutcome
+}
+
+// pendingOutcome is the result of one planned item. msg, when non-empty, is the
+// exact progress text for a SKIP or a planning-time FAIL; otherwise the
+// reporter formats "<src> -> <dest>" (success) or "<src> -> <dest>: <err>".
+type pendingOutcome struct {
+	action string
+	err    error
+	msg    string
+	skip   bool
 }
 
 // destinationPath resolves where src should land under dst. When flatten
