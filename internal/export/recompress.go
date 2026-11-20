@@ -231,29 +231,54 @@ func recompressHEIC(ctx context.Context, src, dst string, maxEdge, quality int) 
 // ffmpeg invocation: ffmpeg decodes the HEIF (libheif/HEVC), its scaler fits
 // the long edge to maxEdge, and its mjpeg encoder writes the JPEG at the
 // mapped quality — one decode, one encode, no intermediate max-quality JPEG.
-// ffmpeg auto-applies the HEIF container rotation (the same autorotate the
-// thumb path relies on), so the output is upright with no orientation tag,
-// matching recompressImage's baked-in-orientation contract. The write is
-// atomic and durable (temp + fsync + rename), like recompressVideo.
+// A tiled grid HEIC (the iPhone default) needs the stream-group filter form on
+// ffmpeg >= 7.1; every other layout needs -vf, so the second form is retried
+// if the first fails. ffmpeg auto-applies the HEIF container rotation (the same
+// autorotate the thumb path relies on), so the output is upright with no
+// orientation tag, matching recompressImage's baked-in-orientation contract.
+// The write is atomic and durable (temp + fsync + rename), like recompressVideo.
 func recompressHEICViaFfmpeg(ctx context.Context, src, dst string, maxEdge, quality int) error {
 	tmp := dst + ".tmp.jpg"
+	err := runHEICRecompress(ctx, src, tmp,
+		[]string{"-filter_complex", "[0:g:0]" + heicScaleFilter(maxEdge)}, quality)
+	if err != nil {
+		// Only a rejected stream-group specifier (no grid, or an older ffmpeg)
+		// is worth a -vf retry; a corrupt file or missing decoder fails both.
+		if ctx.Err() != nil || !strings.Contains(err.Error(), "pecifier") {
+			return err
+		}
+		// No grid stream group (or an older ffmpeg): retry once with -vf.
+		if err := runHEICRecompress(ctx, src, tmp,
+			[]string{"-vf", heicScaleFilter(maxEdge)}, quality); err != nil {
+			return err
+		}
+	}
+	return publishTemp(tmp, dst)
+}
+
+// runHEICRecompress runs the single ffmpeg pass behind recompressHEICViaFfmpeg,
+// placing filterArgs where the scaling filter belongs. On failure it removes the
+// partial temp and folds ffmpeg's diagnostics into the error.
+func runHEICRecompress(ctx context.Context, src, tmp string, filterArgs []string, quality int) error {
 	args := []string{
 		"-loglevel", "error",
 		"-y",
 		"-i", src,
 		"-frames:v", "1",
-		"-vf", heicScaleFilter(maxEdge),
+	}
+	args = append(args, filterArgs...)
+	args = append(args,
 		"-c:v", "mjpeg",
 		"-q:v", strconv.Itoa(mjpegQScale(quality)),
 		"-f", "image2",
 		tmp,
-	}
+	)
 	cmd := exec.CommandContext(ctx, "ffmpeg", args...)
 	if out, err := cmd.CombinedOutput(); err != nil {
 		os.Remove(tmp)
 		return fmt.Errorf("ffmpeg: %v: %s", err, strings.TrimSpace(string(out)))
 	}
-	return publishTemp(tmp, dst)
+	return nil
 }
 
 // publishTemp makes an ffmpeg-written temp durable and moves it into place. The

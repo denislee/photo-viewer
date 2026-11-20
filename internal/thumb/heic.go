@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"sync/atomic"
 )
 
@@ -22,18 +23,19 @@ var ffmpegNoHEIC atomic.Bool
 
 // HEIC converts a HEIC/HEIF file to JPEG and resamples it.
 //
-// Strategy: prefer ffmpeg with `-vf scale` (one subprocess does the HEIC
-// decode + downscale + JPEG encode in a single pass — same trick the video
-// thumbnailer uses). Fall back to `heif-convert` + an in-process scale when
-// ffmpeg can't open the file (HEIC support depends on how ffmpeg was built).
-// The previous implementation always wrote a full-resolution JPEG then
+// Strategy: prefer ffmpeg (one subprocess does the HEIC decode + downscale +
+// JPEG encode in a single pass — same trick the video thumbnailer uses), using
+// the stream-group filter form for tiled grid HEICs and falling back to
+// `-vf scale` for everything else. Fall back to `heif-convert` + an in-process
+// scale when ffmpeg can't open the file (HEIC support depends on how ffmpeg was
+// built). The previous implementation always wrote a full-resolution JPEG then
 // re-decoded + re-scaled + re-encoded it, paying for two JPEG codec passes.
 func HEIC(ctx context.Context, src, dst string, size int) error {
 	ffmpegTried := false
 	if !ffmpegNoHEIC.Load() {
 		if haveFfmpeg() {
 			ffmpegTried = true
-			if err := imageViaFfmpeg(ctx, src, dst, size); err == nil {
+			if err := heicViaFfmpeg(ctx, src, dst, size); err == nil {
 				return nil
 			}
 			// fall through — ffmpeg either lacks HEIC or refused this file.
@@ -67,6 +69,37 @@ func HEIC(ctx context.Context, src, dst string, size int) error {
 		return err
 	}
 	return writeThumb(img, dst, size, 1)
+}
+
+// heicViaFfmpeg thumbnails a HEIC through ffmpeg, handling both container
+// layouts. Tiled grid HEIC (every iPhone photo) needs the stream-group form on
+// ffmpeg >= 7.1: -vf then fails with "Simple and complex filtering cannot be
+// used together", while -filter_complex "[0:g:0]<scale>" works. Non-grid HEIC
+// has no stream group and needs -vf instead, and older ffmpeg rejects `g:` —
+// both fall through to -vf (T5-01).
+func heicViaFfmpeg(ctx context.Context, src, dst string, size int) error {
+	gridFilter := []string{"-filter_complex", "[0:g:0]" + ffmpegScaleFilter(size)}
+	err := runFfmpegThumbFilter(ctx, dst, gridFilter, nil, "-i", src)
+	if err == nil {
+		return nil
+	}
+	if cerr := ctx.Err(); cerr != nil {
+		return cerr
+	}
+	// Retry with -vf only when ffmpeg rejected the stream-group specifier (a
+	// non-grid file, or an ffmpeg without stream groups). Any other failure —
+	// a corrupt file, no HEVC decoder — would fail -vf too, so it costs one
+	// fork, not two (T4-03).
+	if !isStreamSpecifierError(err) {
+		return err
+	}
+	return imageViaFfmpeg(ctx, src, dst, size)
+}
+
+// isStreamSpecifierError reports whether an ffmpeg error says the `[0:g:0]`
+// stream specifier matched nothing or was not understood.
+func isStreamSpecifierError(err error) bool {
+	return err != nil && strings.Contains(err.Error(), "pecifier")
 }
 
 // HEICToJPEG decodes a HEIC/HEIF file to a full-resolution JPEG written under

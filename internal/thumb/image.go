@@ -107,11 +107,19 @@ func ffmpegError(err error, stderr *bytes.Buffer) error {
 // the cap each child defaults to ~NumCPU threads, and the store runs an
 // extSem-worth (3×NumCPU) of these at once — HEIC's HEVC decoder included.
 func ffmpegThumbArgs(dst string, size int, inArgs ...string) []string {
+	return ffmpegThumbArgsFilter(dst, []string{"-vf", ffmpegScaleFilter(size)}, inArgs...)
+}
+
+// ffmpegThumbArgsFilter is ffmpegThumbArgs with the output-filter arguments
+// supplied by the caller. It exists because tiled HEIC (see heicViaFfmpeg)
+// can't use -vf at all: ffmpeg >= 7.1 exposes the grid as a stream group, so
+// the filter must be written as -filter_complex "[0:g:0]…" instead.
+func ffmpegThumbArgsFilter(dst string, filterArgs []string, inArgs ...string) []string {
 	args := []string{"-loglevel", "error", "-y", "-threads", "1"}
 	args = append(args, inArgs...)
+	args = append(args, "-frames:v", "1")
+	args = append(args, filterArgs...)
 	return append(args,
-		"-frames:v", "1",
-		"-vf", ffmpegScaleFilter(size),
 		"-f", "image2",
 		dst,
 	)
@@ -121,7 +129,13 @@ func ffmpegThumbArgs(dst string, size int, inArgs ...string) []string {
 // On failure it removes any partial dst and returns ffmpeg's stderr as the
 // error; on success it confirms dst exists.
 func runFfmpegThumb(ctx context.Context, dst string, size int, stdin io.Reader, inArgs ...string) error {
-	cmd := exec.CommandContext(ctx, "ffmpeg", ffmpegThumbArgs(dst, size, inArgs...)...)
+	return runFfmpegThumbFilter(ctx, dst, []string{"-vf", ffmpegScaleFilter(size)}, stdin, inArgs...)
+}
+
+// runFfmpegThumbFilter is runFfmpegThumb with the output-filter arguments
+// supplied by the caller (see ffmpegThumbArgsFilter).
+func runFfmpegThumbFilter(ctx context.Context, dst string, filterArgs []string, stdin io.Reader, inArgs ...string) error {
+	cmd := exec.CommandContext(ctx, "ffmpeg", ffmpegThumbArgsFilter(dst, filterArgs, inArgs...)...)
 	if stdin != nil {
 		cmd.Stdin = stdin
 	}
