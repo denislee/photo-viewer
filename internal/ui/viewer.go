@@ -673,7 +673,10 @@ func (v *Viewer) playVideo(e cache.Entry, w, h int) (paint.ImageOp, bool) {
 		return paint.ImageOp{}, false
 	}
 	op := paint.NewImageOp(frame)
-	op.Filter = paint.FilterLinear
+	// mpv already rendered at imgArea pixels, so the frame is drawn 1:1:
+	// FilterLinear would make Gio build (and never sample) a full mip chain
+	// on every frame upload (V5-01).
+	op.Filter = paint.FilterNearest
 	v.lastVideoOp, v.lastVideoPath, v.lastVideoSize = op, e.Path, sz
 	return op, true
 }
