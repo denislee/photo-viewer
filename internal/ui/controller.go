@@ -609,11 +609,12 @@ func sortEntries(entries []cache.Entry, mode string) {
 	sort.Slice(entries, func(i, j int) bool {
 		di, dj := entries[i].DurationMs, entries[j].DurationMs
 		if di != dj {
-			// Non-video / unknown duration → end of list.
-			if di == 0 {
+			// Non-video / unknown duration (0 or the -1 probe-failure
+			// sentinel) → end of list.
+			if di <= 0 {
 				return false
 			}
-			if dj == 0 {
+			if dj <= 0 {
 				return true
 			}
 			return di > dj

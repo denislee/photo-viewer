@@ -81,7 +81,9 @@ type Entry struct {
 	ModTime time.Time      `json:"mtime"`
 	ThumbID string         `json:"thumb_id"`
 	// DurationMs is the playback length of a video in milliseconds. 0 for
-	// non-videos and for videos whose duration could not be probed.
+	// non-videos and for videos whose duration is unknown; -1
+	// (scan.DurationProbeFailed) when a probe of this file version failed
+	// (treated as unknown by display code).
 	DurationMs int64 `json:"duration_ms"`
 	Favorite   bool  `json:"favorite"`
 }
@@ -383,10 +385,12 @@ const reconcileChunkSize = 5000
 // incremental rescan of an unchanged library would otherwise rewrite every row,
 // maintaining four indexes and writing ~10 MB of WAL per 100k files while
 // holding the write lock. The guard lists exactly the columns the SET writes;
-// an incoming duration_ms of 0 never counts as a change because the CASE below
-// preserves the stored value in that case. The hash/media_date CASEs only fire
-// on a size or mtime change, which the guard also admits, so semantics are
-// unchanged — a skipped row reports 0 changes, which ReconcileBatchChanged sums.
+// an incoming duration_ms of 0 preserves the stored value unless the file
+// changed (size or mtime differing then resets it to unknown, 0), and -1 is the
+// persisted probe-failure sentinel (scan.DurationProbeFailed), carried like any
+// other non-zero value. The hash/media_date CASEs only fire on a size or mtime
+// change, which the guard also admits, so semantics are unchanged — a skipped
+// row reports 0 changes, which ReconcileBatchChanged sums.
 const reconcileInsertSQL = `INSERT INTO entries (path, type, size, mtime, thumb_id, year, duration_ms) VALUES (?, ?, ?, ?, ?, ?, ?)
 	ON CONFLICT(path) DO UPDATE SET
 		type = excluded.type,
@@ -395,7 +399,8 @@ const reconcileInsertSQL = `INSERT INTO entries (path, type, size, mtime, thumb_
 		thumb_id = excluded.thumb_id,
 		year = excluded.year,
 		duration_ms = CASE
-			WHEN excluded.duration_ms > 0 THEN excluded.duration_ms
+			WHEN excluded.duration_ms != 0 THEN excluded.duration_ms
+			WHEN entries.size != excluded.size OR entries.mtime != excluded.mtime THEN 0
 			ELSE entries.duration_ms END,
 		quick_hash = CASE
 			WHEN entries.size != excluded.size OR entries.mtime != excluded.mtime
@@ -409,7 +414,7 @@ const reconcileInsertSQL = `INSERT INTO entries (path, type, size, mtime, thumb_
 	WHERE entries.size IS NOT excluded.size OR entries.mtime IS NOT excluded.mtime
 		OR entries.type IS NOT excluded.type OR entries.year IS NOT excluded.year
 		OR entries.thumb_id IS NOT excluded.thumb_id
-		OR (excluded.duration_ms > 0 AND entries.duration_ms IS NOT excluded.duration_ms)`
+		OR (excluded.duration_ms != 0 AND entries.duration_ms IS NOT excluded.duration_ms)`
 
 // ReconcileBatch inserts or updates a slice of scan results, chunking the
 // work into bounded transactions so readers aren't blocked for the whole
@@ -832,6 +837,20 @@ func (i *Index) SetFavorite(path string, favorite bool) error {
 		return sql.ErrNoRows
 	}
 	return nil
+}
+
+// KnownDurationMs returns the duration stored for path when the row still
+// describes the same file version (size and mtime to the second), else 0. It
+// is the scan's WalkOptions.KnownDurationMs callback, shared by the GUI and
+// pv-scan so both skip re-forking ffprobe for videos whose duration is already
+// indexed (X5-01, U5-05). A stored -1 (probe failure) is returned as-is so the
+// scan also skips re-probing a corrupt file version.
+func (i *Index) KnownDurationMs(path string, size int64, mtime time.Time) int64 {
+	e, ok := i.GetEntry(path)
+	if !ok || e.Size != size || e.ModTime.Unix() != mtime.Unix() {
+		return 0
+	}
+	return e.DurationMs
 }
 
 // SetDurationMs records a video's playback length (in milliseconds) on its

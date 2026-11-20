@@ -18,18 +18,22 @@ type Result struct {
 	Size    int64
 	ModTime time.Time
 	// DurationMs is the playback length in milliseconds for videos. 0 when
-	// the file is not a video, or when probing failed (e.g. ffprobe missing
-	// or corrupt file). Probed lazily in the scan workers.
+	// the file is not a video, or when the duration is unknown (e.g. ffprobe
+	// missing); DurationProbeFailed (-1) when a previous probe of this same
+	// file version failed. Probed lazily in the scan workers.
 	DurationMs int64
 }
 
 // WalkOptions configures WalkWith. The zero value probes every video via ffprobe.
 type WalkOptions struct {
 	// KnownDurationMs, if non-nil, is consulted before launching ffprobe
-	// against a video. Returning a non-zero value short-circuits the probe.
-	// Used by the controller to skip re-probing every video on incremental
-	// scans when the cached duration is already in the index.
-	KnownDurationMs func(path string) int64
+	// against a video. Return > 0 for a known duration, DurationProbeFailed
+	// (< 0) when a previous probe of this same file version failed (which
+	// also skips the probe), or 0 when the duration is unknown (the probe
+	// runs). Used by the controller and pv-scan to skip re-probing every
+	// video on incremental scans when the cached duration is already in the
+	// index.
+	KnownDurationMs func(path string, size int64, mtime time.Time) int64
 
 	// SkipDurationProbe, when true, suppresses the per-video ffprobe entirely
 	// so Result.DurationMs is always 0 for videos. Callers that never read the
@@ -123,9 +127,9 @@ func WalkWith(ctx context.Context, root string, opts WalkOptions) <-chan Result 
 				dest := out
 				if w.t == TypeVideo && !opts.SkipDurationProbe {
 					if opts.KnownDurationMs != nil {
-						r.DurationMs = opts.KnownDurationMs(w.path)
+						r.DurationMs = opts.KnownDurationMs(w.path, r.Size, r.ModTime)
 					}
-					if r.DurationMs <= 0 {
+					if r.DurationMs == 0 {
 						dest = probe // unknown duration: hand it to the ffprobe stage
 					}
 				}

@@ -223,14 +223,11 @@ func (c *Controller) scanInto(ctx context.Context, dir string) {
 	}()
 
 	// Pass an index-backed duration lookup so videos that already have a
-	// stored duration_ms skip the ffprobe fork on incremental rescans.
+	// stored duration_ms skip the ffprobe fork on incremental rescans. The
+	// index only trusts the stored duration when the file's size and mtime
+	// still match the indexed version.
 	results := scan.WalkWith(ctx, dir, scan.WalkOptions{
-		KnownDurationMs: func(path string) int64 {
-			if e, ok := c.index.GetEntry(path); ok {
-				return e.DurationMs
-			}
-			return 0
-		},
+		KnownDurationMs: c.index.KnownDurationMs,
 	})
 	var batch []scan.Result
 	flushAt := time.Now().Add(time.Second)

@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 )
 
 // walk is the zero-options WalkWith the tests use.
@@ -36,7 +37,7 @@ func TestWalkSkipDurationProbe(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	known := func(string) int64 { return 5000 } // would set a duration if consulted
+	known := func(string, int64, time.Time) int64 { return 5000 } // would set a duration if consulted
 	var got []Result
 	for r := range WalkWith(context.Background(), dir, WalkOptions{
 		SkipDurationProbe: true,
@@ -53,6 +54,70 @@ func TestWalkSkipDurationProbe(t *testing.T) {
 	}
 	if got[0].DurationMs != 0 {
 		t.Errorf("DurationMs = %d, want 0 (SkipDurationProbe must win over KnownDurationMs)", got[0].DurationMs)
+	}
+}
+
+// TestWalkKnownProbeFailureSkipsProbe verifies that a KnownDurationMs result of
+// DurationProbeFailed is carried through to the emitted Result and does not
+// hand the video to the ffprobe stage: a corrupt file's failed probe is
+// persisted once instead of being re-forked on every scan.
+func TestWalkKnownProbeFailureSkipsProbe(t *testing.T) {
+	dir := t.TempDir()
+	vid := filepath.Join(dir, "a.mp4")
+	if err := os.WriteFile(vid, []byte("not really a video"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	var got []Result
+	for r := range WalkWith(context.Background(), dir, WalkOptions{
+		KnownDurationMs: func(string, int64, time.Time) int64 { return DurationProbeFailed },
+	}) {
+		got = append(got, r)
+	}
+
+	if len(got) != 1 {
+		t.Fatalf("expected 1 result, got %d", len(got))
+	}
+	if got[0].DurationMs != DurationProbeFailed {
+		t.Errorf("DurationMs = %d, want %d (a known probe failure must skip the probe)", got[0].DurationMs, DurationProbeFailed)
+	}
+}
+
+// TestWalkKnownDurationGetsSizeAndMtime verifies the callback receives the
+// file's real size and mtime, which is what lets the cache trust a stored
+// duration only for the same file version (U5-05).
+func TestWalkKnownDurationGetsSizeAndMtime(t *testing.T) {
+	dir := t.TempDir()
+	vid := filepath.Join(dir, "a.mp4")
+	content := make([]byte, 321)
+	if err := os.WriteFile(vid, content, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	want, err := os.Stat(vid)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var gotSize int64
+	var gotMtime time.Time
+	called := false
+	for range WalkWith(context.Background(), dir, WalkOptions{
+		KnownDurationMs: func(_ string, size int64, mtime time.Time) int64 {
+			called = true
+			gotSize, gotMtime = size, mtime
+			return 5000
+		},
+	}) {
+	}
+
+	if !called {
+		t.Fatal("KnownDurationMs callback was never called")
+	}
+	if gotSize != want.Size() {
+		t.Errorf("callback size = %d, want %d", gotSize, want.Size())
+	}
+	if !gotMtime.Equal(want.ModTime()) {
+		t.Errorf("callback mtime = %v, want %v", gotMtime, want.ModTime())
 	}
 }
 

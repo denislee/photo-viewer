@@ -117,6 +117,9 @@ func main() {
 	}
 
 	opts := scan.WalkOptions{
+		// Skip re-forking ffprobe for videos whose duration is already
+		// stored for the current file version (X5-01).
+		KnownDurationMs: idx.KnownDurationMs,
 		OnError: func(path string, werr error) {
 			log.Printf("pv-scan: walk error %s: %v", path, werr)
 		},

@@ -168,6 +168,95 @@ func TestReconcileDurationZeroPreserved(t *testing.T) {
 	}
 }
 
+// TestReconcileDurationProbeFailedSentinel checks the -1 probe-failure
+// sentinel: a failed probe is persisted, an incoming 0 preserves it while the
+// file version is unchanged, a size change resets the duration to unknown, and
+// a later real duration overwrites it.
+func TestReconcileDurationProbeFailedSentinel(t *testing.T) {
+	idx, cleanup := loadEmpty(t)
+	defer cleanup()
+
+	const path = "/lib/clip.mp4"
+	base := time.Unix(1_700_000_000, 0)
+	video := func(size, durMs int64) scan.Result {
+		return scan.Result{
+			Path:       path,
+			Type:       scan.TypeVideo,
+			Size:       size,
+			ModTime:    base,
+			DurationMs: durMs,
+		}
+	}
+	duration := func() int64 {
+		e, ok := idx.GetEntry(path)
+		if !ok {
+			t.Fatalf("GetEntry(%s) missing", path)
+		}
+		return e.DurationMs
+	}
+
+	if got := idx.ReconcileBatchChanged([]scan.Result{video(10, scan.DurationProbeFailed)}); got != 1 {
+		t.Fatalf("insert with probe-failure sentinel = %d changed, want 1", got)
+	}
+	if got := duration(); got != scan.DurationProbeFailed {
+		t.Fatalf("DurationMs = %d, want %d (failure must be persisted)", got, scan.DurationProbeFailed)
+	}
+
+	if got := idx.ReconcileBatchChanged([]scan.Result{video(10, 0)}); got != 0 {
+		t.Fatalf("reconcile same version with 0 = %d changed, want 0", got)
+	}
+	if got := duration(); got != scan.DurationProbeFailed {
+		t.Fatalf("DurationMs after zero-duration reconcile = %d, want %d", got, scan.DurationProbeFailed)
+	}
+
+	if got := idx.ReconcileBatchChanged([]scan.Result{video(11, 0)}); got != 1 {
+		t.Fatalf("reconcile with a new size and 0 = %d changed, want 1", got)
+	}
+	if got := duration(); got != 0 {
+		t.Fatalf("DurationMs after size change = %d, want 0 (unknown)", got)
+	}
+
+	if got := idx.ReconcileBatchChanged([]scan.Result{video(11, 5000)}); got != 1 {
+		t.Fatalf("reconcile with duration 5000 = %d changed, want 1", got)
+	}
+	if got := duration(); got != 5000 {
+		t.Fatalf("DurationMs after real duration = %d, want 5000", got)
+	}
+}
+
+// TestKnownDurationMsChecksVersion checks that the scan callback only trusts a
+// stored duration for the exact file version (size + mtime in seconds) it was
+// probed from, and reports 0 for anything else.
+func TestKnownDurationMsChecksVersion(t *testing.T) {
+	idx, cleanup := loadEmpty(t)
+	defer cleanup()
+
+	const path = "/lib/clip.mp4"
+	mtime := time.Unix(1_700_000_000, 0)
+	if got := idx.ReconcileBatchChanged([]scan.Result{{
+		Path:       path,
+		Type:       scan.TypeVideo,
+		Size:       10,
+		ModTime:    mtime,
+		DurationMs: 5000,
+	}}); got != 1 {
+		t.Fatalf("insert video = %d changed, want 1", got)
+	}
+
+	if got := idx.KnownDurationMs(path, 10, mtime); got != 5000 {
+		t.Errorf("KnownDurationMs(same version) = %d, want 5000", got)
+	}
+	if got := idx.KnownDurationMs(path, 11, mtime); got != 0 {
+		t.Errorf("KnownDurationMs(different size) = %d, want 0", got)
+	}
+	if got := idx.KnownDurationMs(path, 10, mtime.Add(time.Second)); got != 0 {
+		t.Errorf("KnownDurationMs(different mtime) = %d, want 0", got)
+	}
+	if got := idx.KnownDurationMs("/lib/other.mp4", 10, mtime); got != 0 {
+		t.Errorf("KnownDurationMs(unknown path) = %d, want 0", got)
+	}
+}
+
 // TestReconcileTypeChangeCounts checks that a type change with identical size
 // and mtime still counts as a changed row and is persisted.
 func TestReconcileTypeChangeCounts(t *testing.T) {
