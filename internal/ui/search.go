@@ -419,33 +419,121 @@ func (v *FuzzySearchView) recomputeResults() {
 		return
 	}
 
-	out := make([]searchResult, 0, 256)
-	for i, c := range candidates {
-		out = appendFuzzyResult(out, ql, i, c)
-	}
-	sortSearchResults(out, candidates)
-	truncated := false
-	if len(out) > searchResultCap {
-		out = out[:searchResultCap]
-		truncated = true
-	}
+	// Bounded top-K (G5-01): keep only the searchResultCap best matches in a
+	// heap instead of collecting, sorting and truncating every match — on a
+	// broad query over a large library the old full sort dominated the frame
+	// goroutine.
+	out, matched := topSearchResults(ql, candidates, searchResultCap)
 	v.results = out
-	v.resultsTruncated = truncated
+	v.resultsTruncated = matched > searchResultCap
+}
+
+// scoreCandidate scores candidate c against the lowercased query ql. A basename
+// hit wins outright; a path-only hit is penalized (+50) so basename matches
+// float to the top. It is the single source of truth for match scores, shared
+// by appendFuzzyResult and topSearchResults so both assign identical values.
+func scoreCandidate(ql string, c searchCandidate) (int, bool) {
+	if ok, sc := fuzzyScore(ql, c.baseLower); ok {
+		return sc, true
+	}
+	if ok, sc := fuzzyScore(ql, c.relLower); ok {
+		return sc + 50, true
+	}
+	return 0, false
 }
 
 // appendFuzzyResult scores candidate c (at index i) against the lowercased
-// query ql and appends a searchResult to out when it matches. A basename hit
-// wins outright; a path-only hit is penalized (+50) so basename matches float
-// to the top. Shared by the full and incremental scan paths so both assign
-// identical scores.
+// query ql and appends a searchResult to out when it matches. Shared by the
+// full and incremental scan paths so both assign identical scores.
 func appendFuzzyResult(out []searchResult, ql string, i int, c searchCandidate) []searchResult {
-	if ok, sc := fuzzyScore(ql, c.baseLower); ok {
+	if sc, ok := scoreCandidate(ql, c); ok {
 		return append(out, searchResult{idx: i, score: sc})
 	}
-	if ok, sc := fuzzyScore(ql, c.relLower); ok {
-		return append(out, searchResult{idx: i, score: sc + 50})
-	}
 	return out
+}
+
+// betterResult reports whether a ranks ahead of b under sortSearchResults'
+// ordering: lower score wins, ties broken by relative path. Both idx values
+// must index the same candidates slice.
+func betterResult(a, b searchResult, candidates []searchCandidate) bool {
+	if a.score != b.score {
+		return a.score < b.score
+	}
+	return candidates[a.idx].rel < candidates[b.idx].rel
+}
+
+// worseResult reports whether a ranks behind b — the "greater" relation of the
+// max-heap in topSearchResults, whose root is the worst kept result.
+func worseResult(a, b searchResult, candidates []searchCandidate) bool {
+	return betterResult(b, a, candidates)
+}
+
+// siftUpWorst restores the max-heap invariant after appending at i.
+func siftUpWorst(h []searchResult, i int, candidates []searchCandidate) {
+	for i > 0 {
+		parent := (i - 1) / 2
+		if !worseResult(h[i], h[parent], candidates) {
+			break
+		}
+		h[i], h[parent] = h[parent], h[i]
+		i = parent
+	}
+}
+
+// siftDownWorst restores the max-heap invariant after replacing the root at i.
+func siftDownWorst(h []searchResult, i int, candidates []searchCandidate) {
+	n := len(h)
+	for {
+		worst := i
+		if l := 2*i + 1; l < n && worseResult(h[l], h[worst], candidates) {
+			worst = l
+		}
+		if r := 2*i + 2; r < n && worseResult(h[r], h[worst], candidates) {
+			worst = r
+		}
+		if worst == i {
+			return
+		}
+		h[i], h[worst] = h[worst], h[i]
+		i = worst
+	}
+}
+
+// topSearchResults returns the k best matches for the lowercased query ql, in
+// sortSearchResults order, plus the total number of matches seen (which may
+// exceed k). It scores every candidate once and keeps a bounded max-heap whose
+// root is the worst kept result, so a broad query costs O(n log k) instead of
+// O(n log n) (G5-01).
+func topSearchResults(ql string, candidates []searchCandidate, k int) (top []searchResult, matched int) {
+	if k <= 0 {
+		for _, c := range candidates {
+			if _, ok := scoreCandidate(ql, c); ok {
+				matched++
+			}
+		}
+		return nil, matched
+	}
+	heap := make([]searchResult, 0, min(k, len(candidates)))
+	for i, c := range candidates {
+		sc, ok := scoreCandidate(ql, c)
+		if !ok {
+			continue
+		}
+		matched++
+		r := searchResult{idx: i, score: sc}
+		if len(heap) < k {
+			heap = append(heap, r)
+			siftUpWorst(heap, len(heap)-1, candidates)
+			continue
+		}
+		// Full: the new match only earns a slot if it beats the current worst.
+		if betterResult(r, heap[0], candidates) {
+			heap[0] = r
+			siftDownWorst(heap, 0, candidates)
+		}
+	}
+	sortSearchResults(heap, candidates)
+	return heap, matched
 }
 
 // sortSearchResults orders results best→worst: lower score first, ties broken
