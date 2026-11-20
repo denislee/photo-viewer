@@ -350,7 +350,10 @@ func (g *Grid) Layout(gtx layout.Context, th *Theme, entries []cache.Entry, ctrl
 	thumbs.BeginFrame()
 	cellPx := gtx.Dp(g.cellSize)
 	gapPx := gtx.Dp(cellGapDp)
-	width := gtx.Constraints.Max.X
+	// The scrollbar occupies a strip on the right edge (material.Occupy), so
+	// columns are fitted to what is left of the width.
+	listStyle := material.List(th.Theme, &g.list)
+	width := max(gtx.Constraints.Max.X-gtx.Dp(listStyle.Width()), 0)
 	cols = max((width+gapPx)/(cellPx+gapPx), 1)
 	g.cols = cols
 	rowH := cellPx + gapPx
@@ -398,7 +401,7 @@ func (g *Grid) Layout(gtx layout.Context, th *Theme, entries []cache.Entry, ctrl
 	}
 
 	g.missing = 0
-	dims := g.list.Layout(gtx, rowCount, func(gtx layout.Context, row int) layout.Dimensions {
+	dims := listStyle.Layout(gtx, rowCount, func(gtx layout.Context, row int) layout.Dimensions {
 		return g.layoutRow(gtx, th, entries, thumbs, selectionMode, selectedSnap, row, cols, cellPx, gapPx)
 	})
 	g.prefetchBeyondViewport(thumbs, entries, cols, rowCount, cellPx > LargeThumbCellPx)
@@ -592,7 +595,7 @@ const badgeLabelCap = 256
 // draws a badge: resetting the ops invalidates every CallOp recorded into them,
 // and those may only be replayed during the frame that fetched them.
 func beginBadgeFrame() {
-	if badgeLabels.m != nil && len(badgeLabels.m) >= badgeLabelCap {
+	if len(badgeLabels.m) >= badgeLabelCap {
 		badgeLabels.ops.Reset()
 		badgeLabels.m = make(map[badgeLabelKey]badgeLabel, badgeLabelCap)
 	}
@@ -603,7 +606,7 @@ func beginBadgeFrame() {
 // cache never resets here: a mid-frame overflow just grows the map until the
 // next frame's beginBadgeFrame clears it, which keeps every CallOp handed out
 // earlier in this frame valid.
-func cachedBadgeLabel(gtx layout.Context, th *Theme, key badgeLabelKey, record func(gtx layout.Context) layout.Dimensions) badgeLabel {
+func cachedBadgeLabel(gtx layout.Context, key badgeLabelKey, record func(gtx layout.Context) layout.Dimensions) badgeLabel {
 	if lbl, ok := badgeLabels.m[key]; ok {
 		return lbl
 	}
@@ -657,7 +660,7 @@ func drawGlyphBadge(gtx layout.Context, th *Theme, cell image.Rectangle, corner 
 	// Glyph, sized to roughly fill the badge. The label layout is cached and
 	// replayed as a recorded op — shaping text every frame for every badge
 	// dominated a dense grid's frame time (G5-02).
-	badge := cachedBadgeLabel(gtx, th, badgeLabelKey{
+	badge := cachedBadgeLabel(gtx, badgeLabelKey{
 		text:   glyph,
 		sp:     sp,
 		col:    col,
@@ -714,7 +717,7 @@ func drawDurationBadge(gtx layout.Context, th *Theme, cell image.Rectangle, badg
 	// Measure label first so the pill hugs the text width. The measurement and
 	// its recorded draw op are cached: the text is the same every frame for a
 	// given clip length and cell width (G5-02).
-	badge := cachedBadgeLabel(gtx, th, badgeLabelKey{
+	badge := cachedBadgeLabel(gtx, badgeLabelKey{
 		text:   text,
 		sp:     unit.Sp(11),
 		col:    th.Foreground,

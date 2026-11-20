@@ -52,11 +52,11 @@ func TestCachedBadgeLabelReuses(t *testing.T) {
 		box:    image.Pt(26, 26),
 		metric: gtx.Metric,
 	}
-	first := cachedBadgeLabel(gtx, th, key, record)
+	first := cachedBadgeLabel(gtx, key, record)
 	if calls != 1 {
 		t.Fatalf("record ran %d times on first call, want 1", calls)
 	}
-	second := cachedBadgeLabel(gtx, th, key, record)
+	second := cachedBadgeLabel(gtx, key, record)
 	if calls != 1 {
 		t.Fatalf("record ran %d times on identical key, want 1 (cache hit)", calls)
 	}
@@ -67,7 +67,7 @@ func TestCachedBadgeLabelReuses(t *testing.T) {
 
 	other := key
 	other.text = "✓"
-	cachedBadgeLabel(gtx, th, other, record)
+	cachedBadgeLabel(gtx, other, record)
 	if calls != 2 {
 		t.Fatalf("record ran %d times after a different key, want 2", calls)
 	}
@@ -77,7 +77,7 @@ func TestCachedBadgeLabelReuses(t *testing.T) {
 	for i := 0; i <= badgeLabelCap; i++ {
 		k := key
 		k.text = "g" + strconv.Itoa(i)
-		cachedBadgeLabel(gtx, th, k, record)
+		cachedBadgeLabel(gtx, k, record)
 	}
 	if n := len(badgeLabels.m); n <= badgeLabelCap {
 		t.Fatalf("badgeLabels has %d entries, want > %d before beginBadgeFrame", n, badgeLabelCap)
@@ -88,7 +88,7 @@ func TestCachedBadgeLabelReuses(t *testing.T) {
 	}
 	// The reset ops are reusable: a label recorded after it is valid.
 	var fresh op.Ops
-	third := cachedBadgeLabel(gtx, th, key, record)
+	third := cachedBadgeLabel(gtx, key, record)
 	third.call.Add(&fresh)
 }
 
