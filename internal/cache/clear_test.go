@@ -14,7 +14,7 @@ func TestClear(t *testing.T) {
 	seed(t, idx, root, 5)
 
 	// Add a face + cluster so Clear's faces-table wipe is exercised too.
-	if _, err := idx.WriteFacesForPath(root+"/000000.jpg", []FaceOp{{
+	if _, err := idx.WriteFacesForPath(root+"/000000.jpg", 1, []FaceOp{{
 		Face:               Face{Path: root + "/000000.jpg", ThumbMtime: 1, BBox: [4]int{1, 2, 3, 4}, Embedding: []float32{0.1, 0.2}},
 		NewClusterCentroid: []float32{0.1, 0.2},
 	}}); err != nil {

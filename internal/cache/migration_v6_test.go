@@ -29,7 +29,7 @@ func TestMigrationV6SweepsOrphanFaces(t *testing.T) {
 	root := "/lib"
 	seed(t, idx, root, 3)
 	kept := root + "/000000.jpg"
-	if _, err := idx.WriteFacesForPath(kept, []FaceOp{{
+	if _, err := idx.WriteFacesForPath(kept, 1, []FaceOp{{
 		Face:               Face{Path: kept, ThumbMtime: 1, BBox: [4]int{1, 2, 3, 4}, Embedding: []float32{0.1, 0.2}},
 		NewClusterCentroid: []float32{0.1, 0.2},
 	}}); err != nil {
@@ -100,8 +100,8 @@ func TestMigrationV6SweepsOrphanFaces(t *testing.T) {
 
 	var uv int
 	_ = idx2.db.QueryRow("PRAGMA user_version").Scan(&uv)
-	if uv != 7 {
-		t.Errorf("user_version = %d, want 7", uv)
+	if uv != 8 {
+		t.Errorf("user_version = %d, want 8", uv)
 	}
 }
 

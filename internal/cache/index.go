@@ -214,6 +214,15 @@ func Load(dbPath string) (*Index, error) {
 	if err := addColumn(db, "ALTER TABLE entries ADD COLUMN media_date INTEGER"); err != nil {
 		return nil, err
 	}
+	// face_thumb_mtime (v8, F5-01) records the thumbnail mtime the face
+	// pipeline last ran detection against, including runs that found no faces.
+	// Freshness used to be derived from face rows alone, so every face-free
+	// photo (most of a library) was re-detected on every pv-scan run. NULL means
+	// "never scanned for faces". Living on the entries row, it follows MovePath
+	// and is dropped by RemoveEntry/Clear with the row itself.
+	if err := addColumn(db, "ALTER TABLE entries ADD COLUMN face_thumb_mtime INTEGER"); err != nil {
+		return nil, err
+	}
 
 	// idx_entries_thumb backs GetEntryByThumbID, which fronts every /thumb/,
 	// /media/, /view/, /hls/ and /api/* request. Without it that lookup was a
@@ -258,7 +267,10 @@ func Load(dbPath string) (*Index, error) {
 	// idempotent addColumn above (like every other column add) rather than a
 	// gated block — a new nullable column needs no backfill, so the version bump
 	// alone records that a v6 database has been brought forward.
-	const schemaVersion = 7
+	//
+	// v8 (F5-01) adds face_thumb_mtime and backfills it once from the face rows
+	// (the only freshness record before v8).
+	const schemaVersion = 8
 	var userVersion int
 	_ = db.QueryRow("PRAGMA user_version").Scan(&userVersion)
 	if userVersion < 1 {
@@ -364,6 +376,14 @@ func Load(dbPath string) (*Index, error) {
 		_, _ = db.Exec("DELETE FROM faces WHERE path NOT IN (SELECT path FROM entries)")
 		_, _ = db.Exec("UPDATE face_clusters SET sample_face_id = NULL " +
 			"WHERE sample_face_id IS NOT NULL AND sample_face_id NOT IN (SELECT id FROM faces)")
+	}
+
+	if userVersion < 8 {
+		// v8: seed face_thumb_mtime from the face rows written before the column
+		// existed, so paths that already have faces aren't re-detected once.
+		_, _ = db.Exec(`UPDATE entries SET face_thumb_mtime =
+			(SELECT MAX(thumb_mtime) FROM faces WHERE faces.path = entries.path)
+			WHERE face_thumb_mtime IS NULL AND path IN (SELECT path FROM faces)`)
 	}
 
 	if userVersion < schemaVersion {

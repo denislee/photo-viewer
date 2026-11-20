@@ -42,7 +42,7 @@ func TestVacuumShrinksAfterClear(t *testing.T) {
 				NewClusterCentroid: emb,
 			}
 		}
-		if _, err := idx.WriteFacesForPath(p, ops); err != nil {
+		if _, err := idx.WriteFacesForPath(p, 1, ops); err != nil {
 			t.Fatalf("WriteFacesForPath: %v", err)
 		}
 	}

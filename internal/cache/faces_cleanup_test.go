@@ -1,12 +1,24 @@
 package cache
 
-import "testing"
+import (
+	"testing"
+	"time"
+
+	"github.com/dns/photo-viewer/internal/scan"
+)
+
+// reconcilePath indexes a single photo row for path, so face freshness (which
+// lives on the entries row since v8) has a row to land on.
+func reconcilePath(t *testing.T, idx *Index, path string) {
+	t.Helper()
+	idx.ReconcileBatch([]scan.Result{{Path: path, Type: scan.TypePhoto, Size: 1, ModTime: time.Unix(1, 0)}})
+}
 
 // writeFace inserts one face row (with a fresh cluster) for path, so the
 // delete/move cleanup paths have something to act on.
 func writeFace(t *testing.T, idx *Index, path string) {
 	t.Helper()
-	if _, err := idx.WriteFacesForPath(path, []FaceOp{{
+	if _, err := idx.WriteFacesForPath(path, 1, []FaceOp{{
 		Face:               Face{Path: path, ThumbMtime: 1, BBox: [4]int{1, 2, 3, 4}, Embedding: []float32{0.1, 0.2}},
 		NewClusterCentroid: []float32{0.1, 0.2},
 	}}); err != nil {
@@ -74,6 +86,8 @@ func TestMoveFacesRelocatesRows(t *testing.T) {
 	oldPath := root + "/000000.jpg"
 	newPath := root + "/2024-01-01/000000.jpg"
 	writeFace(t, idx, oldPath)
+	// ApplyMove indexes newPath before relocating its faces.
+	reconcilePath(t, idx, newPath)
 
 	if err := idx.MoveFaces(oldPath, newPath); err != nil {
 		t.Fatalf("MoveFaces: %v", err)
@@ -96,9 +110,10 @@ func TestMoveFacesRelocatesRows(t *testing.T) {
 func TestWriteFacesForPathRejectsMismatchedPath(t *testing.T) {
 	idx, cleanup := loadEmpty(t)
 	defer cleanup()
+	reconcilePath(t, idx, "/lib/a.jpg")
 	writeFace(t, idx, "/lib/a.jpg")
 
-	_, err := idx.WriteFacesForPath("/lib/a.jpg", []FaceOp{{
+	_, err := idx.WriteFacesForPath("/lib/a.jpg", 1, []FaceOp{{
 		Face:               Face{Path: "/lib/b.jpg", ThumbMtime: 2, Embedding: []float32{0.3}},
 		NewClusterCentroid: []float32{0.3},
 	}})

@@ -59,8 +59,8 @@ func TestMigrationV7AddsMediaDate(t *testing.T) {
 	if !hasColumn(t, idx, "entries", "media_date") {
 		t.Fatalf("fresh database is missing the media_date column")
 	}
-	if uv := userVersion(t, idx); uv != 7 {
-		t.Fatalf("fresh database user_version = %d, want 7", uv)
+	if uv := userVersion(t, idx); uv != 8 {
+		t.Fatalf("fresh database user_version = %d, want 8", uv)
 	}
 
 	// Rewind to a genuine v6 layout: drop media_date, stamp user_version = 6.
@@ -89,8 +89,8 @@ func TestMigrationV7AddsMediaDate(t *testing.T) {
 	if !hasColumn(t, idx2, "entries", "media_date") {
 		t.Errorf("media_date column should exist after v6 -> v7 upgrade")
 	}
-	if uv := userVersion(t, idx2); uv != 7 {
-		t.Errorf("user_version = %d after upgrade, want 7", uv)
+	if uv := userVersion(t, idx2); uv != 8 {
+		t.Errorf("user_version = %d after upgrade, want 8", uv)
 	}
 	if got := idx2.Count(); got != 5 {
 		t.Errorf("row count = %d after upgrade, want 5 (upgrade must not drop data)", got)
@@ -108,8 +108,8 @@ func TestMigrationV7AddsMediaDate(t *testing.T) {
 	if !hasColumn(t, idx3, "entries", "media_date") {
 		t.Errorf("media_date column vanished on idempotent reopen")
 	}
-	if uv := userVersion(t, idx3); uv != 7 {
-		t.Errorf("user_version = %d on idempotent reopen, want 7", uv)
+	if uv := userVersion(t, idx3); uv != 8 {
+		t.Errorf("user_version = %d on idempotent reopen, want 8", uv)
 	}
 }
 

@@ -51,12 +51,12 @@ func DecodeEmbedding(b []byte) []float32 {
 	return out
 }
 
-// LoadFaceFreshness returns the maximum thumb_mtime stored against each path
-// that has any face rows. The face pipeline pre-loads this on start so its
-// per-job freshness checks can be answered from memory rather than firing a
-// COUNT(*) per submit.
+// LoadFaceFreshness returns, per path, the thumbnail mtime face detection last
+// ran against (entries.face_thumb_mtime) — for paths with and without faces
+// (F5-01). The face pipeline pre-loads this on start so its per-job freshness
+// checks are answered from memory rather than one query per submit.
 func (i *Index) LoadFaceFreshness() map[string]int64 {
-	rows, err := i.db.Query("SELECT path, MAX(thumb_mtime) FROM faces GROUP BY path")
+	rows, err := i.db.Query("SELECT path, face_thumb_mtime FROM entries WHERE face_thumb_mtime IS NOT NULL")
 	if err != nil {
 		return map[string]int64{}
 	}
@@ -140,6 +140,9 @@ func (i *Index) faceStatements() (del, ins, updCluster, newCluster, setCluster *
 
 // WriteFacesForPath wipes existing face rows for path and writes the given
 // ops in a single transaction (1 fsync per image instead of ~3 per face).
+// thumbMtime, the mtime of the thumbnail detection ran on, is recorded on the
+// entries row in the same transaction, so an image with no faces (nil ops) is
+// remembered as processed too and not re-detected next run (F5-01).
 // Callers (the face pipeline) are expected to have already chosen
 // existing-cluster vs. new-cluster against an in-memory cache.
 //
@@ -147,7 +150,7 @@ func (i *Index) faceStatements() (del, ins, updCluster, newCluster, setCluster *
 // inserted under any other path would survive the next rewrite of path and
 // orphan (or clobber another file's faces). A mismatch is rejected up front,
 // before anything is written.
-func (i *Index) WriteFacesForPath(path string, ops []FaceOp) ([]FaceOpResult, error) {
+func (i *Index) WriteFacesForPath(path string, thumbMtime int64, ops []FaceOp) ([]FaceOpResult, error) {
 	for k, op := range ops {
 		if op.Face.Path != path {
 			return nil, fmt.Errorf("WriteFacesForPath(%q): op %d has Face.Path %q", path, k, op.Face.Path)
@@ -231,6 +234,9 @@ func (i *Index) WriteFacesForPath(path string, ops []FaceOp) ([]FaceOpResult, er
 		results[k] = FaceOpResult{FaceID: faceID, ClusterID: clusterID}
 	}
 
+	if _, err := tx.Exec("UPDATE entries SET face_thumb_mtime = ? WHERE path = ?", thumbMtime, path); err != nil {
+		return nil, err
+	}
 	if err := tx.Commit(); err != nil {
 		return nil, err
 	}
@@ -243,9 +249,31 @@ func (i *Index) WriteFacesForPath(path string, ops []FaceOp) ([]FaceOpResult, er
 // pipeline to re-detect it from scratch (the exact cost the thumbnail carry-over
 // in ApplyMove avoids) while the old rows orphan. The embeddings and thumb_mtime
 // stay valid because the thumbnail file was renamed, not regenerated.
+//
+// The face-detection freshness (entries.face_thumb_mtime) moves too: it is
+// taken from the old row when there is one, else from the moved face rows, so
+// the relocated file isn't re-detected (F5-01).
 func (i *Index) MoveFaces(oldPath, newPath string) error {
-	_, err := i.db.Exec("UPDATE faces SET path = ? WHERE path = ?", newPath, oldPath)
-	return err
+	tx, err := i.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if _, err := tx.Exec("UPDATE faces SET path = ? WHERE path = ?", newPath, oldPath); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(`UPDATE entries SET face_thumb_mtime = COALESCE(
+			(SELECT face_thumb_mtime FROM entries WHERE path = ?),
+			(SELECT MAX(thumb_mtime) FROM faces WHERE path = ?),
+			face_thumb_mtime)
+		WHERE path = ?`, oldPath, newPath, newPath); err != nil {
+		return err
+	}
+	// The old path's faces are gone, so it no longer counts as scanned.
+	if _, err := tx.Exec("UPDATE entries SET face_thumb_mtime = NULL WHERE path = ?", oldPath); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 // AllClusters returns every cluster with its current face count.

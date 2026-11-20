@@ -16,7 +16,7 @@ func TestWriteFacesForPathClusterIDs(t *testing.T) {
 	idx, cleanup := loadEmpty(t)
 	defer cleanup()
 
-	r1, err := idx.WriteFacesForPath("/lib/a.jpg", []FaceOp{{
+	r1, err := idx.WriteFacesForPath("/lib/a.jpg", 1, []FaceOp{{
 		Face:               Face{Path: "/lib/a.jpg", ThumbMtime: 1, BBox: [4]int{1, 2, 3, 4}, Embedding: []float32{0.1, 0.2}},
 		NewClusterCentroid: []float32{0.1, 0.2},
 	}})
@@ -31,7 +31,7 @@ func TestWriteFacesForPathClusterIDs(t *testing.T) {
 		t.Fatalf("new-cluster op reported ClusterID 0, want a real cluster id")
 	}
 
-	r2, err := idx.WriteFacesForPath("/lib/b.jpg", []FaceOp{
+	r2, err := idx.WriteFacesForPath("/lib/b.jpg", 1, []FaceOp{
 		{
 			Face:              Face{Path: "/lib/b.jpg", ThumbMtime: 2, BBox: [4]int{5, 6, 7, 8}, Embedding: []float32{0.3, 0.4}},
 			ExistingClusterID: c1,
@@ -84,8 +84,8 @@ func TestWriteFacesForPathClusterIDs(t *testing.T) {
 	}
 
 	// Reusing the cached DELETE through tx.Stmt must clear the path's rows.
-	if _, err := idx.WriteFacesForPath("/lib/b.jpg", nil); err != nil {
-		t.Fatalf("WriteFacesForPath(/lib/b.jpg, nil): %v", err)
+	if _, err := idx.WriteFacesForPath("/lib/b.jpg", 1, nil); err != nil {
+		t.Fatalf("WriteFacesForPath(/lib/b.jpg, 1, nil): %v", err)
 	}
 	var n int
 	if err := idx.db.QueryRow("SELECT COUNT(*) FROM faces WHERE path = '/lib/b.jpg'").Scan(&n); err != nil {

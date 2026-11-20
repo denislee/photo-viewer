@@ -465,7 +465,7 @@ func (p *Pipeline) assignAndPersist(j Job, dets []Detection) (changed bool) {
 		}
 	}
 
-	results, err := p.idx.WriteFacesForPath(j.Entry.Path, ops)
+	results, err := p.idx.WriteFacesForPath(j.Entry.Path, j.ThumbMod, ops)
 	if err != nil {
 		log.Printf("face: write %s: %v", j.Entry.Path, err)
 		// Cache may be inconsistent with DB now; drop it so the next
