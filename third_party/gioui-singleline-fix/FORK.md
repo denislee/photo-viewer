@@ -16,8 +16,13 @@ points `gioui.org` here with a `replace` directive.
   previous frame, so closing the full-screen viewer re-uploads every visible grid thumbnail in
   one frame, and scrolling back re-uploads rows that just left the screen. The patch keeps
   unused textures for up to 120 frames, and only while the unused ones total at most 128 MB of
-  pixels, releasing the least recently used first. This is a performance patch, not a fix, so
-  it can be dropped at any time; see G6 in `PLAN.md`.
+  pixels, releasing the least recently used first. An idle texture whose source `*image.RGBA`
+  was drawn again this frame under a new handle (a video frame buffer reused across frames) is
+  released at once, so dead video frames don't fill that budget and evict grid thumbnails
+  (G5-03). This is a performance patch, not a fix, so it can be dropped at any time; see G6 in
+  `PLAN.md`.
+- **Known upstream issue:** `go test gioui.org/gpu` doesn't build at v0.9.0, because
+  `clip_test.go` and `pack_test.go` call `testing.B.Loop` while the module declares go1.23.
 
 ## Checking the fork
 

@@ -91,9 +91,27 @@ func (r *textureCache) frame() {
 		lastUsed uint64
 		bytes    int
 	}
+	// Pixel buffers drawn this frame. A streaming source (a video player that
+	// re-wraps one reused *image.RGBA in a fresh ImageOp every frame) leaves an
+	// idle texture per frame whose src is the very buffer just drawn again;
+	// those can never be drawn again, so they are released at once instead of
+	// filling the idle budget and evicting textures that will be (G5-03).
+	liveSrc := make(map[*image.RGBA]struct{})
+	for _, v := range r.res {
+		if t, ok := v.resource.(*texture); ok && v.used && t.src != nil {
+			liveSrc[t.src] = struct{}{}
+		}
+	}
 	var idles []idle
 	idleBytes := 0
 	for k, v := range r.res {
+		if t, ok := v.resource.(*texture); ok && !v.used && t.src != nil {
+			if _, live := liveSrc[t.src]; live {
+				delete(r.res, k)
+				v.resource.release()
+				continue
+			}
+		}
 		switch {
 		case v.used:
 			v.used = false
