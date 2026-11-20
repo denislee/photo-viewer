@@ -49,7 +49,7 @@ func TestBeginCtxCancelReleasesPausedWorker(t *testing.T) {
 // process stays pausable and Wait blocks until an explicit Resume.
 func TestBeginNilCtxStillPausable(t *testing.T) {
 	reg := NewProcessRegistry(nil)
-	p := reg.Begin(nil, ProcScan, "t", nil, true)
+	p := reg.Begin(context.Background(), ProcScan, "t", nil, true)
 	p.Pause()
 
 	done := make(chan struct{})

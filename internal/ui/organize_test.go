@@ -75,7 +75,7 @@ func TestOrganizeBumpProgressRoutesThroughCoalescer(t *testing.T) {
 	r := NewProcessRegistry(func() { registryInvalidates.Add(1) })
 	v.SetProcessRegistry(r)
 
-	proc := r.Begin(nil, ProcOrganize, "test", nil, true)
+	proc := r.Begin(context.Background(), ProcOrganize, "test", nil, true)
 	v.mu.Lock()
 	v.scope.attachLocked(proc, nil)
 	v.mu.Unlock()

@@ -1,6 +1,7 @@
 package ui
 
 import (
+	"context"
 	"fmt"
 	"sync/atomic"
 	"testing"
@@ -18,7 +19,7 @@ func TestTaskViewSetStatusCoalescesWithLiveProc(t *testing.T) {
 	v := NewOrganizeView(func() { direct.Add(1) })
 	v.SetProcessRegistry(reg)
 
-	proc := reg.Begin(nil, ProcOrganize, "t", nil, true)
+	proc := reg.Begin(context.Background(), ProcOrganize, "t", nil, true)
 	v.mu.Lock()
 	v.scope.attachLocked(proc, nil)
 	v.mu.Unlock()
