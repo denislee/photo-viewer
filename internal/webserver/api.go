@@ -166,6 +166,10 @@ func (s *Server) handleAPIFavorite(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "set favorite failed", http.StatusInternalServerError)
 		return
 	}
+	// The caches now serve stale values while revalidating (W5-01), so drop them
+	// explicitly: the favorite counts this toggle just changed must not lag.
+	s.sidebar.clear()
+	s.viewCounts.clear()
 	resp := struct {
 		ID       string `json:"id"`
 		Favorite bool   `json:"favorite"`

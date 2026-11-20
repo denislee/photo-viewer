@@ -136,6 +136,193 @@ func TestTTLCacheLeaderPanicReleasesFollowers(t *testing.T) {
 	}
 }
 
+// TestTTLCacheSWRServesStaleWithoutBlocking verifies that past the TTL a
+// stale-while-revalidate cache hands back the stale value immediately, kicks a
+// single background refresh, and picks the fresh value up on a later lookup
+// (W5-01).
+func TestTTLCacheSWRServesStaleWithoutBlocking(t *testing.T) {
+	c := &ttlCache[string, int]{ttl: 10 * time.Millisecond, swr: true}
+	var refreshes atomic.Int32
+
+	if got := c.get("k", 1, func() int { return 1 }); got != 1 {
+		t.Fatalf("first get = %d, want 1", got)
+	}
+	time.Sleep(20 * time.Millisecond)
+
+	started := make(chan struct{})
+	release := make(chan struct{})
+	var once sync.Once
+	compute := func() int {
+		refreshes.Add(1)
+		once.Do(func() { close(started) })
+		<-release
+		return 2
+	}
+
+	done := make(chan int, 1)
+	go func() { done <- c.get("k", 1, compute) }()
+	select {
+	case got := <-done:
+		if got != 1 {
+			t.Fatalf("stale get = %d, want stale 1", got)
+		}
+	case <-time.After(100 * time.Millisecond):
+		t.Fatal("stale get blocked on the refresh compute")
+	}
+
+	select {
+	case <-started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("no background refresh started")
+	}
+
+	// A concurrent stale lookup must not block and must not start a second
+	// refresh: the inflight flight is shared.
+	done2 := make(chan int, 1)
+	go func() { done2 <- c.get("k", 1, compute) }()
+	select {
+	case got := <-done2:
+		if got != 1 {
+			t.Fatalf("concurrent stale get = %d, want stale 1", got)
+		}
+	case <-time.After(100 * time.Millisecond):
+		t.Fatal("concurrent stale get blocked on the refresh compute")
+	}
+	if got := refreshes.Load(); got != 1 {
+		t.Fatalf("refresh compute ran %d times while blocked, want 1", got)
+	}
+
+	close(release)
+
+	// Poll until the background refresh has landed its value.
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		c.mu.Lock()
+		e, ok := c.m["k"]
+		var v int
+		if ok {
+			v = e.v
+		}
+		inflight := len(c.inflight)
+		c.mu.Unlock()
+		if ok && v == 2 && inflight == 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("background refresh did not store 2 (present=%v value=%d inflight=%d)", ok, v, inflight)
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if got := refreshes.Load(); got != 1 {
+		t.Fatalf("refresh compute ran %d times, want 1", got)
+	}
+	if got := c.get("k", 1, func() int { return 3 }); got != 2 {
+		t.Fatalf("post-refresh get = %d, want the refreshed 2", got)
+	}
+}
+
+// TestTTLCacheSWRGenerationMismatchBlocks verifies that a generation change
+// still forces a synchronous recompute even with SWR on: a stale value from an
+// older generation must never be served.
+func TestTTLCacheSWRGenerationMismatchBlocks(t *testing.T) {
+	c := &ttlCache[string, int]{ttl: 10 * time.Millisecond, swr: true}
+
+	if got := c.get("k", 1, func() int { return 1 }); got != 1 {
+		t.Fatalf("gen-1 get = %d, want 1", got)
+	}
+	time.Sleep(20 * time.Millisecond)
+
+	var calls atomic.Int32
+	if got := c.get("k", 2, func() int { calls.Add(1); return 2 }); got != 2 {
+		t.Fatalf("gen-2 get = %d, want 2 (synchronous recompute)", got)
+	}
+	if got := calls.Load(); got != 1 {
+		t.Fatalf("compute ran %d times, want 1", got)
+	}
+}
+
+// TestTTLCacheClearDropsAndFencesInflight verifies clear drops the map and that
+// a refresh already in flight cannot resurrect a pre-clear value.
+func TestTTLCacheClearDropsAndFencesInflight(t *testing.T) {
+	c := &ttlCache[string, int]{ttl: 10 * time.Millisecond, swr: true}
+
+	if got := c.get("k", 1, func() int { return 1 }); got != 1 {
+		t.Fatalf("first get = %d, want 1", got)
+	}
+	time.Sleep(20 * time.Millisecond)
+
+	started := make(chan struct{})
+	release := make(chan struct{})
+	var once sync.Once
+	if got := c.get("k", 1, func() int {
+		once.Do(func() { close(started) })
+		<-release
+		return 2
+	}); got != 1 {
+		t.Fatalf("stale get = %d, want stale 1", got)
+	}
+	<-started
+
+	c.clear()
+	close(release)
+
+	// Wait for the fenced refresh to finish, then assert it stored nothing.
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		c.mu.Lock()
+		_, ok := c.m["k"]
+		inflight := len(c.inflight)
+		c.mu.Unlock()
+		if !ok && inflight == 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("pre-clear refresh leaked into the map (present=%v inflight=%d)", ok, inflight)
+		}
+		time.Sleep(time.Millisecond)
+	}
+
+	var calls atomic.Int32
+	if got := c.get("k", 1, func() int { calls.Add(1); return 3 }); got != 3 {
+		t.Fatalf("post-clear get = %d, want a fresh synchronous 3", got)
+	}
+	if got := calls.Load(); got != 1 {
+		t.Fatalf("compute ran %d times after clear, want 1", got)
+	}
+}
+
+// TestTTLCacheSWRBackgroundPanicRecovered verifies a panicking background
+// refresh does not take the process down and stores no value, so a later lookup
+// recomputes.
+func TestTTLCacheSWRBackgroundPanicRecovered(t *testing.T) {
+	c := &ttlCache[string, int]{ttl: 10 * time.Millisecond, swr: true}
+
+	if got := c.get("k", 1, func() int { return 1 }); got != 1 {
+		t.Fatalf("first get = %d, want 1", got)
+	}
+	time.Sleep(20 * time.Millisecond)
+
+	if got := c.get("k", 1, func() int { panic("boom") }); got != 1 {
+		t.Fatalf("stale get = %d, want stale 1", got)
+	}
+
+	deadline := time.Now().Add(2 * time.Second)
+	var calls atomic.Int32
+	for {
+		got := c.get("k", 1, func() int { calls.Add(1); return 2 })
+		if got == 2 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("get never returned the recomputed 2 (last %d)", got)
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if got := calls.Load(); got == 0 {
+		t.Fatal("recompute never ran after the panicking refresh")
+	}
+}
+
 // TestCachedCountViewSharesSidebarCounts verifies rootSidebarAgg's All total
 // goes through the shared view-count cache (W3-01).
 func TestCachedCountViewSharesSidebarCounts(t *testing.T) {

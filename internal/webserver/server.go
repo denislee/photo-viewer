@@ -81,8 +81,8 @@ func New(index *cache.Index, store, display *cache.ThumbStore, libraryRoot, tras
 	return &Server{
 		index: index, store: store, display: display, libraryRoot: libraryRoot, trashDir: trashDir,
 		trash:      ttlCache[struct{}, trashSnapshot]{ttl: trashEntriesTTL},
-		sidebar:    ttlCache[sidebarKey, *sidebarAgg]{ttl: sidebarCacheTTL},
-		viewCounts: ttlCache[cache.View, int]{ttl: viewCountTTL, sweepAt: viewCountCacheCap},
+		sidebar:    ttlCache[sidebarKey, *sidebarAgg]{ttl: sidebarCacheTTL, swr: true},
+		viewCounts: ttlCache[cache.View, int]{ttl: viewCountTTL, sweepAt: viewCountCacheCap, swr: true},
 		hlsDurations: ttlCache[hlsDurKey, float64]{
 			ttl: hlsDurationTTL, sweepAt: hlsDurationCacheCap,
 		},

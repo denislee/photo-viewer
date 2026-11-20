@@ -90,8 +90,10 @@ func (s *Server) renderSidebar(w http.ResponseWriter, vi viewInfo, dirChildren [
 // sidebarCacheTTL bounds how long a cached sidebar aggregate is reused. Like
 // trashEntriesTTL, a few seconds coalesces a navigation burst (every page
 // render re-derives the same aggregate scans) without letting counts drift
-// noticeably after an import, rebuild, or favorite toggle — all of which
-// self-heal on the next refresh past the window.
+// noticeably after an import, rebuild, or favorite toggle. Past the TTL the
+// stale aggregate is served while one background refresh runs (W5-01), so
+// counts may lag by one page view after an import or a GUI-side change; the web
+// UI's own favorite toggle clears the caches, so its counts stay exact.
 const sidebarCacheTTL = 5 * time.Second
 
 const viewCountTTL = 5 * time.Second
