@@ -181,7 +181,13 @@ func basicAuth(next http.Handler, password string) http.Handler {
 // and the GC work that goes with it. Writers are Reset before reuse and only
 // returned to the pool once Close has flushed them.
 var gzipPool = sync.Pool{
-	New: func() any { return gzip.NewWriter(io.Discard) },
+	New: func() any {
+		// BestSpeed: about 2x faster than the default level for 1-2 KB more
+		// per page, and these responses are small and generated per request
+		// (W5-05). NewWriterLevel only fails on an invalid level.
+		gz, _ := gzip.NewWriterLevel(io.Discard, gzip.BestSpeed)
+		return gz
+	},
 }
 
 // gzipMiddleware wraps next so text responses are gzip-compressed when the

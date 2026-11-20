@@ -17,7 +17,7 @@ import (
 	"strings"
 
 	_ "golang.org/x/image/bmp"
-	_ "golang.org/x/image/tiff"
+	"golang.org/x/image/tiff"
 	_ "golang.org/x/image/webp"
 
 	"github.com/dns/photo-viewer/internal/cache"
@@ -261,7 +261,17 @@ func decodeDimensions(e cache.Entry) string {
 		return "—"
 	}
 	defer f.Close()
-	cfg, _, err := image.DecodeConfig(f)
+	// image.DecodeConfig wraps f in a bufio.Reader, which hides its ReaderAt
+	// from x/image/tiff and makes it buffer up to the IFD — 72 ms / 118 MB on
+	// a 48 MB TIFF (W5-04). tiff.DecodeConfig reads the IFD directly when the
+	// file is an io.ReaderAt, so hand TIFFs to it unwrapped.
+	var cfg image.Config
+	switch strings.ToLower(filepath.Ext(e.Path)) {
+	case ".tif", ".tiff":
+		cfg, err = tiff.DecodeConfig(f)
+	default:
+		cfg, _, err = image.DecodeConfig(f)
+	}
 	if err != nil {
 		return "—"
 	}

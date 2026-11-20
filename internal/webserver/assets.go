@@ -36,15 +36,28 @@ const mobileTopBar = `<div class="topbar"><label for="navtoggle" class="hamburge
 // parse network strings as HTML.
 var gridScript = "<script>\n" + gridJS + "</script>"
 
+// Pre-encoded copies of the page chrome (W5-06). fmt.Fprint/io.WriteString on
+// a string go through a WriteString path, but the gzip response writer has no
+// WriteString, so each string was converted (and copied) to []byte per request.
+// Writing these []byte values with w.Write hands the gzip writer the bytes
+// directly. Go's package-level initialisation orders these after the
+// strings they reference, including the //go:embed ones, so no init() is needed.
+var (
+	viewerJSBytes   = []byte(viewerJS)
+	pageHeaderBytes = []byte(pageHeader)
+	gridScriptBytes = []byte(gridScript)
+)
+
 // writeViewerScript writes the viewer's inline <script>: the pvNav literal,
 // then viewer.js streamed straight from the embedded string instead of being
-// concatenated into a fresh ~4 KB string per /view/ request (W4-12).
+// concatenated into a fresh ~4 KB string per /view/ request (W4-12). The script
+// body is a pre-encoded []byte so the gzip writer never copies it (W5-06).
 //
 // nextImg is the /display URL of the next photo ("" when the successor is a
 // video or there is none).
 func writeViewerScript(w io.Writer, prevHref, nextHref, backHref, nextImg string) {
 	fmt.Fprintf(w, "<script>\nvar pvNav = {prev: %q, next: %q, back: %q, nextImg: %q};\n",
 		prevHref, nextHref, backHref, nextImg)
-	_, _ = io.WriteString(w, viewerJS)
+	_, _ = w.Write(viewerJSBytes)
 	_, _ = io.WriteString(w, "</script>")
 }
