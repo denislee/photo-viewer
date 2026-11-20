@@ -15,6 +15,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -28,7 +29,7 @@ import (
 
 	_ "golang.org/x/image/bmp"
 	"golang.org/x/image/draw"
-	_ "golang.org/x/image/tiff"
+	"golang.org/x/image/tiff"
 	_ "golang.org/x/image/webp"
 
 	"github.com/dns/photo-viewer/internal/cache"
@@ -1011,7 +1012,16 @@ func decodeDimensions(path string) string {
 	if _, err := f.Seek(0, io.SeekStart); err != nil {
 		return "—"
 	}
-	cfg, _, err := image.DecodeConfig(f)
+	var cfg image.Config
+	switch ext := strings.ToLower(filepath.Ext(path)); ext {
+	case ".tif", ".tiff":
+		// x/image/tiff needs an io.ReaderAt to jump to the IFD; handed a plain
+		// io.Reader it buffers everything up to it (72 ms / 118 MB on a 48 MB
+		// TIFF). Passing the *os.File keeps it on the ReaderAt path (W5-04).
+		cfg, err = tiff.DecodeConfig(f)
+	default:
+		cfg, _, err = image.DecodeConfig(f)
+	}
 	if err != nil {
 		return "—"
 	}

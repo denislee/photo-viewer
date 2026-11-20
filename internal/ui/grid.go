@@ -317,6 +317,11 @@ func (g *Grid) SelectedIndex(total int) int {
 
 // Layout draws the grid for the supplied entries.
 func (g *Grid) Layout(gtx layout.Context, th *Theme, entries []cache.Entry, ctrl *Controller) layout.Dimensions {
+	// Expire the previous frame's recorded badge ops, if the cache is full,
+	// before any badge of this frame is drawn: the reset invalidates every
+	// CallOp handed out last frame (G5-02).
+	beginBadgeFrame()
+
 	g.ensureCells(len(entries))
 
 	// Drain click events for the cells that were drawn last frame. Cells
@@ -545,6 +550,76 @@ const (
 	cornerBottomRight
 )
 
+// badgeLabelKey identifies one cached badge label: its text, text size,
+// colour, layout box and dp/px metric, which together determine the recorded
+// ops.
+type badgeLabelKey struct {
+	text   string
+	sp     unit.Sp
+	col    color.NRGBA
+	box    image.Point
+	metric unit.Metric
+}
+
+// badgeLabel is a label's recorded draw op together with the dimensions it
+// reported when recorded.
+type badgeLabel struct {
+	call op.CallOp
+	dims layout.Dimensions
+}
+
+// badgeLabels memoizes badge label layouts as recorded ops. material.Label
+// re-shapes its text on every Layout call (~862 ns per badge versus ~131 ns to
+// replay a recorded op), which on a dense grid costs milliseconds per frame
+// (G5-02).
+//
+// Only touched from the Gio frame goroutine: the CallOps alias badgeLabels.ops
+// and are valid solely for the frame that fetched them, because beginBadgeFrame
+// may Reset that Ops between frames.
+var badgeLabels struct {
+	ops op.Ops
+	m   map[badgeLabelKey]badgeLabel
+}
+
+// badgeLabelCap is the soft cap on badgeLabels.m. beginBadgeFrame bulk-clears
+// the cache once it is reached, so a long scroll through a library of distinct
+// labels can't grow it without bound. Re-recording is cheap next to the
+// per-frame shaping it saves.
+const badgeLabelCap = 256
+
+// beginBadgeFrame expires the recorded badge labels of the previous frame once
+// the cache has reached its cap. Call it once per frame before anything that
+// draws a badge: resetting the ops invalidates every CallOp recorded into them,
+// and those may only be replayed during the frame that fetched them.
+func beginBadgeFrame() {
+	if badgeLabels.m != nil && len(badgeLabels.m) >= badgeLabelCap {
+		badgeLabels.ops.Reset()
+		badgeLabels.m = make(map[badgeLabelKey]badgeLabel, badgeLabelCap)
+	}
+}
+
+// cachedBadgeLabel returns the recorded label for key, recording it with record
+// on a miss. record lays the label out at the constraints it is handed. The
+// cache never resets here: a mid-frame overflow just grows the map until the
+// next frame's beginBadgeFrame clears it, which keeps every CallOp handed out
+// earlier in this frame valid.
+func cachedBadgeLabel(gtx layout.Context, th *Theme, key badgeLabelKey, record func(gtx layout.Context) layout.Dimensions) badgeLabel {
+	if lbl, ok := badgeLabels.m[key]; ok {
+		return lbl
+	}
+	if badgeLabels.m == nil {
+		badgeLabels.m = make(map[badgeLabelKey]badgeLabel, badgeLabelCap)
+	}
+	rgtx := gtx
+	rgtx.Ops = &badgeLabels.ops
+	macro := op.Record(rgtx.Ops)
+	dims := record(rgtx)
+	call := macro.Stop()
+	lbl := badgeLabel{call: call, dims: dims}
+	badgeLabels.m[key] = lbl
+	return lbl
+}
+
 // drawGlyphBadge draws glyph centred in a favouriteBadgeSize square, inset by
 // favouriteBadgeInset from the given corner of cell, over a dark backdrop so
 // the glyph stays legible on any thumbnail content. It returns the square's
@@ -579,16 +654,27 @@ func drawGlyphBadge(gtx layout.Context, th *Theme, cell image.Rectangle, corner 
 	paint.PaintOp{}.Add(gtx.Ops)
 	ca.Pop()
 
-	// Glyph, sized to roughly fill the badge.
-	stack := op.Offset(image.Pt(x0, y0)).Push(gtx.Ops)
-	gtx2 := gtx
-	gtx2.Constraints.Max = image.Pt(size, size)
-	gtx2.Constraints.Min = image.Pt(size, size)
-	layout.Center.Layout(gtx2, func(gtx layout.Context) layout.Dimensions {
-		lbl := material.Label(th.Theme, sp, glyph)
-		lbl.Color = col
-		return lbl.Layout(gtx)
+	// Glyph, sized to roughly fill the badge. The label layout is cached and
+	// replayed as a recorded op — shaping text every frame for every badge
+	// dominated a dense grid's frame time (G5-02).
+	badge := cachedBadgeLabel(gtx, th, badgeLabelKey{
+		text:   glyph,
+		sp:     sp,
+		col:    col,
+		box:    image.Pt(size, size),
+		metric: gtx.Metric,
+	}, func(gtx layout.Context) layout.Dimensions {
+		gtx2 := gtx
+		gtx2.Constraints.Max = image.Pt(size, size)
+		gtx2.Constraints.Min = image.Pt(size, size)
+		return layout.Center.Layout(gtx2, func(gtx layout.Context) layout.Dimensions {
+			lbl := material.Label(th.Theme, sp, glyph)
+			lbl.Color = col
+			return lbl.Layout(gtx)
+		})
 	})
+	stack := op.Offset(image.Pt(x0, y0)).Push(gtx.Ops)
+	badge.call.Add(gtx.Ops)
 	stack.Pop()
 
 	return bg
@@ -625,16 +711,26 @@ func drawDurationBadge(gtx layout.Context, th *Theme, cell image.Rectangle, badg
 	size := gtx.Dp(favoriteBadgeSize)
 	hGap := gtx.Dp(unit.Dp(4))
 
-	// Measure label first so the pill hugs the text width.
-	macro := op.Record(gtx.Ops)
-	mgtx := gtx
-	mgtx.Constraints.Min = image.Point{}
-	mgtx.Constraints.Max.X = cell.Dx()
-	lbl := material.Label(th.Theme, unit.Sp(11), text)
-	lbl.Color = th.Foreground
-	lbl.MaxLines = 1
-	lblDims := lbl.Layout(mgtx)
-	labelCall := macro.Stop()
+	// Measure label first so the pill hugs the text width. The measurement and
+	// its recorded draw op are cached: the text is the same every frame for a
+	// given clip length and cell width (G5-02).
+	badge := cachedBadgeLabel(gtx, th, badgeLabelKey{
+		text:   text,
+		sp:     unit.Sp(11),
+		col:    th.Foreground,
+		box:    image.Pt(cell.Dx(), 0),
+		metric: gtx.Metric,
+	}, func(gtx layout.Context) layout.Dimensions {
+		mgtx := gtx
+		mgtx.Constraints.Min = image.Point{}
+		mgtx.Constraints.Max.X = cell.Dx()
+		lbl := material.Label(th.Theme, unit.Sp(11), text)
+		lbl.Color = th.Foreground
+		lbl.MaxLines = 1
+		return lbl.Layout(mgtx)
+	})
+	lblDims := badge.dims
+	labelCall := badge.call
 
 	padX := gtx.Dp(unit.Dp(6))
 	pillH := size
