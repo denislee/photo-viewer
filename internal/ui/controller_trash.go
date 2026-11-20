@@ -83,8 +83,8 @@ func (c *Controller) DeletePaths(paths []string) error {
 // here on its own goroutine so a 200-item multi-select restore doesn't block the
 // Gio frame loop on 200 renames + 200 single-row DB transactions + 200 dirCounts
 // clone-swaps + 200 refreshes. A per-item failure is logged and skipped, never
-// aborting the batch. Never mutates widget state directly — the single
-// scheduleRefresh at the end repaints via the Controller's refresh path.
+// aborting the batch. Never mutates widget state directly — the single recount
+// request at the end repaints via the Controller's refresh path.
 func (c *Controller) restoreBatch(paths []string) {
 	results, restored := collectRestores(paths, c.store)
 	if len(results) > 0 {
@@ -93,7 +93,7 @@ func (c *Controller) restoreBatch(paths []string) {
 	if restored > 0 {
 		c.bumpTrashCount(-restored)
 	}
-	c.scheduleRefresh(c.activeDir())
+	c.scheduleRefreshRecount(c.activeDir())
 }
 
 // collectRestores performs the filesystem half of a trash restore for every
@@ -244,7 +244,7 @@ func (c *Controller) performDeletion(paths []string) {
 			// force a refresh so the next paint resurfaces the index's truth
 			// instead of phantom rows with broken cells.
 			log.Printf("trash: index cleanup failed for %d path(s): %v", len(paths), err)
-			c.scheduleRefresh(c.activeDir())
+			c.scheduleRefreshRecount(c.activeDir())
 		}
 		for _, p := range failed {
 			if c.store != nil {
@@ -275,7 +275,7 @@ func (c *Controller) performDeletion(paths []string) {
 		// refresh so the next paint resurfaces the index's truth instead of
 		// phantom rows with broken cells.
 		log.Printf("delete: index cleanup failed for %d path(s): %v", len(paths), err)
-		c.scheduleRefresh(c.activeDir())
+		c.scheduleRefreshRecount(c.activeDir())
 	}
 }
 
@@ -394,8 +394,8 @@ func (c *Controller) EmptyTrash(done func(count int, bytes int64, err error)) {
 		count, bytes, err := cache.EmptyTrash(dir)
 		c.resetTrashCount()
 		// The trash view (if currently shown) needs a refresh so the now-
-		// empty list reflects on screen.
-		c.scheduleRefresh(c.activeDir())
+		// empty list reflects on screen, and the sidebar's counts changed.
+		c.scheduleRefreshRecount(c.activeDir())
 		if done != nil {
 			done(count, bytes, err)
 		}

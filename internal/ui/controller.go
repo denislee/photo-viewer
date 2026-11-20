@@ -52,6 +52,18 @@ func normalizeSort(s string) string {
 // under each date subdir bucketed beneath that year header.
 const YearViewPrefix = "\x00year:"
 
+// countsKey identifies the inputs the sidebar counts depend on. When a
+// refresh's key matches the one the published dirCounts was computed from, the
+// counts are still valid and refreshFromIndex can skip recomputing them —
+// previewing another directory or switching the sort order must not re-run the
+// per-subdir COUNT queries (U5-01).
+type countsKey struct {
+	treeDir string
+	root    string
+	filter  string
+	showRAW bool
+}
+
 type Controller struct {
 	libraryRoot string
 	cacheDir    string
@@ -115,6 +127,11 @@ type Controller struct {
 	// cheaply detect changes without comparing the map contents.
 	dirCounts    map[string]int
 	dirCountsVer uint64
+	// countsKey/countsValid record the inputs the published dirCounts was
+	// computed from. A refresh whose key matches (and that carries no recount
+	// request) can keep the map as-is (U5-01). Guarded by mu.
+	countsKey   countsKey
+	countsValid bool
 
 	// Coalesces refreshFromIndex calls so back-to-back scan flushes don't
 	// pile up dozens of concurrent refresh goroutines (each one re-runs the
@@ -125,9 +142,19 @@ type Controller struct {
 	refreshRunning bool
 	refreshPending bool
 	refreshDir     string
+	// refreshRecount forces the follow-up refresh to recompute the sidebar
+	// counts. OR-merged across requests so a pending recount is never lost
+	// when a plain scheduleRefresh coalesces with it (U5-01).
+	refreshRecount bool
 	// refreshCalls counts refreshFromIndex runs. A test seam: it lets tests
 	// assert that a scan flush which changed no rows schedules no refresh.
 	refreshCalls atomic.Uint64
+
+	// lastRefreshNanos is the duration of the most recent refreshFromIndex, in
+	// nanoseconds. scanInto spaces its refresh requests by at least half of it
+	// (floored at 500ms) so a first scan's refresh work never saturates the
+	// frame loop (U5-04).
+	lastRefreshNanos atomic.Int64
 
 	// trashCount mirrors what cache.TrashStats would report. Seeded lazily
 	// (on first read) so startup doesn't pay for a directory walk; bumped
@@ -434,17 +461,32 @@ func (c *Controller) ApplyMove(oldPath, newPath string) error {
 // RefreshActive re-queries the index for the directory currently shown in the
 // grid and repaints. Exposed so flows that mutate the index outside the normal
 // scan path (the organize move pass via ApplyMove) can surface their changes
-// with a single coalesced refresh once their batch completes.
+// with a single coalesced refresh once their batch completes. A recount is
+// requested because those flows changed the data the sidebar counts describe.
 func (c *Controller) RefreshActive() {
-	c.scheduleRefresh(c.activeDir())
+	c.scheduleRefreshRecount(c.activeDir())
 }
 
 // scheduleRefresh asks for a refreshFromIndex against dir, coalescing with any
 // in-flight refresh so callers can fire it freely without spawning a goroutine
-// per flush.
+// per flush. The sidebar counts are left alone when their inputs are unchanged.
 func (c *Controller) scheduleRefresh(dir string) {
+	c.scheduleRefreshOpts(dir, false)
+}
+
+// scheduleRefreshRecount is scheduleRefresh for callers that changed index
+// data: it forces the next refreshFromIndex to recompute the sidebar counts.
+// The request is OR-merged, so coalescing with a plain scheduleRefresh (in
+// either order) never loses it.
+func (c *Controller) scheduleRefreshRecount(dir string) {
+	c.scheduleRefreshOpts(dir, true)
+}
+
+// scheduleRefreshOpts implements both scheduleRefresh flavors.
+func (c *Controller) scheduleRefreshOpts(dir string, recount bool) {
 	c.refreshMu.Lock()
 	c.refreshDir = dir
+	c.refreshRecount = c.refreshRecount || recount
 	if c.refreshRunning {
 		c.refreshPending = true
 		c.refreshMu.Unlock()
@@ -456,9 +498,11 @@ func (c *Controller) scheduleRefresh(dir string) {
 		for {
 			c.refreshMu.Lock()
 			d := c.refreshDir
+			recount := c.refreshRecount
 			c.refreshPending = false
+			c.refreshRecount = false
 			c.refreshMu.Unlock()
-			c.refreshFromIndex(d)
+			c.refreshFromIndex(d, recount)
 			c.refreshMu.Lock()
 			if !c.refreshPending {
 				c.refreshRunning = false
@@ -470,7 +514,8 @@ func (c *Controller) scheduleRefresh(dir string) {
 	}()
 }
 
-func (c *Controller) refreshFromIndex(dir string) {
+func (c *Controller) refreshFromIndex(dir string, recount bool) {
+	start := time.Now()
 	c.refreshCalls.Add(1)
 	// Snapshot the controller state this refresh reads once, up front, so the
 	// year-preview branch below can scope its query to a treeDir consistent with
@@ -483,14 +528,25 @@ func (c *Controller) refreshFromIndex(dir string) {
 	root := c.libraryRoot
 	prevSubdirs := c.subdirs
 	yearDirs := append([]string(nil), c.yearPreviewDirs...)
+	countsValid := c.countsValid
+	prevCountsKey := c.countsKey
 	c.mu.Unlock()
 
 	var entries []cache.Entry
+	// needGoFilter marks the branches that still hand back unfiltered rows:
+	// the trash listing (read off the filesystem) and the per-dir year fallback.
+	// Every other branch pushes the media filter into SQL.
+	needGoFilter := false
+	// fromDirView marks the plain dir listing, whose rows are exactly what the
+	// sidebar counts describe — so the counts can be derived from the loaded
+	// slice instead of re-queried (U5-02).
+	fromDirView := false
 	switch {
 	case dir == FavoritesView:
-		entries = c.index.ListFavorites()
+		entries = c.index.ListPage(cache.View{Kind: "favorites", Filter: filter, ShowRAW: showRAW}, 0, 0)
 	case dir == TrashView:
 		entries = cache.ListTrash(c.trashDir)
+		needGoFilter = true
 	case strings.HasPrefix(dir, YearViewPrefix):
 		// U-08: resolve the year-preview union in a single covering-index query
 		// scoped to treeDir instead of one prefix-LIKE ListDir per date dir. The
@@ -499,24 +555,26 @@ func (c *Controller) refreshFromIndex(dir string) {
 		// parent-dir name, so ListByYear(year, …, treeDir) returns exactly their
 		// union with the media filter pushed into SQL. A parse failure (the
 		// sentinel is always built from a YYYY string, so this shouldn't happen)
-		// falls back to the per-dir loop.
+		// falls back to the per-dir loop, which still needs the Go-side filter.
 		if y, err := strconv.Atoi(strings.TrimPrefix(dir, YearViewPrefix)); err == nil {
 			entries = c.index.ListByYear(y, filter, showRAW, treeDir)
 		} else {
 			for _, d := range yearDirs {
 				entries = append(entries, c.index.ListDir(d)...)
 			}
+			needGoFilter = true
 		}
 	default:
-		entries = c.index.ListDir(dir)
+		entries = c.index.ListPage(cache.View{Kind: "dir", Dir: dir, Filter: filter, ShowRAW: showRAW}, 0, 0)
+		fromDirView = true
 	}
 
 	// Filter in place: every branch above returns a freshly allocated slice,
 	// so reusing its backing array avoids a second full-size copy per refresh
-	// (~9 MB at 100k entries). "All" with RAW shown keeps everything, so the
-	// pass is skipped outright.
+	// (~9 MB at 100k entries). The SQL-backed branches already applied the
+	// filter, so only the trash / year-fallback rows need the Go pass.
 	filtered := entries
-	if filter != "All" || !showRAW {
+	if needGoFilter && (filter != "All" || !showRAW) {
 		filtered = slices.DeleteFunc(entries, func(e cache.Entry) bool {
 			if !showRAW && e.Type == scan.TypeRAW {
 				return true
@@ -541,22 +599,70 @@ func (c *Controller) refreshFromIndex(dir string) {
 		subs = prevSubdirs
 	}
 
+	// Publish the grid first: the entries are what the user is looking at, and
+	// the sidebar counts below can cost several queries on a deep tree. Waking
+	// the frame loop here lets the grid repaint while the counts are computed
+	// (U5-01).
+	c.mu.Lock()
+	if c.currentDir == dir {
+		c.entries = filtered
+	}
+	if wantSubdirs && c.treeDir == dir {
+		c.subdirs = subs
+	}
+	c.mu.Unlock()
+	if c.invalidate != nil {
+		c.invalidate()
+	}
+
+	// The counts only depend on the tree anchor, the filter and showRAW — plus,
+	// for the tree dir itself, the set of subdirs it lists. A refresh that
+	// changed none of those (a preview of another dir, a sort-order switch, a
+	// rescan that landed no rows) can keep the published map as-is: the
+	// in-memory patches in patchLocalDeletion / patchFavorite / bumpTrashCount
+	// have kept it accurate (U5-01).
+	key := countsKey{treeDir: treeDir, root: root, filter: filter, showRAW: showRAW}
+	needCounts := recount || !countsValid || prevCountsKey != key ||
+		(wantSubdirs && !slices.Equal(subs, prevSubdirs))
+	if !needCounts {
+		c.lastRefreshNanos.Store(int64(time.Since(start)))
+		return
+	}
+
 	// Counts are computed for the rows the sidebar will render: root,
 	// treeDir's parent (if the tree isn't anchored at root), and each subdir.
-	// Recomputed on every refresh so they stay in sync with filter/showRAW
-	// changes and with newly-batched scan results.
 	//
-	// The per-subdir counts come from one grouped scan over treeDir's path
-	// range (CountChildDirsFiltered) instead of N round-trips, so a deep
-	// directory with dozens of children is one query instead of N+3.
+	// The dir-view entries already are exactly the filtered rows under treeDir,
+	// in path order, so the tree's total and its per-child counts come straight
+	// from the loaded slice instead of two more queries on the biggest range in
+	// the index (U5-02). The per-subdir counts otherwise come from one grouped
+	// scan over treeDir's path range (CountChildDirsFiltered) instead of N
+	// round-trips, so a deep directory with dozens of children is one query
+	// instead of N+3.
+	useLoadedCounts := fromDirView && dir == treeDir
 	counts := make(map[string]int, len(subs)+3)
-	counts[root] = c.index.CountDirFiltered(root, filter, showRAW)
+	if useLoadedCounts {
+		counts[dir] = len(entries)
+	}
+	// The library root's total is the tree's total when the tree is anchored
+	// there; otherwise (including a previewed subdir whose parent chain reaches
+	// the root) it still comes from the index.
+	if !useLoadedCounts || root != dir {
+		counts[root] = c.index.CountDirFiltered(root, filter, showRAW)
+	} else {
+		counts[root] = counts[dir]
+	}
 	if treeDir != root {
 		parent := filepath.Dir(treeDir)
 		counts[parent] = c.index.CountDirFiltered(parent, filter, showRAW)
 	}
 	if len(subs) > 0 {
-		childCounts := c.index.CountChildDirsFiltered(treeDir, filter, showRAW)
+		var childCounts map[string]int
+		if useLoadedCounts {
+			childCounts = childCountsFromEntries(dir, entries)
+		} else {
+			childCounts = c.index.CountChildDirsFiltered(treeDir, filter, showRAW)
+		}
 		for _, s := range subs {
 			counts[s] = childCounts[s]
 		}
@@ -569,20 +675,43 @@ func (c *Controller) refreshFromIndex(dir string) {
 	}
 
 	c.mu.Lock()
-	if c.currentDir == dir {
-		c.entries = filtered
-	}
-	if wantSubdirs && c.treeDir == dir {
-		c.subdirs = subs
-	}
 	if c.treeDir == treeDir {
 		c.dirCounts = counts
 		c.dirCountsVer++
+		c.countsKey = key
+		c.countsValid = true
 	}
 	c.mu.Unlock()
 	if c.invalidate != nil {
 		c.invalidate()
 	}
+	c.lastRefreshNanos.Store(int64(time.Since(start)))
+}
+
+// childCountsFromEntries reproduces cache.Index.CountChildDirsFiltered on an
+// already media-filtered, path-sorted entry slice: it counts, per immediate
+// child directory of dir, the rows living anywhere beneath it. Rows directly
+// in dir (no further separator) and the dir's own exact-path row — which
+// ListPage folds in when a *file* path is passed as dir — contribute nothing,
+// matching the SQL's instr(…, '/') > 0 guard.
+func childCountsFromEntries(dir string, entries []cache.Entry) map[string]int {
+	prefix := dir
+	if !strings.HasSuffix(prefix, string(filepath.Separator)) {
+		prefix += string(filepath.Separator)
+	}
+	out := make(map[string]int, 16)
+	for _, e := range entries {
+		if !strings.HasPrefix(e.Path, prefix) {
+			continue
+		}
+		rest := e.Path[len(prefix):]
+		j := strings.IndexByte(rest, filepath.Separator)
+		if j <= 0 {
+			continue
+		}
+		out[filepath.Join(dir, rest[:j])]++
+	}
+	return out
 }
 
 func (c *Controller) activeDir() string {

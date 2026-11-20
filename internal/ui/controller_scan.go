@@ -239,26 +239,41 @@ func (c *Controller) scanInto(ctx context.Context, dir string) {
 	})
 	var batch []scan.Result
 	flushAt := time.Now().Add(time.Second)
-	flush := func() {
-		if len(batch) == 0 {
-			return
+	// refreshPending records that some batch since the last scheduled refresh
+	// changed rows. Refreshes are throttled: during a first scan the index is
+	// growing fast and each refresh re-runs the grid listing plus the sidebar
+	// counts, so issuing one per 1s flush lets the refresh work saturate the
+	// frame loop. Spacing them by at least max(500ms, 2x the last refresh's own
+	// duration) caps grid refreshes at ~2/s, or half the duty cycle when a
+	// refresh is slow (U5-04).
+	var refreshPending bool
+	var lastSched time.Time
+	flush := func(final bool) {
+		if len(batch) > 0 {
+			n := len(batch)
+			changed := c.index.ReconcileBatchChanged(batch)
+			batch = batch[:0]
+			flushAt = time.Now().Add(time.Second)
+			c.mu.Lock()
+			c.scanBatched += n
+			c.mu.Unlock()
+			if proc != nil {
+				proc.AddDone(int64(n))
+			}
+			// An incremental rescan of an unchanged library reconciles every
+			// file but changes no row (the upsert's WHERE guard skips them);
+			// refreshing the grid then would re-run ListDir + the sidebar
+			// counts for nothing, back to back for the whole scan (C4-01).
+			if changed > 0 {
+				refreshPending = true
+			}
 		}
-		n := len(batch)
-		changed := c.index.ReconcileBatchChanged(batch)
-		batch = batch[:0]
-		flushAt = time.Now().Add(time.Second)
-		c.mu.Lock()
-		c.scanBatched += n
-		c.mu.Unlock()
-		if proc != nil {
-			proc.AddDone(int64(n))
-		}
-		// An incremental rescan of an unchanged library reconciles every file
-		// but changes no row (the upsert's WHERE guard skips them); refreshing
-		// the grid then would re-run ListDir + the sidebar counts for nothing,
-		// back to back for the whole scan (C4-01).
-		if changed > 0 {
-			c.scheduleRefresh(c.activeDir())
+		if refreshPending && (final || time.Since(lastSched) >= max(500*time.Millisecond, 2*time.Duration(c.lastRefreshNanos.Load()))) {
+			// The scan inserts rows, so the sidebar counts are stale: ask for a
+			// recount, not just a grid re-query.
+			c.scheduleRefreshRecount(c.activeDir())
+			lastSched = time.Now()
+			refreshPending = false
 		}
 	}
 	for r := range results {
@@ -266,14 +281,20 @@ func (c *Controller) scanInto(ctx context.Context, dir string) {
 			proc.Wait()
 		}
 		if ctx.Err() != nil {
+			// A superseded scan: the last scheduled refresh may be behind its
+			// throttle window, but its changes were committed, so fire one last
+			// recount rather than leave them invisible.
+			if refreshPending {
+				c.scheduleRefreshRecount(c.activeDir())
+			}
 			return
 		}
 		batch = append(batch, r)
 		if len(batch) >= 1000 || (len(batch) > 0 && time.Now().After(flushAt)) {
-			flush()
+			flush(false)
 		}
 	}
-	flush()
+	flush(true)
 }
 
 // WarmUp iterates over every entry in the index and ensures its thumbnail
