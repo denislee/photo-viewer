@@ -73,5 +73,16 @@ func DecodeFit(data []byte, fit func(w, h int) (minW, minH int)) (*image.RGBA, C
 	return decodeFit(data, fit)
 }
 
+// EncodeRGBA compresses img as a JPEG with 4:2:0 chroma subsampling at the
+// given quality (1..100; values outside the range are clamped). libjpeg-turbo
+// encodes roughly 10× faster than image/jpeg (T5-03), which matters because
+// every display rendition and export is re-encoded.
+//
+// EncodeRGBA returns ErrUnavailable when built without libjpeg-turbo; callers
+// then fall back to image/jpeg.
+func EncodeRGBA(img *image.RGBA, quality int) ([]byte, error) {
+	return encodeRGBA(img, quality)
+}
+
 // Available reports whether libjpeg-turbo was linked in.
 func Available() bool { return available }

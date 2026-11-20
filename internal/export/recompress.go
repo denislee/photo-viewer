@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"image"
 	_ "image/gif"
-	"image/jpeg"
 	_ "image/png"
 	"os"
 	"os/exec"
@@ -16,7 +15,6 @@ import (
 	"strings"
 
 	_ "golang.org/x/image/bmp"
-	"golang.org/x/image/draw"
 	_ "golang.org/x/image/tiff"
 	_ "golang.org/x/image/webp"
 
@@ -87,7 +85,9 @@ func recompressFile(ctx context.Context, t scan.MediaType, src, dst string, maxE
 // is at most maxEdge (no upscaling), and writes a JPEG at the given
 // quality. JPEGs decode through libjpeg-turbo with DCT scaling
 // (thumb.DecodeFit), so a large photo is decoded only as large as the output
-// needs; ctx cancels the read and the decode.
+// needs; ctx cancels the read and the decode. The output is encoded through
+// thumb.EncodeJPEG, which uses libjpeg-turbo when it is linked (T5-03) and
+// image/jpeg otherwise.
 func recompressImage(ctx context.Context, src, dst string, maxEdge, quality int) error {
 	// Capture the source mtime before decoding so we can stamp it onto the
 	// finalized output (see the Chtimes after rename below).
@@ -108,8 +108,8 @@ func recompressImage(ctx context.Context, src, dst string, maxEdge, quality int)
 	if err != nil {
 		return err
 	}
-	// Go's image decoders ignore the EXIF Orientation tag and jpeg.Encode
-	// writes no EXIF, so a portrait camera JPEG (Orientation != 1) would
+	// Go's image decoders ignore the EXIF Orientation tag and no JPEG encoder
+	// we use writes EXIF, so a portrait camera JPEG (Orientation != 1) would
 	// otherwise export with sideways pixels AND no tag left to correct it —
 	// permanently rotated. Bake the orientation into the pixels so the output
 	// JPEG is upright with no orientation tag needed. (The plain non-recompress
@@ -126,8 +126,9 @@ func recompressImage(ctx context.Context, src, dst string, maxEdge, quality int)
 	// of a 24 MP source down to a 2048 px edge is exactly the large-downscale
 	// regime where bilinear aliases badly — the same reason the 256 px thumb path
 	// uses it (thumb/image.go). Exports aren't latency-critical (video is
-	// ffmpeg-bound anyway), so the extra CPU is fine.
-	draw.CatmullRom.Scale(scaled, scaled.Rect, img, b, draw.Src, nil)
+	// ffmpeg-bound anyway), so the extra CPU is fine. thumb.ScaleCatmullRom also
+	// pools the scaler's float64 scratch across same-size exports (T5-04).
+	thumb.ScaleCatmullRom(scaled, scaled.Rect, img, b)
 	dstImg := imgorient.Apply(scaled, orient)
 	if err := ctx.Err(); err != nil {
 		return err
@@ -138,7 +139,7 @@ func recompressImage(ctx context.Context, src, dst string, maxEdge, quality int)
 	if err != nil {
 		return err
 	}
-	if err := jpeg.Encode(out, dstImg, &jpeg.Options{Quality: quality}); err != nil {
+	if err := thumb.EncodeJPEG(out, dstImg, quality); err != nil {
 		out.Close()
 		os.Remove(tmp)
 		return err

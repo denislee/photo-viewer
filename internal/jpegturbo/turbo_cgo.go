@@ -11,6 +11,10 @@ package jpegturbo
 static tjhandle pv_tj_init_decompress(void) {
 	return tj3Init(TJINIT_DECOMPRESS);
 }
+
+static tjhandle pv_tj_init_compress(void) {
+	return tj3Init(TJINIT_COMPRESS);
+}
 */
 import "C"
 
@@ -65,6 +69,32 @@ func getHandle() (C.tjhandle, error) {
 func putHandle(h C.tjhandle) {
 	select {
 	case handles <- h:
+	default:
+		C.tj3Destroy(h)
+	}
+}
+
+// chandles keeps idle TurboJPEG compressor handles for reuse, mirroring
+// handles for decompressors. Small pool: encoding runs inline on the thumbnail
+// and export paths rather than under a large worker fan-out.
+var chandles = make(chan C.tjhandle, 16)
+
+func getCHandle() (C.tjhandle, error) {
+	select {
+	case h := <-chandles:
+		return h, nil
+	default:
+	}
+	h := C.pv_tj_init_compress()
+	if h == nil {
+		return nil, errors.New("jpegturbo: tj3Init failed")
+	}
+	return h, nil
+}
+
+func putCHandle(h C.tjhandle) {
+	select {
+	case chandles <- h:
 	default:
 		C.tj3Destroy(h)
 	}
@@ -133,4 +163,45 @@ func decodeFit(data []byte, fit func(w, h int) (minW, minH int)) (*image.RGBA, C
 	// A TJERR_WARNING (for example a truncated scan) still produces a usable
 	// image, as image/jpeg would reject it; keep it, like most viewers do.
 	return img, cfg, nil
+}
+
+// encodeRGBA compresses img with 4:2:0 chroma subsampling at quality (clamped
+// to 1..100). The output buffer is allocated by libjpeg-turbo itself because a
+// NULL *jpegBuf asks it to (TJPARAM_NOREALLOC stays at its default of 0), which
+// avoids a Go-side guess at the compressed size.
+func encodeRGBA(img *image.RGBA, quality int) ([]byte, error) {
+	b := img.Bounds()
+	w, hgt := b.Dx(), b.Dy()
+	if w <= 0 || hgt <= 0 {
+		return nil, errors.New("jpegturbo: empty image")
+	}
+	q := max(min(quality, 100), 1)
+	h, err := getCHandle()
+	if err != nil {
+		return nil, err
+	}
+	defer putCHandle(h)
+
+	if C.tj3Set(h, C.TJPARAM_QUALITY, C.int(q)) != 0 {
+		return nil, tjError(h, "quality")
+	}
+	if C.tj3Set(h, C.TJPARAM_SUBSAMP, C.TJSAMP_420) != 0 {
+		return nil, tjError(h, "subsampling")
+	}
+	var buf *C.uchar
+	var size C.size_t
+	// libjpeg-turbo neither retains the source buffer nor sees Go pointers in
+	// it, so handing it the sub-image's first pixel is safe.
+	rc := C.tj3Compress8(h,
+		(*C.uchar)(unsafe.Pointer(&img.Pix[img.PixOffset(b.Min.X, b.Min.Y)])),
+		C.int(w), C.int(img.Stride), C.int(hgt), C.TJPF_RGBA, &buf, &size)
+	if rc != 0 {
+		if buf != nil {
+			C.tj3Free(unsafe.Pointer(buf))
+		}
+		return nil, tjError(h, "compress")
+	}
+	out := C.GoBytes(unsafe.Pointer(buf), C.int(size))
+	C.tj3Free(unsafe.Pointer(buf))
+	return out, nil
 }

@@ -137,6 +137,71 @@ func diff(a uint32, b uint8) int {
 	return d
 }
 
+func TestEncodeRGBARoundTrip(t *testing.T) {
+	if !Available() {
+		t.Skip("built without libjpeg-turbo")
+	}
+	const w, h = 640, 480
+	img := image.NewRGBA(image.Rect(0, 0, w, h))
+	for y := range h {
+		for x := range w {
+			img.SetRGBA(x, y, color.RGBA{
+				R: uint8(x * 255 / (w - 1)),
+				G: uint8(y * 255 / (h - 1)),
+				B: uint8((x + y) % 256),
+				A: 0xff,
+			})
+		}
+	}
+
+	data, err := EncodeRGBA(img, 82)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !IsJPEG(data) {
+		t.Fatalf("EncodeRGBA output is not a JPEG (%d bytes)", len(data))
+	}
+	dec, err := jpeg.Decode(bytes.NewReader(data))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if dec.Bounds() != img.Bounds() {
+		t.Fatalf("decoded bounds %v, want %v", dec.Bounds(), img.Bounds())
+	}
+	var sumR, sumG, sumB int
+	for y := range h {
+		for x := range w {
+			got := color.RGBAModel.Convert(dec.At(x, y)).(color.RGBA)
+			want := img.RGBAAt(x, y)
+			sumR += diff(uint32(got.R), want.R)
+			sumG += diff(uint32(got.G), want.G)
+			sumB += diff(uint32(got.B), want.B)
+		}
+	}
+	n := w * h
+	for _, c := range []struct {
+		name string
+		sum  int
+	}{{"R", sumR}, {"G", sumG}, {"B", sumB}} {
+		if mean := float64(c.sum) / float64(n); mean >= 6 {
+			t.Errorf("mean absolute %s error %.2f, want < 6", c.name, mean)
+		}
+	}
+
+	sub := img.SubImage(image.Rect(10, 10, 330, 250)).(*image.RGBA)
+	data, err = EncodeRGBA(sub, 82)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dec, err = jpeg.Decode(bytes.NewReader(data))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if b := dec.Bounds(); b != image.Rect(0, 0, 320, 240) {
+		t.Fatalf("sub-image decode bounds %v, want 320x240", b)
+	}
+}
+
 func BenchmarkDecode12MP(b *testing.B) {
 	if !Available() {
 		b.Skip("built without libjpeg-turbo")

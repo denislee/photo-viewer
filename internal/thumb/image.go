@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"image"
 	_ "image/gif"
-	"image/jpeg"
 	_ "image/png"
 	"io"
 	"os"
@@ -16,7 +15,6 @@ import (
 	"sync"
 
 	_ "golang.org/x/image/bmp"
-	"golang.org/x/image/draw"
 	_ "golang.org/x/image/tiff"
 	_ "golang.org/x/image/webp"
 
@@ -200,7 +198,9 @@ func writeThumb(src image.Image, dst string, size, orientation int) error {
 	// ApproxBiLinear because bilinear aliases badly at the large downscale
 	// factors thumbnails hit (a multi-MP source → 256 px); it costs more CPU,
 	// but this runs once per thumbnail under the store's cpuSem/extSem bound.
-	draw.CatmullRom.Scale(thumb, thumb.Rect, src, b, draw.Src, nil)
+	// ScaleCatmullRom reuses a cached scaler, so the large float64 scratch
+	// buffer is pooled across thumbnails instead of allocated per call (T5-04).
+	ScaleCatmullRom(thumb, thumb.Rect, src, b)
 
 	// Bake EXIF orientation in *after* the downscale (S-04): rotation commutes
 	// with scaling, so remapping the small thumbnail costs (src/dst)² less than
@@ -215,5 +215,5 @@ func writeThumb(src image.Image, dst string, size, orientation int) error {
 		return err
 	}
 	defer out.Close()
-	return jpeg.Encode(out, oriented, &jpeg.Options{Quality: 82})
+	return EncodeJPEG(out, oriented, 82)
 }
