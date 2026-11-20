@@ -61,6 +61,34 @@ type Status struct {
 	BinaryPath string
 	Working    bool
 	Error      string // populated when not working; safe to display verbatim
+	// Python is the interpreter that passed --check (the path printed after
+	// "ok "), "" if unknown. Daemons are re-launched under it directly so the
+	// helper doesn't repeat its pipx probe in every process.
+	Python string
+}
+
+// isPythonScript reports whether path looks like a Python script: its first
+// 128 bytes begin with "#!" and the shebang line mentions python.
+func isPythonScript(path string) bool {
+	f, err := os.Open(path)
+	if err != nil {
+		return false
+	}
+	defer f.Close()
+	buf := make([]byte, 128)
+	n, _ := f.Read(buf)
+	if n == 0 {
+		return false
+	}
+	buf = buf[:n]
+	if !bytes.HasPrefix(buf, []byte("#!")) {
+		return false
+	}
+	line := buf
+	if i := bytes.IndexByte(line, '\n'); i >= 0 {
+		line = line[:i]
+	}
+	return bytes.Contains(line, []byte("python"))
 }
 
 // Probe inspects PATH and runs the helper's --check mode. The timeout is
@@ -101,6 +129,7 @@ func Probe() Status {
 		return s
 	}
 	s.Working = true
+	s.Python = strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(stdout.String()), "ok"))
 	return s
 }
 
@@ -172,13 +201,25 @@ func spawnDaemon() (*daemon, error) {
 	if err != nil {
 		return nil, errors.New(BinaryName + " not installed")
 	}
-	cmd := exec.Command(bin, "--server")
+	// F5-02 — running the script directly under the interpreter --check found
+	// skips the helper's per-process pipx re-probe and execve (one dlib import
+	// per daemon instead of two); PV_FACE_REEXECED=1 tells the script not to
+	// look for pipx again.
+	name, args := bin, []string{"--server"}
+	env := append(os.Environ(), "OMP_NUM_THREADS=1")
+	if py := cachedProbe().Python; py != "" && isPythonScript(bin) {
+		if st, err := os.Stat(py); err == nil && !st.IsDir() {
+			name, args = py, []string{bin, "--server"}
+			env = append(env, "PV_FACE_REEXECED=1")
+		}
+	}
+	cmd := exec.Command(name, args...)
 	cmd.Stderr = os.Stderr
 	// Pin the child to a single OpenMP thread. dlib/numpy otherwise spin up one
 	// OMP thread per core in *every* daemon, so N daemons × NumCPU threads
 	// thrash the scheduler for no throughput gain (each detection is already a
 	// separate process). One thread per daemon is both cheaper and faster here.
-	cmd.Env = append(os.Environ(), "OMP_NUM_THREADS=1")
+	cmd.Env = env
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
 		return nil, err
