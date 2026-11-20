@@ -623,6 +623,29 @@ func TestSweepHLSDir(t *testing.T) {
 	}
 }
 
+func TestRemoveLegacyHLS(t *testing.T) {
+	root := t.TempDir()
+	legacy := filepath.Join(root, "ab", "abcd", "seg0.ts")
+	current := filepath.Join(root, hlsCacheVersion, "ab", "abcd", "seg0.ts")
+	for _, p := range []string{legacy, current} {
+		if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(p, []byte("x"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	removeLegacyHLS(root)
+
+	if _, err := os.Stat(filepath.Join(root, "ab")); !os.IsNotExist(err) {
+		t.Errorf("legacy tree still present: err = %v", err)
+	}
+	if _, err := os.Stat(current); err != nil {
+		t.Errorf("current-version segment removed: %v", err)
+	}
+}
+
 func TestHLSRejectsNonVideo(t *testing.T) {
 	// A bogus id that resolves to nothing must 404, not 500.
 	id, ts, cleanup := hlsFixture(t, "clip.mkv", 4)

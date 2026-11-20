@@ -289,8 +289,9 @@ func (s *Server) transcodeSegment(ctx context.Context, e cache.Entry, k int, dst
 	tmp := dst + ".tmp"
 	// -ss before -i is a fast keyframe seek; -output_ts_offset re-anchors the
 	// segment's timestamps to its real position so the player stitches
-	// segments together without gaps. -force_key_frames guarantees the
-	// segment opens on an IDR frame, making it independently decodable.
+	// segments together without gaps. -force_key_frames expr:eq(n,0) forces
+	// only the segment's first frame to an IDR, making it independently
+	// decodable (gte(t,0) made every frame a keyframe, 3.2× the bytes; W5-03).
 	args := []string{
 		"-nostdin", "-loglevel", "error", "-y",
 		"-ss", strconv.FormatFloat(start, 'f', 3, 64),
@@ -300,7 +301,7 @@ func (s *Server) transcodeSegment(ctx context.Context, e cache.Entry, k int, dst
 		"-c:v", "libx264", "-preset", "veryfast", "-profile:v", "high",
 		"-level", "4.0", "-pix_fmt", "yuv420p",
 		"-c:a", "aac", "-ac", "2", "-b:a", "128k",
-		"-force_key_frames", "expr:gte(t,0)",
+		"-force_key_frames", "expr:eq(n,0)",
 		"-output_ts_offset", strconv.FormatFloat(start, 'f', 3, 64),
 		"-muxdelay", "0", "-muxpreload", "0",
 		"-f", "mpegts", tmp,
@@ -330,10 +331,34 @@ func (s *Server) transcodeSegment(ctx context.Context, e cache.Entry, k int, dst
 	return nil
 }
 
-// hlsSegPath maps (id, k) to <cache>/hls/<aa>/<id>/seg<k>.ts, sharded by the
+// hlsCacheVersion namespaces the segment tree so a change to the transcode
+// arguments that alters the segment bytes cannot serve a stale cache. Bumped
+// when the transcode arguments change the segment bytes (v2: W5-03 keyframe
+// fix); segments from older versions live outside this subdir and are removed
+// at startup by removeLegacyHLS.
+const hlsCacheVersion = "v2"
+
+// hlsSegPath maps (id, k) to <cache>/hls/v2/<aa>/<id>/seg<k>.ts, sharded by the
 // first two hex chars of the id the same way the thumb store shards.
 func (s *Server) hlsSegPath(id string, k int) string {
-	return filepath.Join(s.store.CacheDir(), "hls", id[:2], id, fmt.Sprintf("seg%d.ts", k))
+	return filepath.Join(s.store.CacheDir(), "hls", hlsCacheVersion, id[:2], id, fmt.Sprintf("seg%d.ts", k))
+}
+
+// removeLegacyHLS reclaims pre-versioning segment trees: every entry directly
+// under root whose name is not the current hlsCacheVersion is a tree written by
+// an older transcode configuration and can never be served again. Best effort —
+// errors are ignored, since a stale tree only costs disk space.
+func removeLegacyHLS(root string) {
+	entries, err := os.ReadDir(root)
+	if err != nil {
+		return
+	}
+	for _, e := range entries {
+		if e.Name() == hlsCacheVersion {
+			continue
+		}
+		os.RemoveAll(filepath.Join(root, e.Name()))
+	}
 }
 
 // hlsInit lazily sets up the segment semaphore and singleflight map, and kicks
@@ -347,7 +372,10 @@ func (s *Server) hlsInit() {
 		s.hlsSweepMu.Lock()
 		s.hlsSweepAt = time.Now()
 		s.hlsSweepMu.Unlock()
-		go s.sweepHLS()
+		go func() {
+			removeLegacyHLS(filepath.Join(s.store.CacheDir(), "hls"))
+			s.sweepHLS()
+		}()
 	})
 }
 
