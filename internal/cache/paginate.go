@@ -53,6 +53,65 @@ func (v View) whereClause() (string, []any) {
 	}
 }
 
+// whereWithCursor renders whereClause() plus one keyset bound on path, op being
+// one of ">", "<" or "<=". It is the single place the neighbour probes and the
+// keyset page build their WHERE from, so the SQL they issue is also the SQL the
+// query-plan tests inspect.
+//
+// C5-01: for every non-dir kind the cursor is simply appended (`AND path op ?`),
+// which is harmless because those kinds have no path range of their own. A dir
+// view does: whereClause already renders `(path >= lower AND path < upper)`.
+// SQLite gives an index column at most one lower and one upper bound, so a
+// third `AND path > cursor` term degrades to a per-row filter evaluated across
+// the entire subtree — the statement becomes O(dir size) per viewer keystroke
+// instead of a range SEARCH. So for "dir" the cursor is clamped against
+// [lower, upper) in Go and replaces one of the two existing bounds, keeping
+// exactly one lower and one upper path bound in the statement:
+//
+//   - ">"  — cursor at/after lower means "everything strictly after cursor in
+//     the range", i.e. (path > cursor AND path < upper). A cursor before the
+//     range is already implied by the lower bound, so the whole range is used.
+//   - "<"  — cursor at/before upper means (path >= lower AND path < cursor); a
+//     cursor at/after upper selects the whole range.
+//   - "<=" — like "<" but inclusive, except at the range's own upper bound
+//     (path == upper is not in the view) where the plain half-open range is
+//     both equivalent and strictly cheaper.
+//
+// The media-type filter and its args always follow the path bounds, matching
+// whereClause's fragment order.
+func (v View) whereWithCursor(op, cursor string) (string, []any) {
+	if v.Kind != "dir" {
+		where, args := v.whereClause()
+		args = append(args, cursor)
+		return where + " AND path " + op + " ?", args
+	}
+
+	lower, upper := dirRange(v.Dir)
+	typeWhere, typeArgs := typeFilterClause(v.Filter, v.ShowRAW)
+
+	frag := "(path >= ? AND path < ?)"
+	args := []any{lower, upper}
+	switch op {
+	case ">":
+		if cursor >= lower {
+			frag = "(path > ? AND path < ?)"
+			args = []any{cursor, upper}
+		}
+	case "<":
+		if cursor <= upper {
+			frag = "(path >= ? AND path < ?)"
+			args = []any{lower, cursor}
+		}
+	case "<=":
+		if cursor < upper {
+			frag = "(path >= ? AND path <= ?)"
+			args = []any{lower, cursor}
+		}
+	}
+	args = append(args, typeArgs...)
+	return frag + typeWhere, args
+}
+
 // dirExactEntry returns the "exact path" row for a dir view: the at-most-one
 // entry whose path equals v.Dir itself (honoring the media-type filter). It
 // exists only when a caller passes a *file* path where a directory is expected
@@ -161,34 +220,39 @@ func hintFor(limit int) int {
 //   - prev/next use the path index directly — "biggest path strictly less than
 //     X within the view" for prev, "smallest strictly greater" for next — so
 //     they cost O(log N) regardless of view size.
-//   - pos is `COUNT(*) WHERE <where> AND path <= probe`. SQLite bounds the scan
-//     at the probe path (SEARCH ... path<=?), so the position costs O(pos)
-//     instead of the O(view) COUNT+SUM aggregate the old combined query paid.
+//   - pos is `COUNT(*) WHERE <where-with-<=-cursor>`. SQLite bounds the scan
+//     at the probe path, so the position costs O(pos) instead of the O(view)
+//     COUNT+SUM aggregate the old combined query paid.
 //
 // For the same inputs the returned prev/next/pos are identical to Neighbors;
 // total is identical when the caller passes CountView(v) (as Neighbors does).
-// The where-clause here is the exact one CountView totals over, so pos and
-// total can never disagree about which rows belong to the view.
+// Each statement's WHERE is whereClause() narrowed by the probe (see
+// whereWithCursor), so it selects exactly the rows CountView totals over and
+// pos and total can never disagree about which rows belong to the view.
 func (i *Index) NeighborsWithTotal(v View, path string, total int) (prev, next *Entry, pos, _ int) {
-	where, args := v.whereClause()
-
-	probeArgs := append(append(make([]any, 0, len(args)+1), args...), path)
+	// Each probe clamps a cursor onto the view's own range (see
+	// whereWithCursor): for a dir view that keeps one lower and one upper path
+	// bound, so prev/next stay O(log N) and pos O(pos) instead of degrading to
+	// an O(dir size) per-row filter (C5-01).
+	prevWhere, prevArgs := v.whereWithCursor("<", path)
 	prev = i.queryOne(
 		entrySelect+" WHERE "+
-			where+" AND path < ? ORDER BY path DESC LIMIT 1",
-		probeArgs...)
+			prevWhere+" ORDER BY path DESC LIMIT 1",
+		prevArgs...)
 
+	nextWhere, nextArgs := v.whereWithCursor(">", path)
 	next = i.queryOne(
 		entrySelect+" WHERE "+
-			where+" AND path > ? ORDER BY path ASC LIMIT 1",
-		probeArgs...)
+			nextWhere+" ORDER BY path ASC LIMIT 1",
+		nextArgs...)
 
-	// Bounded position: rows at or before path within the view. The trailing
-	// `AND path <= ?` lets SQLite stop the index walk at the probe path, so this
-	// equals the old query's SUM(path<=?) without scanning the whole view range.
+	// Bounded position: rows at or before path within the view. The cursor
+	// bound lets SQLite stop the index walk at the probe path, so this equals
+	// the old query's SUM(path<=?) without scanning the whole view range.
+	posWhere, posArgs := v.whereWithCursor("<=", path)
 	_ = i.db.QueryRow(
-		"SELECT COUNT(*) FROM entries WHERE "+where+" AND path <= ?",
-		probeArgs...).Scan(&pos)
+		"SELECT COUNT(*) FROM entries WHERE "+posWhere,
+		posArgs...).Scan(&pos)
 
 	// Fold in the dir view's exact-path row (see dirExactEntry). Its path
 	// (== Dir) sorts strictly before every range row, so relative to the probe
@@ -372,9 +436,8 @@ func (i *Index) ListPageAfter(v View, afterPath string, limit int) []Entry {
 // listPageAfterQuery builds ListPageAfter's range statement. Split out so the
 // query-plan test checks the exact SQL that runs.
 func listPageAfterQuery(v View, afterPath string, limit int) (string, []any) {
-	where, args := v.whereClause()
-	q := entrySelect + " WHERE " + where + " AND path > ? ORDER BY path"
-	args = append(args, afterPath)
+	where, args := v.whereWithCursor(">", afterPath)
+	q := entrySelect + " WHERE " + where + " ORDER BY path"
 	if limit > 0 {
 		q += " LIMIT ?"
 		args = append(args, limit)

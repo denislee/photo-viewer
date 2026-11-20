@@ -153,17 +153,24 @@ func TestPlanListDirAndListPage(t *testing.T) {
 	mustNotContain(t, "listpage", plan, "TEMP B-TREE")
 }
 
-// TestPlanNeighborsPosBounded proves the W-10 position probe
-// (`COUNT(*) WHERE <where> AND path <= ?`) is a bounded index SEARCH stopping at
-// the probe path (`path<?`), not the O(view) full COUNT+SUM scan the old
-// combined query paid. Every view kind must bound the scan so nav cost is
-// O(pos), not O(view).
+// TestPlanNeighborsPosBounded proves every statement NeighborsWithTotal and
+// listPageAfterQuery issue is a bounded index SEARCH: no full SCAN, no temp
+// b-tree, and — for a dir view — both a lower and an upper bound on path in the
+// same SEARCH, which is what keeps the statement O(log N)/O(pos) instead of a
+// per-row filter over the whole subtree (C5-01).
+//
+// The statements are built through whereWithCursor, i.e. exactly the SQL those
+// callers run. Asserting on whereClause() + a hand-appended "AND path < ?" (the
+// old form) was vacuous for dir views: the `path<?` it found was the directory's
+// own upper bound, so a degraded third path term went unnoticed.
 func TestPlanNeighborsPosBounded(t *testing.T) {
 	idx, cleanup := loadEmpty(t)
 	defer cleanup()
 	seed(t, idx, "/lib", 200)
 
 	probe := filepath.Join("/lib", "000100.jpg")
+	// The three bounds the neighbour/keyset callers pass (prev, next, pos/after).
+	ops := []string{"<", ">", "<="}
 	for _, tc := range []struct {
 		label string
 		v     View
@@ -173,16 +180,113 @@ func TestPlanNeighborsPosBounded(t *testing.T) {
 		{"year", View{Kind: "year", Year: 2024}},
 		{"dir", View{Kind: "dir", Dir: "/lib"}},
 	} {
-		where, args := tc.v.whereClause()
-		// The exact position statement issued by NeighborsWithTotal (paginate.go).
-		q := "SELECT COUNT(*) FROM entries WHERE " + where + " AND path <= ?"
-		args = append(args, probe)
-		plan := explainPlan(t, idx, q, args...)
+		for _, op := range ops {
+			where, args := tc.v.whereWithCursor(op, probe)
+			label := "pos-" + tc.label + "-" + op
 
-		mustContain(t, "pos-"+tc.label, plan, "SEARCH entries USING")
-		mustContain(t, "pos-"+tc.label, plan, "path<?") // scan bounded at the probe
-		mustNotContain(t, "pos-"+tc.label, plan, "SCAN entries")
-		mustNotContain(t, "pos-"+tc.label, plan, "TEMP B-TREE")
+			// The position statement issued by NeighborsWithTotal (paginate.go).
+			plan := explainPlan(t, idx, "SELECT COUNT(*) FROM entries WHERE "+where, args...)
+			mustContain(t, label, plan, "SEARCH entries USING")
+			mustNotContain(t, label, plan, "SCAN entries")
+			mustNotContain(t, label, plan, "TEMP B-TREE")
+
+			// The prev/next statements issued by NeighborsWithTotal and the
+			// page statement issued by listPageAfterQuery. Same WHERE, so the
+			// plan must show the same bounded search for the ordered row reads.
+			for _, tail := range []string{
+				" ORDER BY path DESC LIMIT 1", // prev
+				" ORDER BY path ASC LIMIT 1",  // next
+				" ORDER BY path LIMIT 7",      // listPageAfterQuery
+			} {
+				plan = explainPlan(t, idx,
+					"SELECT path, type, size, mtime, thumb_id, favorite, duration_ms FROM entries WHERE "+
+						where+tail, args...)
+				mustContain(t, label, plan, "SEARCH entries USING")
+				mustNotContain(t, label, plan, "SCAN entries")
+				mustNotContain(t, label, plan, "TEMP B-TREE")
+			}
+
+			if tc.v.Kind != "dir" {
+				continue
+			}
+			// C5-01: one lower AND one upper bound on path in a single SEARCH.
+			// SQLite renders both `>` and `>=` as path>? and both `<` and `<=`
+			// as path<?, so this is the plan's two-sided range, whichever
+			// operators whereWithCursor picked.
+			bounded := false
+			for _, want := range []string{
+				"(path>? AND path<?)",
+				"(path>? AND path<=?)",
+				"(path>=? AND path<?)",
+				"(path>=? AND path<=?)",
+			} {
+				if strings.Contains(plan, want) {
+					bounded = true
+					break
+				}
+			}
+			if !bounded {
+				t.Errorf("%s: dir plan should bound path from both sides in one SEARCH\nplan:\n%s", label, plan)
+			}
+		}
+	}
+}
+
+// TestWhereWithCursorDirHasOneBoundEach pins C5-01 at the SQL text level: for a
+// dir view, whatever the cursor position relative to [Dir+"/", Dir+"0"), the
+// rendered WHERE holds exactly one lower and one upper path bound. Two bounds is
+// what SQLite's index range scan can use; a third would be evaluated per row and
+// make the statement O(dir size).
+//
+// "path >" also matches "path >=", and "path <" also matches "path <=", so the
+// counts below cover both operator spellings.
+func TestWhereWithCursorDirHasOneBoundEach(t *testing.T) {
+	v := View{Kind: "dir", Dir: "/lib/sub", Filter: "All", ShowRAW: true}
+	lower, upper := dirRange("/lib/sub")
+	if lower != "/lib/sub/" {
+		t.Fatalf("dirRange lower = %q, want /lib/sub/", lower)
+	}
+
+	cursors := []struct {
+		label  string
+		cursor string
+	}{
+		{"exact-dir (before)", "/lib/sub"},
+		{"before", "/lib/aaa.jpg"},
+		{"at-lower", lower},
+		{"inside", filepath.Join("/lib/sub", "000100.jpg")},
+		{"at-upper", upper},
+		{"after", upper + "/child.jpg"},
+	}
+	for _, op := range []string{"<", ">", "<="} {
+		for _, c := range cursors {
+			where, _ := v.whereWithCursor(op, c.cursor)
+			label := fmt.Sprintf("dir op=%q cursor=%s", op, c.label)
+			if got := strings.Count(where, "path >"); got != 1 {
+				t.Errorf("%s: %d lower path bounds, want exactly 1\nwhere: %s",
+					label, got, where)
+			}
+			if got := strings.Count(where, "path <"); got != 1 {
+				t.Errorf("%s: %d upper path bounds, want exactly 1\nwhere: %s",
+					label, got, where)
+			}
+		}
+	}
+
+	// Same guarantee under a type filter, whose fragment must trail the bounds.
+	filtered := View{Kind: "dir", Dir: "/lib/sub", Filter: "Photos", ShowRAW: false}
+	for _, op := range []string{"<", ">", "<="} {
+		where, args := filtered.whereWithCursor(op, filepath.Join("/lib/sub", "000100.jpg"))
+		if got := strings.Count(where, "path >"); got != 1 {
+			t.Errorf("filtered op=%q: %d lower path bounds, want 1\nwhere: %s", op, got, where)
+		}
+		if got := strings.Count(where, "path <"); got != 1 {
+			t.Errorf("filtered op=%q: %d upper path bounds, want 1\nwhere: %s", op, got, where)
+		}
+		// Two path bounds + the two type-filter args (RAW and video).
+		if len(args) != 4 {
+			t.Errorf("filtered op=%q: len(args) = %d, want 4\nwhere: %s", op, len(args), where)
+		}
 	}
 }
 
