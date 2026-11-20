@@ -28,14 +28,25 @@ const probeTimeout = 10 * time.Second
 var haveFFprobe = tools.FFprobe
 
 // probeVideoDurationMs returns the playback length of path in milliseconds.
-// It returns 0 when ffprobe is missing (nothing to record — a later scan may
-// have it) or when the scan itself was cancelled, and DurationProbeFailed when
-// ffprobe ran on this file version but produced no positive duration (corrupt
-// or unreadable), so the failure is persisted and not re-probed every scan.
-// Stream-level duration is preferred over container duration since some
-// formats (MTS, raw H.264) report the container as N/A but still expose a
-// per-stream duration.
+// ISO-BMFF containers (mp4, mov, m4v, 3gp) are read natively from their movie
+// header box first (S5-01), which costs microseconds instead of the ~100 ms
+// ffprobe fork; anything else, and any container the native reader cannot
+// resolve, falls back to ffprobe.
+//
+// The fallback returns 0 when ffprobe is missing (nothing to record — a later
+// scan may have it) or when the scan itself was cancelled, and
+// DurationProbeFailed when ffprobe ran on this file version but produced no
+// positive duration (corrupt or unreadable), so the failure is persisted and
+// not re-probed every scan. Stream-level duration is preferred over container
+// duration since some formats (MTS, raw H.264) report the container as N/A but
+// still expose a per-stream duration.
 func probeVideoDurationMs(ctx context.Context, path string) int64 {
+	// S5-01: the mvhd duration is the movie length, which can differ from the
+	// v:0 stream duration ffprobe would report by tens of ms when audio runs
+	// longer; that difference is accepted.
+	if ms, ok := mp4DurationMs(path); ok {
+		return ms
+	}
 	if !haveFFprobe() {
 		return 0
 	}
