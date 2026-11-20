@@ -125,9 +125,12 @@ var haveExiftool = tools.Exiftool
 // -stay_open daemon and returns its stdout, so callers outside the package
 // (e.g. internal/thumb's RAW preview probe) don't pay a fresh fork per read.
 //
-// It is for textual metadata reads only. Do NOT use it for "-b" binary
-// extraction: the daemon protocol is newline-framed, so binary output can
-// desync the stream — extract binary via a one-shot exec.Command instead.
+// stdout must stay textual: the daemon protocol is newline-framed, so a "-b"
+// binary value printed to stdout can desync the stream. Binary extraction can
+// still ride the daemon by having exiftool write the value to a file instead —
+// `-b -<Tag> -W! <outfile> <src>` leaves stdout with nothing but the "N output
+// files created" line — and RunExiftool falls back to a one-shot exec with the
+// same args (which writes the same file) when the daemon is unavailable.
 func RunExiftool(args ...string) ([]byte, error) {
 	return runExiftool(args...)
 }

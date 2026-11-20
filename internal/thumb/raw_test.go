@@ -51,18 +51,18 @@ func TestPresentPreviewTags(t *testing.T) {
 	}
 
 	tags := []string{"PreviewImage", "JpgFromRaw", "ThumbnailImage", "PreviewTIFF", "OtherImage"}
-	got := presentPreviewTags(src, tags)
+	got, _ := probeRAWPreview(src, tags)
 	want := []string{"ThumbnailImage"}
 	if !reflect.DeepEqual(got, want) {
-		t.Errorf("presentPreviewTags = %v, want %v", got, want)
+		t.Errorf("probeRAWPreview = %v, want %v", got, want)
 	}
 
 	// A file with no embedded previews yields an empty set (caller then falls
 	// back to trying every tag).
 	plain := filepath.Join(dir, "plain.jpg")
 	writeJPEG(t, plain, color.RGBA{5, 5, 5, 255})
-	if got := presentPreviewTags(plain, tags); len(got) != 0 {
-		t.Errorf("presentPreviewTags(plain) = %v, want empty", got)
+	if got, _ := probeRAWPreview(plain, tags); len(got) != 0 {
+		t.Errorf("probeRAWPreview(plain) = %v, want empty", got)
 	}
 }
 
