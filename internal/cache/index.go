@@ -89,10 +89,10 @@ type Entry struct {
 }
 
 // entryCols is the ordered column list backing every Entry read. It must stay
-// in lockstep with the rows.Scan(&e.Path, &e.Type, &e.Size, &mtimeUnix,
-// &e.ThumbID, &fav, &e.DurationMs) calls that consume it. entrySelect is the
-// bare "SELECT <cols> FROM entries" prefix that every entry query builds on by
-// appending its own WHERE/ORDER/LIMIT tail.
+// in lockstep with entryDecoder.dest (and decode's conversions) in paginate.go,
+// the one place that consumes it. entrySelect is the bare "SELECT <cols> FROM
+// entries" prefix that every entry query builds on by appending its own
+// WHERE/ORDER/LIMIT tail.
 const (
 	entryCols   = "path, type, size, mtime, thumb_id, favorite, duration_ms"
 	entrySelect = "SELECT " + entryCols + " FROM entries"
@@ -656,7 +656,7 @@ func (i *Index) ListByYear(year int, filter string, showRAW bool, dir string) []
 		return nil
 	}
 	defer rows.Close()
-	return scanEntries(rows)
+	return scanEntries(rows, 0)
 }
 
 // backfillYear populates the `year` column for legacy rows where it's still
@@ -760,7 +760,7 @@ func (i *Index) pageEntries(where string, args []any, visit func(Entry) bool) {
 		if err != nil {
 			return
 		}
-		page := scanEntries(rows)
+		page := scanEntries(rows, pageSize)
 		rows.Close()
 		if len(page) == 0 {
 			return

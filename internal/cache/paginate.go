@@ -2,8 +2,12 @@ package cache
 
 import (
 	"database/sql"
+	"errors"
 	"log"
+	"slices"
 	"time"
+
+	"github.com/dns/photo-viewer/internal/scan"
 )
 
 // View describes a sub-list of the index used by the web UI. Each view is
@@ -130,11 +134,21 @@ func (i *Index) ListPage(v View, offset, limit int) []Entry {
 		return nil
 	}
 	defer rows.Close()
-	out := scanEntries(rows)
+	out := scanEntries(rows, hintFor(limit))
 	if prependExact {
 		out = append([]Entry{*exact}, out...)
 	}
 	return out
+}
+
+// hintFor turns a page limit into scanEntries' capacity hint: a positive limit
+// is the expected row count; a no-limit query passes 0 so the drain falls back
+// to its default and grows by doubling.
+func hintFor(limit int) int {
+	if limit > 0 {
+		return limit
+	}
+	return 0
 }
 
 // NeighborsWithTotal returns (prev, next) entries adjacent to path within v,
@@ -202,22 +216,83 @@ func (i *Index) NeighborsWithTotal(v View, path string, total int) (prev, next *
 }
 
 // rowScanner is the shared surface of *sql.Row and *sql.Rows: anything that can
-// decode one entry row. scanEntry is written against it so single-row and
+// decode one entry row. entryDecoder is written against it so single-row and
 // multi-row readers use the same decoder.
 type rowScanner interface{ Scan(dest ...any) error }
+
+// entryDecoder decodes the entryCols column list into an Entry. It exists to
+// keep every Entry read on one code path while avoiding two per-row costs of the
+// old direct Scan: the fresh locals that escaped per row, and the reflection
+// fallback database/sql takes for *scan.MediaType / *int64 / *int destinations.
+//
+// The nullable/numeric columns are scanned into `any` fields (the *any case is
+// handled natively by database/sql, with no reflection), then converted by
+// decode. dest holds the matching *any pointers in entryCols order and is what
+// goes to Scan. One decoder is reused across every row of a drain: decode
+// resets the numeric fields to nil before each Scan so a row can never inherit
+// the previous row's values.
+type entryDecoder struct {
+	path, thumbID string
+	typ, size     any
+	mtime, fav    any
+	dur           any
+	dest          [7]any
+}
+
+// newEntryDecoder returns a decoder wired to dest in entryCols order: path,
+// type, size, mtime, thumb_id, favorite, duration_ms.
+func newEntryDecoder() *entryDecoder {
+	d := &entryDecoder{}
+	d.dest = [7]any{&d.path, &d.typ, &d.size, &d.mtime, &d.thumbID, &d.fav, &d.dur}
+	return d
+}
+
+// asInt64 reports the value as an int64 when the driver handed back an integer
+// (SQLite's only integer representation) and false otherwise, including NULL.
+func asInt64(v any) (int64, bool) {
+	n, ok := v.(int64)
+	return n, ok
+}
+
+// decode scans exactly one row through d and converts it to an Entry. type,
+// size and mtime are NOT NULL in every row the writer produces, so a NULL or
+// otherwise unexpected value there is a malformed row and reported as an error;
+// the multi-row drain skips it, exactly as the old typed Scan did when it hit a
+// NULL. favorite and duration_ms fall back to 0 (false / unknown) on NULL.
+func (d *entryDecoder) decode(s rowScanner) (Entry, error) {
+	d.typ, d.size, d.mtime, d.fav, d.dur = nil, nil, nil, nil, nil
+	if err := s.Scan(d.dest[:]...); err != nil {
+		return Entry{}, err
+	}
+	typ, ok := asInt64(d.typ)
+	if !ok {
+		return Entry{}, errors.New("cache: malformed entry row")
+	}
+	size, ok := asInt64(d.size)
+	if !ok {
+		return Entry{}, errors.New("cache: malformed entry row")
+	}
+	mtime, ok := asInt64(d.mtime)
+	if !ok {
+		return Entry{}, errors.New("cache: malformed entry row")
+	}
+	fav, _ := asInt64(d.fav)
+	dur, _ := asInt64(d.dur)
+	return Entry{
+		Path:       d.path,
+		Type:       scan.MediaType(typ),
+		Size:       size,
+		ModTime:    time.Unix(mtime, 0),
+		ThumbID:    d.thumbID,
+		DurationMs: dur,
+		Favorite:   fav != 0,
+	}, nil
+}
 
 // scanEntry is the single decoder for the entryCols column list. Every Entry
 // read goes through it, so adding a column is a one-site change.
 func scanEntry(s rowScanner) (Entry, error) {
-	var e Entry
-	var mtimeUnix int64
-	var fav int
-	if err := s.Scan(&e.Path, &e.Type, &e.Size, &mtimeUnix, &e.ThumbID, &fav, &e.DurationMs); err != nil {
-		return Entry{}, err
-	}
-	e.ModTime = time.Unix(mtimeUnix, 0)
-	e.Favorite = fav != 0
-	return e, nil
+	return newEntryDecoder().decode(s)
 }
 
 // queryOne runs a single-row SELECT and decodes one Entry. Returns nil when
@@ -230,13 +305,23 @@ func (i *Index) queryOne(query string, args ...any) *Entry {
 	return &e
 }
 
-// scanEntries drains rows produced by the standard 7-column SELECT.
-func scanEntries(rows *sql.Rows) []Entry {
-	var out []Entry
+// scanEntries drains rows produced by the standard 7-column SELECT. hint is the
+// caller's expected row count (its page limit) and sizes the initial slice; the
+// slice then grows by doubling, which keeps the drain amortized O(n) with at
+// most one copy of the live entries instead of the old 1.25x regrowth.
+func scanEntries(rows *sql.Rows, hint int) []Entry {
+	if hint <= 0 {
+		hint = 64
+	}
+	out := make([]Entry, 0, hint)
+	dec := newEntryDecoder()
 	for rows.Next() {
-		e, err := scanEntry(rows)
+		e, err := dec.decode(rows)
 		if err != nil {
 			continue
+		}
+		if len(out) == cap(out) {
+			out = slices.Grow(out, cap(out))
 		}
 		out = append(out, e)
 	}
@@ -277,7 +362,7 @@ func (i *Index) ListPageAfter(v View, afterPath string, limit int) []Entry {
 		return nil
 	}
 	defer rows.Close()
-	out := scanEntries(rows)
+	out := scanEntries(rows, hintFor(limit))
 	if exact != nil {
 		out = append([]Entry{*exact}, out...)
 	}
