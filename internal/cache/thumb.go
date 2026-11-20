@@ -57,6 +57,26 @@ const thumbGenTimeout = 30 * time.Second
 // orphan. Mirrors the webserver's hlsTmpMaxAge .tmp reaper.
 const staleTmpMaxAge = time.Hour
 
+// failMemo records one thumbnail-generation failure, keyed in ThumbStore.failed
+// by thumb id. It is only valid while the source still has srcMod: a newer
+// source mtime naturally bypasses it. until bounds how long the failure is
+// remembered.
+type failMemo struct {
+	srcMod time.Time
+	until  time.Time
+	err    error
+}
+
+// failMemoTTL is how long a generation failure is remembered before Path tries
+// again. Without it, /thumb and /display would re-fork ffmpeg (or re-run a
+// wedged decoder to its timeout) on every request for a broken rendition.
+const failMemoTTL = 5 * time.Minute
+
+// failMemoCap bounds the failure memo map. It is reset wholesale when it
+// reaches this size, so a scan over a large library of corrupt files can't grow
+// it without limit.
+const failMemoCap = 4096
+
 // ThumbStore turns Entry → on-disk thumbnail JPEG path. It generates the
 // thumbnail on demand if the file does not yet exist.
 //
@@ -76,6 +96,12 @@ type ThumbStore struct {
 	// it and re-stat the result. Keyed by thumb id.
 	flightMu sync.Mutex
 	inflight map[string]chan struct{}
+
+	// failed memoizes recent generation failures by thumb id (C5-06), guarded
+	// by flightMu. A request for a rendition that just failed returns the same
+	// error immediately instead of regenerating it, until failMemoTTL expires
+	// or the source's mtime changes.
+	failed map[string]failMemo
 
 	// tiers are sibling stores of other sizes created through Tier. Forget
 	// and Rename on this store apply to them too, so trashing or deleting a
@@ -129,6 +155,7 @@ func newStore(cacheDir, subdir string, size int, cpuSem, extSem chan struct{}) (
 		cpuSem:   cpuSem,
 		extSem:   extSem,
 		inflight: make(map[string]chan struct{}),
+		failed:   make(map[string]failMemo),
 	}, nil
 }
 
@@ -238,8 +265,15 @@ func (s *ThumbStore) Path(e Entry) (string, error) {
 		return dst, nil
 	}
 
-	// Singleflight: dedupe concurrent calls for the same thumb id.
+	// Singleflight: dedupe concurrent calls for the same thumb id. The failure
+	// memo is checked under the same lock, before joining or starting a flight:
+	// a generation that failed recently for this exact source mtime is not
+	// retried until it expires (C5-06).
 	s.flightMu.Lock()
+	if m, ok := s.failed[e.ThumbID]; ok && m.srcMod.Equal(e.ModTime) && time.Now().Before(m.until) {
+		s.flightMu.Unlock()
+		return "", fmt.Errorf("thumb generation failed recently for %s: %w", e.Path, m.err)
+	}
 	if ch, ok := s.inflight[e.ThumbID]; ok {
 		s.flightMu.Unlock()
 		<-ch
@@ -301,6 +335,7 @@ func (s *ThumbStore) Path(e Entry) (string, error) {
 
 	if err != nil {
 		os.Remove(tmp)
+		s.memoFail(e, err)
 		return "", err
 	}
 	// No fsync before the rename (G4): it cost one disk flush per thumbnail,
@@ -310,9 +345,29 @@ func (s *ThumbStore) Path(e Entry) (string, error) {
 	// fail to decode a thumb call Forget and regenerate it (self-healing).
 	if err := os.Rename(tmp, dst); err != nil {
 		os.Remove(tmp)
+		s.memoFail(e, err)
 		return "", err
 	}
+	s.flightMu.Lock()
+	delete(s.failed, e.ThumbID)
+	s.flightMu.Unlock()
 	return dst, nil
+}
+
+// memoFail records err as the recent failure for e's thumb id, so subsequent
+// Path calls return it without regenerating until failMemoTTL expires or the
+// source's mtime changes. Context/timeout failures are memoized too — a wedged
+// decoder is exactly what this must not retry on every request — but the
+// filesystem errors before generation (os.CreateTemp / os.MkdirAll) are not,
+// since those are transient and cheap to retry.
+func (s *ThumbStore) memoFail(e Entry, err error) {
+	now := time.Now()
+	s.flightMu.Lock()
+	defer s.flightMu.Unlock()
+	if len(s.failed) >= failMemoCap {
+		clear(s.failed)
+	}
+	s.failed[e.ThumbID] = failMemo{srcMod: e.ModTime, until: now.Add(failMemoTTL), err: err}
 }
 
 // fresh reports whether a non-empty thumbnail at dst exists and is at least as
@@ -349,6 +404,9 @@ func (s *ThumbStore) generate(ctx context.Context, e Entry, dst string) error {
 // Forget deletes the thumbnail file for the given thumb id, if any, in this
 // store and its tiers.
 func (s *ThumbStore) Forget(id string) {
+	s.flightMu.Lock()
+	delete(s.failed, id)
+	s.flightMu.Unlock()
 	os.Remove(s.thumbPath(id))
 	for _, t := range s.tierList() {
 		t.Forget(id)
@@ -359,6 +417,9 @@ func (s *ThumbStore) Forget(id string) {
 // Readers call it on a thumbnail that exists but won't decode, so the next
 // Path regenerates it.
 func (s *ThumbStore) Discard(id string) {
+	s.flightMu.Lock()
+	delete(s.failed, id)
+	s.flightMu.Unlock()
 	os.Remove(s.thumbPath(id))
 }
 
