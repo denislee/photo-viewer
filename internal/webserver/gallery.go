@@ -339,14 +339,16 @@ func (s *Server) renderGalleryPage(w http.ResponseWriter, r *http.Request, vi vi
 	// filtered counts. Compute them once here and hand them to both renderers
 	// so the os.ReadDir and the O(subtree) grouped-count scan
 	// (CountChildDirsFiltered) each run a single time per page instead of once
-	// per renderer (W-08). Non-dir views leave both nil and neither renderer
-	// touches them.
+	// per renderer (W-08). Both are cached across requests too (W5-02): the
+	// listing is validated against the directory's mtime and the counts against
+	// a TTL + the index generation. Non-dir views leave both nil and neither
+	// renderer touches them.
 	var dirChildren []string
 	var dirChildCounts map[string]int
 	if vi.v.Kind == "dir" {
-		dirChildren = listSubdirs(vi.v.Dir)
+		dirChildren = s.cachedSubdirs(vi.v.Dir)
 		if len(dirChildren) > 0 {
-			dirChildCounts = s.index.CountChildDirsFiltered(vi.v.Dir, vi.v.Filter, vi.v.ShowRAW)
+			dirChildCounts = s.cachedChildCounts(vi.v.Dir, vi.v.Filter, vi.v.ShowRAW)
 		}
 	}
 
@@ -507,6 +509,77 @@ func listSubdirs(dir string) []string {
 	// os.ReadDir already returns entries sorted by filename; joining each with
 	// the common `dir` prefix preserves that order, so no explicit sort needed.
 	return out
+}
+
+// subdirCacheCap bounds the subdir listing cache before a miss resets it.
+// Entries are invalidated by the directory's mtime, but a server that browses
+// many directories would still accumulate one entry per directory ever opened;
+// the cap keeps that map off the unbounded-growth path at the cost of dropping
+// every listing (they are cheap to recompute) once the cap is crossed.
+const subdirCacheCap = 256
+
+// subdirCacheEntry is one cached child-directory listing plus the parent
+// directory's mtime when the listing was read. The mtime moves whenever a
+// child is created, removed or renamed, so comparing it is enough to notice a
+// listing went stale — no TTL or inotify watcher needed.
+type subdirCacheEntry struct {
+	mtime time.Time
+	subs  []string
+}
+
+// cachedSubdirs returns dir's immediate child directories, reusing the listing
+// cached for that directory while its mtime is unchanged. An empty dir, or one
+// that can't be stat'ed, is not cached: the former has no listing to keep and
+// the latter should surface the directory's real state on every call.
+func (s *Server) cachedSubdirs(dir string) []string {
+	if dir == "" {
+		return nil
+	}
+	st, err := os.Stat(dir)
+	if err != nil {
+		return listSubdirs(dir)
+	}
+	mtime := st.ModTime()
+
+	s.subdirMu.Lock()
+	if e, ok := s.subdirCache[dir]; ok && e.mtime.Equal(mtime) {
+		s.subdirMu.Unlock()
+		return e.subs
+	}
+	s.subdirMu.Unlock()
+
+	// Read outside the lock: os.ReadDir can block on a slow or remote volume
+	// and must not serialise every other gallery render.
+	subs := listSubdirs(dir)
+
+	s.subdirMu.Lock()
+	if s.subdirCache == nil || len(s.subdirCache) >= subdirCacheCap {
+		s.subdirCache = make(map[string]subdirCacheEntry)
+	}
+	s.subdirCache[dir] = subdirCacheEntry{mtime: mtime, subs: subs}
+	s.subdirMu.Unlock()
+	return subs
+}
+
+// childCountKey identifies a cached CountChildDirsFiltered result: the parent
+// directory plus the two toolbar toggles that change which entries count.
+type childCountKey struct {
+	dir     string
+	filter  string
+	showRAW bool
+}
+
+// cachedChildCounts returns the per-child-directory entry counts under dir,
+// reusing a cached map while it is younger than sidebarCacheTTL and the index
+// generation is unchanged.
+//
+// The returned map is shared with other callers — it must be read, never
+// mutated. renderSidebar and the chip renderer only index into it.
+func (s *Server) cachedChildCounts(dir, filter string, showRAW bool) map[string]int {
+	return s.childCounts.get(childCountKey{dir: dir, filter: filter, showRAW: showRAW},
+		s.index.Generation(), func() map[string]int {
+			return s.index.CountChildDirsFiltered(dir, filter, showRAW)
+		})
 }
 
 // trashEntriesTTL is how long the cached trash listing is reused before

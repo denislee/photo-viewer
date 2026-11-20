@@ -129,8 +129,8 @@ func (s *Server) rootSidebarAgg(filter string, showRAW bool) *sidebarAgg {
 		return &sidebarAgg{
 			allCount: s.cachedCountView(cache.View{Kind: "all", Filter: filter, ShowRAW: showRAW}),
 			favCount: s.cachedCountView(cache.View{Kind: "favorites", Filter: filter, ShowRAW: showRAW}),
-			subdirs:  listSubdirs(s.libraryRoot),
-			counts:   s.index.CountChildDirsFiltered(s.libraryRoot, filter, showRAW),
+			subdirs:  s.cachedSubdirs(s.libraryRoot),
+			counts:   s.cachedChildCounts(s.libraryRoot, filter, showRAW),
 			years:    s.index.Years(filter, showRAW),
 		}
 	})

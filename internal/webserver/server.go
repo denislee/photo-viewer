@@ -39,6 +39,18 @@ type Server struct {
 	sidebar ttlCache[sidebarKey, *sidebarAgg]
 	// viewCounts caches CountView per View for the gallery header and sidebar.
 	viewCounts ttlCache[cache.View, int]
+	// childCounts caches CountChildDirsFiltered per (dir, filter, raw) so the
+	// gallery's "In <dir>" section, its chip strip and the root sidebar don't
+	// rescan the subtree on every page render.
+	childCounts ttlCache[childCountKey, map[string]int]
+
+	// subdirCache memoises a directory's immediate child directories, keyed by
+	// the directory path and validated against its mtime: a dir's mtime moves
+	// whenever a child is created, removed or renamed, so a stale listing is
+	// dropped without any TTL. subdirMu guards the map only, never the
+	// os.ReadDir.
+	subdirMu    sync.Mutex
+	subdirCache map[string]subdirCacheEntry
 	// hlsDurations memoises probed HLS source durations per file version, so a
 	// trashed or probe-failed entry doesn't fork ffprobe on every playlist and
 	// segment request (W4-06). See hlsDuration.
@@ -83,6 +95,9 @@ func New(index *cache.Index, store, display *cache.ThumbStore, libraryRoot, tras
 		trash:      ttlCache[struct{}, trashSnapshot]{ttl: trashEntriesTTL},
 		sidebar:    ttlCache[sidebarKey, *sidebarAgg]{ttl: sidebarCacheTTL, swr: true},
 		viewCounts: ttlCache[cache.View, int]{ttl: viewCountTTL, sweepAt: viewCountCacheCap, swr: true},
+		childCounts: ttlCache[childCountKey, map[string]int]{
+			ttl: sidebarCacheTTL, sweepAt: viewCountCacheCap, swr: true,
+		},
 		hlsDurations: ttlCache[hlsDurKey, float64]{
 			ttl: hlsDurationTTL, sweepAt: hlsDurationCacheCap,
 		},
