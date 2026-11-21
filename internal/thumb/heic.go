@@ -109,7 +109,7 @@ func isStreamSpecifierError(err error) bool {
 // HEIC and has no heif-convert pays one doomed fork per file, not two (T4-03).
 // The fallback is also skipped once ffmpegNoHEIC has latched.
 func HEICToJPEG(ctx context.Context, src, tmpDir string, skipFfmpeg bool) (string, error) {
-	var firstErr error
+	var heifErr error
 	if haveHeifConvert() {
 		intermediate := filepath.Join(tmpDir, "out.jpg")
 		var stderr bytes.Buffer
@@ -125,19 +125,17 @@ func HEICToJPEG(ctx context.Context, src, tmpDir string, skipFfmpeg bool) (strin
 			return jpg, nil
 		}
 		if errRun != nil {
-			msg := stderr.String()
-			if msg == "" {
-				msg = errRun.Error()
-			}
-			firstErr = fmt.Errorf("heif-convert: %s", msg)
+			heifErr = fmt.Errorf("heif-convert: %s", stderrOr(&stderr, errRun))
 		} else {
-			firstErr = errors.New("heif-convert produced no jpeg output")
+			heifErr = errors.New("heif-convert produced no jpeg output")
 		}
 	} else {
-		firstErr = errors.New("heif-convert not installed")
+		heifErr = errors.New("heif-convert not installed")
 	}
 
 	// Fallback: ffmpeg can decode HEIC via libheif/HEVC and write a JPEG.
+	// Both failure reasons are reported, so a missing heif-convert no longer
+	// hides why ffmpeg failed (S6-04).
 	if !skipFfmpeg && !ffmpegNoHEIC.Load() && haveFfmpeg() {
 		out := filepath.Join(tmpDir, "ff-out.jpg")
 		var stderr bytes.Buffer
@@ -147,22 +145,23 @@ func HEICToJPEG(ctx context.Context, src, tmpDir string, skipFfmpeg bool) (strin
 		cmd := exec.CommandContext(ctx, "ffmpeg", "-y", "-loglevel", "error",
 			"-threads", "1", "-i", src, "-frames:v", "1", "-update", "1", out)
 		cmd.Stderr = &stderr
-		if err := cmd.Run(); err == nil {
-			if _, statErr := os.Stat(out); statErr == nil {
+		err := cmd.Run()
+		if err == nil {
+			if _, err = os.Stat(out); err == nil {
 				return out, nil
 			}
-		} else if firstErr == nil {
-			msg := stderr.String()
-			if msg == "" {
-				msg = err.Error()
-			}
-			firstErr = fmt.Errorf("ffmpeg: %s", msg)
 		}
+		return "", errors.Join(heifErr, fmt.Errorf("ffmpeg: %s", stderrOr(&stderr, err)))
 	}
-	if firstErr == nil {
-		firstErr = errors.New("no HEIC decoder available")
+	return "", heifErr
+}
+
+// stderrOr returns a tool's trimmed stderr, or err's text when it wrote none.
+func stderrOr(stderr *bytes.Buffer, err error) string {
+	if msg := strings.TrimSpace(stderr.String()); msg != "" {
+		return msg
 	}
-	return "", firstErr
+	return err.Error()
 }
 
 func pickHeifOutput(dir, preferred string) (string, error) {

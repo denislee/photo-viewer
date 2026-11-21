@@ -65,3 +65,32 @@ func TestHEICMissingDecoderForksFfmpegOnce(t *testing.T) {
 		t.Errorf("ffmpegNoHEIC latched without a successful fallback decode")
 	}
 }
+
+// TestHEICToJPEGKeepsFfmpegReason covers S6-04: with heif-convert missing,
+// the ffmpeg fallback's failure reason must reach the caller.
+func TestHEICToJPEGKeepsFfmpegReason(t *testing.T) {
+	oldFfmpeg, oldHeifConvert := haveFfmpeg, haveHeifConvert
+	haveFfmpeg = func() bool { return true }
+	haveHeifConvert = func() bool { return false }
+	t.Cleanup(func() { haveFfmpeg, haveHeifConvert = oldFfmpeg, oldHeifConvert })
+	oldNoHEIC := ffmpegNoHEIC.Load()
+	ffmpegNoHEIC.Store(false)
+	t.Cleanup(func() { ffmpegNoHEIC.Store(oldNoHEIC) })
+
+	dir := t.TempDir()
+	script := "#!/bin/sh\necho 'boom: no hevc decoder' >&2\nexit 1\n"
+	if err := os.WriteFile(filepath.Join(dir, "ffmpeg"), []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", dir)
+
+	_, err := HEICToJPEG(context.Background(), "/nonexistent.heic", t.TempDir(), false)
+	if err == nil {
+		t.Fatal("HEICToJPEG = nil error, want failure")
+	}
+	for _, want := range []string{"heif-convert not installed", "ffmpeg: boom: no hevc decoder"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error %q does not mention %q", err, want)
+		}
+	}
+}
