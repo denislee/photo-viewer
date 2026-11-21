@@ -95,6 +95,8 @@
 
   document.addEventListener('keydown', function(e){
     if (e.target && /^(input|textarea)$/i.test(e.target.tagName)) return;
+    // Leave browser shortcuts (Ctrl+L, Ctrl+F, Cmd+[ …) alone, as grid.js does.
+    if (e.ctrlKey || e.metaKey || e.altKey) return;
     var key = e.key;
     if (key === 'ArrowLeft' || key === 'h' || key === 'k') { go(prev); return; }
     if (key === 'ArrowRight'|| key === 'l' || key === 'j') { go(next); return; }
