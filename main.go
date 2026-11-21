@@ -52,7 +52,7 @@ func main() {
 	// The config must be loaded before NewController, which reads the saved
 	// sort mode from it (U6-B1).
 	ui.LoadConfig()
-	ctrl := ui.NewController(abs, idx, store, cacheDir, dbPath)
+	ctrl := ui.NewController(abs, idx, store, cacheDir)
 
 	go func() {
 		w := new(app.Window)

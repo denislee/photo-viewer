@@ -2,7 +2,6 @@ package ui
 
 import (
 	"context"
-	"fmt"
 	"log"
 	"os"
 	"path/filepath"
@@ -13,77 +12,6 @@ import (
 	"github.com/dns/photo-viewer/internal/cache"
 	"github.com/dns/photo-viewer/internal/scan"
 )
-
-// CancelScan stops any in-flight scan or warm-up. The toolbar's Cancel
-// button is the only place that should cancel a warm-up — directory changes
-// only abort the scan context.
-func (c *Controller) CancelScan() {
-	c.mu.Lock()
-	if c.scanCancel != nil {
-		c.scanCancel()
-		c.scanCancel = nil
-	}
-	if c.warmUpCancel != nil {
-		c.warmUpCancel()
-		c.warmUpCancel = nil
-	}
-	c.mu.Unlock()
-}
-
-// IndexStatus is a snapshot of the indexing pipeline state. No UI reads it
-// since the index-info modal was removed; tests use it to observe scan,
-// warm-up and surfaced-error state.
-// Active/Target/StartedAt/EndedAt/Batched describe directory scans only; the
-// thumbnail warm-up, which runs independently, is reported in WarmUp.
-type IndexStatus struct {
-	LibraryRoot string
-	CacheDir    string
-	DBPath      string
-	Active      bool
-	Target      string
-	StartedAt   time.Time
-	EndedAt     time.Time
-	Batched     int
-	ScanTotal   int // files the scan will visit (scan.Count); 0 while still counting
-	LastError   string
-	WarmUp      WarmUpStatus
-}
-
-// WarmUpStatus is the current/last thumbnail warm-up pass.
-type WarmUpStatus struct {
-	Active    bool
-	StartedAt time.Time
-	EndedAt   time.Time
-	Done      int // entries checked so far
-	Total     int // entries in the index when the pass started
-}
-
-// IndexStatus returns a snapshot of the current/last indexing run plus
-// pointers to the on-disk state. Safe to call from any goroutine.
-func (c *Controller) IndexStatus() IndexStatus {
-	c.mu.Lock()
-	st := IndexStatus{
-		LibraryRoot: c.libraryRoot,
-		CacheDir:    c.cacheDir,
-		DBPath:      c.indexPath,
-		Active:      c.scanning > 0,
-		Target:      c.scanTarget,
-		StartedAt:   c.scanStartedAt,
-		EndedAt:     c.scanEndedAt,
-		Batched:     c.scanBatched,
-		ScanTotal:   c.scanTotal,
-		LastError:   c.scanLastErr,
-		WarmUp: WarmUpStatus{
-			Active:    c.warmUpRunning,
-			StartedAt: c.warmUpStartedAt,
-			EndedAt:   c.warmUpEndedAt,
-			Done:      c.warmUpDone,
-			Total:     c.warmUpTotal,
-		},
-	}
-	c.mu.Unlock()
-	return st
-}
 
 // Rebuild empties the index in place, forgets every generated thumbnail, and
 // kicks off a full rescan of the library root. The active grid view is
@@ -167,31 +95,13 @@ func (c *Controller) Rebuild() error {
 
 func (c *Controller) scanInto(ctx context.Context, dir string) {
 	// Give this scan its own cancellable context so the process bar's Cancel
-	// (and the pause-gate release) only aborts this scan. Previously the row
-	// called c.CancelScan, which also cancelled the separate Thumbnails
-	// warm-up, and a stale row could cancel whatever scan was current.
+	// (and the pause-gate release) only aborts this scan: it can't take down
+	// the Thumbnails warm-up or a newer scan that has since started (U5-03).
 	ctx, cancelThis := context.WithCancel(ctx)
 	defer cancelThis()
 
-	c.mu.Lock()
-	c.scanning++
-	c.scanTarget = dir
-	c.scanStartedAt = time.Now()
-	c.scanEndedAt = time.Time{}
-	c.scanBatched = 0
-	c.scanTotal = 0
-	c.scanGen++
-	gen := c.scanGen
-	c.scanLastErr = ""
-	c.mu.Unlock()
-	if c.invalidate != nil {
-		c.invalidate()
-	}
-
 	// Register with the process bar so the user can pause / resume /
-	// cancel from the main screen. Cancellation is scoped to this scan's
-	// own ctx (cancelThis), not c.CancelScan, so it can't take down the
-	// Thumbnails warm-up or a newer scan that has since started.
+	// cancel from the main screen.
 	var proc *Process
 	if c.processes != nil {
 		proc = c.processes.Begin(ctx, ProcScan, "Indexing", cancelThis, true)
@@ -199,10 +109,6 @@ func (c *Controller) scanInto(ctx context.Context, dir string) {
 	}
 
 	defer func() {
-		c.mu.Lock()
-		c.scanning--
-		c.scanEndedAt = time.Now()
-		c.mu.Unlock()
 		if proc != nil {
 			proc.End()
 		}
@@ -211,24 +117,17 @@ func (c *Controller) scanInto(ctx context.Context, dir string) {
 		}
 	}()
 
-	// Count the files alongside the scan so the process bar and the info
-	// modal can show "done / total (pct)" instead of a bare running count.
-	// The count only reads directory entries, so it finishes long before the
-	// scan's stat/ffprobe work; until then the bar stays indeterminate.
-	go func() {
-		n, err := scan.Count(ctx, dir)
-		if err != nil {
-			return // cancelled along with the scan
-		}
-		c.mu.Lock()
-		if c.scanGen == gen {
-			c.scanTotal = n
-		}
-		c.mu.Unlock()
-		if proc != nil {
-			proc.SetTotal(int64(n))
-		}
-	}()
+	// Count the files alongside the scan so the process bar can show
+	// "done / total (pct)" instead of a bare running count. The count only
+	// reads directory entries, so it finishes long before the scan's
+	// stat/ffprobe work; until then the bar stays indeterminate.
+	if proc != nil {
+		go func() {
+			if n, err := scan.Count(ctx, dir); err == nil { // err: cancelled with the scan
+				proc.SetTotal(int64(n))
+			}
+		}()
+	}
 
 	// Pass an index-backed duration lookup so videos that already have a
 	// stored duration_ms skip the ffprobe fork on incremental rescans. The
@@ -254,9 +153,6 @@ func (c *Controller) scanInto(ctx context.Context, dir string) {
 			changed := c.index.ReconcileBatchChanged(batch)
 			batch = batch[:0]
 			flushAt = time.Now().Add(time.Second)
-			c.mu.Lock()
-			c.scanBatched += n
-			c.mu.Unlock()
 			if proc != nil {
 				proc.AddDone(int64(n))
 			}
@@ -300,8 +196,8 @@ func (c *Controller) scanInto(ctx context.Context, dir string) {
 // WarmUp iterates over every entry in the index and ensures its thumbnail
 // is generated. It runs in the background under its own cancel context, so
 // switching directories or running an incremental scan does not abort it —
-// only an explicit Cancel (via CancelScan) or another WarmUp invocation
-// stops it.
+// only its process-bar Cancel, a Rebuild or another WarmUp invocation stops
+// it.
 func (c *Controller) WarmUp() {
 	c.mu.Lock()
 	if c.warmUpCancel != nil {
@@ -311,15 +207,7 @@ func (c *Controller) WarmUp() {
 	c.warmUpCancel = cancel
 	c.warmUpGen++
 	myGen := c.warmUpGen
-	c.warmUpRunning = true
-	c.warmUpStartedAt = time.Now()
-	c.warmUpEndedAt = time.Time{}
-	c.warmUpDone = 0
-	c.warmUpTotal = 0
 	c.mu.Unlock()
-	if c.invalidate != nil {
-		c.invalidate()
-	}
 
 	go func() {
 		defer cancel()
@@ -329,13 +217,11 @@ func (c *Controller) WarmUp() {
 			proc.SetStatus("Generating thumbnails…")
 		}
 		defer func() {
-			// A superseded pass (another WarmUp started since) leaves the
-			// status alone: it now belongs to the newer pass.
+			// A superseded pass (another WarmUp started since) leaves
+			// warmUpCancel alone: it now belongs to the newer pass.
 			c.mu.Lock()
 			if c.warmUpGen == myGen {
-				c.warmUpRunning = false
 				c.warmUpCancel = nil
-				c.warmUpEndedAt = time.Now()
 			}
 			c.mu.Unlock()
 			if proc != nil {
@@ -346,15 +232,9 @@ func (c *Controller) WarmUp() {
 			}
 		}()
 
-		total := c.index.Count()
 		if proc != nil {
-			proc.SetTotal(int64(total))
+			proc.SetTotal(int64(c.index.Count()))
 		}
-		c.mu.Lock()
-		if c.warmUpGen == myGen {
-			c.warmUpTotal = total
-		}
-		c.mu.Unlock()
 
 		// Fan out across a worker pool. store.Path is internally bounded by
 		// the CPU/external decode semaphores, but driving it from a single
@@ -366,24 +246,8 @@ func (c *Controller) WarmUp() {
 		jobs := make(chan cache.Entry, workers*2)
 
 		// proc.SetDone already goes through the registry's ~30Hz coalescer, so
-		// no second throttle here (U4-09). Without a registry (tests) invalidate
-		// directly. warmUpDone is published every 50 items for IndexStatus
-		// and once more, exactly, after the pool drains.
-		var done, generated int64
-		notify := func(n int64) {
-			if proc != nil {
-				proc.SetDone(n)
-			} else if c.invalidate != nil {
-				c.invalidate()
-			}
-			if n%50 == 0 {
-				c.mu.Lock()
-				if c.warmUpGen == myGen {
-					c.warmUpDone = int(n)
-				}
-				c.mu.Unlock()
-			}
-		}
+		// no second throttle here (U4-09).
+		var done atomic.Int64
 
 		var wg sync.WaitGroup
 		for range workers {
@@ -397,11 +261,12 @@ func (c *Controller) WarmUp() {
 					// cache this is almost every entry, so it is what makes a
 					// re-run of the warm-up cheap.
 					if ctx.Err() == nil && !c.store.Has(e) {
-						if _, err := c.store.Path(e); err == nil {
-							atomic.AddInt64(&generated, 1)
-						}
+						_, _ = c.store.Path(e)
 					}
-					notify(atomic.AddInt64(&done, 1))
+					n := done.Add(1)
+					if proc != nil {
+						proc.SetDone(n)
+					}
 				}
 			})
 		}
@@ -415,24 +280,5 @@ func (c *Controller) WarmUp() {
 		})
 		close(jobs)
 		wg.Wait()
-		// Concurrent workers can publish their n out of order and a cancel can
-		// stop at any count, so the final value is stored unconditionally
-		// (U4-09: it used to be stored only when n%50==0 or n==total, so a
-		// cancelled pass could show a count up to 49 too low forever).
-		final := atomic.LoadInt64(&done)
-		if proc != nil {
-			proc.SetDone(final)
-		}
-		c.mu.Lock()
-		if c.warmUpGen == myGen {
-			c.warmUpDone = int(final)
-		}
-		c.mu.Unlock()
-
-		if proc != nil {
-			n := atomic.LoadInt64(&generated)
-			proc.SetStatus(fmt.Sprintf("Generated %d new thumbnail(s), skipped %d existing",
-				n, final-n))
-		}
 	}()
 }

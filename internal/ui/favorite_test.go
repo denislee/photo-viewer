@@ -112,7 +112,7 @@ func TestToggleFavoriteEndToEnd(t *testing.T) {
 	}
 	idx.ReconcileBatch(results)
 
-	c := NewController(root, idx, store, cacheDir, cache.IndexPath(root, cacheDir))
+	c := NewController(root, idx, store, cacheDir)
 	// currentDir defaults to root (an ordinary dir), so ToggleFavorite takes the
 	// patch-in-place branch rather than the favorites-view full-refresh branch.
 	c.mu.Lock()
@@ -171,9 +171,9 @@ func TestToggleFavoriteOrderedAndReverted(t *testing.T) {
 
 	var warned []string
 	var warnMu sync.Mutex
-	orig := favoriteWarnFn
-	favoriteWarnFn = func(msg string) { warnMu.Lock(); warned = append(warned, msg); warnMu.Unlock() }
-	defer func() { favoriteWarnFn = orig }()
+	orig := warnUser
+	warnUser = func(_, msg string) { warnMu.Lock(); warned = append(warned, msg); warnMu.Unlock() }
+	defer func() { warnUser = orig }()
 
 	fav := false
 	for range 7 { // odd number of presses: ends favorited

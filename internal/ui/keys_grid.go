@@ -149,8 +149,7 @@ func handleGridKey(ke key.Event, grid *Grid, sidebarFocus *bool, viewer *Viewer,
 						for _, e := range errs {
 							log.Printf("export selection to %s: %v", target, e)
 						}
-						_, _ = runZenity("--warning", "--no-markup", "--title=Export selection",
-							"--text="+exportSelectionSummary(copied, len(selected), target, errs))
+						warnUser("Export selection", exportSelectionSummary(copied, len(selected), target, errs))
 					})
 				}()
 			}

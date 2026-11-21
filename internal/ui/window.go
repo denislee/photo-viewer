@@ -511,13 +511,14 @@ func pxToDp(gtx layout.Context, px int) int {
 // exportFavoritesViaPicker pops a zenity directory picker and, on confirm,
 // asks the controller to copy every favorite into the chosen target while
 // preserving subfolders. Always call from a goroutine — zenity blocks.
-// Status surfaces in the bottom process bar; no callback is needed here.
+// Progress surfaces in the bottom process bar; a failure or any per-file
+// failure is reported in a warning dialog (U6-B2).
 func exportFavoritesViaPicker(ctrl *Controller, invalidate func()) {
 	dst, err := runZenity("--file-selection", "--directory", "--title=Export favorites to…")
 	if err != nil || dst == "" {
 		return
 	}
-	ctrl.ExportFavorites(ExportFavoritesOptions{Dst: dst}, nil)
+	ctrl.ExportFavorites(ExportFavoritesOptions{Dst: dst}, exportFavoritesDone(dst))
 	if invalidate != nil {
 		invalidate()
 	}

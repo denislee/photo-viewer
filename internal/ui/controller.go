@@ -68,13 +68,8 @@ type Controller struct {
 	libraryRoot string
 	cacheDir    string
 	trashDir    string
-	// indexPath is the real on-disk SQLite path, resolved once at construction
-	// via cache.Locate (which may fall back to cacheDir on a read-only
-	// library root). Stored so IndexStatus reports the true path without
-	// re-deriving or re-statting the filesystem.
-	indexPath string
-	index     *cache.Index
-	store     *cache.ThumbStore
+	index       *cache.Index
+	store       *cache.ThumbStore
 
 	mu          sync.Mutex
 	treeDir     string // anchor for the sidebar tree (parent + subdirs)
@@ -85,33 +80,15 @@ type Controller struct {
 	showRAW     bool
 	sortMode    string // "name" or "duration"
 	scanCancel  context.CancelFunc
-	scanning    int // active scanInto goroutines
 
 	// warmUpCancel is owned by the thumbnail warm-up pass and lives outside
 	// scanCancel so that picking a new directory (which cancels the current
 	// scan) does not also abort a warm-up running in the background.
-	warmUpCancel  context.CancelFunc
-	warmUpRunning bool
+	warmUpCancel context.CancelFunc
 	// warmUpGen increments each time WarmUp() starts a fresh pass so the
 	// background goroutine can tell whether warmUpCancel still references
 	// its own context when it exits.
 	warmUpGen int
-	// Warm-up progress, exposed via IndexStatus.WarmUp. Kept apart from the
-	// scan* fields below: a warm-up usually runs alongside directory scans,
-	// and sharing the fields made each overwrite the other's status.
-	warmUpStartedAt time.Time
-	warmUpEndedAt   time.Time
-	warmUpDone      int
-	warmUpTotal     int
-
-	// Indexing status, exposed via IndexStatus.
-	scanTarget    string
-	scanStartedAt time.Time
-	scanEndedAt   time.Time
-	scanBatched   int // entries reconciled during the current/last scan
-	scanTotal     int // media files the current/last scan will visit; 0 while still counting
-	scanGen       int // bumped per scanInto so a stale count can't set a newer scan's total
-	scanLastErr   string
 
 	// yearPreviewDirs holds the date subdirs whose union is shown when
 	// currentDir is a YearViewPrefix sentinel. refreshFromIndex reads this
@@ -190,14 +167,12 @@ type Controller struct {
 	display     *cache.ThumbStore
 }
 
-// dbPath is the on-disk index path idx was loaded from (see cache.Locate).
-func NewController(root string, idx *cache.Index, store *cache.ThumbStore, cacheDir, dbPath string) *Controller {
+func NewController(root string, idx *cache.Index, store *cache.ThumbStore, cacheDir string) *Controller {
 	trashDir, _ := cache.TrashDir(root, cacheDir)
 	c := &Controller{
 		libraryRoot:   root,
 		cacheDir:      cacheDir,
 		trashDir:      trashDir,
-		indexPath:     dbPath,
 		index:         idx,
 		store:         store,
 		treeDir:       root,
@@ -356,22 +331,23 @@ func (c *Controller) SetSort(mode string) {
 	c.scheduleRefresh(dir)
 }
 
-// surfaceError records err as the controller's last error — reported via
-// IndexStatus.LastError — after logging it under label, then requests a redraw
-// so the message appears without waiting for the next scan flush. Used by fire-and-forget goroutines (e.g. the Rebuild button
-// handler) whose failures would otherwise vanish. Safe to call from any
-// goroutine; scanLastErr is guarded by c.mu like the other status fields.
+// surfaceError logs err under label and shows it in a warning dialog. Used by
+// fire-and-forget goroutines (e.g. the Rebuild button handler) whose failures
+// would otherwise vanish. Safe to call from any goroutine; the dialog runs on
+// its own goroutine since zenity blocks until dismissed.
 func (c *Controller) surfaceError(label string, err error) {
 	if err == nil {
 		return
 	}
 	log.Printf("%s: %v", label, err)
-	c.mu.Lock()
-	c.scanLastErr = err.Error()
-	c.mu.Unlock()
-	if c.invalidate != nil {
-		c.invalidate()
-	}
+	go warnUser("Photo Viewer: "+label+" failed", err.Error())
+}
+
+// warnUser shows a warning dialog. A package var so tests can capture the
+// message instead of spawning zenity. It blocks until the dialog closes, so
+// call it from a goroutine.
+var warnUser = func(title, msg string) {
+	_, _ = runZenity("--warning", "--no-markup", "--title="+title, "--text="+msg)
 }
 
 // PreviewDir refreshes the grid with path's contents without changing the

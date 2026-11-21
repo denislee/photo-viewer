@@ -2,6 +2,7 @@ package ui
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"maps"
@@ -85,12 +86,6 @@ type FavoriteRevert struct {
 	Favorite bool
 }
 
-// favoriteWarnFn tells the user a favorite could not be saved. A package var
-// only so tests can capture the message instead of spawning zenity.
-var favoriteWarnFn = func(msg string) {
-	_, _ = runZenity("--warning", "--no-markup", "--title=Favorite not saved", "--text="+msg)
-}
-
 // ToggleFavorite flips path's favorite flag from current and returns the new
 // value. The grid and sidebar counts update at once (patchFavorite, an
 // in-memory patch rather than a refreshFromIndex, so rating a 10k-photo shoot
@@ -150,7 +145,7 @@ func (c *Controller) writeFavorite(fw favWrite) {
 	if c.invalidate != nil {
 		c.invalidate()
 	}
-	go favoriteWarnFn(fmt.Sprintf("Could not save the favorite flag for %s: %v", filepath.Base(fw.path), err))
+	go warnUser("Favorite not saved", fmt.Sprintf("Could not save the favorite flag for %s: %v", filepath.Base(fw.path), err))
 }
 
 // TakeFavoriteReverts returns (and clears) the favorite toggles undone since
@@ -221,5 +216,19 @@ func (c *Controller) patchFavorite(path string, newVal bool) {
 	c.mu.Unlock()
 	if c.invalidate != nil {
 		c.invalidate()
+	}
+}
+
+// exportFavoritesDone builds the toolbar / Ctrl+E export's completion
+// callback: it warns the user when the export failed or skipped files on
+// error, and stays quiet on success or a user Cancel.
+func exportFavoritesDone(dst string) func(export.Result, error) {
+	return func(res export.Result, err error) {
+		switch {
+		case err != nil && !errors.Is(err, context.Canceled):
+			warnUser("Export favorites", fmt.Sprintf("Export to %s failed after %d file(s): %v", dst, res.Done, err))
+		case err == nil && res.Failed > 0:
+			warnUser("Export favorites", fmt.Sprintf("Exported %d favorite(s) to %s; %d failed (see the log).", res.Done, dst, res.Failed))
+		}
 	}
 }

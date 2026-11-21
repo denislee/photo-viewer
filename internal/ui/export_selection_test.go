@@ -9,6 +9,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/dns/photo-viewer/internal/export"
 )
 
 // TestExportSelectionNeverOverwrites is the G-17 regression: the old export
@@ -127,5 +129,34 @@ func TestControllerExportSelection(t *testing.T) {
 	}
 	if b, err := os.ReadFile(filepath.Join(target, "clip.mov")); err != nil || string(b) != "video" {
 		t.Errorf("exported copy = %q, %v", b, err)
+	}
+}
+
+// TestExportFavoritesDoneWarns covers U6-B2: the toolbar / Ctrl+E export used
+// to pass a nil done, so failures vanished with the process row.
+func TestExportFavoritesDoneWarns(t *testing.T) {
+	warnings := captureWarnings(t)
+	done := exportFavoritesDone("/out")
+	for _, c := range []struct {
+		res  export.Result
+		err  error
+		warn bool
+	}{
+		{export.Result{Done: 3}, nil, false},
+		{export.Result{Done: 2, Failed: 1}, nil, true},
+		{export.Result{Done: 1}, errors.New("disk full"), true},
+		{export.Result{Done: 1}, context.Canceled, false},
+	} {
+		done(c.res, c.err)
+		select {
+		case msg := <-warnings:
+			if !c.warn {
+				t.Errorf("res=%+v err=%v: unexpected warning %q", c.res, c.err, msg)
+			}
+		default:
+			if c.warn {
+				t.Errorf("res=%+v err=%v: no warning", c.res, c.err)
+			}
+		}
 	}
 }

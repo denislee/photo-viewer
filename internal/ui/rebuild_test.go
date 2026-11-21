@@ -3,6 +3,7 @@ package ui
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -30,7 +31,19 @@ func TestRebuildWipesCacheSubtrees(t *testing.T) {
 	if err := os.MkdirAll(root, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	c := NewController(root, idx, store, cacheDir, cache.IndexPath(root, cacheDir))
+	c := NewController(root, idx, store, cacheDir)
+	// Track the rescan's process row so the test can wait for it to end
+	// before the temp dir is torn down.
+	var reg *ProcessRegistry
+	var sawScan atomic.Bool
+	reg = NewProcessRegistry(func() {
+		for _, s := range reg.Snapshot() {
+			if s.Kind == ProcScan {
+				sawScan.Store(true)
+			}
+		}
+	})
+	c.SetProcessRegistry(reg)
 
 	// Seed a sentinel file in each cache subtree Rebuild is expected to wipe.
 	subs := []string{"thumbs", "hls", "display"}
@@ -59,15 +72,14 @@ func TestRebuildWipesCacheSubtrees(t *testing.T) {
 	// The rescan runs on an empty root, so it settles almost immediately; wait
 	// for it before the temp dir is torn down.
 	deadline := time.Now().Add(2 * time.Second)
-	for c.IndexStatus().Active && time.Now().Before(deadline) {
+	for (!sawScan.Load() || reg.Count() > 0) && time.Now().Before(deadline) {
 		time.Sleep(2 * time.Millisecond)
 	}
 }
 
 // TestRebuildFailureSurfaced verifies that a failing Rebuild is made visible
 // rather than silently swallowed (U-05): the error the toolbar handler receives
-// is recorded in IndexStatus.LastError (the field the index-info modal shows)
-// and accompanied by an invalidate. The failure is forced by closing the index
+// is shown in a warning dialog. The failure is forced by closing the index
 // so idx.Clear() errors before any rescan starts — deterministic and free of
 // permission tricks (which the test user, if root, would bypass anyway).
 func TestRebuildFailureSurfaced(t *testing.T) {
@@ -85,10 +97,8 @@ func TestRebuildFailureSurfaced(t *testing.T) {
 	if err := os.MkdirAll(root, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	c := NewController(root, idx, store, cacheDir, cache.IndexPath(root, cacheDir))
-
-	var invalidated atomic.Int32
-	c.SetInvalidate(func() { invalidated.Add(1) })
+	c := NewController(root, idx, store, cacheDir)
+	warnings := captureWarnings(t)
 
 	// Close the index so idx.Clear() inside Rebuild fails deterministically,
 	// returning before any scanInto goroutine is spawned.
@@ -103,10 +113,12 @@ func TestRebuildFailureSurfaced(t *testing.T) {
 	// Mirror the toolbar handler (window.go OnRebuild): surface, don't drop.
 	c.surfaceError("rebuild index", rebuildErr)
 
-	if got := c.IndexStatus().LastError; got != rebuildErr.Error() {
-		t.Errorf("IndexStatus().LastError = %q, want %q", got, rebuildErr.Error())
-	}
-	if invalidated.Load() == 0 {
-		t.Error("surfaceError did not invalidate the UI")
+	select {
+	case got := <-warnings:
+		if !strings.Contains(got, rebuildErr.Error()) {
+			t.Errorf("warning %q does not carry the error %q", got, rebuildErr.Error())
+		}
+	case <-time.After(2 * time.Second):
+		t.Error("surfaceError showed no warning")
 	}
 }
