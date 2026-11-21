@@ -121,8 +121,11 @@ func (s *Server) renderViewer(w http.ResponseWriter,
 	} else {
 		fmt.Fprint(w, `<span class="vpos"></span>`)
 	}
-	fmt.Fprintf(w, `<button type="button" class="%s" id="favBtn" data-id="%s" title="Toggle favorite (f)">%s</button>`,
-		starCls, cur.ThumbID, star)
+	// Trash entries have no index row, so /api/favorite would 404 (W6-B4).
+	if !s.isTrashPath(cur.Path) {
+		fmt.Fprintf(w, `<button type="button" class="%s" id="favBtn" data-id="%s" title="Toggle favorite (f)">%s</button>`,
+			starCls, cur.ThumbID, star)
+	}
 	fmt.Fprintf(w, `<button type="button" class="vinfo" id="infoBtn" data-id="%s" title="Info (i)">i</button>`, cur.ThumbID)
 	fmt.Fprint(w, `</header>`)
 

@@ -1,10 +1,15 @@
 package webserver
 
 import (
+	"net/http/httptest"
 	"net/url"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
+
+	"github.com/dns/photo-viewer/internal/cache"
+	"github.com/dns/photo-viewer/internal/scan"
 )
 
 // TestNewViewInfoMatchesViewFromQuery pins the W4-03 invariant: the gallery
@@ -114,6 +119,25 @@ func TestNewViewInfoMatchesViewFromQuery(t *testing.T) {
 	} {
 		if _, ok := s.viewFromQuery(q); ok {
 			t.Errorf("viewFromQuery(%v) = _, true; want false", q)
+		}
+	}
+}
+
+// TestViewerOmitsFavoriteForTrash covers W6-B4: a trashed item has no index
+// row, so the favorite button would only produce a swallowed 404.
+func TestViewerOmitsFavoriteForTrash(t *testing.T) {
+	s := &Server{trashDir: "/lib/.photo-viewer-trash"}
+	for _, c := range []struct {
+		path string
+		want bool
+	}{
+		{"/lib/a.jpg", true},
+		{"/lib/.photo-viewer-trash/a.jpg", false},
+	} {
+		rec := httptest.NewRecorder()
+		s.renderViewer(rec, cache.Entry{Path: c.path, ThumbID: "abc", Type: scan.TypePhoto}, nil, nil, viewInfo{}, 0, 0)
+		if got := strings.Contains(rec.Body.String(), `id="favBtn"`); got != c.want {
+			t.Errorf("%s: favBtn rendered = %v, want %v", c.path, got, c.want)
 		}
 	}
 }
