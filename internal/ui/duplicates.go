@@ -167,7 +167,7 @@ func (d *DuplicatesView) startHash() {
 	d.mu.Unlock()
 	go func() {
 		defer cancel()
-		d.hashAndScan(ctx, gen)
+		d.hashAndScan(ctx, gen, cancel)
 	}()
 }
 
@@ -181,17 +181,13 @@ func (d *DuplicatesView) Close() {
 	}
 }
 
-func (d *DuplicatesView) hashAndScan(ctx context.Context, gen int) {
+func (d *DuplicatesView) hashAndScan(ctx context.Context, gen int, cancel context.CancelFunc) {
 	// Publish to the main-screen process bar so the user can pause /
-	// resume / cancel without keeping the modal open.
-	proc := d.scope.begin(ctx, ProcDuplicates, "Duplicates", func() {
-		d.mu.Lock()
-		c := d.cancel
-		d.mu.Unlock()
-		if c != nil {
-			c()
-		}
-	})
+	// resume / cancel without keeping the modal open. The row cancels this
+	// pass's own ctx, not whatever d.cancel holds by the time it is clicked:
+	// after a Rescan the old row is still on screen until EnsureHashes
+	// unwinds, and its Cancel must not stop the new pass (U6-14).
+	proc := d.scope.begin(ctx, ProcDuplicates, "Duplicates", cancel)
 	if proc != nil {
 		proc.SetStatus("Hashing files…")
 		// Only claim the shared proc slot if we're still the current pass — a

@@ -1,10 +1,12 @@
 package ui
 
 import (
+	"context"
 	"fmt"
 	"image"
 	"os"
 	"path/filepath"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -185,5 +187,43 @@ func TestDuplicatesClickOnLastVisibleRowSelects(t *testing.T) {
 	d.mu.Unlock()
 	if selected != last {
 		t.Fatalf("selected = %d, want %d (last visible row)", selected, last)
+	}
+}
+
+// TestDuplicatesStaleRowCancelSparesNewPass covers U6-14: a pass's process-bar
+// Cancel must cancel that pass, not whatever pass d.cancel holds by the time
+// the (still visible) old row is clicked.
+func TestDuplicatesStaleRowCancelSparesNewPass(t *testing.T) {
+	d := NewDuplicatesView(newDuplicatesTestIndex(t), nil, nil, func() {})
+	var reg *ProcessRegistry
+	var first atomic.Pointer[Process]
+	reg = NewProcessRegistry(func() {
+		for _, s := range reg.Snapshot() {
+			if s.Kind == ProcDuplicates && first.Load() == nil {
+				first.CompareAndSwap(nil, reg.Get(s.ID))
+			}
+		}
+	})
+	d.SetProcessRegistry(reg)
+
+	d.startHash()
+	deadline := time.Now().Add(5 * time.Second)
+	for first.Load() == nil || reg.Count() > 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("first pass never registered or never finished")
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+
+	// A newer pass now owns d.cancel.
+	ctx2, cancel2 := context.WithCancel(context.Background())
+	defer cancel2()
+	d.mu.Lock()
+	d.cancel = cancel2
+	d.mu.Unlock()
+
+	first.Load().Cancel()
+	if ctx2.Err() != nil {
+		t.Fatal("the old pass's Cancel cancelled the newer pass")
 	}
 }
