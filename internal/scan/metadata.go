@@ -2,7 +2,6 @@ package scan
 
 import (
 	"encoding/json"
-	"errors"
 	"fmt"
 	"math/big"
 	"os"
@@ -34,8 +33,8 @@ var dateLayouts = []string{
 }
 
 // metaExiftool and openExifFile are seams so tests can prove a successful
-// exiftool read never opens the file for the goexif fallback; production never
-// reassigns them.
+// exiftool read never opens the file for the goexif fallback, and can stub the
+// metadata write without a real exiftool; production never reassigns them.
 var metaExiftool = RunExiftool
 var openExifFile = os.Open
 
@@ -224,9 +223,6 @@ func GetOldestMediaDate(path string) (oldest time.Time, metaDate time.Time, mtim
 // two stay in sync. Returns an error if exiftool is missing or the write
 // fails.
 func SetMediaDate(path string, t time.Time) error {
-	if !haveExiftool() {
-		return errors.New("exiftool not available")
-	}
 	stamp := t.Format("2006:01:02 15:04:05")
 	// Route the write through the pooled -stay_open daemon (RunExiftool) rather
 	// than a fresh exec per file (S-14): a "fix dates" pass over hundreds of
@@ -236,8 +232,10 @@ func SetMediaDate(path string, t time.Time) error {
 	// binary reads are excluded). RunExiftool applies the argsUnsafeForDaemon
 	// gate, so a path carrying a newline (which would corrupt the newline-framed
 	// argfile stream) transparently falls back to a one-shot exec; it also
-	// short-circuits to one-shot when the daemon spawn is backing off.
-	out, err := RunExiftool(
+	// short-circuits to one-shot when the daemon spawn is backing off. It goes
+	// through the metaExiftool seam (RunExiftool in production) so tests can
+	// stub the write.
+	out, err := metaExiftool(
 		"-overwrite_original",
 		"-P",
 		"-DateTimeOriginal="+stamp,
@@ -249,10 +247,11 @@ func SetMediaDate(path string, t time.Time) error {
 		"-TrackModifyDate="+stamp,
 		path)
 	if err != nil {
-		// One-shot fallbacks surface a non-zero exit via err (and carry stderr
-		// in the returned bytes); daemon I/O errors and "exiftool not installed"
-		// also arrive here.
-		return fmt.Errorf("exiftool: %w: %s", err, strings.TrimSpace(string(out)))
+		// RunExiftool already reports why: a one-shot failure carries exiftool's
+		// first stderr line inside the error (ExiftoolError), and a missing tool
+		// arrives as "exiftool not installed". The returned stdout is empty on
+		// error, so it must not be folded into the message.
+		return err
 	}
 	// The daemon reports write success/failure only through its stdout summary:
 	// the "{ready}" sentinel that frames the response fires whether the write

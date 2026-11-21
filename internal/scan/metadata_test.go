@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -387,5 +388,25 @@ func TestGetMediaDateFallsBackToModTime(t *testing.T) {
 
 	if got := GetMediaDate(path); !got.Equal(want) {
 		t.Errorf("GetMediaDate = %v, want file mtime %v", got, want)
+	}
+}
+
+// TestSetMediaDateReturnsExiftoolError pins the error path: SetMediaDate used to
+// build its error from exiftool's stdout, which is always empty on failure, so
+// the message ended in a dangling ": ". It must return RunExiftool's own error
+// unwrapped enough to inspect (errors.Is) and without that trailing separator.
+func TestSetMediaDateReturnsExiftoolError(t *testing.T) {
+	orig := metaExiftool
+	t.Cleanup(func() { metaExiftool = orig })
+
+	sentinel := errors.New("exiftool: not installed")
+	metaExiftool = func(args ...string) ([]byte, error) { return nil, sentinel }
+
+	err := SetMediaDate(filepath.Join(t.TempDir(), "fixture.jpg"), time.Now())
+	if !errors.Is(err, sentinel) {
+		t.Fatalf("SetMediaDate error = %v, want the underlying exiftool error", err)
+	}
+	if strings.HasSuffix(err.Error(), ": ") {
+		t.Errorf("SetMediaDate error %q ends in a dangling %q", err.Error(), ": ")
 	}
 }

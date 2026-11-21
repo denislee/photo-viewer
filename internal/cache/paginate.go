@@ -338,9 +338,9 @@ func (d *entryDecoder) decode(s rowScanner) (Entry, error) {
 	}, nil
 }
 
-// scanEntry decodes one row of the entryCols column list. Most Entry reads go
-// through it; FindDuplicates hand-scans its own narrower six-column projection,
-// so it needs updating alongside entryCols.
+// scanEntry decodes one row of the entryCols column list — every Entry read
+// goes through it except FindDuplicates, which hand-scans the narrower
+// path/type/size/mtime/thumb_id/content_hash projection it needs.
 func scanEntry(s rowScanner) (Entry, error) {
 	return newEntryDecoder().decode(s)
 }

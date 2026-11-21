@@ -87,8 +87,9 @@ func RAW(ctx context.Context, src, dst string, size int) error {
 // then decodes only what it shows. nil decodes at full size.
 func LoadRAWImage(ctx context.Context, src string, fit func(w, h, orientation int) (minW, minH int)) (img image.Image, orientation int, err error) {
 	data, orientation, err := loadRAWPreview(ctx, src)
+	var derr error
 	if err == nil {
-		img, _, derr := DecodeFitFunc(ctx, data, bindFit(fit, orientation))
+		img, _, derr = DecodeFitFunc(ctx, data, bindFit(fit, orientation))
 		if derr == nil {
 			return img, orientation, nil
 		}
@@ -101,7 +102,10 @@ func LoadRAWImage(ctx context.Context, src string, fit func(w, h, orientation in
 	if err != nil {
 		return nil, 1, err
 	}
-	return nil, 1, errors.New("could not decode RAW file")
+	// Both the in-process decode and the ffmpeg fallback failed; carry their
+	// causes so the caller can see why instead of a bare "could not decode".
+	// errors.Join drops nil operands (derr is nil when no preview ever loaded).
+	return nil, 1, errors.Join(errors.New("could not decode RAW file"), derr, ferr)
 }
 
 // bindFit fixes the orientation argument of a LoadRAWImage fit, giving the

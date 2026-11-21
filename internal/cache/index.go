@@ -89,12 +89,12 @@ type Entry struct {
 	Favorite   bool  `json:"favorite"`
 }
 
-// entryCols is the ordered column list backing the standard Entry read. It
-// must stay in lockstep with entryDecoder.dest (and decode's conversions) in
-// paginate.go. entrySelect is the bare "SELECT <cols> FROM entries" prefix that
-// every entry query builds on by appending its own WHERE/ORDER/LIMIT tail.
-// FindDuplicates scans its own narrower projection (no favorite/duration_ms),
-// which must be kept in sync by hand.
+// entryCols is the ordered column list backing the standard Entry read — every
+// Entry read except FindDuplicates, which hand-scans the narrower
+// path/type/size/mtime/thumb_id/content_hash projection it needs. It must stay
+// in lockstep with entryDecoder.dest (and decode's conversions) in paginate.go.
+// entrySelect is the bare "SELECT <cols> FROM entries" prefix that every entry
+// query builds on by appending its own WHERE/ORDER/LIMIT tail.
 const (
 	entryCols   = "path, type, size, mtime, thumb_id, favorite, duration_ms"
 	entrySelect = "SELECT " + entryCols + " FROM entries"

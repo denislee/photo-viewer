@@ -2,6 +2,7 @@ package ui
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"image"
 	"image/color"
@@ -244,7 +245,7 @@ func (d *DuplicatesView) hashAndScan(ctx context.Context, gen int, cancel contex
 		// pass's status/hashing flag — the Rescan-clobber bug.
 		d.mu.Lock()
 		if d.gen == gen {
-			d.statusMsg = "Error: " + err.Error()
+			d.statusMsg = dupStatusForErr(err)
 			d.hashing = false
 		}
 		d.mu.Unlock()
@@ -268,6 +269,18 @@ func (d *DuplicatesView) hashAndScan(ctx context.Context, gen int, cancel contex
 	if d.invalidate != nil {
 		d.invalidate()
 	}
+}
+
+// dupStatusForErr formats the status line shown when the hash pass ends with
+// err. A pass cancelled through its own context is an expected outcome (the
+// user pressed Cancel or Rescan), so it reads as "Cancelled." rather than the
+// alarming bare "Error: context canceled"; every other error keeps the Error:
+// prefix.
+func dupStatusForErr(err error) string {
+	if errors.Is(err, context.Canceled) {
+		return "Cancelled."
+	}
+	return "Error: " + err.Error()
 }
 
 // pruneMissing stats every entry in groups, drops vanished paths from the

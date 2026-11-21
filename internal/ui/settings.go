@@ -191,10 +191,14 @@ func (v *SettingsView) Layout(gtx layout.Context, th *Theme) layout.Dimensions {
 			}
 			if p != "" {
 				v.statusMsg = "Not saved: " + p
-				v.mu.Unlock()
 			} else {
 				v.statusMsg = "Saved to " + configPath()
-				v.mu.Unlock()
+				// Persist in the SAME critical section as the saveGen check.
+				// Releasing v.mu first would leave a window where a newer Save
+				// bumps saveGen and writes its config before this older one
+				// calls UpdateConfig, letting the older values win. UpdateConfig
+				// only mutates config under cfgMu and never calls back into this
+				// view, so holding v.mu across it cannot deadlock.
 				UpdateConfig(func(c *Config) {
 					c.InboxDir = inbox
 					c.OutboxDir = outbox
@@ -202,6 +206,7 @@ func (v *SettingsView) Layout(gtx layout.Context, th *Theme) layout.Dimensions {
 					c.ShowShortcutHints = hints
 				})
 			}
+			v.mu.Unlock()
 			if v.invalidate != nil {
 				v.invalidate()
 			}

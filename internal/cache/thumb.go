@@ -345,7 +345,9 @@ func (s *ThumbStore) Path(e Entry) (string, error) {
 	// fail to decode a thumb call Forget and regenerate it (self-healing).
 	if err := os.Rename(tmp, dst); err != nil {
 		os.Remove(tmp)
-		s.memoFail(e, err)
+		// Deliberately not memoized: this is a filesystem error, not a failing
+		// generator, and a successful generation's temp file is thrown away —
+		// retrying is cheap (see memoFail).
 		return "", err
 	}
 	s.flightMu.Lock()
@@ -357,9 +359,10 @@ func (s *ThumbStore) Path(e Entry) (string, error) {
 // memoFail records err as the recent failure for e's thumb id, so subsequent
 // Path calls return it without regenerating until failMemoTTL expires or the
 // source's mtime changes. Context/timeout failures are memoized too — a wedged
-// decoder is exactly what this must not retry on every request — but the
-// filesystem errors before generation (os.CreateTemp / os.MkdirAll) are not,
-// since those are transient and cheap to retry.
+// decoder is exactly what this must not retry on every request — but
+// filesystem errors (os.CreateTemp / os.MkdirAll before generation, and the
+// os.Rename that moves the finished temp into place) are not, since those are
+// transient and cheap to retry.
 func (s *ThumbStore) memoFail(e Entry, err error) {
 	now := time.Now()
 	s.flightMu.Lock()

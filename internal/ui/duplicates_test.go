@@ -2,6 +2,7 @@ package ui
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"image"
 	"os"
@@ -225,5 +226,27 @@ func TestDuplicatesStaleRowCancelSparesNewPass(t *testing.T) {
 	first.Load().Cancel()
 	if ctx2.Err() != nil {
 		t.Fatal("the old pass's Cancel cancelled the newer pass")
+	}
+}
+
+// TestDupStatusForErr: a pass cancelled through its own context (Cancel or a
+// superseding Rescan) reads as "Cancelled.", while a real failure keeps the
+// "Error: " prefix. Wrapped context errors count as cancellation too.
+func TestDupStatusForErr(t *testing.T) {
+	cases := []struct {
+		name string
+		err  error
+		want string
+	}{
+		{"cancelled", context.Canceled, "Cancelled."},
+		{"wrapped cancelled", fmt.Errorf("hash pass: %w", context.Canceled), "Cancelled."},
+		{"other error", errors.New("disk full"), "Error: disk full"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := dupStatusForErr(tc.err); got != tc.want {
+				t.Fatalf("dupStatusForErr(%v) = %q, want %q", tc.err, got, tc.want)
+			}
+		})
 	}
 }

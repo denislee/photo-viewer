@@ -126,10 +126,10 @@ func (p *progressModel) load() (done, max int64) {
 
 // layoutProgressBar paints the thin 6dp progress bar shared by the Import and
 // Organize modals: a full-width CellBG track with an Accent fill proportional to
-// done/max. clamp caps the fill at the track width — Import always clamped;
-// Organize never did (its done never exceeds max), so the flag preserves each
-// view's exact rendering.
-func layoutProgressBar(gtx layout.Context, th *Theme, done, max int64, clamp bool) layout.Dimensions {
+// done/max. done is clamped to [0,max] so a pass that overshoots its total (both
+// views can) never paints past the track width or backwards into the track.
+func layoutProgressBar(gtx layout.Context, th *Theme, done, max int64) layout.Dimensions {
+	done = clampProgressDone(done, max)
 	w := gtx.Constraints.Max.X
 	barH := gtx.Dp(unit.Dp(6))
 	bg := image.Rect(0, 0, w, barH)
@@ -139,9 +139,6 @@ func layoutProgressBar(gtx layout.Context, th *Theme, done, max int64, clamp boo
 	clipBg.Pop()
 	if max > 0 {
 		frac := float32(done) / float32(max)
-		if clamp && frac > 1 {
-			frac = 1
-		}
 		fg := image.Rect(0, 0, int(float32(w)*frac), barH)
 		clipFg := clip.Rect(fg).Push(gtx.Ops)
 		paint.ColorOp{Color: th.Accent}.Add(gtx.Ops)
@@ -149,6 +146,15 @@ func layoutProgressBar(gtx layout.Context, th *Theme, done, max int64, clamp boo
 		clipFg.Pop()
 	}
 	return layout.Dimensions{Size: image.Pt(w, barH)}
+}
+
+// clampProgressDone bounds done to [0,total]. A total of zero or less means "no
+// known total" (the bar paints an empty track), so done collapses to zero.
+func clampProgressDone(done, total int64) int64 {
+	if total <= 0 {
+		return 0
+	}
+	return min(max(done, 0), total)
 }
 
 // procScope owns the single "live Process" slot a modal task view publishes to

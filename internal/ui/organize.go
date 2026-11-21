@@ -408,7 +408,7 @@ func (v *OrganizeView) Layout(gtx layout.Context, th *Theme, root string) layout
 				if scanning || running {
 					// clamp=false preserves organize's original bar rendering,
 					// which never clamped frac (its done never exceeds max).
-					return layoutProgressBar(gtx, th, progressDone, progressMax, false)
+					return layoutProgressBar(gtx, th, progressDone, progressMax)
 				}
 				return layout.Dimensions{}
 			}),

@@ -315,3 +315,29 @@ func TestProcScopeConcurrent(t *testing.T) {
 		t.Fatalf("registry left with %d live processes, want 0", n)
 	}
 }
+
+// TestClampProgressDone: the shared progress bar clamps done into [0,max] for
+// every caller, so Organize's done (which can exceed max) can no longer paint
+// past the track, and a negative tick cannot paint backwards. max <= 0 means
+// "no known total" and yields 0 (an empty track).
+func TestClampProgressDone(t *testing.T) {
+	cases := []struct {
+		done, max int64
+		want      int64
+	}{
+		{0, 0, 0},
+		{5, 0, 0},
+		{0, 10, 0},
+		{5, 10, 5},
+		{10, 10, 10},
+		{11, 10, 10},
+		{1000, 10, 10},
+		{-1, 10, 0},
+		{-1, 0, 0},
+	}
+	for _, tc := range cases {
+		if got := clampProgressDone(tc.done, tc.max); got != tc.want {
+			t.Errorf("clampProgressDone(%d, %d) = %d, want %d", tc.done, tc.max, got, tc.want)
+		}
+	}
+}
