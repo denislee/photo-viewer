@@ -34,11 +34,9 @@ const (
 	splitterWidthDp = 6
 )
 
-// Run is the Gio replacement for fyne.Window.ShowAndRun. It blocks until the
-// window is closed.
+// Run drives the window's event loop. It blocks until the window is closed.
+// The caller must have called LoadConfig before building ctrl.
 func Run(w *app.Window, ctrl *Controller) error {
-	LoadConfig()
-
 	th := NewTheme()
 	toolbar := NewToolbar()
 	sidebar := NewSidebar()

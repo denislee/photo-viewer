@@ -49,6 +49,9 @@ func main() {
 		log.Fatalf("thumb store: %v", err)
 	}
 
+	// The config must be loaded before NewController, which reads the saved
+	// sort mode from it (U6-B1).
+	ui.LoadConfig()
 	ctrl := ui.NewController(abs, idx, store, cacheDir, dbPath)
 
 	go func() {

@@ -252,3 +252,21 @@ func TestWriteFileAtomicRenameFailureCleansTemp(t *testing.T) {
 		t.Fatalf("dir has %d entries, want 1 (temp file left behind): %v", len(entries), entries)
 	}
 }
+
+// TestNewControllerRestoresSavedSort covers U6-B1: NewController reads the
+// saved sort mode, so a config loaded first (as main.go now does) must win.
+func TestNewControllerRestoresSavedSort(t *testing.T) {
+	path := resetConfigForTest(t)
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte(`{"sort_mode":"duration"}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	LoadConfig()
+	root := t.TempDir()
+	c := newTestController(t, root, filepath.Join(root, ".cache"))
+	if c.sortMode != SortByDuration {
+		t.Fatalf("sortMode = %q, want %q", c.sortMode, SortByDuration)
+	}
+}
