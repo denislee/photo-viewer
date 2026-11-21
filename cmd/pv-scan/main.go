@@ -4,11 +4,13 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"log"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"sync"
 	"syscall"
 
@@ -40,17 +42,32 @@ func startFaces(ctx context.Context, idx *cache.Index, noFaces bool) *face.Pipel
 	return p
 }
 
+// resolveRoot makes -root absolute. The index is keyed by absolute path and
+// the GUI always resolves its root, so a relative root here would store rows
+// the GUI never matches and hash a different fallback db path (S6-01).
+func resolveRoot(root string) (string, error) {
+	if root == "" {
+		return "", errors.New("-root is required")
+	}
+	abs, err := filepath.Abs(root)
+	if err != nil {
+		return "", fmt.Errorf("resolve -root: %w", err)
+	}
+	return abs, nil
+}
+
 func main() {
 	root := flag.String("root", "", "library root to scan (required)")
 	noFaces := flag.Bool("no-faces", false, "skip face detection even if pv-face-detect is installed")
 	verbose := flag.Bool("v", false, "print one line per file (debug firehose) instead of periodic progress")
 	flag.Parse()
 
-	if *root == "" {
-		log.Fatal("pv-scan: -root is required")
+	absRoot, err := resolveRoot(*root)
+	if err != nil {
+		log.Fatalf("pv-scan: %v", err)
 	}
 
-	cacheDir, dbPath, err := cache.Locate(*root, true)
+	cacheDir, dbPath, err := cache.Locate(absRoot, true)
 	if err != nil {
 		log.Fatalf("pv-scan: cache dir: %v", err)
 	}
@@ -136,7 +153,7 @@ func main() {
 		batch = batch[:0]
 	}
 
-	for r := range scan.WalkWith(ctx, *root, opts) {
+	for r := range scan.WalkWith(ctx, absRoot, opts) {
 		batch = append(batch, r)
 		if len(batch) >= batchSize {
 			flushBatch()
