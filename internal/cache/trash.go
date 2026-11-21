@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"time"
 
@@ -157,39 +158,59 @@ func restoreCandidate(target string, n int) string {
 }
 
 // EmptyTrash deletes every entry inside trashDir. Returns the number of
-// top-level entries removed, total bytes freed (best-effort; symlinks and
-// stat errors count as 0), and the first error encountered (other entries
-// are still attempted).
+// top-level media entries removed, total bytes freed (best-effort; items whose
+// Info fails are still removed but count as 0), and the first error encountered
+// (other entries are still attempted).
 func EmptyTrash(trashDir string) (count int, bytes int64, err error) {
-	if trashDir == "" {
-		return 0, 0, nil
-	}
-	entries, rerr := os.ReadDir(trashDir)
-	if rerr != nil {
-		if os.IsNotExist(rerr) {
-			return 0, 0, nil
-		}
-		return 0, 0, rerr
-	}
-	for _, e := range entries {
-		full := filepath.Join(trashDir, e.Name())
-		isMeta := strings.HasSuffix(e.Name(), trashMetaSuffix)
-		if !isMeta {
-			if n, statErr := trashItemBytes(full, e); statErr == nil {
-				bytes += n
-			}
-		}
+	lerr := trashItems(trashDir, func(full string, n int64, ok bool) {
 		if rmErr := os.RemoveAll(full); rmErr != nil {
 			if err == nil {
 				err = rmErr
 			}
-			continue
+			return
 		}
-		if !isMeta {
+		if ok {
 			count++
+			bytes += n
 		}
+	})
+	if err == nil {
+		err = lerr
 	}
 	return count, bytes, err
+}
+
+// trashItems calls visit for every top-level entry of trashDir with its on-disk
+// size. ok is false when the entry's Info fails or when it is a ".meta"
+// sidecar, in which case n is 0 and callers skip counting it. A missing
+// trashDir yields no items.
+func trashItems(trashDir string, visit func(full string, n int64, ok bool)) error {
+	if trashDir == "" {
+		return nil
+	}
+	entries, err := os.ReadDir(trashDir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return err
+	}
+	for _, e := range entries {
+		full := filepath.Join(trashDir, e.Name())
+		isMeta := strings.HasSuffix(e.Name(), trashMetaSuffix)
+		var n int64
+		var ok bool
+		if !isMeta {
+			var statErr error
+			if n, statErr = trashItemBytes(full, e); statErr == nil {
+				ok = true
+			} else {
+				n = 0
+			}
+		}
+		visit(full, n, ok)
+	}
+	return nil
 }
 
 // ListTrash returns one Entry per file inside trashDir, suitable for handing
@@ -210,8 +231,7 @@ func ListTrash(trashDir string) []Entry {
 	// os.ReadDir returns entries sorted by filename ascending, and trash names
 	// lead with a UTC timestamp (YYYYMMDDTHHMMSS), so walking the slice in
 	// reverse yields newest first without a sort.
-	for k := len(dirEntries) - 1; k >= 0; k-- {
-		de := dirEntries[k]
+	for _, de := range slices.Backward(dirEntries) {
 		if de.IsDir() {
 			continue
 		}
@@ -246,25 +266,12 @@ func ListTrash(trashDir string) []Entry {
 // without removing anything. Errors are swallowed — this is for the settings
 // readout, not a load-bearing computation.
 func TrashStats(trashDir string) (count int, bytes int64) {
-	if trashDir == "" {
-		return 0, 0
-	}
-	entries, err := os.ReadDir(trashDir)
-	if err != nil {
-		return 0, 0
-	}
-	for _, e := range entries {
-		if strings.HasSuffix(e.Name(), trashMetaSuffix) {
-			continue
+	_ = trashItems(trashDir, func(_ string, n int64, ok bool) {
+		if ok {
+			count++
+			bytes += n
 		}
-		full := filepath.Join(trashDir, e.Name())
-		n, statErr := trashItemBytes(full, e)
-		if statErr != nil {
-			continue
-		}
-		count++
-		bytes += n
-	}
+	})
 	return count, bytes
 }
 

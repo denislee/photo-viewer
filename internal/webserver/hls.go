@@ -344,7 +344,7 @@ const hlsCacheVersion = "v2"
 // hlsSegPath maps (id, k) to <cache>/hls/v2/<aa>/<id>/seg<k>.ts, sharded by the
 // first two hex chars of the id the same way the thumb store shards.
 func (s *Server) hlsSegPath(id string, k int) string {
-	return filepath.Join(s.store.CacheDir(), "hls", hlsCacheVersion, id[:2], id, fmt.Sprintf("seg%d.ts", k))
+	return filepath.Join(s.store.CacheDir(), cache.HLSDir, hlsCacheVersion, id[:2], id, fmt.Sprintf("seg%d.ts", k))
 }
 
 // removeLegacyHLS reclaims pre-versioning segment trees: every entry directly
@@ -376,7 +376,7 @@ func (s *Server) hlsInit() {
 		s.hlsSweepAt = time.Now()
 		s.hlsSweepMu.Unlock()
 		go func() {
-			removeLegacyHLS(filepath.Join(s.store.CacheDir(), "hls"))
+			removeLegacyHLS(filepath.Join(s.store.CacheDir(), cache.HLSDir))
 			s.sweepHLS()
 		}()
 	})
@@ -459,7 +459,7 @@ func (s *Server) maybeSweepHLS() {
 // for the mechanics; this just binds the live cache root, the configured cap,
 // and the current time.
 func (s *Server) sweepHLS() {
-	sweepHLSDir(filepath.Join(s.store.CacheDir(), "hls"), hlsCacheMaxBytes, hlsTmpMaxAge, time.Now())
+	sweepHLSDir(filepath.Join(s.store.CacheDir(), cache.HLSDir), hlsCacheMaxBytes, hlsTmpMaxAge, time.Now())
 }
 
 // sweepHLSDir walks root, deleting crash-orphaned .tmp files older than

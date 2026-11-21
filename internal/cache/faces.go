@@ -94,50 +94,6 @@ type FaceOpResult struct {
 	ClusterID int64
 }
 
-// faceStatements lazily prepares the long-lived statements used by
-// WriteFacesForPath. The statements are reused for the life of the *Index; each
-// face-detection scan would otherwise reprepare them per call.
-func (i *Index) faceStatements() (del, ins, updCluster, newCluster, setCluster *sql.Stmt, err error) {
-	i.stmtMu.Lock()
-	defer i.stmtMu.Unlock()
-	if i.faceDelStmt == nil {
-		if i.faceDelStmt, err = i.db.Prepare(
-			"DELETE FROM faces WHERE path = ?",
-		); err != nil {
-			return
-		}
-	}
-	if i.faceInsStmt == nil {
-		if i.faceInsStmt, err = i.db.Prepare(
-			`INSERT INTO faces (path, thumb_mtime, bbox_x, bbox_y, bbox_w, bbox_h, embedding, cluster_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-		); err != nil {
-			return
-		}
-	}
-	if i.faceUpdClusterStmt == nil {
-		if i.faceUpdClusterStmt, err = i.db.Prepare(
-			"UPDATE face_clusters SET centroid = ? WHERE id = ?",
-		); err != nil {
-			return
-		}
-	}
-	if i.faceNewClusterStmt == nil {
-		if i.faceNewClusterStmt, err = i.db.Prepare(
-			"INSERT INTO face_clusters (centroid, sample_face_id) VALUES (?, ?)",
-		); err != nil {
-			return
-		}
-	}
-	if i.faceSetClusterStmt == nil {
-		if i.faceSetClusterStmt, err = i.db.Prepare(
-			"UPDATE faces SET cluster_id = ? WHERE id = ?",
-		); err != nil {
-			return
-		}
-	}
-	return i.faceDelStmt, i.faceInsStmt, i.faceUpdClusterStmt, i.faceNewClusterStmt, i.faceSetClusterStmt, nil
-}
-
 // WriteFacesForPath wipes existing face rows for path and writes the given
 // ops in a single transaction (1 fsync per image instead of ~3 per face).
 // thumbMtime, the mtime of the thumbnail detection ran on, is recorded on the
@@ -156,7 +112,27 @@ func (i *Index) WriteFacesForPath(path string, thumbMtime int64, ops []FaceOp) (
 			return nil, fmt.Errorf("WriteFacesForPath(%q): op %d has Face.Path %q", path, k, op.Face.Path)
 		}
 	}
-	delStmt, insStmt, updClusterStmt, newClusterStmt, setClusterStmt, err := i.faceStatements()
+	delStmt, err := i.stmt(&i.faceDelStmt, "DELETE FROM faces WHERE path = ?")
+	if err != nil {
+		return nil, err
+	}
+	insStmt, err := i.stmt(&i.faceInsStmt,
+		`INSERT INTO faces (path, thumb_mtime, bbox_x, bbox_y, bbox_w, bbox_h, embedding, cluster_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`)
+	if err != nil {
+		return nil, err
+	}
+	updClusterStmt, err := i.stmt(&i.faceUpdClusterStmt,
+		"UPDATE face_clusters SET centroid = ? WHERE id = ?")
+	if err != nil {
+		return nil, err
+	}
+	newClusterStmt, err := i.stmt(&i.faceNewClusterStmt,
+		"INSERT INTO face_clusters (centroid, sample_face_id) VALUES (?, ?)")
+	if err != nil {
+		return nil, err
+	}
+	setClusterStmt, err := i.stmt(&i.faceSetClusterStmt,
+		"UPDATE faces SET cluster_id = ? WHERE id = ?")
 	if err != nil {
 		return nil, err
 	}
@@ -423,26 +399,12 @@ func mergeCentroids(a []float32, na int, b []float32, nb int) []float32 {
 
 // GetEntry returns the index row for path, or (Entry{}, false) if unknown.
 func (i *Index) GetEntry(path string) (Entry, bool) {
-	e, err := scanEntry(i.db.QueryRow(
-		entrySelect+" WHERE path = ?",
-		path,
-	))
-	if err != nil {
-		return Entry{}, false
-	}
-	return e, true
+	return i.getOne(entrySelect+" WHERE path = ?", path)
 }
 
 // GetEntryByThumbID returns the index row whose thumb_id matches id.
 // Used by the webserver to look up media by an opaque ID without exposing
 // filesystem paths to clients.
 func (i *Index) GetEntryByThumbID(id string) (Entry, bool) {
-	e, err := scanEntry(i.db.QueryRow(
-		entrySelect+" WHERE thumb_id = ? LIMIT 1",
-		id,
-	))
-	if err != nil {
-		return Entry{}, false
-	}
-	return e, true
+	return i.getOne(entrySelect+" WHERE thumb_id = ? LIMIT 1", id)
 }

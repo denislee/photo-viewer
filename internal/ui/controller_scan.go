@@ -48,7 +48,7 @@ func (c *Controller) Rebuild() error {
 	// ones would show wrong images for re-derived originals — abort so the
 	// caller can surface it, with the index already cleared but no half-wiped
 	// thumb store served.
-	if err := os.RemoveAll(filepath.Join(c.cacheDir, "thumbs")); err != nil {
+	if err := os.RemoveAll(filepath.Join(c.cacheDir, cache.ThumbDir)); err != nil {
 		return err
 	}
 	// Drop the on-the-fly HLS transcode cache and the larger browser-viewer
@@ -61,7 +61,7 @@ func (c *Controller) Rebuild() error {
 	// wipe failure here is best-effort: log and press on to the rescan rather
 	// than aborting with a cleared index and no rebuild in flight. Each dir may
 	// also simply not exist if the webserver never ran (RemoveAll no-ops then).
-	for _, sub := range []string{"hls", cache.DisplayDir, cache.LargeThumbDir} {
+	for _, sub := range []string{cache.HLSDir, cache.DisplayDir, cache.LargeThumbDir} {
 		if err := os.RemoveAll(filepath.Join(c.cacheDir, sub)); err != nil {
 			log.Printf("rebuild: clear %s cache: %v", sub, err)
 		}

@@ -23,7 +23,7 @@ type DuplicateGroup struct {
 	Entries []Entry
 }
 
-func hashFile(path string) (string, error) {
+func hashFile(path string, size int64) (string, error) {
 	f, err := os.Open(path)
 	if err != nil {
 		return "", err
@@ -362,7 +362,7 @@ func (i *Index) EnsureHashes(ctx context.Context, progress func(done, total int)
 	}
 
 	err = i.hashPass(ctx, todo, toFull, cpuWorkers,
-		func(p string, _ int64) (string, error) { return hashFile(p) },
+		hashFile,
 		func(c *hashCand) *string { return &c.full },
 		"UPDATE entries SET content_hash = ? WHERE path = ?",
 		waitIfPaused, progress,

@@ -53,7 +53,7 @@ func decoderFixture(t *testing.T) (*Index, []string) {
 }
 
 // TestEntryDecoderMatchesScanEntry proves the bulk decoder (scanEntries, via
-// entryDecoder) and the single-row decoder (GetEntry, via scanEntry) agree
+// entryDecoder) and the single-row decoder (GetEntry, via getOne) agree
 // field-for-field on real rows: same paths in the same order, and identical
 // Path/Type/Size/ModTime/ThumbID/DurationMs/Favorite.
 func TestEntryDecoderMatchesScanEntry(t *testing.T) {

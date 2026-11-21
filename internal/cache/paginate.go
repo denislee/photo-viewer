@@ -99,7 +99,6 @@ func (v View) whereWithCursor(op, cursor string) (string, []any) {
 		}
 	case "<":
 		if cursor <= upper {
-			frag = "(path >= ? AND path < ?)"
 			args = []any{lower, cursor}
 		}
 	case "<=":
@@ -131,10 +130,14 @@ func (i *Index) dirExactEntry(v View) *Entry {
 	}
 	typeWhere, typeArgs := typeFilterClause(v.Filter, v.ShowRAW)
 	args := append([]any{v.Dir}, typeArgs...)
-	return i.queryOne(
+	e, ok := i.getOne(
 		entrySelect+" WHERE path = ?"+
 			typeWhere+" LIMIT 1",
 		args...)
+	if !ok {
+		return nil
+	}
+	return &e
 }
 
 // CountView returns the number of entries that match the view.
@@ -220,16 +223,20 @@ func (i *Index) NeighborsWithTotal(v View, path string) (prev, next *Entry, pos 
 	// bound, so prev/next stay O(log N) and pos O(pos) instead of degrading to
 	// an O(dir size) per-row filter (C5-01).
 	prevWhere, prevArgs := v.whereWithCursor("<", path)
-	prev = i.queryOne(
+	if e, ok := i.getOne(
 		entrySelect+" WHERE "+
 			prevWhere+" ORDER BY path DESC LIMIT 1",
-		prevArgs...)
+		prevArgs...); ok {
+		prev = &e
+	}
 
 	nextWhere, nextArgs := v.whereWithCursor(">", path)
-	next = i.queryOne(
+	if e, ok := i.getOne(
 		entrySelect+" WHERE "+
 			nextWhere+" ORDER BY path ASC LIMIT 1",
-		nextArgs...)
+		nextArgs...); ok {
+		next = &e
+	}
 
 	// Bounded position: rows at or before path within the view. The cursor
 	// bound lets SQLite stop the index walk at the probe path, so this equals
@@ -296,12 +303,9 @@ func newEntryDecoder() *entryDecoder {
 	return d
 }
 
-// asInt64 reports the value as an int64 when the driver handed back an integer
-// (SQLite's only integer representation) and false otherwise, including NULL.
-func asInt64(v any) (int64, bool) {
-	n, ok := v.(int64)
-	return n, ok
-}
+// errMalformedEntryRow is the decode error for a row whose NOT NULL numeric
+// columns did not come back as integers.
+var errMalformedEntryRow = errors.New("cache: malformed entry row")
 
 // decode scans exactly one row through d and converts it to an Entry. type,
 // size and mtime are NOT NULL in every row the writer produces, so a NULL or
@@ -313,20 +317,20 @@ func (d *entryDecoder) decode(s rowScanner) (Entry, error) {
 	if err := s.Scan(d.dest[:]...); err != nil {
 		return Entry{}, err
 	}
-	typ, ok := asInt64(d.typ)
+	typ, ok := d.typ.(int64)
 	if !ok {
-		return Entry{}, errors.New("cache: malformed entry row")
+		return Entry{}, errMalformedEntryRow
 	}
-	size, ok := asInt64(d.size)
+	size, ok := d.size.(int64)
 	if !ok {
-		return Entry{}, errors.New("cache: malformed entry row")
+		return Entry{}, errMalformedEntryRow
 	}
-	mtime, ok := asInt64(d.mtime)
+	mtime, ok := d.mtime.(int64)
 	if !ok {
-		return Entry{}, errors.New("cache: malformed entry row")
+		return Entry{}, errMalformedEntryRow
 	}
-	fav, _ := asInt64(d.fav)
-	dur, _ := asInt64(d.dur)
+	fav, _ := d.fav.(int64)
+	dur, _ := d.dur.(int64)
 	return Entry{
 		Path:       d.path,
 		Type:       scan.MediaType(typ),
@@ -338,21 +342,14 @@ func (d *entryDecoder) decode(s rowScanner) (Entry, error) {
 	}, nil
 }
 
-// scanEntry decodes one row of the entryCols column list — every Entry read
-// goes through it except FindDuplicates, which hand-scans the narrower
-// path/type/size/mtime/thumb_id/content_hash projection it needs.
-func scanEntry(s rowScanner) (Entry, error) {
-	return newEntryDecoder().decode(s)
-}
-
-// queryOne runs a single-row SELECT and decodes one Entry. Returns nil when
-// the query produces no rows or fails.
-func (i *Index) queryOne(query string, args ...any) *Entry {
-	e, err := scanEntry(i.db.QueryRow(query, args...))
+// getOne runs a single-row SELECT and decodes one Entry. The bool is false
+// when the query produces no rows or fails.
+func (i *Index) getOne(query string, args ...any) (Entry, bool) {
+	e, err := newEntryDecoder().decode(i.db.QueryRow(query, args...))
 	if err != nil {
-		return nil
+		return Entry{}, false
 	}
-	return &e
+	return e, true
 }
 
 // scanEntries drains rows produced by the standard 7-column SELECT. hint is the

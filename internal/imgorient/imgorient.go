@@ -55,11 +55,13 @@ func ReadOrientation(path string) int {
 // jpegOrientation walks the marker segments and parses the EXIF APP1's TIFF
 // header in place instead; goexif is never used for a JPEG reachable that way.
 func ReadOrientationFrom(r io.Reader) int {
-	if o, ok := jpegOrientation(r); ok {
-		return o
-	}
-	if o, ok := tiffOrientation(r); ok {
-		return o
+	if ra, ok := readerAtStart(r); ok {
+		if o, ok := jpegOrientation(ra); ok {
+			return o
+		}
+		if o, ok := tiffOrientation(ra); ok {
+			return o
+		}
 	}
 	x, err := exif.Decode(r)
 	if err != nil {
@@ -76,6 +78,24 @@ func ReadOrientationFrom(r io.Reader) int {
 	return o
 }
 
+// readerAtStart returns r as an io.ReaderAt when the stream is positioned at
+// its start, where ReadAt's absolute offsets match what exif.Decode would read.
+// A non-ReaderAt, or a seeker past the start, returns false so the callers fall
+// back to goexif. Checked once here rather than in each format probe, so a TIFF
+// read pays one lseek, not two.
+func readerAtStart(r io.Reader) (io.ReaderAt, bool) {
+	ra, ok := r.(io.ReaderAt)
+	if !ok {
+		return nil, false
+	}
+	if s, ok := r.(io.Seeker); ok {
+		if pos, err := s.Seek(0, io.SeekCurrent); err != nil || pos != 0 {
+			return nil, false
+		}
+	}
+	return ra, true
+}
+
 // orientationTag is the EXIF/TIFF Orientation tag; tiffShort is the SHORT
 // field type it is stored as.
 const (
@@ -84,23 +104,11 @@ const (
 )
 
 // tiffOrientation reads the Orientation entry of IFD0 straight from a TIFF
-// header. ok is false when r is not an io.ReaderAt at offset 0 or does not
-// start with TIFF magic, in which case the caller falls back to goexif. Once
-// the magic matches, every failure (truncated IFD, absent tag, wrong type,
-// out-of-range value) yields (1, true): the file is TIFF and goexif would read
-// the same IFD0.
-func tiffOrientation(r io.Reader) (int, bool) {
-	ra, ok := r.(io.ReaderAt)
-	if !ok {
-		return 0, false
-	}
-	// ReadAt is absolute; only take the fast path when the stream is at its
-	// start, which is where exif.Decode would begin reading too.
-	if s, ok := r.(io.Seeker); ok {
-		if pos, err := s.Seek(0, io.SeekCurrent); err != nil || pos != 0 {
-			return 0, false
-		}
-	}
+// header. ok is false when ra does not start with TIFF magic, in which case the
+// caller falls back to goexif. Once the magic matches, every failure (truncated
+// IFD, absent tag, wrong type, out-of-range value) yields (1, true): the file is
+// TIFF and goexif would read the same IFD0.
+func tiffOrientation(ra io.ReaderAt) (int, bool) {
 	// One buffer serves the header, the entry count and the entry blocks: it
 	// escapes through the ReaderAt interface, so this is the only allocation.
 	var buf [64 * 12]byte
@@ -157,24 +165,15 @@ func tiffOrientation(r io.Reader) (int, bool) {
 // keeps the marker walk allocation-free after the first call.
 var jpegScratchPool = sync.Pool{New: func() any { return new([6]byte) }}
 
-// jpegOrientation walks the JPEG marker segments of r looking for the EXIF APP1
-// block and parses its embedded TIFF header directly (H5-01). ok is false when r
-// is not an io.ReaderAt at offset 0 or does not start with SOI (FF D8), in which
-// case the caller falls back to tiffOrientation/goexif. Once SOI matches, every
-// failure (truncated segment, no EXIF, absent Orientation tag, out-of-range
-// value) yields (1, true): the file is a JPEG, and 1 is what goexif would
-// produce for the same bytes. Skipping non-EXIF APP1 blocks (XMP) is the point:
-// goexif stops at the first APP1 and would miss an EXIF block that follows one.
-func jpegOrientation(r io.Reader) (int, bool) {
-	ra, ok := r.(io.ReaderAt)
-	if !ok {
-		return 0, false
-	}
-	if s, ok := r.(io.Seeker); ok {
-		if pos, err := s.Seek(0, io.SeekCurrent); err != nil || pos != 0 {
-			return 0, false
-		}
-	}
+// jpegOrientation walks the JPEG marker segments of ra looking for the EXIF APP1
+// block and parses its embedded TIFF header directly (H5-01). ok is false when ra
+// does not start with SOI (FF D8), in which case the caller falls back to
+// tiffOrientation/goexif. Once SOI matches, every failure (truncated segment, no
+// EXIF, absent Orientation tag, out-of-range value) yields (1, true): the file
+// is a JPEG, and 1 is what goexif would produce for the same bytes. Skipping
+// non-EXIF APP1 blocks (XMP) is the point: goexif stops at the first APP1 and
+// would miss an EXIF block that follows one.
+func jpegOrientation(ra io.ReaderAt) (int, bool) {
 	bp := jpegScratchPool.Get().(*[6]byte)
 	defer jpegScratchPool.Put(bp)
 	buf := bp[:]

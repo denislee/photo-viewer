@@ -4,9 +4,11 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"maps"
 	"os"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -25,6 +27,12 @@ const LargeThumbSize = 512
 
 // LargeThumbDir is the cache subdirectory of the LargeThumbSize tier.
 const LargeThumbDir = "thumbs-512"
+
+// ThumbDir is the cache subdirectory of the default ThumbSize tier.
+const ThumbDir = "thumbs"
+
+// HLSDir is the cache subdirectory of the HLS transcode cache.
+const HLSDir = "hls"
 
 // DisplaySize is the target longest-edge of the larger "display" renditions
 // the webserver serves to the browser viewer (W-03). A file a browser can't
@@ -111,7 +119,7 @@ type ThumbStore struct {
 }
 
 func NewThumbStore(cacheDir string) (*ThumbStore, error) {
-	return newStore(cacheDir, "thumbs", ThumbSize, nil, nil)
+	return newStore(cacheDir, ThumbDir, ThumbSize, nil, nil)
 }
 
 // NewDisplayStore constructs a second store rooted at <cacheDir>/display that
@@ -188,11 +196,7 @@ func (s *ThumbStore) Tier(subdir string, size int) (*ThumbStore, error) {
 func (s *ThumbStore) tierList() []*ThumbStore {
 	s.tierMu.Lock()
 	defer s.tierMu.Unlock()
-	out := make([]*ThumbStore, 0, len(s.tiers))
-	for _, t := range s.tiers {
-		out = append(out, t)
-	}
-	return out
+	return slices.Collect(maps.Values(s.tiers))
 }
 
 // sweepStaleTmp walks root once, removing crash-orphaned "*.tmp" files older
@@ -407,10 +411,7 @@ func (s *ThumbStore) generate(ctx context.Context, e Entry, dst string) error {
 // Forget deletes the thumbnail file for the given thumb id, if any, in this
 // store and its tiers.
 func (s *ThumbStore) Forget(id string) {
-	s.flightMu.Lock()
-	delete(s.failed, id)
-	s.flightMu.Unlock()
-	os.Remove(s.thumbPath(id))
+	s.Discard(id)
 	for _, t := range s.tierList() {
 		t.Forget(id)
 	}

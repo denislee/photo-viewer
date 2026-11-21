@@ -7,12 +7,19 @@ import (
 	"path/filepath"
 )
 
+// cacheDirName and dbFileName are the names Locate and IndexPath use for the
+// cache directory and the index database inside the library root.
+const (
+	cacheDirName = ".photo-viewer-cache"
+	dbFileName   = ".photo-viewer.db"
+)
+
 // CacheDir returns the directory where thumbnails and other generated files
 // for an explicitly chosen library (--root) are written: <libraryRoot>/
 // .photo-viewer-cache, so the cache travels with the library. Falls back to
 // the per-user cache dir when the library root is not writable.
 func CacheDir(libraryRoot string) (string, error) {
-	candidate := filepath.Join(libraryRoot, ".photo-viewer-cache")
+	candidate := filepath.Join(libraryRoot, cacheDirName)
 	if writable(candidate) {
 		return candidate, nil
 	}
@@ -50,13 +57,15 @@ func Locate(libraryRoot string, inRoot bool) (cacheDir, dbPath string, err error
 		if err != nil {
 			return "", "", err
 		}
+		// IndexPath probes the root itself: a writable cache dir does not
+		// prove the root writable (it may predate a read-only remount).
 		return cacheDir, IndexPath(libraryRoot, cacheDir), nil
 	}
 	cacheDir, err = UserCacheDir()
 	if err != nil {
 		return "", "", err
 	}
-	if local := filepath.Join(libraryRoot, ".photo-viewer.db"); fileExists(local) {
+	if local := filepath.Join(libraryRoot, dbFileName); fileExists(local) {
 		return cacheDir, local, nil
 	}
 	return cacheDir, hashedIndexPath(libraryRoot, cacheDir), nil
@@ -72,7 +81,7 @@ func fileExists(p string) bool {
 // the media), but falls back to a hashed name inside cacheDir if the library
 // root is read-only.
 func IndexPath(libraryRoot, cacheDir string) string {
-	local := filepath.Join(libraryRoot, ".photo-viewer.db")
+	local := filepath.Join(libraryRoot, dbFileName)
 	if fileExists(local) {
 		// Existing database found in library root.
 		return local

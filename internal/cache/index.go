@@ -477,20 +477,21 @@ func (i *Index) reconcile(results []scan.Result, out *[]Entry) int {
 	return changed
 }
 
-// reconcileStatement lazily prepares the long-lived reconcile upsert. The
-// statement survives across batches — over a full library scan that's tens
-// of thousands of avoided Prepare calls.
-func (i *Index) reconcileStatement() (*sql.Stmt, error) {
+// stmt returns the long-lived prepared statement at p, preparing q on first
+// use. Hot writers (scan reconcile, face writes) reuse the statement for the
+// life of the *Index instead of paying a Prepare per call; stmtMu serialises
+// the lazy preparation.
+func (i *Index) stmt(p **sql.Stmt, q string) (*sql.Stmt, error) {
 	i.stmtMu.Lock()
 	defer i.stmtMu.Unlock()
-	if i.reconcileStmt != nil {
-		return i.reconcileStmt, nil
+	if *p != nil {
+		return *p, nil
 	}
-	s, err := i.db.Prepare(reconcileInsertSQL)
+	s, err := i.db.Prepare(q)
 	if err != nil {
 		return nil, err
 	}
-	i.reconcileStmt = s
+	*p = s
 	return s, nil
 }
 
@@ -500,7 +501,7 @@ func (i *Index) reconcileStatement() (*sql.Stmt, error) {
 // prepare, transaction begin, any row exec, or commit fails; entries are only
 // appended to out, and the count only returned, when the transaction commits.
 func (i *Index) reconcileChunk(chunk []scan.Result, out *[]Entry) (int, error) {
-	stmt, err := i.reconcileStatement()
+	stmt, err := i.stmt(&i.reconcileStmt, reconcileInsertSQL)
 	if err != nil {
 		return 0, err
 	}
@@ -532,11 +533,7 @@ func (i *Index) reconcileChunk(chunk []scan.Result, out *[]Entry) (int, error) {
 			ThumbID:    ThumbIDFor(r.Path),
 			DurationMs: r.DurationMs,
 		}
-		var yearArg any
-		if y := pathYear(r.Path); y != 0 {
-			yearArg = y
-		}
-		res, err := txStmt.Exec(e.Path, e.Type, e.Size, e.ModTime.Unix(), e.ThumbID, yearArg, e.DurationMs)
+		res, err := txStmt.Exec(e.Path, e.Type, e.Size, e.ModTime.Unix(), e.ThumbID, yearArg(r.Path), e.DurationMs)
 		if err != nil {
 			return 0, err
 		}
@@ -601,7 +598,7 @@ func pathYear(path string) int {
 		return 0
 	}
 	y := 0
-	for k := 0; k < len(dir); k++ {
+	for k := range len(dir) {
 		if k == 4 || k == 7 {
 			continue
 		}
@@ -617,6 +614,15 @@ func pathYear(path string) int {
 		return 0
 	}
 	return y
+}
+
+// yearArg returns path's parent-dir year as a bind argument, or nil when the
+// parent is not a YYYY-MM-DD directory so the stored year stays NULL.
+func yearArg(path string) any {
+	if y := pathYear(path); y != 0 {
+		return y
+	}
+	return nil
 }
 
 // yearExpr is the SQL expression for the per-entry year: prefer the stored
@@ -979,12 +985,8 @@ func (i *Index) MovePath(oldPath, newPath string) error {
 	); err != nil {
 		return err
 	}
-	var yearArg any
-	if y := pathYear(newPath); y != 0 {
-		yearArg = y
-	}
 	res, err := tx.Exec("UPDATE entries SET path = ?, thumb_id = ?, year = ? WHERE path = ?",
-		newPath, ThumbIDFor(newPath), yearArg, oldPath)
+		newPath, ThumbIDFor(newPath), yearArg(newPath), oldPath)
 	if err != nil {
 		return err
 	}
