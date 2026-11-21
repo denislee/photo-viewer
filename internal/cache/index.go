@@ -89,11 +89,12 @@ type Entry struct {
 	Favorite   bool  `json:"favorite"`
 }
 
-// entryCols is the ordered column list backing every Entry read. It must stay
-// in lockstep with entryDecoder.dest (and decode's conversions) in paginate.go,
-// the one place that consumes it. entrySelect is the bare "SELECT <cols> FROM
-// entries" prefix that every entry query builds on by appending its own
-// WHERE/ORDER/LIMIT tail.
+// entryCols is the ordered column list backing the standard Entry read. It
+// must stay in lockstep with entryDecoder.dest (and decode's conversions) in
+// paginate.go. entrySelect is the bare "SELECT <cols> FROM entries" prefix that
+// every entry query builds on by appending its own WHERE/ORDER/LIMIT tail.
+// FindDuplicates scans its own narrower projection (no favorite/duration_ms),
+// which must be kept in sync by hand.
 const (
 	entryCols   = "path, type, size, mtime, thumb_id, favorite, duration_ms"
 	entrySelect = "SELECT " + entryCols + " FROM entries"
@@ -377,7 +378,7 @@ func Load(dbPath string) (*Index, error) {
 		// cluster centroids toward vanished files. Sweep the orphans, then null
 		// any cluster sample_face_id left dangling by the sweep. Both statements
 		// are no-ops on a database that never had orphans (e.g. a fresh one).
-		// Going forward RemoveEntry/RemoveEntries delete face rows and MoveFaces
+		// Going forward RemoveEntry/RemoveEntries delete face rows and MovePath
 		// relocates them, so no new orphans accrue.
 		_, _ = db.Exec("DELETE FROM faces WHERE path NOT IN (SELECT path FROM entries)")
 		_, _ = db.Exec("UPDATE face_clusters SET sample_face_id = NULL " +
@@ -509,9 +510,9 @@ func (i *Index) reconcileChunk(chunk []scan.Result, out *[]Entry) (int, error) {
 	}
 	defer tx.Rollback()
 
-	// On update, clear quick_hash and content_hash whenever size or mtime
-	// changed so a re-hash kicks in on the next duplicate scan. (SQLite's
-	// `entries.column` inside DO UPDATE refers to the existing row.)
+	// Bind the shared upsert to this chunk's transaction. The SQL itself (see
+	// reconcileInsertSQL) clears the cached hashes whenever size or mtime
+	// changed, so a re-hash kicks in on the next duplicate scan.
 	txStmt := tx.Stmt(stmt)
 	defer txStmt.Close()
 

@@ -22,11 +22,11 @@ const (
 	processBarHeaderDp = 26
 )
 
-// ProcessBar is the strip below the toolbar that lists every in-flight
-// background task (import, refresh scan, thumbnail warm-up, duplicates
-// hashing, organize) with a progress bar and Pause / Resume / Cancel /
-// Open controls per row. Collapsed it shows a one-line summary; expanded
-// shows the per-process detail.
+// ProcessBar is the strip at the bottom of the window that lists every
+// in-flight background task (import, refresh scan, thumbnail warm-up,
+// duplicates hashing, organize) with a progress bar and Pause / Resume /
+// Cancel / Open controls per row. Collapsed it shows a one-line summary;
+// expanded shows the per-process detail.
 type ProcessBar struct {
 	registry *ProcessRegistry
 

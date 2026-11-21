@@ -528,9 +528,9 @@ type subdirCacheEntry struct {
 }
 
 // cachedSubdirs returns dir's immediate child directories, reusing the listing
-// cached for that directory while its mtime is unchanged. An empty dir, or one
-// that can't be stat'ed, is not cached: the former has no listing to keep and
-// the latter should surface the directory's real state on every call.
+// cached for that directory while its mtime is unchanged. An empty listing is
+// cached like any other; a directory that can't be stat'ed is not cached, so
+// its real state surfaces on every call.
 func (s *Server) cachedSubdirs(dir string) []string {
 	if dir == "" {
 		return nil
@@ -570,8 +570,9 @@ type childCountKey struct {
 }
 
 // cachedChildCounts returns the per-child-directory entry counts under dir,
-// reusing a cached map while it is younger than sidebarCacheTTL and the index
-// generation is unchanged.
+// reusing a cached map for sidebarCacheTTL and invalidating it when the index
+// generation changes. Past the TTL the stale map is served while one
+// background refresh runs (stale-while-revalidate).
 //
 // The returned map is shared with other callers — it must be read, never
 // mutated. renderSidebar and the chip renderer only index into it.

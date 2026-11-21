@@ -211,7 +211,6 @@ func (i *Index) ListPage(v View, offset, limit int) []Entry {
 //     at the probe path, so the position costs O(pos) instead of the O(view)
 //     COUNT+SUM aggregate the old combined query paid.
 //
-// For the same inputs the returned prev/next/pos are identical to Neighbors.
 // Each statement's WHERE is whereClause() narrowed by the probe (see
 // whereWithCursor), so it selects exactly the rows CountView totals over and
 // pos can never disagree about which rows belong to the view.
@@ -244,7 +243,7 @@ func (i *Index) NeighborsWithTotal(v View, path string) (prev, next *Entry, pos 
 	// (== Dir) sorts strictly before every range row, so relative to the probe
 	// `path` it can only ever be the smallest element. Therefore:
 	//   - it bumps pos when it is <= path (CountView folds the same row in,
-	//     matching what Neighbors reports);
+	//     so the two never disagree);
 	//   - it becomes `prev` only when no range row precedes path (it's the sole
 	//     predecessor);
 	//   - it becomes `next` only when it itself follows path (then it's smaller
@@ -339,8 +338,9 @@ func (d *entryDecoder) decode(s rowScanner) (Entry, error) {
 	}, nil
 }
 
-// scanEntry is the single decoder for the entryCols column list. Every Entry
-// read goes through it, so adding a column is a one-site change.
+// scanEntry decodes one row of the entryCols column list. Most Entry reads go
+// through it; FindDuplicates hand-scans its own narrower six-column projection,
+// so it needs updating alongside entryCols.
 func scanEntry(s rowScanner) (Entry, error) {
 	return newEntryDecoder().decode(s)
 }

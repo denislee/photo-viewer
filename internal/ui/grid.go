@@ -623,8 +623,8 @@ func cachedBadgeLabel(gtx layout.Context, key badgeLabelKey, record func(gtx lay
 	return lbl
 }
 
-// drawGlyphBadge draws glyph centred in a favouriteBadgeSize square, inset by
-// favouriteBadgeInset from the given corner of cell, over a dark backdrop so
+// drawGlyphBadge draws glyph centred in a favoriteBadgeSize square, inset by
+// favoriteBadgeInset from the given corner of cell, over a dark backdrop so
 // the glyph stays legible on any thumbnail content. It returns the square's
 // rectangle so callers can hang more chrome off it. This is the one drawing
 // path shared by the favourite, selection and video badges (G4-10).
@@ -705,10 +705,10 @@ func drawVideoBadge(gtx layout.Context, th *Theme, cell image.Rectangle, duratio
 	}
 }
 
-// drawDurationBadge renders a small "MM:SS" pill in the bottom-left of the
-// cell, immediately to the left of the ▶ play badge. badgeLeftX is the left
-// edge of the play badge so the duration pill butts up against it with a
-// small gap. bottomY is the bottom edge shared with the play badge.
+// drawDurationBadge renders a small "MM:SS" pill immediately left of the ▶
+// play badge. badgeLeftX is the play badge's left edge, so the pill butts up
+// against it with a small gap; bottomY is the bottom edge they share. When the
+// pill does not fit, it is clamped to the cell's left inset.
 func drawDurationBadge(gtx layout.Context, th *Theme, cell image.Rectangle, badgeLeftX, bottomY int, text string) {
 	pad := gtx.Dp(favoriteBadgeInset)
 	size := gtx.Dp(favoriteBadgeSize)
@@ -742,8 +742,8 @@ func drawDurationBadge(gtx layout.Context, th *Theme, cell image.Rectangle, badg
 	x1 := badgeLeftX - hGap
 	x0 := x1 - pillW
 	if x0 < cell.Min.X+pad {
-		// Not enough room in the cell — fall back to drawing inside the play
-		// badge column. Shrink rather than overlap.
+		// Not enough room left of the play badge — clamp the pill to the
+		// cell's left inset, widening it if the clamp would invert it.
 		x0 = cell.Min.X + pad
 		if x1 <= x0 {
 			x1 = x0 + pillW

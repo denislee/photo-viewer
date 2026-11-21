@@ -7,8 +7,8 @@ import (
 
 // ttlCache memoizes compute(key) for ttl, invalidating an entry early when the
 // caller's generation (Index.Generation() for index-derived values) moves on.
-// It replaces three hand-rolled copies of the same TTL + generation + mutex
-// logic (sidebar aggregate, per-view counts, trash listing; W4-02).
+// It backs the trash listing, sidebar aggregate, per-view counts, child counts
+// and HLS duration memo (W4-02).
 //
 // The lock is only held to read or write the map, never across compute, so a
 // slow recompute for one key no longer stalls lookups of unrelated keys (W3-01).
@@ -110,8 +110,10 @@ func (c *ttlCache[K, V]) refresh(key K, f *ttlFlight[V], gen uint64, compute fun
 }
 
 // get returns the cached value for key when it is younger than ttl and was
-// computed at generation gen; otherwise it runs compute (outside the lock),
-// stores the result and returns it.
+// computed at generation gen. With swr enabled, an expired entry whose
+// generation still matches is returned immediately while one background flight
+// recomputes it. Otherwise — swr disabled, a generation mismatch, or a missing
+// entry — get runs compute outside the lock, stores the result and returns it.
 func (c *ttlCache[K, V]) get(key K, gen uint64, compute func() V) V {
 	c.mu.Lock()
 	if e, ok := c.m[key]; ok && e.gen == gen {

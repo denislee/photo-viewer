@@ -459,8 +459,6 @@ func (v *Viewer) preloadVideoIfNeeded() {
 
 // cachePut inserts img for e at the MRU end of v.recent, replacing any older
 // decode of the same path and evicting the oldest entry past viewerRecentCap.
-// A smaller decode never replaces a larger one of the same source version (a
-// late prefetch landing after an upgrade).
 func (v *Viewer) cachePut(e cache.Entry, d decodedImage) {
 	v.recentMu.Lock()
 	defer v.recentMu.Unlock()
@@ -515,7 +513,8 @@ func (v *Viewer) cacheGet(e cache.Entry) (recentImage, bool) {
 	return recentImage{}, false
 }
 
-// cacheHasEntry is cacheHas that also requires the source mtime to match.
+// cacheHasEntry reports whether v.recent holds a decode of e whose source mtime
+// still matches e's, so a re-edited file is never served from the cache.
 func (v *Viewer) cacheHasEntry(e cache.Entry) bool {
 	v.recentMu.Lock()
 	defer v.recentMu.Unlock()

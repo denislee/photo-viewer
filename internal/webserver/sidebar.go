@@ -67,9 +67,9 @@ func (s *Server) renderSidebar(w http.ResponseWriter, vi viewInfo, dirChildren [
 	// When viewing a directory, surface its child folders as a nested
 	// section so the user can drill down instead of paginating through
 	// a 100k-photo flat list. This is per-directory, so it stays off the
-	// cached root aggregate and pays one live count query for the open dir —
-	// which renderGalleryPage runs once and passes in as dirChildren/
-	// dirChildCounts, shared with renderSubdirChips (W-08).
+	// cached root aggregate and pays one cached count lookup for the open
+	// dir — which renderGalleryPage resolves once and passes in as
+	// dirChildren/dirChildCounts, shared with renderSubdirChips (W-08).
 	if v.Kind == "dir" && len(dirChildren) > 0 {
 		fmt.Fprintf(w, `<div class="sec">In %s</div>`, html.EscapeString(filepath.Base(v.Dir)))
 		s.renderSubdirsGrouped(w, dirChildren, dirChildCounts, vi)
@@ -91,20 +91,23 @@ func (s *Server) renderSidebar(w http.ResponseWriter, vi viewInfo, dirChildren [
 // trashEntriesTTL, a few seconds coalesces a navigation burst (every page
 // render re-derives the same aggregate scans) without letting counts drift
 // noticeably after an import, rebuild, or favorite toggle. Past the TTL the
-// stale aggregate is served while one background refresh runs (W5-01), so
-// counts may lag by one page view after an import or a GUI-side change; the web
-// UI's own favorite toggle clears the caches, so its counts stay exact.
+// stale aggregate is served while one background refresh runs (W5-01). It
+// wraps view-count and child-count caches that are themselves
+// stale-while-revalidate, so counts can lag by up to two refresh cycles after
+// an import or a GUI-side change (W6-01). The web UI's own favorite toggle
+// clears the sidebar and view-count caches explicitly.
 const sidebarCacheTTL = 5 * time.Second
 
 const viewCountTTL = 5 * time.Second
 
-// viewCountCacheCap bounds viewCountCache before the miss path sweeps it. The
-// cache keys on the full cache.View (dir path × filter × raw), so a long-lived
-// server browsing many directories would otherwise accumulate one entry per
-// distinct view ever rendered — the TTL only marks entries stale and overwrites
-// them in place, it never deletes, so the map grows without bound (W-07). Past
-// this many entries the miss path drops everything the TTL has already made
-// stale in one O(n) pass; the cap keeps that pass off the common path.
+// viewCountCacheCap bounds the view-count cache before the insert path sweeps
+// it. The cache keys on the full cache.View (dir path × filter × raw), so a
+// long-lived server browsing many directories would otherwise accumulate one
+// entry per distinct view ever rendered — the TTL only marks entries stale and
+// overwrites them in place, it never deletes, so the map grows without bound
+// (W-07). Past this many entries the insert path drops everything the TTL has
+// already made stale in one O(n) pass; the cap keeps that pass off the common
+// path. The child-count cache uses the same cap.
 const viewCountCacheCap = 1024
 
 // cachedCountView returns the count for v, reusing a cached value if it is
@@ -118,11 +121,13 @@ func (s *Server) cachedCountView(v cache.View) int {
 }
 
 // rootSidebarAgg returns the cached library-root sidebar aggregate for the
-// given filter/raw toggles, recomputing it when the entry is missing, older
-// than sidebarCacheTTL, or the index was cleared (generation mismatch). The
-// recompute runs outside the cache lock, so concurrent renders of other
-// toggles don't queue behind it, and the All/Favorites totals share the
-// view-count cache with the gallery header (W3-01).
+// given filter/raw toggles, recomputing it when the entry is missing or the
+// index was cleared (generation mismatch). An entry older than
+// sidebarCacheTTL is served stale while one background refresh recomputes it
+// (stale-while-revalidate). The recompute runs outside the cache lock, so
+// concurrent renders of other toggles don't queue behind it, and the
+// All/Favorites totals share the view-count cache with the gallery header
+// (W3-01).
 func (s *Server) rootSidebarAgg(filter string, showRAW bool) *sidebarAgg {
 	key := sidebarKey{filter: filter, showRAW: showRAW}
 	return s.sidebar.get(key, s.index.Generation(), func() *sidebarAgg {

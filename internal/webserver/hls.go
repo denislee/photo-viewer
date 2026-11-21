@@ -48,13 +48,16 @@ const (
 	hlsPlaylistCacheControl = "private, max-age=60"
 
 	// hlsSegTimeout caps one on-the-fly segment transcode and hlsProbeTimeout
-	// caps the playlist duration probe. Both guard the same wedge: ffmpeg /
-	// ffprobe holds one of only NumCPU/2 hlsSem slots, so a handful of hung
-	// children would starve HLS entirely until restart. The per-op deadlines
-	// are further derived from r.Context() (see below) so a client disconnect
-	// — e.g. a seek-happy Safari session that has already moved on — cancels
-	// the transcode instead of leaving minutes of dead work queued ahead of
-	// the segment actually wanted.
+	// caps the playlist duration probe. Both guard against a wedged child
+	// outliving its usefulness: ffmpeg holds one of only NumCPU/2 hlsSem
+	// slots, so a handful of hung children would starve HLS entirely until
+	// restart, and a hung ffprobe would hang the playlist request. The
+	// segment transcode deadline is further derived from r.Context() (see
+	// below) so a client disconnect — e.g. a seek-happy Safari session that
+	// has already moved on — cancels the transcode instead of leaving minutes
+	// of dead work queued ahead of the segment actually wanted. The duration
+	// probe is not request-cancellable (see hlsDuration): its result is shared
+	// by every request waiting on the key.
 	hlsSegTimeout   = 2 * time.Minute
 	hlsProbeTimeout = 15 * time.Second
 
@@ -516,9 +519,11 @@ func sweepHLSDir(root string, maxBytes int64, tmpMaxAge time.Duration, now time.
 }
 
 // probeDuration returns the container duration in seconds via ffprobe. The
-// probe is bounded by hlsProbeTimeout (and cancelled if the requesting client
-// disconnects) so a wedged ffprobe can't hang the playlist request or hold a
-// worker; on failure the caller returns a 500, exactly as before.
+// probe is bounded by hlsProbeTimeout; it is not cancelled when the requesting
+// client disconnects, because hlsDuration detaches it with
+// context.WithoutCancel so one shared probe isn't memoised as a failure. A
+// wedged ffprobe therefore can't hang the playlist request past the timeout;
+// on failure the caller returns a 500, exactly as before.
 func probeDuration(ctx context.Context, path string) (float64, error) {
 	if !tools.FFprobe() {
 		return 0, fmt.Errorf("ffprobe not installed")

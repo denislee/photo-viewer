@@ -21,9 +21,9 @@ const (
 	toolbarTooltipPadV = 4
 )
 
-// Toolbar is the slim top bar above the main split. Shows the active path,
-// the entry count, and an icon-button row that mirrors the Fyne build's
-// actions (filter, RAW toggle, import, duplicates, settings, rebuild).
+// Toolbar is the slim top bar above the main split. Shows the active path, the
+// entry count, and an icon-button row: filters, RAW, grouping, sort, import,
+// duplicates, organize, export, settings, rebuild, warm-up and web server.
 type Toolbar struct {
 	allBtn        widget.Clickable
 	photosBtn     widget.Clickable

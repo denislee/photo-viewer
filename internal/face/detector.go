@@ -217,8 +217,8 @@ func spawnDaemon() (*daemon, error) {
 	cmd.Stderr = os.Stderr
 	// Pin the child to a single OpenMP thread. dlib/numpy otherwise spin up one
 	// OMP thread per core in *every* daemon, so N daemons × NumCPU threads
-	// thrash the scheduler for no throughput gain (each detection is already a
-	// separate process). One thread per daemon is both cheaper and faster here.
+	// thrash the scheduler for no throughput gain (each daemon is already its
+	// own process). One thread per daemon is both cheaper and faster here.
 	cmd.Env = env
 	stdin, err := cmd.StdinPipe()
 	if err != nil {

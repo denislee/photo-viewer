@@ -18,9 +18,9 @@ import (
 const (
 	// maxWorkers caps the number of concurrent daemons. Each pv-face-detect
 	// --server child loads dlib + numpy (~300–500 MB RSS), so on a 16-core box
-	// one-per-CPU would burn 5–8 GB and thrash OpenMP threads. Detection is
-	// coarse-grained (a separate process per call) so 4 in flight already keeps
-	// the disk/CPU busy without the memory blow-up.
+	// one-per-CPU would burn 5–8 GB and thrash OpenMP threads. Each worker
+	// drives one long-running daemon, so 4 in flight already keeps the
+	// disk/CPU busy without the memory blow-up.
 	maxWorkers = 4
 	// detectTimeout bounds a single Detect call. A HOG detect on a thumbnail is
 	// tens of milliseconds; 60s is a generous ceiling that still guarantees a
@@ -40,8 +40,9 @@ type Job struct {
 	ThumbMod  int64 // mtime of the thumbnail used for invalidation
 }
 
-// OnClusterChange is called when a new cluster is created or an existing one
-// grows. The UI uses it to refresh the People list.
+// OnClusterChange is called after a face creates a new cluster. No current
+// caller passes one; the hook exists for a UI that needs to refresh a People
+// list.
 type OnClusterChange func()
 
 // Pipeline owns a worker pool that detects faces and writes them into the
@@ -74,9 +75,10 @@ type Pipeline struct {
 	clusterCacheOK bool
 
 	// freshnessMu guards freshness, an in-memory mirror of the latest
-	// thumb_mtime stored per-path in the faces table. acceptJob consults
-	// it instead of running a COUNT(*) per Submit. Populated lazily on
-	// first need; updated by process() after it successfully writes faces.
+	// thumb_mtime stored per-path in entries.face_thumb_mtime (F5-01).
+	// acceptJob consults it instead of running a COUNT(*) per Submit.
+	// Populated lazily on first need; updated by process() after it
+	// successfully writes faces.
 	freshnessMu sync.RWMutex
 	freshness   map[string]int64
 }
@@ -124,10 +126,11 @@ func (p *Pipeline) Start(parent context.Context) {
 	}
 	ctx, cancel := context.WithCancel(parent)
 	p.cancel = cancel
-	// Detection is CPU-bound (HOG + dlib feature extraction) with a separate
-	// process per call, so one-per-CPU is the natural ceiling; maxWorkers then
-	// caps the daemon count so we don't spawn a dlib child per core on big
-	// machines. Floor of 2 so even a single-core box overlaps I/O and compute.
+	// Detection is CPU-bound (HOG + dlib feature extraction) and each worker
+	// drives one long-running daemon, so one-per-CPU is the natural ceiling;
+	// maxWorkers then caps the daemon count so we don't spawn a dlib child per
+	// core on big machines. Floor of 2 so even a single-core box overlaps I/O
+	// and compute.
 	n := min(max(runtime.NumCPU(), 2), maxWorkers)
 	jobs := make(chan Job, n*4)
 	quit := make(chan struct{})

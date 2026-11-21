@@ -24,7 +24,9 @@ type Result struct {
 	DurationMs int64
 }
 
-// WalkOptions configures WalkWith. The zero value probes every video via ffprobe.
+// WalkOptions configures WalkWith. The zero value knows no cached durations:
+// every video's duration is resolved, reading an ISO-BMFF mvhd box natively and
+// falling back to ffprobe when that fails.
 type WalkOptions struct {
 	// KnownDurationMs, if non-nil, is consulted before launching ffprobe
 	// against a video. Return > 0 for a known duration, DurationProbeFailed
@@ -72,7 +74,7 @@ func send(ctx context.Context, ch chan<- Result, r Result) bool {
 // The pipeline has two stages so the cheap d.Info()/stat work isn't blocked by
 // the per-video ffprobe fork:
 //
-//	walker → metaJobs → metaWorkers (NumCPU)
+//	walker → metaJobs → metaWorkers (max(NumCPU, 4))
 //	            ├─ non-video Result → out
 //	            └─ video → probeJobs → probeWorkers (≤ maxProbeWorkers) → out
 //

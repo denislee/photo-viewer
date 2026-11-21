@@ -16,7 +16,8 @@ import (
 // are fully self-contained: a single inline <style> block in <head>
 // (style-src 'unsafe-inline'), inline <script> blocks for the grid/viewer
 // keybindings and the HLS src picker (script-src 'unsafe-inline'), and
-// <img>/<video> sources that are all same-origin /thumb, /media and /hls URLs.
+// <img>/<video> sources that are all same-origin /thumb, /media, /display
+// and /hls URLs.
 // No external host, font, or XHR target is ever loaded, so pinning every fetch
 // directive to 'self' costs the pages nothing while blocking any injected
 // off-origin resource. object-src 'none', base-uri 'self', form-action 'self'
@@ -59,7 +60,7 @@ const (
 )
 
 // authThrottle bounds password guessing without leaking a map entry per
-// attacker IP forever (mirrors the viewCountCache sweep, W-07): an IP idle for
+// attacker IP forever (mirrors the ttlCache sweep, W-07): an IP idle for
 // a full refill window carries no state — its bucket has refilled to capacity,
 // making it indistinguishable from a fresh one — so the insert path sweeps such
 // entries once the map grows past authThrottleSweepAt. A hard cap stops growth

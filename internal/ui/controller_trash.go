@@ -261,9 +261,8 @@ func (c *Controller) performDeletion(paths []string, recount bool) {
 }
 
 // isInTrash reports whether path lives under the trash dir. Used so a
-// "delete" gesture inside the Trash view permanently removes the item
-// instead of trying to soft-delete it (which would be a no-op rename onto
-// itself).
+// "delete" gesture inside the Trash view restores the item instead of trying
+// to soft-delete it (which would be a no-op rename onto itself).
 func (c *Controller) isInTrash(path string) bool {
 	if c.trashDir == "" {
 		return false

@@ -4,9 +4,9 @@
 // EXIF Orientation tag entirely: they hand back the pixels exactly as stored,
 // so a portrait photo shot on a camera that recorded "rotate 90°" in EXIF
 // decodes sideways. Anything that re-encodes such an image (export
-// recompression today; thumbnail generation in a follow-up) and does NOT copy
-// the original EXIF forward would otherwise produce a permanently-rotated file
-// with no tag left to correct it.
+// recompression and thumbnail generation) and does NOT copy the original EXIF
+// forward would otherwise produce a permanently-rotated file with no tag left
+// to correct it.
 //
 // The package is intentionally standalone and dependency-light (image + goexif
 // only) so it can be reused wherever a decoded image needs to be made upright.

@@ -13,8 +13,8 @@ import (
 	"github.com/dns/photo-viewer/internal/fsutil"
 )
 
-// Config is the small persisted-prefs replacement for the Fyne build's
-// fyne.Preferences. Stored at ~/.config/photo-viewer/config.json.
+// Config holds the persisted user preferences, loaded from and saved to
+// ~/.config/photo-viewer/config.json.
 type Config struct {
 	InboxDir           string `json:"inbox_dir"`
 	OutboxDir          string `json:"outbox_dir"`

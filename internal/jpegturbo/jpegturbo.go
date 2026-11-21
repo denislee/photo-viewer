@@ -1,7 +1,8 @@
-// Package jpegturbo decodes JPEGs with libjpeg-turbo's TurboJPEG 3 API in
-// process. It is 2.5–3× faster than image/jpeg, can decode straight to a
-// reduced size through DCT scaling (1/2, 1/4, 1/8 …), and writes RGBA directly,
-// so the result needs no further conversion before it is handed to Gio.
+// Package jpegturbo decodes and encodes JPEGs with libjpeg-turbo's TurboJPEG 3
+// API in process. Decoding is 2.5–3× faster than image/jpeg, can decode straight
+// to a reduced size through DCT scaling (1/2, 1/4, 1/8 …), and writes RGBA
+// directly, so the result needs no further conversion before it is handed to
+// Gio. Encoding is roughly 10× faster than image/jpeg (T5-03).
 //
 // The cgo binding is built by default. Building with the nojpegturbo tag (or
 // with cgo disabled) swaps in a stub whose Available reports false, so callers
@@ -13,8 +14,8 @@ import (
 	"image"
 )
 
-// ErrUnavailable is returned by DecodeFit when the package was built without
-// libjpeg-turbo.
+// ErrUnavailable is returned by DecodeFit and EncodeRGBA when the package was
+// built without libjpeg-turbo.
 var ErrUnavailable = errors.New("jpegturbo: built without libjpeg-turbo")
 
 // IsJPEG reports whether data starts with a JPEG SOI marker.

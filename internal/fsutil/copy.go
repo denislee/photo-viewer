@@ -18,7 +18,7 @@ import (
 //
 // A plain rename can't cross filesystems (EXDEV) — an SD card or a separate
 // library disk is the common case — so only then does it fall back to a
-// crash-safe copy (WriteUnique) that claims its name the same no-replace way,
+// crash-safe copy (CopyUnique) that claims its name the same no-replace way,
 // fsyncs dir so the new entry is durable, and only then removes src. Every other
 // rename error (permission denied, disk full, …) is returned as is instead of
 // being masked by a silent copy. Cancelling ctx aborts the copy and leaves src

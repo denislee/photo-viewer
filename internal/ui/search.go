@@ -441,8 +441,8 @@ func scoreCandidate(ql string, c searchCandidate) (int, bool) {
 }
 
 // appendFuzzyResult scores candidate c (at index i) against the lowercased
-// query ql and appends a searchResult to out when it matches. Shared by the
-// full and incremental scan paths so both assign identical scores.
+// query ql and appends a searchResult to out when it matches. Used by the
+// incremental narrowing path, which reuses the scores' idx values.
 func appendFuzzyResult(out []searchResult, ql string, i int, c searchCandidate) []searchResult {
 	if sc, ok := scoreCandidate(ql, c); ok {
 		return append(out, searchResult{idx: i, score: sc})

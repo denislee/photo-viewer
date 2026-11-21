@@ -953,7 +953,9 @@ func drawTagPill(gtx layout.Context, th *Theme, text string, bg color.NRGBA) lay
 	return dims
 }
 
-// shortPath trims a path to its trailing component(s) for compact display.
+// shortPath keeps a long path readable by trimming it to its trailing ~47 bytes,
+// cut on a rune boundary and prefixed with an ellipsis; shorter paths pass
+// through unchanged.
 func shortPath(p string) string {
 	if len(p) <= 48 {
 		return p

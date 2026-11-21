@@ -222,6 +222,7 @@ func (s *Sidebar) Layout(gtx layout.Context, th *Theme, root, treeDir, highlight
 // buildRows materializes the visible row list, applying year-grouping when
 // requested. The order is:
 //   - Favorites
+//   - Trash
 //   - library root
 //   - ".. (parent)" if treeDir != root
 //   - non-date subdirs (alphabetical)

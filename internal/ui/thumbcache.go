@@ -34,12 +34,13 @@ const thumbCacheCapacity = 1024
 const thumbCacheShards = 16
 
 // A thumbnail whose generation fails (corrupt file, or a missing external tool
-// in the supported degraded mode) must not be re-queued every frame — that
-// re-runs ThumbStore.Path, which for RAW/HEIC/video forks exiftool/heif-convert/
-// ffmpeg once per frame per broken file, a constant fork loop that pegs a core.
-// Instead a failed entry is marked and retried no sooner than an exponential
-// backoff from thumbRetryBase up to thumbRetryMax, so a transient failure still
-// heals while a permanent one costs one attempt per (growing) interval.
+// in the supported degraded mode) must not be re-queued every frame: each
+// attempt re-enters the thumbnail pipeline, and ThumbStore's failure memo
+// (C5-06) only skips the external-tool fork — the request and its bookkeeping
+// still cost a queue slot and a worker wake-up per frame. Instead a failed
+// entry is marked and retried no sooner than an exponential backoff from
+// thumbRetryBase up to thumbRetryMax, so a transient failure still heals while
+// a permanent one costs one attempt per (growing) interval.
 const (
 	thumbRetryBase = 3 * time.Second
 	thumbRetryMax  = 5 * time.Minute

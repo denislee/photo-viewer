@@ -37,8 +37,7 @@ var (
 // indirected so tests can stall the probe.
 var inboxProbe = inboxHasFiles
 
-// ImportView is the modal "import media" overlay. It mirrors the Fyne
-// Controller.runImportFromDirs flow:
+// ImportView is the modal "import media" overlay. It runs in three phases:
 //   - phase 1: extract user-supplied ZIPs into the inbox
 //   - phase 2: process anything currently in the inbox as one batch
 //   - phase 3: walk each user-supplied directory; copy and process each
@@ -835,8 +834,8 @@ func (v *ImportView) haveSomethingToImport(cfg Config, problem string, inboxHas 
 // so hidden files and hidden directories (._* AppleDouble junk, .Trashes) don't
 // count (U4-04). It short-circuits: the callback returns fs.SkipAll on the
 // first hit, so a huge inbox costs O(1) in the common "has files" case instead
-// of a full recursive count — this runs on the frame goroutine, so a stall here
-// shows up as a dropped frame per Start click (U-10). Only DetectType !=
+// of a full recursive count. Start clicks run it on a background goroutine
+// (U3-06), so a slow walk cannot stall a frame. Only DetectType !=
 // TypeUnknown files count, matching what phase-2 processing actually files, so
 // a stray .DS_Store in an otherwise-empty inbox doesn't claim "something to
 // import".
@@ -850,9 +849,9 @@ func inboxHasFiles(dir string) bool {
 }
 
 // startImport kicks off a background goroutine that runs the same three-phase
-// flow as the Fyne import. Updates progressDone/progressMax/log atomically;
-// the UI polls them at frame time. cfg is the already-validated config from the
-// Start-click handler (requestStart), so no inbox/outbox checks run here.
+// import flow as ImportView. Progress and log lines go through the shared task
+// model, which the UI polls at frame time. cfg is the already-validated config
+// from the Start-click handler (requestStart), so no inbox/outbox checks run here.
 func (v *ImportView) startImport(cfg Config) {
 	v.mu.Lock()
 	if v.running {
@@ -915,7 +914,7 @@ func (v *ImportView) startImport(cfg Config) {
 	}()
 }
 
-// runImport mirrors the Fyne flow: extract zips → process inbox → walk dirs.
+// runImport runs the three phases: extract zips → process inbox → walk dirs.
 func (v *ImportView) runImport(ctx context.Context, cfg Config, importDirs, zipFiles []string, deleteSrc bool) {
 	v.setStatus("Starting…")
 	v.appendLog("Starting import to " + cfg.OutboxDir)
@@ -1108,7 +1107,7 @@ func (v *ImportView) copyToInbox(ctx context.Context, files []string, inboxDir s
 	return batch
 }
 
-// processBatch is the Fyne flow: read EXIF, group by base name, move into the
+// processBatch imports one batch: read EXIF, group by base name, move into the
 // outbox under YYYY-MM-DD folders.
 func (v *ImportView) processBatch(ctx context.Context, outboxDir string, entries []string) {
 	if len(entries) == 0 {

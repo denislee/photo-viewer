@@ -255,10 +255,10 @@ func (c *Controller) DirCountsWithVersion() (map[string]int, uint64) {
 	return c.dirCounts, c.dirCountsVer
 }
 
-// SelectDir is the equivalent of the Fyne Controller.SelectDir — it cancels
-// any in-flight scan, refreshes from the index, then kicks off an incremental
-// scan. Both the grid and the sidebar tree re-anchor on path. Safe to call
-// from any goroutine.
+// SelectDir switches the active directory: it cancels any in-flight scan,
+// refreshes from the index, then starts an incremental scan of path. The grid
+// and the sidebar tree both re-anchor on path; the Favorites and Trash views
+// skip the scan. Safe to call from any goroutine.
 func (c *Controller) SelectDir(path string) {
 	if path == FavoritesView || path == TrashView {
 		c.mu.Lock()

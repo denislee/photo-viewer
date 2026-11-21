@@ -48,8 +48,8 @@ func (s *Server) handleView(w http.ResponseWriter, r *http.Request) {
 }
 
 // trashNeighbors returns the prev/next/pos/total tuple for the trash listing,
-// matching the shape of cache.Index.Neighbors so the viewer can treat the
-// two sources identically.
+// matching the shape of cache.Index.NeighborsWithTotal (plus total) so the
+// viewer can treat the two sources identically.
 func (s *Server) trashNeighbors(path string) (prev, next *cache.Entry, pos, total int) {
 	entries := s.trashEntries()
 	total = len(entries)
