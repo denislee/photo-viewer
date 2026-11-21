@@ -5,7 +5,6 @@
 package main
 
 import (
-	"context"
 	"flag"
 	"fmt"
 	"log"
@@ -14,6 +13,7 @@ import (
 	"strings"
 
 	"github.com/dns/photo-viewer/internal/cache"
+	"github.com/dns/photo-viewer/internal/cliutil"
 	"github.com/dns/photo-viewer/internal/export"
 )
 
@@ -50,16 +50,12 @@ func main() {
 		log.Fatalf("resolve root: %v", err)
 	}
 	// The index lives inside the library when the GUI/pv-scan ran with
-	// --root, or in the user cache when the GUI ran from the library folder
-	// without it; look in both.
-	_, dbPath, err := cache.Locate(absRoot, true)
+	// --root, or in the user cache otherwise. Locate(false) finds either
+	// (an existing <root>/.photo-viewer.db wins) without writing anything
+	// into the library (S6-02).
+	_, dbPath, err := cache.Locate(absRoot, false)
 	if err != nil {
 		log.Fatalf("cache dir: %v", err)
-	}
-	if _, statErr := os.Stat(dbPath); statErr != nil {
-		if _, alt, err := cache.Locate(absRoot, false); err == nil {
-			dbPath = alt
-		}
 	}
 	if _, err := os.Stat(dbPath); err != nil {
 		log.Fatalf("index not found at %s: %v\n(run the GUI or pv-scan against the library first)", dbPath, err)
@@ -77,7 +73,8 @@ func main() {
 		fmt.Printf("[%s] (%d/%d) %s\n", prefix, step, total, msg)
 	}
 
-	res, err := export.Favorites(context.Background(), idx, export.Options{
+	ctx := cliutil.InterruptContext()
+	res, err := export.Favorites(ctx, idx, export.Options{
 		Root:        absRoot,
 		Dst:         *dst,
 		Flatten:     *flatten,
@@ -88,6 +85,10 @@ func main() {
 		VideoCRF:    *videoCRF,
 	}, progress)
 	if err != nil {
+		if ctx.Err() != nil {
+			fmt.Printf("\nInterrupted after %d favorites (skipped %d, failed %d).\n", res.Done, res.Skipped, res.Failed)
+			os.Exit(130)
+		}
 		log.Fatalf("export: %v", err)
 	}
 

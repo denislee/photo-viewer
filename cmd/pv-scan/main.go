@@ -9,12 +9,11 @@ import (
 	"fmt"
 	"log"
 	"os"
-	"os/signal"
 	"path/filepath"
 	"sync"
-	"syscall"
 
 	"github.com/dns/photo-viewer/internal/cache"
+	"github.com/dns/photo-viewer/internal/cliutil"
 	"github.com/dns/photo-viewer/internal/face"
 	"github.com/dns/photo-viewer/internal/scan"
 )
@@ -91,11 +90,7 @@ func main() {
 	// The first SIGINT/SIGTERM cancels ctx: the walk stops, queued thumbnails
 	// and face jobs are skipped, and the batch already walked is still
 	// reconciled and the index saved (S-23). A second Ctrl-C force-quits.
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	go func() {
-		<-ctx.Done()
-		stop()
-	}()
+	ctx := cliutil.InterruptContext()
 
 	faceCtx, faceCancel := context.WithCancel(ctx)
 	defer faceCancel()

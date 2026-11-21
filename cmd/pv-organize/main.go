@@ -7,14 +7,13 @@ import (
 	"io"
 	"log"
 	"os"
-	"os/signal"
 	"path/filepath"
 	"slices"
 	"sync"
 	"sync/atomic"
-	"syscall"
 	"time"
 
+	"github.com/dns/photo-viewer/internal/cliutil"
 	"github.com/dns/photo-viewer/internal/fsutil"
 	"github.com/dns/photo-viewer/internal/scan"
 	"github.com/dns/photo-viewer/internal/tools"
@@ -41,11 +40,15 @@ func main() {
 		log.Fatalf("Error resolving destination path: %v", err)
 	}
 
-	ctx := interruptContext()
+	ctx := cliutil.InterruptContext()
 	count, failures := organize(ctx, *srcDir, absDst, *dryRun, scan.ExiftoolPoolSize(), os.Stdout)
 
 	if ctx.Err() != nil {
-		fmt.Printf("\nInterrupted. Moved %d files (%d error(s)); nothing was left half-moved.\n", count, failures)
+		if *dryRun {
+			fmt.Printf("\nInterrupted. Planned %d moves (%d planning error(s)).\n", count, failures)
+		} else {
+			fmt.Printf("\nInterrupted. Moved %d files (%d error(s)); nothing was left half-moved.\n", count, failures)
+		}
 		os.Exit(130)
 	}
 	if *dryRun {
@@ -184,21 +187,6 @@ func organize(ctx context.Context, srcDir, absDst string, dryRun bool, workers i
 	}
 
 	return count, failures
-}
-
-// interruptContext returns a context cancelled by the first SIGINT/SIGTERM, so
-// the run stops between (or mid-copy within) files and cleans up its temp
-// instead of dying with a partial temp file in the destination (S-23).
-// After that first signal the default handling is restored: a second Ctrl-C
-// kills the process immediately.
-func interruptContext() context.Context {
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	go func() {
-		<-ctx.Done()
-		stop()
-		fmt.Fprintln(os.Stderr, "\nInterrupted — finishing up (press Ctrl-C again to force quit)…")
-	}()
-	return ctx
 }
 
 // planDest returns the destination a real run would claim for baseName in
