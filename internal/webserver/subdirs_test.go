@@ -63,8 +63,8 @@ func (s *Server) renderSubdirsGroupedRef(w http.ResponseWriter, subdirs []string
 			}
 		}
 		fmt.Fprintf(w,
-			`<details class="year-bucket" data-year="%s"%s><summary><span class="label">%s</span><span class="badge-count">%d</span></summary>`,
-			html.EscapeString(y), openAttr, html.EscapeString(y), b.total)
+			`<details class="year-bucket"%s><summary><span class="label">%s</span><span class="badge-count">%d</span></summary>`,
+			openAttr, html.EscapeString(y), b.total)
 		sort.Strings(b.dirs)
 		for _, d := range b.dirs {
 			href := withExtra(s.dirHref(d))
@@ -124,7 +124,7 @@ func TestRenderSubdirsGroupedMatchesReference(t *testing.T) {
 			}
 
 			if tc.name == "dir-2023-12-31" {
-				if !strings.Contains(got, `data-year="2023" open`) {
+				if !strings.Contains(got, `class="year-bucket" open`) {
 					t.Errorf("expected open 2023 bucket, got:\n%s", got)
 				}
 				if n := strings.Count(got, " open>"); n != 1 {

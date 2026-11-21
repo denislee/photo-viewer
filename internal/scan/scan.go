@@ -35,12 +35,6 @@ type WalkOptions struct {
 	// index.
 	KnownDurationMs func(path string, size int64, mtime time.Time) int64
 
-	// SkipDurationProbe, when true, suppresses the per-video ffprobe entirely
-	// so Result.DurationMs is always 0 for videos. Callers that never read the
-	// duration (e.g. pv-organize, which only needs paths + dates) set this to
-	// avoid forking ffprobe once per clip.
-	SkipDurationProbe bool
-
 	// OnError, if non-nil, is called for each filesystem error encountered
 	// while walking (permission denied, stale symlinks, etc.). The walk
 	// continues into sibling paths after the callback returns. If nil,
@@ -122,10 +116,9 @@ func WalkWith(ctx context.Context, root string, opts WalkOptions) <-chan Result 
 					Size:    info.Size(),
 					ModTime: info.ModTime(),
 				}
-				// SkipDurationProbe callers never need a duration, and a known
-				// (cached) duration skips the ffprobe fork.
+				// A known (cached) duration skips the ffprobe fork.
 				dest := out
-				if w.t == TypeVideo && !opts.SkipDurationProbe {
+				if w.t == TypeVideo {
 					if opts.KnownDurationMs != nil {
 						r.DurationMs = opts.KnownDurationMs(w.path, r.Size, r.ModTime)
 					}

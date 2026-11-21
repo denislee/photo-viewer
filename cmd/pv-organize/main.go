@@ -70,13 +70,7 @@ var mediaDate = scan.GetMediaDate
 // srcDir into absDst/YYYY/MM/DD and returns how many files it moved or
 // planned and how many failed. Per-file lines go to out.
 func organize(ctx context.Context, srcDir, absDst string, dryRun bool, workers int, out io.Writer) (count, failures int) {
-	cwd, _ := os.Getwd()
-	absPath := func(p string) string {
-		if filepath.IsAbs(p) || cwd == "" {
-			return p
-		}
-		return filepath.Join(cwd, p)
-	}
+	absSrcDir, _ := filepath.Abs(srcDir)
 
 	// claimed records destinations the dry-run planner has already handed out
 	// this run so two identically-named sources resolve to distinct names —
@@ -85,23 +79,17 @@ func organize(ctx context.Context, srcDir, absDst string, dryRun bool, workers i
 	// dry-run printed the same destination twice and lied about the outcome.
 	claimed := map[string]bool{}
 
-	// SkipDurationProbe: pv-organize only needs each file's path and date, never
-	// a video's duration, so suppress the per-video ffprobe fork that a plain
-	// Walk would pay for every clip.
 	var files []string
-	for res := range scan.WalkWith(ctx, srcDir, scan.WalkOptions{SkipDurationProbe: true}) {
-		if res.Type == scan.TypeUnknown {
-			continue
-		}
-		files = append(files, res.Path)
-	}
-	if ctx.Err() != nil {
+	err := scan.WalkMediaPaths(ctx, absSrcDir, func(path string, _ scan.MediaType) error {
+		files = append(files, path)
+		return nil
+	})
+	if err != nil || ctx.Err() != nil {
 		return count, failures
 	}
 
-	// The walk emits from parallel workers in no fixed order; sorting gives a
-	// deterministic (lexical, WalkDir) order so collision suffixes and the
-	// printed plan are reproducible.
+	// The walk emits paths in lexical (WalkDir) order; sorting keeps the
+	// printed plan and the collision suffixes deterministic.
 	slices.Sort(files)
 
 	// scan.GetMediaDate rides the pooled -stay_open exiftool daemons, so
@@ -142,8 +130,7 @@ func organize(ctx context.Context, srcDir, absDst string, dryRun bool, workers i
 		// dst overlap: a file already sitting at its correct destination is
 		// left untouched (a rename onto its own path would otherwise be pushed
 		// to a needless "_1" suffix).
-		absSrc := absPath(path)
-		if absSrc == destPath {
+		if path == destPath {
 			continue
 		}
 
@@ -173,7 +160,7 @@ func organize(ctx context.Context, srcDir, absDst string, dryRun bool, workers i
 		// Never overwrites and never unlinks the source before the file is
 		// durably in place; across filesystems (SD card → library disk, the
 		// usual case) it becomes a cancellable fsynced copy.
-		finalDest, err := fsutil.MoveUnique(ctx, absSrc, destSubDir, baseName)
+		finalDest, err := fsutil.MoveUnique(ctx, path, destSubDir, baseName)
 		if err != nil {
 			if ctx.Err() != nil {
 				break // interrupted mid-copy: the move was rolled back, not a failure

@@ -78,9 +78,9 @@ func TestDryRunPlanDistinctForSameNamedSources(t *testing.T) {
 }
 
 // TestOrganizeDryRunOutputIsStable pins organize's dry-run plan to a fixed
-// order: the walk emits from parallel workers in no fixed order, so the sort
-// (and the collision sequence that follows it) must make a 1-worker run and a
-// 4-worker run print exactly the same plan.
+// order: the walk emits paths in lexical order, and the sort (and the collision
+// sequence that follows it) must make a 1-worker run and a 4-worker run print
+// exactly the same plan.
 func TestOrganizeDryRunOutputIsStable(t *testing.T) {
 	dir := t.TempDir()
 	t.Chdir(dir)
@@ -112,13 +112,13 @@ func TestOrganizeDryRunOutputIsStable(t *testing.T) {
 	}
 
 	absDst := filepath.Join(dir, "dst")
-	want := "[Dry Run] " + filepath.Join("src", "a", "img.jpg") + " -> " +
+	want := "[Dry Run] " + filepath.Join(dir, "src", "a", "img.jpg") + " -> " +
 		filepath.Join(absDst, "2024", "01", "02", "img_1.jpg") + "\n" +
-		"[Dry Run] " + filepath.Join("src", "b", "img.jpg") + " -> " +
+		"[Dry Run] " + filepath.Join(dir, "src", "b", "img.jpg") + " -> " +
 		filepath.Join(absDst, "2024", "01", "02", "img_2.jpg") + "\n" +
-		"[Dry Run] " + filepath.Join("src", "c", "IMG.JPG") + " -> " +
+		"[Dry Run] " + filepath.Join(dir, "src", "c", "IMG.JPG") + " -> " +
 		filepath.Join(absDst, "2024", "01", "02", "IMG.JPG") + "\n" +
-		"[Dry Run] " + filepath.Join("src", "clip.mp4") + " -> " +
+		"[Dry Run] " + filepath.Join(dir, "src", "clip.mp4") + " -> " +
 		filepath.Join(absDst, "2023", "12", "31", "clip.mp4") + "\n"
 
 	for _, workers := range []int{1, 4} {

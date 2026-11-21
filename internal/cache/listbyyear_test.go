@@ -92,7 +92,7 @@ func TestListByYearMatchesUnionLoop(t *testing.T) {
 	const treeDir = "/libA"
 	const year = 2023
 	// The sidebar buckets these two immediate YYYY-MM-DD children of treeDir
-	// under the 2023 header; PreviewYear hands them to the old loop.
+	// under the 2023 header; ListByYear must return their union.
 	yearPreviewDirs := []string{"/libA/2023-01-10", "/libA/2023-06-20"}
 
 	cases := []struct {

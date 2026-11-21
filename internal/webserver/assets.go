@@ -19,34 +19,32 @@ var gridJS string
 //go:embed assets/viewer.js
 var viewerJS string
 
-// pageHeader opens every page: doctype, viewport, and the shared stylesheet.
-var pageHeader = `<!doctype html>
+// pageHeaderBytes opens every page: doctype, viewport, and the shared
+// stylesheet.
+var pageHeaderBytes = []byte(`<!doctype html>
 <html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <title>Photo Viewer</title>
 <style>
-` + styleCSS + `</style></head><body>`
+` + styleCSS + `</style></head><body>`)
 
 // mobileTopBar is emitted at the top of every gallery's .content so the
 // hamburger has a place to live. On desktop the bar is hidden via CSS.
 const mobileTopBar = `<div class="topbar"><label for="navtoggle" class="hamburger" aria-label="Menu">☰</label><span class="brand">Photo Viewer</span></div>`
 
-// gridScript handles infinite scroll plus keyboard navigation (j/k/h/l +
+// gridScriptBytes handles infinite scroll plus keyboard navigation (j/k/h/l +
 // arrows) over the cell grid. Cells are built via createElement so we never
 // parse network strings as HTML.
-var gridScript = "<script>\n" + gridJS + "</script>"
+var gridScriptBytes = []byte("<script>\n" + gridJS + "</script>")
 
-// Pre-encoded copies of the page chrome (W5-06). fmt.Fprint/io.WriteString on
-// a string go through a WriteString path, but the gzip response writer has no
-// WriteString, so each string was converted (and copied) to []byte per request.
-// Writing these []byte values with w.Write hands the gzip writer the bytes
-// directly. Go's package-level initialisation orders these after the
-// strings they reference, including the //go:embed ones, so no init() is needed.
-var (
-	viewerJSBytes   = []byte(viewerJS)
-	pageHeaderBytes = []byte(pageHeader)
-	gridScriptBytes = []byte(gridScript)
-)
+// viewerJSBytes is the embedded viewer script as a pre-encoded []byte (W5-06):
+// fmt.Fprint/io.WriteString on a string go through a WriteString path, but the
+// gzip response writer has no WriteString, so a string was converted (and
+// copied) to []byte per request. Writing the []byte value with w.Write
+// hands the gzip writer the bytes directly. Go's package-level initialisation
+// orders these after the //go:embed variables they reference, so no init() is
+// needed.
+var viewerJSBytes = []byte(viewerJS)
 
 // writeViewerScript writes the viewer's inline <script>: the pvNav literal,
 // then viewer.js streamed straight from the embedded string instead of being

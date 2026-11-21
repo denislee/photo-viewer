@@ -193,8 +193,8 @@ func (s *Server) renderSubdirsGrouped(w http.ResponseWriter, subdirs []string, c
 			openAttr = " open"
 		}
 		fmt.Fprintf(w,
-			`<details class="year-bucket" data-year="%s"%s><summary><span class="label">%s</span><span class="badge-count">%d</span></summary>`,
-			html.EscapeString(b.year), openAttr, html.EscapeString(b.year), b.total)
+			`<details class="year-bucket"%s><summary><span class="label">%s</span><span class="badge-count">%d</span></summary>`,
+			openAttr, html.EscapeString(b.year), b.total)
 		for _, d := range b.dirs {
 			href := withExtra(s.dirHref(d))
 			active := vi.kind == "dir" && vi.v.Dir == d

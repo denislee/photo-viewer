@@ -136,10 +136,9 @@ func TestDirKeysetMatchesOffset(t *testing.T) {
 		}
 		return prev, next, pos
 	}
-	total := idx.CountView(v)
 	for _, probe := range probes {
 		wantPrev, wantNext, wantPos := brute(probe)
-		prev, next, pos, gotTotal := idx.NeighborsWithTotal(v, probe, total)
+		prev, next, pos := idx.NeighborsWithTotal(v, probe)
 		gotPrev, gotNext := entryPath(prev), entryPath(next)
 		if gotPrev == "<nil>" {
 			gotPrev = ""
@@ -157,14 +156,11 @@ func TestDirKeysetMatchesOffset(t *testing.T) {
 		if pos != wantPos {
 			t.Errorf("probe %q: pos = %d, want %d", probe, pos, wantPos)
 		}
-		if gotTotal != len(full) {
-			t.Errorf("probe %q: total = %d, want %d", probe, gotTotal, len(full))
-		}
 	}
 
 	// The probes that are members of the view must report their 1-based index.
 	for n, e := range full {
-		_, _, pos, _ := idx.NeighborsWithTotal(v, e.Path, total)
+		_, _, pos := idx.NeighborsWithTotal(v, e.Path)
 		if pos != n+1 {
 			t.Errorf("member %q at index %d: pos = %d, want %d", e.Path, n, pos, n+1)
 		}

@@ -129,14 +129,14 @@ func entryPath(e *Entry) string {
 	return e.Path
 }
 
-// assertNeighborsEquiv proves NeighborsWithTotal(v, probe, CountView(v)) returns
-// the identical prev/next/pos/total tuple as the self-counting Neighbors(v,
-// probe). This is the W-10 equivalence guarantee: threading the cached total
-// into the bounded-position variant must not change any observable result.
+// assertNeighborsEquiv proves NeighborsWithTotal(v, probe) returns the identical
+// prev/next/pos triple as the self-counting Neighbors(v, probe). This is the
+// W-10 equivalence guarantee: the bounded-position variant must not change any
+// observable result.
 func assertNeighborsEquiv(t *testing.T, idx *Index, label string, v View, probe string) {
 	t.Helper()
-	wantPrev, wantNext, wantPos, wantTotal := idx.Neighbors(v, probe)
-	gotPrev, gotNext, gotPos, gotTotal := idx.NeighborsWithTotal(v, probe, idx.CountView(v))
+	wantPrev, wantNext, wantPos, _ := idx.Neighbors(v, probe)
+	gotPrev, gotNext, gotPos := idx.NeighborsWithTotal(v, probe)
 
 	if entryPath(gotPrev) != entryPath(wantPrev) {
 		t.Errorf("%s: prev = %s, want %s", label, entryPath(gotPrev), entryPath(wantPrev))
@@ -146,9 +146,6 @@ func assertNeighborsEquiv(t *testing.T, idx *Index, label string, v View, probe 
 	}
 	if gotPos != wantPos {
 		t.Errorf("%s: pos = %d, want %d", label, gotPos, wantPos)
-	}
-	if gotTotal != wantTotal {
-		t.Errorf("%s: total = %d, want %d", label, gotTotal, wantTotal)
 	}
 }
 

@@ -77,7 +77,7 @@ func TestEnsureBufReuseAndGrow(t *testing.T) {
 }
 
 // TestReleaseBufFreesBuffer covers the buffer-freeing that Stop performs:
-// releaseBuf drops the reference so a window-sized RGBA is not retained for
+// clearing p.buf drops the reference so a window-sized RGBA is not retained for
 // the rest of the session after playback stops. Headless — no mpv needed.
 func TestReleaseBufFreesBuffer(t *testing.T) {
 	p := &Player{}
@@ -85,9 +85,9 @@ func TestReleaseBufFreesBuffer(t *testing.T) {
 	if p.buf == nil {
 		t.Fatalf("ensureBuf did not allocate a buffer")
 	}
-	p.releaseBuf()
+	p.buf = nil
 	if p.buf != nil {
-		t.Fatalf("releaseBuf did not free the buffer")
+		t.Fatalf("clearing buf did not free it")
 	}
 	// A subsequent ensureBuf must allocate fresh (no stale capacity to reuse).
 	p.ensureBuf(64, 64)

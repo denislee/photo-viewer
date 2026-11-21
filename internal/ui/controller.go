@@ -90,11 +90,6 @@ type Controller struct {
 	// its own context when it exits.
 	warmUpGen int
 
-	// yearPreviewDirs holds the date subdirs whose union is shown when
-	// currentDir is a YearViewPrefix sentinel. refreshFromIndex reads this
-	// to recompute entries when scan flushes trigger a refresh.
-	yearPreviewDirs []string
-
 	thumbs *thumbCache
 
 	// dirCounts maps absolute path → file count (recursive, current filter
@@ -284,7 +279,6 @@ func (c *Controller) SelectDir(path string) {
 	c.scanCancel = cancel
 	c.treeDir = path
 	c.currentDir = path
-	c.yearPreviewDirs = nil
 	c.mu.Unlock()
 
 	c.scheduleRefresh(path)
@@ -360,20 +354,16 @@ func (c *Controller) PreviewDir(path string) {
 		c.scanCancel = nil
 	}
 	c.currentDir = path
-	c.yearPreviewDirs = nil
 	c.mu.Unlock()
 
 	c.scheduleRefresh(path)
 }
 
-// PreviewYear loads the union of entries under each given date subdir into the
+// PreviewYear loads the union of entries under the given YYYY year into the
 // grid without changing the sidebar tree anchor. Used while keyboard-previewing
 // a YYYY year header in the sidebar — the grid then shows every photo in that
 // year regardless of which date folder it lives in.
-func (c *Controller) PreviewYear(year string, dirs []string) {
-	if len(dirs) == 0 {
-		return
-	}
+func (c *Controller) PreviewYear(year string) {
 	key := YearViewPrefix + year
 	c.mu.Lock()
 	if c.scanCancel != nil {
@@ -381,7 +371,6 @@ func (c *Controller) PreviewYear(year string, dirs []string) {
 		c.scanCancel = nil
 	}
 	c.currentDir = key
-	c.yearPreviewDirs = append(c.yearPreviewDirs[:0], dirs...)
 	c.mu.Unlock()
 
 	c.scheduleRefresh(key)
@@ -495,7 +484,7 @@ func (c *Controller) refreshFromIndex(dir string, recount bool) {
 	c.refreshCalls.Add(1)
 	// Snapshot the controller state this refresh reads once, up front, so the
 	// year-preview branch below can scope its query to a treeDir consistent with
-	// the yearPreviewDirs read in the same lock.
+	// the filter snapshot.
 	c.mu.Lock()
 	filter := c.mediaFilter
 	showRAW := c.showRAW
@@ -503,15 +492,14 @@ func (c *Controller) refreshFromIndex(dir string, recount bool) {
 	treeDir := c.treeDir
 	root := c.libraryRoot
 	prevSubdirs := c.subdirs
-	yearDirs := append([]string(nil), c.yearPreviewDirs...)
 	countsValid := c.countsValid
 	prevCountsKey := c.countsKey
 	c.mu.Unlock()
 
 	var entries []cache.Entry
-	// needGoFilter marks the branches that still hand back unfiltered rows:
-	// the trash listing (read off the filesystem) and the per-dir year fallback.
-	// Every other branch pushes the media filter into SQL.
+	// needGoFilter marks the branch that still hands back unfiltered rows: the
+	// trash listing (read off the filesystem). Every other branch pushes the
+	// media filter into SQL.
 	needGoFilter := false
 	// fromDirView marks the plain dir listing, whose rows are exactly what the
 	// sidebar counts describe — so the counts can be derived from the loaded
@@ -526,20 +514,12 @@ func (c *Controller) refreshFromIndex(dir string, recount bool) {
 	case strings.HasPrefix(dir, YearViewPrefix):
 		// U-08: resolve the year-preview union in a single covering-index query
 		// scoped to treeDir instead of one prefix-LIKE ListDir per date dir. The
-		// yearPreviewDirs are the YYYY-MM-DD children of treeDir bucketed under
-		// this year header, and each entry's year column is derived from that
+		// date dirs are the YYYY-MM-DD children of treeDir bucketed under this
+		// year header, and each entry's year column is derived from that
 		// parent-dir name, so ListByYear(year, …, treeDir) returns exactly their
-		// union with the media filter pushed into SQL. A parse failure (the
-		// sentinel is always built from a YYYY string, so this shouldn't happen)
-		// falls back to the per-dir loop, which still needs the Go-side filter.
-		if y, err := strconv.Atoi(strings.TrimPrefix(dir, YearViewPrefix)); err == nil {
-			entries = c.index.ListByYear(y, filter, showRAW, treeDir)
-		} else {
-			for _, d := range yearDirs {
-				entries = append(entries, c.index.ListDir(d)...)
-			}
-			needGoFilter = true
-		}
+		// union with the media filter pushed into SQL.
+		y, _ := strconv.Atoi(strings.TrimPrefix(dir, YearViewPrefix))
+		entries = c.index.ListByYear(y, filter, showRAW, treeDir)
 	default:
 		entries = c.index.ListPage(cache.View{Kind: "dir", Dir: dir, Filter: filter, ShowRAW: showRAW}, 0, 0)
 		fromDirView = true
@@ -548,7 +528,7 @@ func (c *Controller) refreshFromIndex(dir string, recount bool) {
 	// Filter in place: every branch above returns a freshly allocated slice,
 	// so reusing its backing array avoids a second full-size copy per refresh
 	// (~9 MB at 100k entries). The SQL-backed branches already applied the
-	// filter, so only the trash / year-fallback rows need the Go pass.
+	// filter, so only the trash rows need the Go pass.
 	filtered := entries
 	if needGoFilter && (filter != "All" || !showRAW) {
 		filtered = slices.DeleteFunc(entries, func(e cache.Entry) bool {

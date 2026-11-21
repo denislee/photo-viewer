@@ -93,18 +93,18 @@ func TestRunExiftoolTimeoutRetiresAndFallsBack(t *testing.T) {
 	t.Cleanup(resetExifPool)
 
 	start := time.Now()
-	out, err := runExiftool("-s", "-S", "-CreateDate", "/some/file.jpg")
+	out, err := RunExiftool("-s", "-S", "-CreateDate", "/some/file.jpg")
 	elapsed := time.Since(start)
 
 	if err != nil {
-		t.Fatalf("runExiftool returned error: %v", err)
+		t.Fatalf("RunExiftool returned error: %v", err)
 	}
 	if !strings.Contains(string(out), "ONESHOT-OK") {
 		t.Errorf("expected one-shot fallback output, got %q", out)
 	}
 	// Must have given up near the deadline, not blocked on the wedged child.
 	if elapsed > 5*time.Second {
-		t.Errorf("runExiftool took %s; expected it to time out near %s", elapsed, exiftoolReqTimeout)
+		t.Errorf("RunExiftool took %s; expected it to time out near %s", elapsed, exiftoolReqTimeout)
 	}
 	// The wedged daemon must have been retired, not left in the pool.
 	if live := livePoolDaemons(); live != 0 {
@@ -212,7 +212,7 @@ func TestRunExiftoolPoolConcurrent(t *testing.T) {
 	for i := range n {
 		wg.Go(func() {
 			path := fmt.Sprintf("/photos/file%02d.jpg", i)
-			out, err := runExiftool("-s", "-S", "-CreateDate", path)
+			out, err := RunExiftool("-s", "-S", "-CreateDate", path)
 			results[i] = result{path: path, out: string(out), err: err}
 		})
 	}
@@ -230,8 +230,8 @@ func TestRunExiftoolPoolConcurrent(t *testing.T) {
 		}
 	}
 	// The pool should never grow past its cap regardless of the request burst.
-	if live := livePoolDaemons(); live > exiftoolPoolSize() {
-		t.Errorf("pool holds %d live daemons, exceeds cap %d", live, exiftoolPoolSize())
+	if live := livePoolDaemons(); live > ExiftoolPoolSize() {
+		t.Errorf("pool holds %d live daemons, exceeds cap %d", live, ExiftoolPoolSize())
 	}
 }
 
@@ -265,9 +265,9 @@ func TestRunExiftoolSpawnFailureBacksOffThenRetries(t *testing.T) {
 
 	// First request: spawn fails, so it falls back to the one-shot exec and arms
 	// the backoff window.
-	out, err := runExiftool("-s", "-S", "-CreateDate", "/photos/first.jpg")
+	out, err := RunExiftool("-s", "-S", "-CreateDate", "/photos/first.jpg")
 	if err != nil {
-		t.Fatalf("first runExiftool errored: %v", err)
+		t.Fatalf("first RunExiftool errored: %v", err)
 	}
 	if !strings.Contains(string(out), "ONESHOT-OK") {
 		t.Errorf("first call: expected one-shot fallback, got %q", out)
@@ -279,9 +279,9 @@ func TestRunExiftoolSpawnFailureBacksOffThenRetries(t *testing.T) {
 	// While the window is open, callers stay on the one-shot path and no further
 	// spawn is attempted.
 	spawnsBefore := spawns.Load()
-	out, err = runExiftool("-s", "-S", "-CreateDate", "/photos/during.jpg")
+	out, err = RunExiftool("-s", "-S", "-CreateDate", "/photos/during.jpg")
 	if err != nil {
-		t.Fatalf("during-backoff runExiftool errored: %v", err)
+		t.Fatalf("during-backoff RunExiftool errored: %v", err)
 	}
 	if !strings.Contains(string(out), "ONESHOT-OK") {
 		t.Errorf("during backoff: expected one-shot fallback, got %q", out)
@@ -299,9 +299,9 @@ func TestRunExiftoolSpawnFailureBacksOffThenRetries(t *testing.T) {
 
 	// Next request retries the daemon spawn (now succeeding) and rides the
 	// daemon path — the one-shot latch is gone.
-	out, err = runExiftool("-s", "-S", "-CreateDate", "/photos/after.jpg")
+	out, err = RunExiftool("-s", "-S", "-CreateDate", "/photos/after.jpg")
 	if err != nil {
-		t.Fatalf("post-backoff runExiftool errored: %v", err)
+		t.Fatalf("post-backoff RunExiftool errored: %v", err)
 	}
 	if strings.Contains(string(out), "ONESHOT-OK") {
 		t.Errorf("post-backoff: should no longer be on the one-shot path, got %q", out)

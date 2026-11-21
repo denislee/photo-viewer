@@ -387,7 +387,7 @@ func (s *Server) renderGalleryPage(w http.ResponseWriter, r *http.Request, vi vi
 // writeCells emits one <a class="cell"> per entry. Used by the initial
 // page render; subsequent pages are appended client-side from /api/page
 // JSON so any change to the cell shape needs to mirror to the JS builder
-// in gridScript.
+// in gridScriptBytes.
 func writeCells(w http.ResponseWriter, entries []cache.Entry, ctxQ string) {
 	for _, e := range entries {
 		name := html.EscapeString(filepath.Base(e.Path))

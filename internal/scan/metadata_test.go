@@ -308,7 +308,7 @@ func TestGetMediaDateReadsMetadata(t *testing.T) {
 }
 
 // TestSetMediaDateWritesReadableDate exercises S-14: SetMediaDate now routes
-// its write through the pooled -stay_open daemon (runExiftool) instead of a
+// its write through the pooled -stay_open daemon (RunExiftool) instead of a
 // fresh exec per file. It writes a date into a JPEG via SetMediaDate, then
 // reads it back through readMetadataDate/GetMediaDate and asserts the round
 // trip matches — proving the daemon-routed write both succeeded (SetMediaDate

@@ -111,7 +111,7 @@ static int render_sw(mpv_render_context *ctx, int w, int h, size_t stride, void 
 // Render. So "release" must not mean "make nothing current": that unbinds
 // Gio's context and its next eglSwapBuffers fails with EGL_BAD_SURFACE,
 // destroying the window. pv_gl_make_current snapshots the thread's EGL
-// state and pv_gl_release puts exactly that state back. All GL entry points are resolved
+// state and pv_gl_restore puts exactly that state back. All GL entry points are resolved
 // via eglGetProcAddress so we link against libEGL only.
 typedef struct pv_gl {
     EGLDisplay dpy;
@@ -156,7 +156,7 @@ static void pv_gl_restore(pv_gl *g) {
 }
 
 // pv_gl_make_current saves the thread's EGL state and makes g current. Every
-// successful call must be paired with pv_gl_release.
+// successful call must be paired with pv_gl_restore.
 static int pv_gl_make_current(pv_gl *g) {
     g->saved_api = eglQueryAPI();
     g->saved_dpy = eglGetCurrentDisplay();
@@ -170,10 +170,6 @@ static int pv_gl_make_current(pv_gl *g) {
     return -1;
 }
 
-static void pv_gl_release(pv_gl *g) {
-    pv_gl_restore(g);
-}
-
 // pv_gl_destroy frees the framebuffer, the context and the display. Safe on
 // a partially-initialised g.
 static void pv_gl_destroy(pv_gl *g) {
@@ -182,7 +178,7 @@ static void pv_gl_destroy(pv_gl *g) {
         if (pv_gl_make_current(g) == 0) {
             if (g->fbo) g->DeleteFramebuffers(1, &g->fbo);
             if (g->tex) g->DeleteTextures(1, &g->tex);
-            pv_gl_release(g);
+            pv_gl_restore(g);
         }
         eglDestroyContext(g->dpy, g->ctx);
     }
@@ -239,7 +235,7 @@ static pv_gl *pv_gl_create(void) {
     // Surfaceless make-current needs EGL_KHR_surfaceless_context; prove it
     // works now rather than on the first frame.
     if (pv_gl_make_current(g) < 0) goto fail;
-    pv_gl_release(g);
+    pv_gl_restore(g);
 
     // Find the render node of the device EGL picked (EGL_EXT_device_query),
     // so VAAPI decodes on the same GPU that renders; else the first node.
@@ -280,7 +276,7 @@ static int create_render_ctx_gl(mpv_handle *h, pv_gl *g, mpv_render_context **ct
     params[n].type = MPV_RENDER_PARAM_INVALID;
     params[n].data = NULL;
     int rc = mpv_render_context_create(ctx, h, params);
-    pv_gl_release(g);
+    pv_gl_restore(g);
     return rc;
 }
 
@@ -289,7 +285,7 @@ static int create_render_ctx_gl(mpv_handle *h, pv_gl *g, mpv_render_context **ct
 static void free_render_ctx_gl(pv_gl *g, mpv_render_context *ctx) {
     int cur = pv_gl_make_current(g) == 0;
     mpv_render_context_free(ctx);
-    if (cur) pv_gl_release(g);
+    if (cur) pv_gl_restore(g);
 }
 
 // pv_gl_ensure_fbo (re)creates the w×h RGBA8 render target. Context must be
@@ -347,7 +343,7 @@ static int render_gl(pv_gl *g, mpv_render_context *ctx, int w, int h, void *dst)
             g->BindFramebuffer(GL_FRAMEBUFFER, 0);
         }
     }
-    pv_gl_release(g);
+    pv_gl_restore(g);
     return rc;
 }
 
@@ -636,10 +632,9 @@ func New(invalidate func()) (*Player, error) {
 	// internal libmpv/ffmpeg/hwdec assertion aborts the process, the message
 	// it logs first lands in the log immediately above the Go crash dump,
 	// which is the only breadcrumb a C-side abort() leaves behind.
-	if lvl := C.CString("warn"); lvl != nil {
-		C.request_log(h, lvl)
-		C.free(unsafe.Pointer(lvl))
-	}
+	lvl := C.CString("warn")
+	C.request_log(h, lvl)
+	C.free(unsafe.Pointer(lvl))
 
 	p := &Player{h: h, invalidate: invalidate, drainDone: make(chan struct{})}
 	p.handle = cgo.NewHandle(p)
@@ -754,7 +749,7 @@ func (p *Player) Stop() {
 	// Drop the frame buffer: after leaving a video we'd otherwise retain a
 	// window-sized RGBA (~33 MB for a 4K window) for the rest of the session
 	// while the user browses photos.
-	p.releaseBuf()
+	p.buf = nil
 	if p.async != nil {
 		p.async.reset()
 	}
@@ -905,12 +900,6 @@ func (p *Player) ensureBuf(w, h int) {
 	for i := 3; i < len(pix); i += 4 {
 		pix[i] = 0xff
 	}
-}
-
-// releaseBuf drops the frame buffer so a large RGBA is not retained after
-// playback stops. Caller must hold p.mu.
-func (p *Player) releaseBuf() {
-	p.buf = nil
 }
 
 // NeedsRedraw reports whether mpv has signalled a new frame since the

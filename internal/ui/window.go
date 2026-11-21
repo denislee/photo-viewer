@@ -127,7 +127,7 @@ func Run(w *app.Window, ctrl *Controller) error {
 		_, prev, _, _ := ctrl.Snapshot()
 		grid.RememberFor(prev)
 		grid.RestoreFor(YearViewPrefix + year)
-		ctrl.PreviewYear(year, dirs)
+		ctrl.PreviewYear(year)
 	}
 	grid.OnOpen = func(idx int) {
 		_, _, entries, _ := ctrl.Snapshot()

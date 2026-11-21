@@ -38,7 +38,7 @@ func (s *Server) handleView(w http.ResponseWriter, r *http.Request) {
 			// gallery page renders) so a navigation burst amortizes the O(view)
 			// count; each keystroke then only pays the bounded position probe.
 			total = s.cachedCountView(vi.v)
-			prev, next, pos, total = s.index.NeighborsWithTotal(vi.v, cur.Path, total)
+			prev, next, pos = s.index.NeighborsWithTotal(vi.v, cur.Path)
 		}
 	} else {
 		vi = viewInfo{backHref: "/", title: "Gallery"}
@@ -129,7 +129,7 @@ func (s *Server) renderViewer(w http.ResponseWriter,
 	fmt.Fprintf(w, `<button type="button" class="vinfo" id="infoBtn" data-id="%s" title="Info (i)">i</button>`, cur.ThumbID)
 	fmt.Fprint(w, `</header>`)
 
-	fmt.Fprint(w, `<div class="vstage" id="vstage">`)
+	fmt.Fprint(w, `<div class="vstage">`)
 	mediaURL := "/media/" + cur.ThumbID
 	if cur.Type == scan.TypeVideo {
 		// iOS Safari (and desktop Safari) play HLS natively in a <video>

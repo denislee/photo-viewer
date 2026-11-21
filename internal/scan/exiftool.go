@@ -72,17 +72,15 @@ func exifSpawnBackedOff() bool {
 // transient spawn failure; production always uses spawnExiftoolDaemon.
 var spawnExiftool = spawnExiftoolDaemon
 
-// exiftoolPoolSize mirrors the face pipeline's worker sizing: at least 2 (so an
+// ExiftoolPoolSize mirrors the face pipeline's worker sizing: at least 2 (so an
 // interactive read isn't stuck behind a single in-flight bulk request) and at
-// most 4, which is where the import date pass caps its own worker count.
-func exiftoolPoolSize() int {
+// most 4, which is where the import date pass caps its own worker count. It is
+// how many pooled exiftool daemons serve metadata reads, i.e. how many
+// concurrent callers run without queueing. Bulk callers outside the package
+// (pv-organize's date pass) size their workers with it.
+func ExiftoolPoolSize() int {
 	return min(max(runtime.NumCPU(), 2), 4)
 }
-
-// ExiftoolPoolSize is how many pooled exiftool daemons serve metadata reads,
-// i.e. how many concurrent callers run without queueing. Bulk callers
-// outside the package (pv-organize's date pass) size their workers with it.
-func ExiftoolPoolSize() int { return exiftoolPoolSize() }
 
 // exifPoolChan lazily builds the daemon pool as a buffered channel pre-filled
 // with empty (nil) slots, each spawned into a live daemon on first use.
@@ -90,7 +88,7 @@ func exifPoolChan() chan *exiftoolDaemon {
 	exifPoolMu.Lock()
 	defer exifPoolMu.Unlock()
 	if exifPool == nil {
-		n := exiftoolPoolSize()
+		n := ExiftoolPoolSize()
 		exifPool = make(chan *exiftoolDaemon, n)
 		for range n {
 			exifPool <- nil
@@ -108,13 +106,13 @@ func exifPoolChan() chan *exiftoolDaemon {
 var exiftoolReqTimeout = 15 * time.Second
 
 // errExiftoolTimeout marks a request that blew exiftoolReqTimeout. It flows
-// through runExiftool's existing "any error retires the daemon" path, so a
+// through RunExiftool's existing "any error retires the daemon" path, so a
 // timed-out request tears the daemon down (killing the wedged child) and falls
 // back to the one-shot exec, and the next caller transparently respawns it.
 var errExiftoolTimeout = errors.New("exiftool: request timed out")
 
 // haveExiftool reports whether exiftool is on PATH, cached in internal/tools.
-// runExiftool gates the daemon pool on it so a never-installed tool
+// RunExiftool gates the daemon pool on it so a never-installed tool
 // short-circuits straight to the one-shot path instead of retrying a doomed
 // spawn every backoff window (S-05), and SetMediaDate — which execs exiftool
 // directly, not through the pooled daemon — reuses it rather than re-walking
@@ -124,6 +122,9 @@ var haveExiftool = tools.Exiftool
 // RunExiftool runs an exiftool request through this package's shared
 // -stay_open daemon and returns its stdout, so callers outside the package
 // (e.g. internal/thumb's RAW preview probe) don't pay a fresh fork per read.
+// The first call spawns the daemon; subsequent calls reuse it. On any I/O
+// error (or a timeout) the daemon is torn down and exiftool falls back to a
+// per-call exec.Command. The callers can be either; both work.
 //
 // stdout must stay textual: the daemon protocol is newline-framed, so a "-b"
 // binary value printed to stdout can desync the stream. Binary extraction can
@@ -132,14 +133,6 @@ var haveExiftool = tools.Exiftool
 // files created" line — and RunExiftool falls back to a one-shot exec with the
 // same args (which writes the same file) when the daemon is unavailable.
 func RunExiftool(args ...string) ([]byte, error) {
-	return runExiftool(args...)
-}
-
-// runExiftool sends an exiftool request to the package daemon and returns
-// its stdout. The first call spawns the daemon; subsequent calls reuse it.
-// On any I/O error (or a timeout) the daemon is torn down and exiftool falls
-// back to a per-call exec.Command. The callers can be either; both work.
-func runExiftool(args ...string) ([]byte, error) {
 	// The -stay_open argfile stream is newline-delimited and treats a leading
 	// '#' as a comment, so any argument carrying a newline/carriage-return or
 	// starting with '#' would corrupt the request framing and desync the daemon

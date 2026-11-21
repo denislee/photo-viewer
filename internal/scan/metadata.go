@@ -36,7 +36,7 @@ var dateLayouts = []string{
 // metaExiftool and openExifFile are seams so tests can prove a successful
 // exiftool read never opens the file for the goexif fallback; production never
 // reassigns them.
-var metaExiftool = runExiftool
+var metaExiftool = RunExiftool
 var openExifFile = os.Open
 
 // parseExifDate parses one exiftool creation-date value in any of the
@@ -228,16 +228,16 @@ func SetMediaDate(path string, t time.Time) error {
 		return errors.New("exiftool not available")
 	}
 	stamp := t.Format("2006:01:02 15:04:05")
-	// Route the write through the pooled -stay_open daemon (runExiftool) rather
+	// Route the write through the pooled -stay_open daemon (RunExiftool) rather
 	// than a fresh exec per file (S-14): a "fix dates" pass over hundreds of
 	// files otherwise pays exiftool's ~50–150 ms fork+Perl startup each time,
 	// while every metadata READ already rides the daemon. Writes are safe on the
 	// daemon protocol — the update summary is plain text on stdout (only "-b"
-	// binary reads are excluded). runExiftool applies the argsUnsafeForDaemon
+	// binary reads are excluded). RunExiftool applies the argsUnsafeForDaemon
 	// gate, so a path carrying a newline (which would corrupt the newline-framed
 	// argfile stream) transparently falls back to a one-shot exec; it also
 	// short-circuits to one-shot when the daemon spawn is backing off.
-	out, err := runExiftool(
+	out, err := RunExiftool(
 		"-overwrite_original",
 		"-P",
 		"-DateTimeOriginal="+stamp,
@@ -282,7 +282,7 @@ func exiftoolWriteFailed(out []byte) bool {
 // GetOldestMediaDate. It returns the metadata creation date (if any) and a
 // flag indicating whether one was found.
 func readMetadataDate(path string) (time.Time, bool) {
-	// No exec.LookPath guard: runExiftool errors out cleanly when exiftool is
+	// No exec.LookPath guard: RunExiftool errors out cleanly when exiftool is
 	// absent, so the err != nil path below skips straight to the goexif
 	// fallback (S-06), which only runs when exiftool errored. -EXIF:ModifyDate
 	// is requested last so it only wins when no capture date exists — it mirrors

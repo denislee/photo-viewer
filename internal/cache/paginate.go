@@ -202,10 +202,7 @@ func (i *Index) ListPage(v View, offset, limit int) []Entry {
 
 // NeighborsWithTotal returns (prev, next) entries adjacent to path within v,
 // plus a 1-based position; prev or next are nil at the list edges and pos is 0
-// when path isn't part of v. The view total is supplied by the caller (the web
-// server's cachedCountView, generation-checked with a short TTL) and returned
-// verbatim, never recomputed, so a navigation burst amortizes the O(view)
-// count. Only the bounded work runs here:
+// when path isn't part of v. Only the bounded work runs here:
 //
 //   - prev/next use the path index directly — "biggest path strictly less than
 //     X within the view" for prev, "smallest strictly greater" for next — so
@@ -214,12 +211,11 @@ func (i *Index) ListPage(v View, offset, limit int) []Entry {
 //     at the probe path, so the position costs O(pos) instead of the O(view)
 //     COUNT+SUM aggregate the old combined query paid.
 //
-// For the same inputs the returned prev/next/pos are identical to Neighbors;
-// total is identical when the caller passes CountView(v) (as Neighbors does).
+// For the same inputs the returned prev/next/pos are identical to Neighbors.
 // Each statement's WHERE is whereClause() narrowed by the probe (see
 // whereWithCursor), so it selects exactly the rows CountView totals over and
-// pos and total can never disagree about which rows belong to the view.
-func (i *Index) NeighborsWithTotal(v View, path string, total int) (prev, next *Entry, pos, _ int) {
+// pos can never disagree about which rows belong to the view.
+func (i *Index) NeighborsWithTotal(v View, path string) (prev, next *Entry, pos int) {
 	// Each probe clamps a cursor onto the view's own range (see
 	// whereWithCursor): for a dir view that keeps one lower and one upper path
 	// bound, so prev/next stay O(log N) and pos O(pos) instead of degrading to
@@ -247,8 +243,8 @@ func (i *Index) NeighborsWithTotal(v View, path string, total int) (prev, next *
 	// Fold in the dir view's exact-path row (see dirExactEntry). Its path
 	// (== Dir) sorts strictly before every range row, so relative to the probe
 	// `path` it can only ever be the smallest element. Therefore:
-	//   - it bumps pos when it is <= path (total already counts it — CountView
-	//     folds the same row in, so we must NOT bump total again here);
+	//   - it bumps pos when it is <= path (CountView folds the same row in,
+	//     matching what Neighbors reports);
 	//   - it becomes `prev` only when no range row precedes path (it's the sole
 	//     predecessor);
 	//   - it becomes `next` only when it itself follows path (then it's smaller
@@ -266,7 +262,7 @@ func (i *Index) NeighborsWithTotal(v View, path string, total int) (prev, next *
 			next = exact
 		}
 	}
-	return prev, next, pos, total
+	return prev, next, pos
 }
 
 // rowScanner is the shared surface of *sql.Row and *sql.Rows: anything that can
