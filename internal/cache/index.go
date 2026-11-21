@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"log"
 	"path/filepath"
 	"runtime"
@@ -272,7 +273,12 @@ func Load(dbPath string) (*Index, error) {
 	// (the only freshness record before v8).
 	const schemaVersion = 8
 	var userVersion int
-	_ = db.QueryRow("PRAGMA user_version").Scan(&userVersion)
+	// A failed read must not be taken as version 0: that would re-run the
+	// destructive migrations (v1 NULLs quick_hash, v4 deletes the faces).
+	if err := db.QueryRow("PRAGMA user_version").Scan(&userVersion); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("read schema version: %w", err)
+	}
 	if userVersion < 1 {
 		// v1: quick_hash now mixes the file size into the digest, so any
 		// values stored under the old format must be re-hashed.
