@@ -3,6 +3,7 @@ package ui
 import (
 	"testing"
 
+	"gioui.org/io/event"
 	"gioui.org/io/key"
 )
 
@@ -55,12 +56,15 @@ func TestModalCloseKeys(t *testing.T) {
 		closes bool
 	}{
 		{"imports", key.Event{Name: key.NameEscape}, true},
-		{"imports", key.Event{Name: "Q"}, true},
+		{"imports", key.Event{Name: "Q"}, false},
 		{"imports", ctrlBracket, true},
 		{"imports", key.Event{Name: "["}, false},
 		{"organize", ctrlBracket, true},
-		{"settings", key.Event{Name: ","}, true},
-		{"settings", ctrlBracket, false},
+		{"organize", key.Event{Name: "Q"}, true},
+		{"settings", key.Event{Name: ","}, false},
+		{"settings", key.Event{Name: "Q"}, false},
+		{"settings", key.Event{Name: key.NameEscape}, true},
+		{"settings", ctrlBracket, true},
 		{"sdPrompt", key.Event{Name: key.NameEscape}, true},
 		{"webServer", key.Event{Name: "Q"}, false},
 		{"webServer", ctrlBracket, true},
@@ -83,5 +87,50 @@ func TestModalCloseKeys(t *testing.T) {
 		if closed := !*open; closed != c.closes {
 			t.Errorf("%s + %v: closed = %v, want %v", c.modal, c.ev.Name, closed, c.closes)
 		}
+	}
+}
+
+// TestTextInputModalKeyFilters covers G6-B1: while a modal with text editors is
+// on top, only its close keys are registered, so typing q or "," into a
+// Settings or Import editor reaches the editor instead of closing the modal.
+func TestTextInputModalKeyFilters(t *testing.T) {
+	has := func(fs []event.Filter, name key.Name) bool {
+		for _, f := range fs {
+			if kf, ok := f.(key.Filter); ok && kf.Name == name && kf.Required == 0 {
+				return true
+			}
+		}
+		return false
+	}
+	for _, c := range []struct {
+		open      func(v *appViews)
+		textInput bool
+	}{
+		{func(v *appViews) { v.settings.Open = true }, true},
+		{func(v *appViews) { v.imports.Open = true }, true},
+		{func(v *appViews) { v.webView.Open = true }, true},
+		{func(v *appViews) { v.organize.Open = true }, false},
+		{func(v *appViews) {}, false},
+	} {
+		v := testAppViews()
+		c.open(v)
+		fs := keyFiltersFor(v)
+		name := "none"
+		if m := v.topModal(); m != nil {
+			name = m.name
+		}
+		for _, k := range []key.Name{"Q", ",", key.NameLeftArrow, key.NameReturn, key.NameSpace} {
+			if got := has(fs, k); got == c.textInput {
+				t.Errorf("%s open: %q registered = %v, want %v", name, k, got, !c.textInput)
+			}
+		}
+		if !has(fs, key.NameEscape) {
+			t.Errorf("%s open: Esc not registered", name)
+		}
+	}
+	v := testAppViews()
+	v.search.Open = true
+	if got := keyFiltersFor(v); len(got) != len(baseKeyFilters) {
+		t.Errorf("search open: %d filters, want the base set", len(got))
 	}
 }

@@ -34,6 +34,15 @@ var (
 		key.Filter{Name: "[", Required: key.ModCtrl},
 	}
 
+	// textInputKeyFilters is registered while a modal with text editors
+	// (Settings, Import, Web server) is on top: only its close keys and the
+	// palette shortcut, so everything else reaches the focused editor.
+	textInputKeyFilters = []event.Filter{
+		key.Filter{Name: key.NameEscape},
+		key.Filter{Name: "K", Required: key.ModCtrl},
+		key.Filter{Name: "[", Required: key.ModCtrl},
+	}
+
 	// fullKeyFilters is baseKeyFilters plus every app-wide hotkey, registered
 	// when no modal editor needs printable keys. Built by copying the base set
 	// into a fresh backing array (append to a nil slice) so appending the
@@ -71,16 +80,26 @@ var (
 	)
 )
 
+// keyFiltersFor picks the pre-built static filter set for this frame. The
+// palette needs printable keys, so it uses the base set; a modal with text
+// editors gets only its close keys; everything else gets the full set.
+func keyFiltersFor(views *appViews) []event.Filter {
+	top := views.topModal()
+	switch {
+	case top == nil:
+		return fullKeyFilters
+	case top.name == "search":
+		return baseKeyFilters
+	case top.textInput:
+		return textInputKeyFilters
+	}
+	return fullKeyFilters
+}
+
 func handleKeys(gtx layout.Context, ctrl *Controller, views *appViews, sidebarFocus *bool, focusSearch *bool, w *app.Window) {
 	grid, sidebar, viewer := views.grid, views.sidebar, views.viewer
 	settings, imports, dups, search := views.settings, views.imports, views.dups, views.search
-	// Select the pre-built static filter set (see baseKeyFilters /
-	// fullKeyFilters). The palette needs printable keys, so it uses the base
-	// set only.
-	filters := fullKeyFilters
-	if search.Open {
-		filters = baseKeyFilters
-	}
+	filters := keyFiltersFor(views)
 	for {
 		ev, ok := gtx.Event(filters...)
 		if !ok {

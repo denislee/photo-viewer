@@ -29,11 +29,18 @@ type appViews struct {
 // modal is one full-window overlay: whether it is open, how to draw it, and
 // how it handles a key press while it is the top modal. keys reports whether
 // the frame needs redrawing.
+//
+// textInput marks a modal with text editors. While it is on top, handleKeys
+// registers only textInputKeyFilters, so printable keys, arrows and Return
+// reach the focused editor instead of being taken as hotkeys (G6-B1): Gio
+// delivers a key.Event as well as the EditEvent for a printable key, and
+// handleKeys runs before the modal lays out.
 type modal struct {
-	name   string
-	open   func() bool
-	layout func(gtx layout.Context, th *Theme)
-	keys   func(ke key.Event) bool
+	name      string
+	open      func() bool
+	layout    func(gtx layout.Context, th *Theme)
+	keys      func(ke key.Event) bool
+	textInput bool
 }
 
 // isCtrlBracket reports Ctrl+[, the vim-style Esc.
@@ -57,8 +64,8 @@ func newModals(v *appViews, libraryRoot func() string) []modal {
 			return false
 		}
 	}
-	closeOrCtrlBracket := func(close func()) func(key.Event) bool {
-		esc := closeOn(close, key.NameEscape, "Q")
+	closeOrCtrlBracket := func(close func(), names ...key.Name) func(key.Event) bool {
+		esc := closeOn(close, names...)
 		return func(ke key.Event) bool {
 			if isCtrlBracket(ke) {
 				close()
@@ -123,19 +130,23 @@ func newModals(v *appViews, libraryRoot func() string) []modal {
 			name:   "imports",
 			open:   func() bool { return v.imports.Open },
 			layout: func(gtx layout.Context, th *Theme) { v.imports.Layout(gtx, th) },
-			keys:   closeOrCtrlBracket(v.imports.Close),
+			// Esc / Ctrl+[ only: Q would be typed into the add-path editor.
+			keys:      closeOrCtrlBracket(v.imports.Close, key.NameEscape),
+			textInput: true,
 		},
 		{
 			name:   "organize",
 			open:   func() bool { return v.organize.Open },
 			layout: func(gtx layout.Context, th *Theme) { v.organize.Layout(gtx, th, libraryRoot()) },
-			keys:   closeOrCtrlBracket(v.organize.Close),
+			keys:   closeOrCtrlBracket(v.organize.Close, key.NameEscape, "Q"),
 		},
 		{
 			name:   "settings",
 			open:   func() bool { return v.settings.Open },
 			layout: func(gtx layout.Context, th *Theme) { v.settings.Layout(gtx, th) },
-			keys:   closeOn(v.settings.Close, key.NameEscape, "Q", ","),
+			// Esc / Ctrl+[ only: Q and "," would be typed into a path editor.
+			keys:      closeOrCtrlBracket(v.settings.Close, key.NameEscape),
+			textInput: true,
 		},
 		{
 			name:   "sdPrompt",
@@ -145,18 +156,12 @@ func newModals(v *appViews, libraryRoot func() string) []modal {
 		},
 		{
 			// Q would collide with the password editor, so only Esc /
-			// Ctrl+[ close the modal; everything else falls through to the
-			// focused editor.
-			name:   "webServer",
-			open:   func() bool { return v.webView.Open },
-			layout: func(gtx layout.Context, th *Theme) { v.webView.Layout(gtx, th) },
-			keys: func(ke key.Event) bool {
-				if ke.Name == key.NameEscape || isCtrlBracket(ke) {
-					v.webView.Close()
-					return true
-				}
-				return false
-			},
+			// Ctrl+[ close the modal.
+			name:      "webServer",
+			open:      func() bool { return v.webView.Open },
+			layout:    func(gtx layout.Context, th *Theme) { v.webView.Layout(gtx, th) },
+			keys:      closeOrCtrlBracket(v.webView.Close, key.NameEscape),
+			textInput: true,
 		},
 	}
 }
