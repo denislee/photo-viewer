@@ -17,15 +17,6 @@ const infoCacheCap = 512
 // reassigns it.
 var mediaInfoFn = scan.GetMediaInfo
 
-// infoKey identifies one version of a file. A file's metadata can only change
-// if its bytes do, which moves mtime/size, so no TTL is needed: an edited
-// file gets a new key and the old one ages out of the LRU.
-type infoKey struct {
-	id    string
-	mtime int64
-	size  int64
-}
-
 // infoVal is the expensive part of an /api/info response: the exiftool
 // metadata and the decoded dimensions. Favorite and the other index fields
 // are read fresh on every request.
@@ -35,18 +26,20 @@ type infoVal struct {
 }
 
 type infoItem struct {
-	key infoKey
+	key fileVersion
 	val infoVal
 }
 
 // infoCache is a small LRU over infoVal. The zero value is ready to use.
+// Entries are keyed by file version, so no TTL is needed: an edited file gets a
+// new key and the old one ages out of the LRU.
 type infoCache struct {
 	mu sync.Mutex
 	ll *list.List // front = most recently used; elements hold *infoItem
-	m  map[infoKey]*list.Element
+	m  map[fileVersion]*list.Element
 }
 
-func (c *infoCache) get(k infoKey) (infoVal, bool) {
+func (c *infoCache) get(k fileVersion) (infoVal, bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	el, ok := c.m[k]
@@ -57,11 +50,11 @@ func (c *infoCache) get(k infoKey) (infoVal, bool) {
 	return el.Value.(*infoItem).val, true
 }
 
-func (c *infoCache) put(k infoKey, v infoVal) {
+func (c *infoCache) put(k fileVersion, v infoVal) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if c.m == nil {
-		c.m = make(map[infoKey]*list.Element)
+		c.m = make(map[fileVersion]*list.Element)
 		c.ll = list.New()
 	}
 	if el, ok := c.m[k]; ok {

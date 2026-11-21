@@ -16,6 +16,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -53,7 +54,7 @@ func fixture(t *testing.T, n int) (*Server, *httptest.Server, func()) {
 	results := make([]scan.Result, 0, n)
 	for i := range n {
 		// Pad numerically so lexicographic order matches insertion order.
-		name := strings.Repeat("0", 6-len(itoa(i))) + itoa(i) + ".jpg"
+		name := strings.Repeat("0", 6-len(strconv.Itoa(i))) + strconv.Itoa(i) + ".jpg"
 		results = append(results, scan.Result{
 			Path:    filepath.Join(libRoot, name),
 			Type:    scan.TypePhoto,
@@ -65,8 +66,8 @@ func fixture(t *testing.T, n int) (*Server, *httptest.Server, func()) {
 
 	s := New(idx, store, display, libRoot, filepath.Join(libRoot, ".photo-viewer-trash"))
 	mux := http.NewServeMux()
-	mux.HandleFunc("/", s.handleIndex)
-	mux.HandleFunc("/favorites", s.handleFavorites)
+	mux.HandleFunc("/", s.galleryOf("all"))
+	mux.HandleFunc("/favorites", s.galleryOf("favorites"))
 	mux.HandleFunc("/year/", s.handleYear)
 	mux.HandleFunc("/dir", s.handleDir)
 	mux.HandleFunc("/view/", s.handleView)
@@ -80,18 +81,6 @@ func fixture(t *testing.T, n int) (*Server, *httptest.Server, func()) {
 		idx.Close()
 		os.RemoveAll(tmp)
 	}
-}
-
-func itoa(n int) string {
-	if n == 0 {
-		return "0"
-	}
-	digits := []byte{}
-	for n > 0 {
-		digits = append([]byte{byte('0' + n%10)}, digits...)
-		n /= 10
-	}
-	return string(digits)
 }
 
 func TestIndexPageIsBounded(t *testing.T) {
@@ -156,7 +145,7 @@ func TestAPIPageReturnsJSON(t *testing.T) {
 		t.Errorf("hasNext = false after page 2 of 3 — should still be more")
 	}
 	// First item on page 2 should be the (pageSize)-th entry overall.
-	wantFirstSuffix := strings.Repeat("0", 6-len(itoa(pageSize))) + itoa(pageSize) + ".jpg"
+	wantFirstSuffix := strings.Repeat("0", 6-len(strconv.Itoa(pageSize))) + strconv.Itoa(pageSize) + ".jpg"
 	if !strings.HasSuffix(payload.Items[0].Name, wantFirstSuffix) {
 		t.Errorf("page 2 first item = %s, want suffix %s", payload.Items[0].Name, wantFirstSuffix)
 	}
@@ -247,7 +236,7 @@ func TestThumbETag(t *testing.T) {
 	// the browser cache instead of 304'ing on the stale thumb forever. Entry 0
 	// (lexicographically first) is the fixture's ModTime base second=0.
 	mtime := time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC)
-	wantETag := `"` + id + "-" + itoa(int(mtime.Unix())) + `"`
+	wantETag := `"` + id + "-" + strconv.Itoa(int(mtime.Unix())) + `"`
 
 	// A stale conditional GET with the old bare-id ETag must NOT match — that
 	// was the bug (a content edit kept the same ETag and 304'd forever).
@@ -793,7 +782,7 @@ func trashFixture(t *testing.T, n int) (*httptest.Server, func()) {
 
 	s := New(idx, store, nil, libRoot, filepath.Join(libRoot, ".photo-viewer-trash"))
 	mux := http.NewServeMux()
-	mux.HandleFunc("/trash", s.handleTrash)
+	mux.HandleFunc("/trash", s.galleryOf("trash"))
 	ts := httptest.NewServer(mux)
 	return ts, func() {
 		ts.Close()
@@ -954,7 +943,7 @@ func TestViewCountCacheSweepsPastCap(t *testing.T) {
 	// Seed past the cap with entries whose timestamps are older than the TTL,
 	// so the sweep considers every one of them stale.
 	stale := time.Now().Add(-time.Hour)
-	for i := range viewCountCacheCap + 50 {
+	for i := range cacheSweepCap + 50 {
 		key := cache.View{Kind: "dir", Dir: fmt.Sprintf("/stale/%d", i)}
 		s.viewCounts.m[key] = ttlEntry[int]{v: i, at: stale}
 	}
@@ -966,8 +955,8 @@ func TestViewCountCacheSweepsPastCap(t *testing.T) {
 	before := len(s.viewCounts.m)
 	s.viewCounts.mu.Unlock()
 
-	if before <= viewCountCacheCap {
-		t.Fatalf("seed size %d is not past cap %d", before, viewCountCacheCap)
+	if before <= cacheSweepCap {
+		t.Fatalf("seed size %d is not past cap %d", before, cacheSweepCap)
 	}
 
 	// A brand-new key is a miss, so cachedCountView takes the insert path —
@@ -1002,7 +991,7 @@ func TestSecureHeaders(t *testing.T) {
 	defer cleanup()
 
 	mux := http.NewServeMux()
-	mux.HandleFunc("/", s.handleIndex)
+	mux.HandleFunc("/", s.galleryOf("all"))
 	mux.HandleFunc("/thumb/", s.handleThumb)
 	mux.HandleFunc("/api/page", s.handleAPIPage)
 	ts := httptest.NewServer(secureHeaders(mux))
@@ -1071,7 +1060,7 @@ func TestAuthThrottle(t *testing.T) {
 	defer cleanup()
 
 	mux := http.NewServeMux()
-	mux.HandleFunc("/", s.handleIndex)
+	mux.HandleFunc("/", s.galleryOf("all"))
 	ts := httptest.NewServer(secureHeaders(basicAuth(mux, "secret")))
 	defer ts.Close()
 
@@ -1354,7 +1343,7 @@ func TestDisplayETag(t *testing.T) {
 	defer cleanup()
 
 	id := ids["small.jpg"]
-	wantETag := `"` + id + "-" + itoa(int(mtime.Unix())) + `"`
+	wantETag := `"` + id + "-" + strconv.Itoa(int(mtime.Unix())) + `"`
 
 	// Stale bare-id ETag (the pre-fix validator) must NOT match.
 	staleReq, _ := http.NewRequest("GET", ts.URL+"/display/"+id, nil)
@@ -1444,7 +1433,7 @@ func TestNoAbsolutePathsExposed(t *testing.T) {
 
 	s := New(idx, store, nil, libRoot, filepath.Join(libRoot, ".photo-viewer-trash"))
 	mux := http.NewServeMux()
-	mux.HandleFunc("/", s.handleIndex)
+	mux.HandleFunc("/", s.galleryOf("all"))
 	mux.HandleFunc("/dir", s.handleDir)
 	mux.HandleFunc("/view/", s.handleView)
 	mux.HandleFunc("/api/info", s.handleAPIInfo)
@@ -1554,7 +1543,7 @@ func TestTrashUsesResolvedDirOnReadOnlyRoot(t *testing.T) {
 	s := New(idx, store, nil, libRoot, td)
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodGet, "/trash", nil)
-	s.handleTrash(rec, req)
+	s.galleryOf("trash")(rec, req)
 
 	if rec.Code != http.StatusOK {
 		t.Fatalf("GET /trash = %d, want 200", rec.Code)

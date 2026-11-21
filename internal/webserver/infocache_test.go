@@ -16,7 +16,7 @@ import (
 
 func TestInfoCacheEvictsLRU(t *testing.T) {
 	var c infoCache
-	key := func(i int) infoKey { return infoKey{id: strconv.Itoa(i)} }
+	key := func(i int) fileVersion { return fileVersion{name: strconv.Itoa(i)} }
 	for i := range infoCacheCap {
 		c.put(key(i), infoVal{dims: strconv.Itoa(i)})
 	}

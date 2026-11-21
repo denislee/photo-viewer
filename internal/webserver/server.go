@@ -18,10 +18,38 @@ import (
 	"net"
 	"net/http"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/dns/photo-viewer/internal/cache"
 )
+
+// fileVersion identifies one version of a file for a version-keyed cache: the
+// identity the cache keys on (an absolute path, or a thumb id), plus the mtime
+// and size that move whenever the bytes change — so an edit or replacement can
+// never be served a value computed from the old file.
+type fileVersion struct {
+	name  string
+	mtime int64
+	size  int64
+}
+
+// shortCacheTTL bounds the small in-memory caches behind the gallery: the trash
+// listing, the sidebar aggregate, view counts and child-directory counts. A few
+// seconds coalesces a navigation burst — every page render re-derives the same
+// scans — without letting counts drift noticeably after an import, a rebuild or
+// a GUI-side change. The stale-while-revalidate caches serve the old value
+// while one background refresh runs.
+const shortCacheTTL = 5 * time.Second
+
+// cacheSweepCap bounds the view-count and child-count caches before the insert
+// path sweeps them. Both key on state that grows with browsing (the full
+// cache.View, or dir × filter × raw), so a long-lived server would otherwise
+// accumulate one entry per distinct view ever rendered — the TTL only marks
+// entries stale and overwrites them in place, it never deletes. Past this many
+// entries the insert path drops everything the TTL has already made stale in
+// one O(n) pass; the cap keeps that pass off the common path.
+const cacheSweepCap = 1024
 
 // Server wraps a net/http.Server scoped to one index + thumb store.
 // All methods are safe for concurrent use.
@@ -54,7 +82,7 @@ type Server struct {
 	// hlsDurations memoises probed HLS source durations per file version, so a
 	// trashed or probe-failed entry doesn't fork ffprobe on every playlist and
 	// segment request (W4-06). See hlsDuration.
-	hlsDurations ttlCache[hlsDurKey, float64]
+	hlsDurations ttlCache[fileVersion, float64]
 
 	mu   sync.Mutex
 	srv  *http.Server
@@ -70,9 +98,10 @@ type Server struct {
 
 	// hlsSweepAt throttles the segment-cache sweep (see maybeSweepHLS): the
 	// cache is walked and evicted back under its size cap at most once per
-	// hlsSweepInterval, tied to segment-serving activity.
-	hlsSweepMu sync.Mutex
-	hlsSweepAt time.Time
+	// hlsSweepInterval, tied to segment-serving activity. It holds the last
+	// sweep's UnixNano and is advanced with CompareAndSwap so concurrent
+	// segment completions start at most one sweep.
+	hlsSweepAt atomic.Int64
 
 	// infoCache holds /api/info's exiftool metadata + dimensions per file
 	// version, so reopening the info panel doesn't fork exiftool again.
@@ -91,13 +120,13 @@ type Server struct {
 func New(index *cache.Index, store, display *cache.ThumbStore, libraryRoot, trashDir string) *Server {
 	return &Server{
 		index: index, store: store, display: display, libraryRoot: libraryRoot, trashDir: trashDir,
-		trash:      ttlCache[struct{}, trashSnapshot]{ttl: trashEntriesTTL},
-		sidebar:    ttlCache[sidebarKey, *sidebarAgg]{ttl: sidebarCacheTTL, swr: true},
-		viewCounts: ttlCache[cache.View, int]{ttl: viewCountTTL, sweepAt: viewCountCacheCap, swr: true},
+		trash:      ttlCache[struct{}, trashSnapshot]{ttl: shortCacheTTL},
+		sidebar:    ttlCache[sidebarKey, *sidebarAgg]{ttl: shortCacheTTL, swr: true},
+		viewCounts: ttlCache[cache.View, int]{ttl: shortCacheTTL, sweepAt: cacheSweepCap, swr: true},
 		childCounts: ttlCache[childCountKey, map[string]int]{
-			ttl: sidebarCacheTTL, sweepAt: viewCountCacheCap, swr: true,
+			ttl: shortCacheTTL, sweepAt: cacheSweepCap, swr: true,
 		},
-		hlsDurations: ttlCache[hlsDurKey, float64]{
+		hlsDurations: ttlCache[fileVersion, float64]{
 			ttl: hlsDurationTTL, sweepAt: hlsDurationCacheCap,
 		},
 	}
@@ -139,9 +168,9 @@ func (s *Server) Start(host string, port int, password string) error {
 	// there relies on range requests and the io.ReaderFrom sendfile fast path
 	// that a wrapping writer would defeat.
 	gz := func(h http.HandlerFunc) http.HandlerFunc { return gzipMiddleware(h).ServeHTTP }
-	mux.HandleFunc("/", gz(s.handleIndex))
-	mux.HandleFunc("/favorites", gz(s.handleFavorites))
-	mux.HandleFunc("/trash", gz(s.handleTrash))
+	mux.HandleFunc("/", gz(s.galleryOf("all")))
+	mux.HandleFunc("/favorites", gz(s.galleryOf("favorites")))
+	mux.HandleFunc("/trash", gz(s.galleryOf("trash")))
 	mux.HandleFunc("/year/", gz(s.handleYear))
 	mux.HandleFunc("/dir", gz(s.handleDir))
 	mux.HandleFunc("/view/", gz(s.handleView))

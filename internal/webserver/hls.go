@@ -47,6 +47,11 @@ const (
 	// time.
 	hlsPlaylistCacheControl = "private, max-age=60"
 
+	// hlsSegCacheControl keeps a finished segment cacheable for an hour; it is
+	// keyed to one version of the source (see serveHLSSegment), so no
+	// revalidation header is needed.
+	hlsSegCacheControl = "private, max-age=3600"
+
 	// hlsSegTimeout caps one on-the-fly segment transcode and hlsProbeTimeout
 	// caps the playlist duration probe. Both guard against a wedged child
 	// outliving its usefulness: ffmpeg holds one of only NumCPU/2 hlsSem
@@ -91,15 +96,6 @@ const (
 	hlsDurationCacheCap = 256
 )
 
-// hlsDurKey identifies one version of a source file. An edit (mtime) or a
-// replacement (size) yields a different key, so a memoised duration is never
-// served for bytes that have since changed.
-type hlsDurKey struct {
-	path  string
-	mtime int64
-	size  int64
-}
-
 // hlsSegCount is the number of segments the playlist lists for a video of
 // dur seconds; serveHLSSegment rejects any index at or past it.
 func hlsSegCount(dur float64) int {
@@ -131,7 +127,7 @@ func (s *Server) handleHLS(w http.ResponseWriter, r *http.Request) {
 			http.NotFound(w, r)
 			return
 		}
-		s.serveHLSSegment(w, r, id, e, k)
+		s.serveHLSSegment(w, r, e, k)
 	default:
 		http.NotFound(w, r)
 	}
@@ -144,7 +140,7 @@ func (s *Server) handleHLS(w http.ResponseWriter, r *http.Request) {
 func (s *Server) serveHLSPlaylist(w http.ResponseWriter, r *http.Request, e cache.Entry) {
 	// The body is a pure function of the source version, so a revalidation
 	// skips both the duration lookup and the rebuild below.
-	etag := mtimeETag(e.ThumbID, e)
+	etag := mtimeETag(e)
 	if notModified(w, r, etag, hlsPlaylistCacheControl) {
 		return
 	}
@@ -170,15 +166,13 @@ func (s *Server) serveHLSPlaylist(w http.ResponseWriter, r *http.Request, e cach
 	}
 	b.WriteString("#EXT-X-ENDLIST\n")
 
-	w.Header().Set("Content-Type", hlsM3UMime)
-	w.Header().Set("Cache-Control", hlsPlaylistCacheControl)
-	w.Header().Set("ETag", etag)
+	versionHeaders(w, hlsM3UMime, hlsPlaylistCacheControl, etag)
 	_, _ = io.WriteString(w, b.String())
 }
 
 // serveHLSSegment serves segment k, transcoding (and caching) it on first
 // request. Concurrent requests for the same segment share one transcode.
-func (s *Server) serveHLSSegment(w http.ResponseWriter, r *http.Request, id string, e cache.Entry, k int) {
+func (s *Server) serveHLSSegment(w http.ResponseWriter, r *http.Request, e cache.Entry, k int) {
 	// Reject segment indices past the end of the video. The playlist only ever
 	// references seg0…seg(n-1); an out-of-range k (a stale player, a manual
 	// probe, a client flooding distinct indices) would otherwise spawn an
@@ -196,13 +190,13 @@ func (s *Server) serveHLSSegment(w http.ResponseWriter, r *http.Request, id stri
 		return
 	}
 
-	dst := s.hlsSegPath(id, k)
+	dst := s.hlsSegPath(e.ThumbID, k)
 
 	// Fresh cache hit: serve it. A segment is stale if the source changed
 	// since it was written (same rule the thumb store uses).
 	if info, err := os.Stat(dst); err == nil {
 		if !info.ModTime().Before(e.ModTime) {
-			s.serveSegmentFile(w, r, dst)
+			serveVersioned(w, r, dst, hlsSegMime, hlsSegCacheControl, "")
 			return
 		}
 		if rerr := os.Remove(dst); rerr != nil {
@@ -216,13 +210,7 @@ func (s *Server) serveHLSSegment(w http.ResponseWriter, r *http.Request, id stri
 		http.Error(w, "segment transcode failed", http.StatusInternalServerError)
 		return
 	}
-	s.serveSegmentFile(w, r, dst)
-}
-
-func (s *Server) serveSegmentFile(w http.ResponseWriter, r *http.Request, dst string) {
-	w.Header().Set("Content-Type", hlsSegMime)
-	w.Header().Set("Cache-Control", "private, max-age=3600")
-	http.ServeFile(w, r, dst)
+	serveVersioned(w, r, dst, hlsSegMime, hlsSegCacheControl, "")
 }
 
 // transcodeSegment produces one mpegts segment via ffmpeg, deduping
@@ -231,6 +219,11 @@ func (s *Server) serveSegmentFile(w http.ResponseWriter, r *http.Request, dst st
 // atomically renames, so a killed transcode never leaves a half-written
 // segment in the cache.
 func (s *Server) transcodeSegment(ctx context.Context, e cache.Entry, k int, dst string) error {
+	// Fail before claiming a singleflight key, an hlsSem slot or a segment
+	// directory: without ffmpeg this call can only ever fail.
+	if !tools.Ffmpeg() {
+		return fmt.Errorf("ffmpeg not installed")
+	}
 	s.hlsInit()
 
 	// Singleflight on the destination path.
@@ -283,9 +276,6 @@ func (s *Server) transcodeSegment(ctx context.Context, e cache.Entry, k int, dst
 
 	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
 		return err
-	}
-	if !tools.Ffmpeg() {
-		return fmt.Errorf("ffmpeg not installed")
 	}
 
 	start := float64(k) * hlsSegDur
@@ -372,9 +362,7 @@ func (s *Server) hlsInit() {
 		n := max(runtime.NumCPU()/2, 1)
 		s.hlsSem = make(chan struct{}, n)
 		s.hlsInflight = make(map[string]chan struct{})
-		s.hlsSweepMu.Lock()
-		s.hlsSweepAt = time.Now()
-		s.hlsSweepMu.Unlock()
+		s.hlsSweepAt.Store(time.Now().UnixNano())
 		go func() {
 			removeLegacyHLS(filepath.Join(s.store.CacheDir(), cache.HLSDir))
 			s.sweepHLS()
@@ -405,7 +393,7 @@ func (s *Server) hlsDuration(ctx context.Context, e cache.Entry) float64 {
 	if e.DurationMs > 0 {
 		return float64(e.DurationMs) / 1000.0
 	}
-	key := hlsDurKey{path: e.Path, mtime: e.ModTime.UnixNano(), size: e.Size}
+	key := fileVersion{name: e.Path, mtime: e.ModTime.UnixNano(), size: e.Size}
 	return s.hlsDurations.get(key, 0, func() float64 {
 		// The probe is shared by every request waiting on this key, so one
 		// requester's disconnect must not cancel it (or memoize a cancellation
@@ -443,15 +431,19 @@ func (s *Server) isTrashPath(path string) bool {
 // keeps the walk cost off the hot path and means an idle server sweeps only
 // the once at init (no background timer to leak on Stop).
 func (s *Server) maybeSweepHLS() {
-	s.hlsSweepMu.Lock()
+	now := time.Now().UnixNano()
+	last := s.hlsSweepAt.Load()
 	// hlsInit always stamps hlsSweepAt before any caller can reach here, so the
 	// zero value never survives to gate the first real sweep.
-	if time.Since(s.hlsSweepAt) < hlsSweepInterval {
-		s.hlsSweepMu.Unlock()
+	if time.Duration(now-last) < hlsSweepInterval {
 		return
 	}
-	s.hlsSweepAt = time.Now()
-	s.hlsSweepMu.Unlock()
+	// Exactly one caller wins the window, so a burst of concurrent segment
+	// completions starts at most one sweep, and without holding a lock on the
+	// segment hot path.
+	if !s.hlsSweepAt.CompareAndSwap(last, now) {
+		return
+	}
 	go s.sweepHLS()
 }
 

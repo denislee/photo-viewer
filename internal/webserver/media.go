@@ -30,7 +30,7 @@ func (s *Server) handleThumb(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
-	etag := mtimeETag(id, e)
+	etag := mtimeETag(e)
 	if notModified(w, r, etag, thumbCacheControl) {
 		return
 	}
@@ -39,10 +39,7 @@ func (s *Server) handleThumb(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "thumbnail unavailable", http.StatusInternalServerError)
 		return
 	}
-	w.Header().Set("Content-Type", "image/jpeg")
-	w.Header().Set("Cache-Control", thumbCacheControl)
-	w.Header().Set("ETag", etag)
-	http.ServeFile(w, r, thumbPath)
+	serveVersioned(w, r, thumbPath, "image/jpeg", thumbCacheControl, etag)
 }
 
 // handleMedia serves the original media file for /media/<id>. Uses
@@ -58,7 +55,7 @@ func (s *Server) handleMedia(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
-	if ct := mimeFor(e); ct != "" {
+	if ct := mimeFor(e.Path); ct != "" {
 		w.Header().Set("Content-Type", ct)
 	}
 	w.Header().Set("Cache-Control", "private, max-age=3600")
@@ -98,8 +95,8 @@ const displayCacheControl = "private, max-age=86400"
 // mtimeETag is the validator for responses derived from one version of an
 // entry: the thumb id plus the source mtime, so an in-place edit yields a new
 // tag.
-func mtimeETag(id string, e cache.Entry) string {
-	return fmt.Sprintf(`"%s-%d"`, id, e.ModTime.Unix())
+func mtimeETag(e cache.Entry) string {
+	return fmt.Sprintf(`"%s-%d"`, e.ThumbID, e.ModTime.Unix())
 }
 
 // notModified answers a conditional GET: when If-None-Match matches etag it
@@ -114,6 +111,26 @@ func notModified(w http.ResponseWriter, r *http.Request, etag, cacheControl stri
 	w.Header().Set("Cache-Control", cacheControl)
 	w.WriteHeader(http.StatusNotModified)
 	return true
+}
+
+// versionHeaders stamps the Content-Type / Cache-Control / ETag triple shared by
+// every response derived from one version of an entry or file. An empty ct or
+// etag leaves that header unset.
+func versionHeaders(w http.ResponseWriter, ct, cc, etag string) {
+	if ct != "" {
+		w.Header().Set("Content-Type", ct)
+	}
+	w.Header().Set("Cache-Control", cc)
+	if etag != "" {
+		w.Header().Set("ETag", etag)
+	}
+}
+
+// serveVersioned stamps the version headers and streams path through
+// http.ServeFile, which keeps range requests (video seeks) working.
+func serveVersioned(w http.ResponseWriter, r *http.Request, path, ct, cc, etag string) {
+	versionHeaders(w, ct, cc, etag)
+	http.ServeFile(w, r, path)
 }
 
 // etagMatches reports whether an If-None-Match header value matches etag,
@@ -151,7 +168,7 @@ func (s *Server) handleDisplay(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
-	etag := mtimeETag(id, e)
+	etag := mtimeETag(e)
 	if notModified(w, r, etag, displayCacheControl) {
 		return
 	}
@@ -162,12 +179,7 @@ func (s *Server) handleDisplay(w http.ResponseWriter, r *http.Request) {
 	// (a RAW would still be un-renderable, but there's nothing better to serve).
 	ext := strings.ToLower(filepath.Ext(e.Path))
 	if s.display == nil || (displayPassThroughExts[ext] && e.Size < displayPassThroughMaxBytes) {
-		if ct := mimeFor(e); ct != "" {
-			w.Header().Set("Content-Type", ct)
-		}
-		w.Header().Set("Cache-Control", displayCacheControl)
-		w.Header().Set("ETag", etag)
-		http.ServeFile(w, r, e.Path)
+		serveVersioned(w, r, e.Path, mimeFor(e.Path), displayCacheControl, etag)
 		return
 	}
 
@@ -176,10 +188,7 @@ func (s *Server) handleDisplay(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "display rendition unavailable", http.StatusInternalServerError)
 		return
 	}
-	w.Header().Set("Content-Type", "image/jpeg")
-	w.Header().Set("Cache-Control", displayCacheControl)
-	w.Header().Set("ETag", etag)
-	http.ServeFile(w, r, renditionPath)
+	serveVersioned(w, r, renditionPath, "image/jpeg", displayCacheControl, etag)
 }
 
 // needsHLS reports whether a video's container should be served via the
@@ -201,8 +210,8 @@ func needsHLS(path string) bool {
 // http.ServeFile sniffs content from the first 512 bytes if we leave the
 // header unset, but that misclassifies HEIC and CR2 — set explicitly when
 // we can so browsers don't try to render RAW as plain text.
-func mimeFor(e cache.Entry) string {
-	ext := strings.ToLower(filepath.Ext(e.Path))
+func mimeFor(path string) string {
+	ext := strings.ToLower(filepath.Ext(path))
 	switch ext {
 	case ".jpg", ".jpeg":
 		return "image/jpeg"

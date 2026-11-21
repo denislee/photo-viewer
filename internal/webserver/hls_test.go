@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -24,8 +25,8 @@ import (
 func makeTestVideo(t *testing.T, path string, seconds int) {
 	t.Helper()
 	cmd := exec.Command("ffmpeg", "-nostdin", "-loglevel", "error", "-y",
-		"-f", "lavfi", "-i", "testsrc=duration="+itoa(seconds)+":size=320x240:rate=10",
-		"-f", "lavfi", "-i", "sine=frequency=440:duration="+itoa(seconds),
+		"-f", "lavfi", "-i", "testsrc=duration="+strconv.Itoa(seconds)+":size=320x240:rate=10",
+		"-f", "lavfi", "-i", "sine=frequency=440:duration="+strconv.Itoa(seconds),
 		"-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac", "-shortest",
 		path)
 	if out, err := cmd.CombinedOutput(); err != nil {

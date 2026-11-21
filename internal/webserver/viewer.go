@@ -84,17 +84,11 @@ func (s *Server) renderViewer(w http.ResponseWriter,
 
 	prevHref := ""
 	if prev != nil {
-		prevHref = "/view/" + prev.ThumbID
-		if vi.ctxQuery != "" {
-			prevHref += "?" + vi.ctxQuery
-		}
+		prevHref = viewHref(prev.ThumbID, vi.ctxQuery)
 	}
 	nextHref := ""
 	if next != nil {
-		nextHref = "/view/" + next.ThumbID
-		if vi.ctxQuery != "" {
-			nextHref += "?" + vi.ctxQuery
-		}
+		nextHref = viewHref(next.ThumbID, vi.ctxQuery)
 	}
 
 	// Warm the successor's display rendition so the next press is served from

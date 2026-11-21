@@ -9,7 +9,6 @@ import (
 	"regexp"
 	"slices"
 	"strconv"
-	"time"
 
 	"github.com/dns/photo-viewer/internal/cache"
 )
@@ -43,15 +42,12 @@ type sidebarAgg struct {
 // matches the currently-rendered view. Each link preserves the filter+raw
 // toolbar state so toggling a category doesn't reset the view options.
 func (s *Server) renderSidebar(w http.ResponseWriter, vi viewInfo, dirChildren []string, dirChildCounts map[string]int, trashCount int) {
-	extra := extraQuery(vi.v.Filter, vi.v.ShowRAW)
-	withExtra := func(href string) string { return appendQuery(href, extra) }
-
 	v := vi.v
 	agg := s.rootSidebarAgg(v.Filter, v.ShowRAW)
 	fmt.Fprint(w, `<nav class="sidebar"><div class="sec">Library</div>`)
 
-	sidebarRow(w, withExtra("/"), "All media", "", agg.allCount, vi.kind == "all")
-	sidebarRow(w, withExtra("/favorites"), "Favorites", "★", agg.favCount, vi.kind == "favorites")
+	sidebarRow(w, vi.link("/"), "All media", "", agg.allCount, vi.kind == "all")
+	sidebarRow(w, vi.link("/favorites"), "Favorites", "★", agg.favCount, vi.kind == "favorites")
 
 	if trashCount > 0 || vi.kind == "trash" {
 		sidebarRow(w, "/trash", "Trash", "🗑", trashCount, vi.kind == "trash")
@@ -81,34 +77,11 @@ func (s *Server) renderSidebar(w http.ResponseWriter, vi viewInfo, dirChildren [
 		for _, y := range agg.years {
 			ys := strconv.Itoa(y.Year)
 			active := vi.kind == "year" && v.Year == y.Year
-			sidebarRow(w, withExtra("/year/"+ys), ys, "", y.Count, active)
+			sidebarRow(w, vi.link("/year/"+ys), ys, "", y.Count, active)
 		}
 	}
 	fmt.Fprint(w, `</nav>`)
 }
-
-// sidebarCacheTTL bounds how long a cached sidebar aggregate is reused. Like
-// trashEntriesTTL, a few seconds coalesces a navigation burst (every page
-// render re-derives the same aggregate scans) without letting counts drift
-// noticeably after an import, rebuild, or favorite toggle. Past the TTL the
-// stale aggregate is served while one background refresh runs (W5-01). It
-// wraps view-count and child-count caches that are themselves
-// stale-while-revalidate, so counts can lag by up to two refresh cycles after
-// an import or a GUI-side change (W6-01). The web UI's own favorite toggle
-// clears the sidebar and view-count caches explicitly.
-const sidebarCacheTTL = 5 * time.Second
-
-const viewCountTTL = 5 * time.Second
-
-// viewCountCacheCap bounds the view-count cache before the insert path sweeps
-// it. The cache keys on the full cache.View (dir path × filter × raw), so a
-// long-lived server browsing many directories would otherwise accumulate one
-// entry per distinct view ever rendered — the TTL only marks entries stale and
-// overwrites them in place, it never deletes, so the map grows without bound
-// (W-07). Past this many entries the insert path drops everything the TTL has
-// already made stale in one O(n) pass; the cap keeps that pass off the common
-// path. The child-count cache uses the same cap.
-const viewCountCacheCap = 1024
 
 // cachedCountView returns the count for v, reusing a cached value if it is
 // fresh enough and the index has not been cleared since the value was computed.
@@ -123,7 +96,7 @@ func (s *Server) cachedCountView(v cache.View) int {
 // rootSidebarAgg returns the cached library-root sidebar aggregate for the
 // given filter/raw toggles, recomputing it when the entry is missing or the
 // index was cleared (generation mismatch). An entry older than
-// sidebarCacheTTL is served stale while one background refresh recomputes it
+// shortCacheTTL is served stale while one background refresh recomputes it
 // (stale-while-revalidate). The recompute runs outside the cache lock, so
 // concurrent renders of other toggles don't queue behind it, and the
 // All/Favorites totals share the view-count cache with the gallery header
@@ -155,9 +128,6 @@ func (s *Server) rootSidebarAgg(filter string, showRAW bool) *sidebarAgg {
 // the year buckets can be accumulated against the last one opened: no map, no
 // re-sort, no re-parse of the year (W4-09).
 func (s *Server) renderSubdirsGrouped(w http.ResponseWriter, subdirs []string, counts map[string]int, vi viewInfo) {
-	extra := extraQuery(vi.v.Filter, vi.v.ShowRAW)
-	withExtra := func(href string) string { return appendQuery(href, extra) }
-
 	type bucket struct {
 		year  string
 		dirs  []string
@@ -187,7 +157,7 @@ func (s *Server) renderSubdirsGrouped(w http.ResponseWriter, subdirs []string, c
 	}
 
 	for _, d := range nonDate {
-		href := withExtra(s.dirHref(d))
+		href := vi.link(s.dirHref(d))
 		active := vi.kind == "dir" && vi.v.Dir == d
 		sidebarRow(w, href, filepath.Base(d), "", counts[d], active)
 	}
@@ -201,7 +171,7 @@ func (s *Server) renderSubdirsGrouped(w http.ResponseWriter, subdirs []string, c
 			`<details class="year-bucket"%s><summary><span class="label">%s</span><span class="badge-count">%d</span></summary>`,
 			openAttr, html.EscapeString(b.year), b.total)
 		for _, d := range b.dirs {
-			href := withExtra(s.dirHref(d))
+			href := vi.link(s.dirHref(d))
 			active := vi.kind == "dir" && vi.v.Dir == d
 			sidebarRow(w, href, filepath.Base(d), "", counts[d], active)
 		}
@@ -219,7 +189,6 @@ func (s *Server) renderSubdirChips(w http.ResponseWriter, vi viewInfo, children 
 	if len(children) == 0 {
 		return
 	}
-	extra := extraQuery(vi.v.Filter, vi.v.ShowRAW)
 	type chip struct {
 		path  string
 		name  string
@@ -239,7 +208,7 @@ func (s *Server) renderSubdirChips(w http.ResponseWriter, vi viewInfo, children 
 	})
 	fmt.Fprint(w, `<div class="chips">`)
 	for _, c := range chips {
-		href := appendQuery(s.dirHref(c.path), extra)
+		href := vi.link(s.dirHref(c.path))
 		fmt.Fprintf(w,
 			`<a class="chip" href="%s"><span>%s</span><span class="chip-count">%d</span></a>`,
 			html.EscapeString(href), html.EscapeString(c.name), c.count)

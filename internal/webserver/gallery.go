@@ -45,6 +45,13 @@ type viewInfo struct {
 	backHref string
 	base     string // canonical gallery path without any query (toolbar flip links)
 	ctxQuery string // forwarded to viewer + api endpoints
+	extra    string // encoded filter/raw toggles, appended to every sidebar/cell link
+}
+
+// link appends the view's toolbar state to href, so a generated link preserves
+// the filter/RAW toggles the page was rendered with.
+func (vi viewInfo) link(href string) string {
+	return appendQuery(href, vi.extra)
 }
 
 // parseFilter normalizes the filter query param, defaulting to "All".
@@ -67,6 +74,12 @@ func parseShowRAW(q url.Values) bool {
 	default:
 		return true
 	}
+}
+
+// parseToggles pulls the two toolbar toggles out of a request's query, applying
+// the same defaults everywhere they're read.
+func parseToggles(q url.Values) (filter string, showRAW bool) {
+	return parseFilter(q.Get("filter")), parseShowRAW(q)
 }
 
 // extraQuery encodes the filter/raw toggles into the URL fragment we tack
@@ -108,10 +121,10 @@ func appendQuery(href, extra string) string {
 // between what a page renders and what the viewer + /api/page recover from the
 // same query string.
 func (s *Server) newViewInfo(kind string, year int, dirAbs, filter string, showRAW bool) viewInfo {
-	extra := extraQuery(filter, showRAW)
 	vi := viewInfo{
-		kind: kind,
-		v:    cache.View{Kind: kind, Filter: filter, ShowRAW: showRAW},
+		kind:  kind,
+		v:     cache.View{Kind: kind, Filter: filter, ShowRAW: showRAW},
+		extra: extraQuery(filter, showRAW),
 	}
 	switch kind {
 	case "all":
@@ -149,7 +162,7 @@ func (s *Server) newViewInfo(kind string, year int, dirAbs, filter string, showR
 		// the toolbar query, as before.
 		vi.backHref = vi.base
 	} else {
-		vi.backHref = appendQuery(vi.base, extra)
+		vi.backHref = vi.link(vi.base)
 	}
 	return vi
 }
@@ -158,8 +171,7 @@ func (s *Server) newViewInfo(kind string, year int, dirAbs, filter string, showR
 // `raw=`) query parameters and returns the corresponding view metadata.
 // Used by the viewer + /api/page to recover the surrounding list context.
 func (s *Server) viewFromQuery(q url.Values) (viewInfo, bool) {
-	filter := parseFilter(q.Get("filter"))
-	showRAW := parseShowRAW(q)
+	filter, showRAW := parseToggles(q)
 
 	switch q.Get("from") {
 	case "all", "favorites", "trash":
@@ -196,27 +208,19 @@ func buildCtxQuery(from, year, dir, filter string, showRAW bool) string {
 	return strings.Join(parts, "&")
 }
 
-// handleIndex serves the default gallery — every indexed media file.
-func (s *Server) handleIndex(w http.ResponseWriter, r *http.Request) {
-	if r.URL.Path != "/" {
-		http.NotFound(w, r)
-		return
+// galleryOf returns the handler for one of the fixed-context galleries — the
+// whole library ("all"), favorites, or trash. They differ only in the viewInfo
+// kind they render, so one body serves all three.
+func (s *Server) galleryOf(kind string) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		// "/" is the mux catch-all; anything else under it is not the index.
+		if kind == "all" && r.URL.Path != "/" {
+			http.NotFound(w, r)
+			return
+		}
+		filter, showRAW := parseToggles(r.URL.Query())
+		s.renderGalleryPage(w, r, s.newViewInfo(kind, 0, "", filter, showRAW))
 	}
-	q := r.URL.Query()
-	s.renderGalleryPage(w, r, s.newViewInfo("all", 0, "", parseFilter(q.Get("filter")), parseShowRAW(q)))
-}
-
-// handleFavorites serves only the entries flagged as favorites.
-func (s *Server) handleFavorites(w http.ResponseWriter, r *http.Request) {
-	q := r.URL.Query()
-	s.renderGalleryPage(w, r, s.newViewInfo("favorites", 0, "", parseFilter(q.Get("filter")), parseShowRAW(q)))
-}
-
-// handleTrash serves a listing of soft-deleted files. Trashed items are
-// not in the index — they're read from the trash directory directly.
-func (s *Server) handleTrash(w http.ResponseWriter, r *http.Request) {
-	q := r.URL.Query()
-	s.renderGalleryPage(w, r, s.newViewInfo("trash", 0, "", parseFilter(q.Get("filter")), parseShowRAW(q)))
 }
 
 // handleYear serves the entries whose capture year matches /year/<YYYY>.
@@ -228,15 +232,16 @@ func (s *Server) handleYear(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
-	q := r.URL.Query()
-	s.renderGalleryPage(w, r, s.newViewInfo("year", year, "", parseFilter(q.Get("filter")), parseShowRAW(q)))
+	filter, showRAW := parseToggles(r.URL.Query())
+	s.renderGalleryPage(w, r, s.newViewInfo("year", year, "", filter, showRAW))
 }
 
 // handleDir serves the entries under /dir?path=<library-relative path>. The
 // requested path must resolve to a directory inside the library root —
 // anything outside is rejected so a URL can't escape the configured tree.
 func (s *Server) handleDir(w http.ResponseWriter, r *http.Request) {
-	raw := r.URL.Query().Get("path")
+	q := r.URL.Query()
+	raw := q.Get("path")
 	if raw == "" {
 		http.Error(w, "missing path", http.StatusBadRequest)
 		return
@@ -246,8 +251,8 @@ func (s *Server) handleDir(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "forbidden", http.StatusForbidden)
 		return
 	}
-	q := r.URL.Query()
-	s.renderGalleryPage(w, r, s.newViewInfo("dir", 0, abs, parseFilter(q.Get("filter")), parseShowRAW(q)))
+	filter, showRAW := parseToggles(q)
+	s.renderGalleryPage(w, r, s.newViewInfo("dir", 0, abs, filter, showRAW))
 }
 
 // withinRoot reports whether abs is the library root itself or a path
@@ -288,7 +293,7 @@ func (s *Server) dirHref(abs string) string {
 // working. Empty is rejected explicitly: joined onto the root it would
 // silently serve the whole library as a "dir" view.
 func (s *Server) resolveDirParam(raw string) (string, bool) {
-	if raw == "" || s.libraryRoot == "" {
+	if raw == "" {
 		return "", false
 	}
 	abs := filepath.Clean(raw)
@@ -392,10 +397,7 @@ func writeCells(w http.ResponseWriter, entries []cache.Entry, ctxQ string) {
 	for _, e := range entries {
 		name := html.EscapeString(filepath.Base(e.Path))
 		thumbURL := "/thumb/" + e.ThumbID
-		viewURL := "/view/" + e.ThumbID
-		if ctxQ != "" {
-			viewURL += "?" + ctxQ
-		}
+		viewURL := viewHref(e.ThumbID, ctxQ)
 		badge := ""
 		if e.Type == scan.TypeVideo {
 			badge = `<span class="badge">video</span>`
@@ -411,12 +413,15 @@ func writeCells(w http.ResponseWriter, entries []cache.Entry, ctxQ string) {
 	}
 }
 
+// viewHref is the /view/<id> link with the surrounding list context ctxQ
+// appended, so prev/next and the grid's cells both carry the same view.
+func viewHref(id, ctxQ string) string {
+	return appendQuery("/view/"+id, ctxQ)
+}
+
 // pageNumber parses a 1-based "?p=" parameter, defaulting to 1 for empty
 // or invalid input. Negative or zero pages collapse to 1.
 func pageNumber(s string) int {
-	if s == "" {
-		return 1
-	}
 	n, err := strconv.Atoi(s)
 	if err != nil || n < 1 {
 		return 1
@@ -570,7 +575,7 @@ type childCountKey struct {
 }
 
 // cachedChildCounts returns the per-child-directory entry counts under dir,
-// reusing a cached map for sidebarCacheTTL and invalidating it when the index
+// reusing a cached map for shortCacheTTL and invalidating it when the index
 // generation changes. Past the TTL the stale map is served while one
 // background refresh runs (stale-while-revalidate).
 //
@@ -583,12 +588,6 @@ func (s *Server) cachedChildCounts(dir, filter string, showRAW bool) map[string]
 		})
 }
 
-// trashEntriesTTL is how long the cached trash listing is reused before
-// we re-scan the directory. Trash is tiny and changes rarely; a few
-// seconds is plenty to coalesce a burst of /thumb, /media, and /api/info
-// requests for the same item.
-const trashEntriesTTL = 5 * time.Second
-
 // trashSnapshot is one trash listing: the entries in listing order plus the
 // id→entry index lookupEntry uses, so both come from a single cache fill.
 type trashSnapshot struct {
@@ -597,7 +596,7 @@ type trashSnapshot struct {
 }
 
 // trashSnap returns the current trash listing snapshot, caching it for
-// trashEntriesTTL. Returns the zero snapshot when no trash directory is
+// shortCacheTTL. Returns the zero snapshot when no trash directory is
 // configured.
 func (s *Server) trashSnap() trashSnapshot {
 	if s.trashDir == "" {
@@ -614,7 +613,7 @@ func (s *Server) trashSnap() trashSnapshot {
 }
 
 // trashEntries returns the current trash listing, reusing the cached snapshot
-// for trashEntriesTTL.
+// for shortCacheTTL.
 func (s *Server) trashEntries() []cache.Entry {
 	return s.trashSnap().entries
 }

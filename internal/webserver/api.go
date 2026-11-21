@@ -15,6 +15,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	_ "golang.org/x/image/bmp"
 	"golang.org/x/image/tiff"
@@ -211,7 +212,7 @@ func (s *Server) handleAPIInfo(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
-	key := infoKey{id: e.ThumbID, mtime: e.ModTime.UnixNano(), size: e.Size}
+	key := fileVersion{name: e.ThumbID, mtime: e.ModTime.UnixNano(), size: e.Size}
 	cached, ok := s.infoCache.get(key)
 	if !ok {
 		// Dimensions are best-effort: a fast image.DecodeConfig works on
@@ -228,7 +229,9 @@ func (s *Server) handleAPIInfo(w http.ResponseWriter, r *http.Request) {
 		Path:         s.relPath(e.Path),
 		Type:         titleCase(e.Type.String()),
 		Size:         formatBytes(e.Size),
+		Created:      fmtTimeOr(mi.Created),
 		Modified:     e.ModTime.Local().Format("2006-01-02 15:04:05"),
+		Dimensions:   cached.dims,
 		Camera:       cmp.Or(mi.Camera, "—"),
 		Lens:         cmp.Or(mi.Lens, "—"),
 		Aperture:     cmp.Or(mi.Aperture, "—"),
@@ -237,15 +240,18 @@ func (s *Server) handleAPIInfo(w http.ResponseWriter, r *http.Request) {
 		FocalLength:  cmp.Or(mi.FocalLength, "—"),
 		Favorite:     e.Favorite,
 	}
-	if !mi.Created.IsZero() {
-		info.Created = mi.Created.Local().Format("2006-01-02 15:04:05")
-	} else {
-		info.Created = "—"
-	}
-	info.Dimensions = cached.dims
 
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	_ = json.NewEncoder(w).Encode(info)
+}
+
+// fmtTimeOr formats a capture timestamp for the info panel, or "—" when the
+// metadata had none.
+func fmtTimeOr(t time.Time) string {
+	if t.IsZero() {
+		return "—"
+	}
+	return t.Local().Format("2006-01-02 15:04:05")
 }
 
 // decodeDimensions returns "WxH" for normal photo formats. RAW/HEIC/video
