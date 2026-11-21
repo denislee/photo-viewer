@@ -122,7 +122,7 @@ func (c *ttlCache[K, V]) get(key K, gen uint64, compute func() V) V {
 		if c.swr {
 			// Stale but still current-generation: hand the value back now and
 			// let one background flight bring it up to date.
-			if f, ok := c.inflight[key]; !ok || f.gen != gen {
+			if f, ok := c.inflight[key]; !ok || f.gen != gen || f.epoch != c.epoch {
 				flight := c.startFlightLocked(key, gen)
 				go c.refresh(key, flight, gen, compute)
 			}
@@ -130,7 +130,9 @@ func (c *ttlCache[K, V]) get(key K, gen uint64, compute func() V) V {
 			return e.v
 		}
 	}
-	if f, ok := c.inflight[key]; ok && f.gen == gen {
+	// Join only a flight from the current epoch: one that started before a
+	// clear computed a pre-clear value, which the caller must not see (W6-B1).
+	if f, ok := c.inflight[key]; ok && f.gen == gen && f.epoch == c.epoch {
 		c.mu.Unlock()
 		<-f.done
 		if f.ok {
@@ -140,8 +142,7 @@ func (c *ttlCache[K, V]) get(key K, gen uint64, compute func() V) V {
 		// a zero value.
 		return compute()
 	}
-	// Lead. A flight for an older generation (the index was cleared while it
-	// ran) is simply superseded: its leader only deletes the map slot if it
+	// Lead. A flight for an older generation or epoch is simply superseded: its leader only deletes the map slot if it
 	// still owns it.
 	f := c.startFlightLocked(key, gen)
 	c.mu.Unlock()

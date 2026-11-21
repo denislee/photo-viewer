@@ -291,6 +291,33 @@ func TestTTLCacheClearDropsAndFencesInflight(t *testing.T) {
 	}
 }
 
+// TestTTLCacheClearDoesNotJoinPreClearFlight: a get after clear, while the
+// pre-clear refresh is still blocked, must compute fresh rather than wait for
+// and return the pre-clear value (W6-B1).
+func TestTTLCacheClearDoesNotJoinPreClearFlight(t *testing.T) {
+	c := &ttlCache[string, int]{ttl: 10 * time.Millisecond, swr: true}
+	c.get("k", 1, func() int { return 1 })
+	time.Sleep(20 * time.Millisecond)
+
+	started := make(chan struct{})
+	release := make(chan struct{})
+	defer close(release)
+	c.get("k", 1, func() int { close(started); <-release; return 2 })
+	<-started
+
+	c.clear()
+	done := make(chan int, 1)
+	go func() { done <- c.get("k", 1, func() int { return 3 }) }()
+	select {
+	case got := <-done:
+		if got != 3 {
+			t.Fatalf("post-clear get = %d, want fresh 3", got)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("post-clear get joined the blocked pre-clear flight")
+	}
+}
+
 // TestTTLCacheSWRBackgroundPanicRecovered verifies a panicking background
 // refresh does not take the process down and stores no value, so a later lookup
 // recomputes.
