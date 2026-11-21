@@ -19,9 +19,7 @@ import (
 // are repopulated as scan batches land via the usual refresh path.
 func (c *Controller) Rebuild() error {
 	c.mu.Lock()
-	if c.scanCancel != nil {
-		c.scanCancel()
-	}
+	c.cancelScanLocked()
 	// Rebuild removes the thumbs an in-flight warm-up would be writing to, so
 	// cancel the warm-up as well — otherwise it races the removal below.
 	if c.warmUpCancel != nil {
@@ -102,16 +100,11 @@ func (c *Controller) scanInto(ctx context.Context, dir string) {
 
 	// Register with the process bar so the user can pause / resume /
 	// cancel from the main screen.
-	var proc *Process
-	if c.processes != nil {
-		proc = c.processes.Begin(ctx, ProcScan, "Indexing", cancelThis, true)
-		proc.SetStatus("Indexing " + filepath.Base(dir))
-	}
+	proc := c.processes.Begin(ctx, ProcScan, "Indexing", cancelThis, true)
+	proc.SetStatus("Indexing " + filepath.Base(dir))
 
 	defer func() {
-		if proc != nil {
-			proc.End()
-		}
+		proc.End()
 		if c.invalidate != nil {
 			c.invalidate()
 		}
@@ -153,9 +146,7 @@ func (c *Controller) scanInto(ctx context.Context, dir string) {
 			changed := c.index.ReconcileBatchChanged(batch)
 			batch = batch[:0]
 			flushAt = time.Now().Add(time.Second)
-			if proc != nil {
-				proc.AddDone(int64(n))
-			}
+			proc.AddDone(int64(n))
 			// An incremental rescan of an unchanged library reconciles every
 			// file but changes no row (the upsert's WHERE guard skips them);
 			// refreshing the grid then would re-run ListDir + the sidebar
@@ -173,9 +164,7 @@ func (c *Controller) scanInto(ctx context.Context, dir string) {
 		}
 	}
 	for r := range results {
-		if proc != nil {
-			proc.Wait()
-		}
+		proc.Wait()
 		if ctx.Err() != nil {
 			// A superseded scan: the last scheduled refresh may be behind its
 			// throttle window, but its changes were committed, so fire one last
@@ -211,11 +200,8 @@ func (c *Controller) WarmUp() {
 
 	go func() {
 		defer cancel()
-		var proc *Process
-		if c.processes != nil {
-			proc = c.processes.Begin(ctx, ProcWarmUp, "Thumbnails", cancel, true)
-			proc.SetStatus("Generating thumbnails…")
-		}
+		proc := c.processes.Begin(ctx, ProcWarmUp, "Thumbnails", cancel, true)
+		proc.SetStatus("Generating thumbnails…")
 		defer func() {
 			// A superseded pass (another WarmUp started since) leaves
 			// warmUpCancel alone: it now belongs to the newer pass.
@@ -224,17 +210,13 @@ func (c *Controller) WarmUp() {
 				c.warmUpCancel = nil
 			}
 			c.mu.Unlock()
-			if proc != nil {
-				proc.End()
-			}
+			proc.End()
 			if c.invalidate != nil {
 				c.invalidate()
 			}
 		}()
 
-		if proc != nil {
-			proc.SetTotal(int64(c.index.Count()))
-		}
+		proc.SetTotal(int64(c.index.Count()))
 
 		// Fan out across a worker pool. store.Path is internally bounded by
 		// the CPU/external decode semaphores, but driving it from a single
@@ -253,9 +235,7 @@ func (c *Controller) WarmUp() {
 		for range workers {
 			wg.Go(func() {
 				for e := range jobs {
-					if proc != nil {
-						proc.Wait()
-					}
+					proc.Wait()
 					// Skip thumbnails that already exist and are fresh: a
 					// single stat, no decode and no singleflight. On a warm
 					// cache this is almost every entry, so it is what makes a
@@ -264,9 +244,7 @@ func (c *Controller) WarmUp() {
 						_, _ = c.store.Path(e)
 					}
 					n := done.Add(1)
-					if proc != nil {
-						proc.SetDone(n)
-					}
+					proc.SetDone(n)
 				}
 			})
 		}

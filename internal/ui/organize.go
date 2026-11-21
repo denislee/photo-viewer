@@ -140,9 +140,7 @@ func (v *OrganizeView) scanForMismatched(ctx context.Context, idx *cache.Index) 
 
 	total := idx.CountByType(scan.TypeVideo)
 	v.progress.set(0, int64(total))
-	if proc != nil {
-		proc.SetTotal(int64(total))
-	}
+	proc.SetTotal(int64(total))
 
 	v.setStatus(fmt.Sprintf("Scanning %d videos for mismatched dates...", total))
 
@@ -161,9 +159,7 @@ func (v *OrganizeView) scanForMismatched(ctx context.Context, idx *cache.Index) 
 	for range numWorkers {
 		wg.Go(func() {
 			for e := range jobs {
-				if proc != nil {
-					proc.Wait()
-				}
+				proc.Wait()
 				if ctx.Err() != nil {
 					return
 				}
@@ -271,9 +267,7 @@ func (v *OrganizeView) startOrganize(root string) {
 			v.moveCancel = nil
 			v.scope.detachLocked(nil)
 			v.mu.Unlock()
-			if proc != nil {
-				proc.End()
-			}
+			proc.End()
 			// One refresh at the end (not per file): the index rows were already
 			// relocated in lockstep with each rename by applyMove, so a single
 			// coalesced repaint surfaces the whole batch. Skipped when nothing
@@ -287,9 +281,7 @@ func (v *OrganizeView) startOrganize(root string) {
 		}()
 
 		for _, m := range mismatched {
-			if proc != nil {
-				proc.Wait()
-			}
+			proc.Wait()
 			if ctx.Err() != nil {
 				v.appendLog("Organization cancelled.")
 				v.setStatus("Cancelled.")

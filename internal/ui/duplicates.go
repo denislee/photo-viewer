@@ -235,9 +235,7 @@ func (d *DuplicatesView) hashAndScan(ctx context.Context, gen int, cancel contex
 			d.invalidate()
 		}
 	}, func() {
-		if proc != nil {
-			proc.Wait()
-		}
+		proc.Wait()
 	})
 	if err != nil {
 		// The error branch runs *before* the ctx.Err() check below, so a

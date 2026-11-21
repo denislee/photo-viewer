@@ -99,18 +99,15 @@ func (pb *ProcessBar) Layout(gtx layout.Context, th *Theme, snap []ProcessSnapsh
 	for _, s := range snap {
 		rb := pb.row[s.ID]
 		if rb.pause.Clicked(gtx) {
-			if p := pb.registry.Get(s.ID); p != nil {
-				if p.IsPaused() {
-					p.Resume()
-				} else {
-					p.Pause()
-				}
+			p := pb.registry.Get(s.ID)
+			if p.IsPaused() {
+				p.Resume()
+			} else {
+				p.Pause()
 			}
 		}
 		if rb.cancel.Clicked(gtx) {
-			if p := pb.registry.Get(s.ID); p != nil {
-				p.Cancel()
-			}
+			pb.registry.Get(s.ID).Cancel()
 		}
 		if rb.open.Clicked(gtx) {
 			if pb.OnOpen != nil {

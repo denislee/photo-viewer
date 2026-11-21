@@ -168,9 +168,6 @@ type procScope struct {
 // the pause gate (U5-03). supportsPause is always true for the modal views.
 // Takes no lock.
 func (s *procScope) begin(ctx context.Context, kind ProcKind, title string, cancel func()) *Process {
-	if s.reg == nil {
-		return nil
-	}
 	return s.reg.Begin(ctx, kind, title, cancel, true)
 }
 
@@ -261,9 +258,7 @@ func (t *taskView) setStatus(msg string) {
 // Workers call this at loop boundaries; if no process is registered (e.g.
 // tests) it's a no-op.
 func (t *taskView) waitIfPaused() {
-	if proc := t.currentProc(); proc != nil {
-		proc.Wait()
-	}
+	t.currentProc().Wait()
 }
 
 // scheduleInvalidate wakes the Gio frame loop through the process registry's

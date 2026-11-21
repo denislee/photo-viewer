@@ -37,25 +37,20 @@ func (c *Controller) ExportFavorites(opts ExportFavoritesOptions, done func(res 
 	go func() {
 		ctx, cancel := context.WithCancel(context.Background())
 		defer cancel()
-		var proc *Process
-		if c.processes != nil {
-			title := "Export favorites: copy"
-			switch {
-			case opts.Move:
-				title = "Export favorites: move"
-			case opts.MaxLongEdge > 0:
-				title = "Export favorites: recompress"
-			}
-			proc = c.processes.Begin(ctx, ProcExportFavorites, title, cancel, false)
-			proc.SetStatus("Starting…")
-			defer proc.End()
+		title := "Export favorites: copy"
+		switch {
+		case opts.Move:
+			title = "Export favorites: move"
+		case opts.MaxLongEdge > 0:
+			title = "Export favorites: recompress"
 		}
+		proc := c.processes.Begin(ctx, ProcExportFavorites, title, cancel, false)
+		proc.SetStatus("Starting…")
+		defer proc.End()
 		progress := func(step, total int, action, msg string) {
-			if proc != nil {
-				proc.SetTotal(int64(total))
-				proc.SetDone(int64(step))
-				proc.SetStatus(action + " " + msg)
-			}
+			proc.SetTotal(int64(total))
+			proc.SetDone(int64(step))
+			proc.SetStatus(action + " " + msg)
 		}
 		res, err := export.Favorites(ctx, c.index, export.Options{
 			Root:        c.libraryRoot,

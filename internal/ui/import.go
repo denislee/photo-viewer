@@ -900,9 +900,7 @@ func (v *ImportView) startImport(cfg Config) {
 			proc := v.scope.currentLocked()
 			v.scope.detachLocked(nil)
 			v.mu.Unlock()
-			if proc != nil {
-				proc.End()
-			}
+			proc.End()
 			if len(mounts) > 0 {
 				v.unmountAll(mounts)
 			}

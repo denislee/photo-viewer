@@ -86,6 +86,7 @@ func (g *PauseGate) IsPaused() bool {
 
 // Process is a single tracked background task. Workers update Done/Total/
 // Status from any goroutine; the UI reads via ProcessRegistry.Snapshot.
+// A nil *Process is valid: every method is a no-op, so callers need no registry in tests.
 type Process struct {
 	ID    int64
 	Kind  ProcKind
@@ -105,6 +106,9 @@ type Process struct {
 }
 
 func (p *Process) SetStatus(s string) {
+	if p == nil {
+		return
+	}
 	p.mu.Lock()
 	p.status = s
 	p.mu.Unlock()
@@ -112,16 +116,25 @@ func (p *Process) SetStatus(s string) {
 }
 
 func (p *Process) SetTotal(t int64) {
+	if p == nil {
+		return
+	}
 	p.total.Store(t)
 	p.registry.notify()
 }
 
 func (p *Process) SetDone(d int64) {
+	if p == nil {
+		return
+	}
 	p.done.Store(d)
 	p.registry.notify()
 }
 
 func (p *Process) AddDone(delta int64) {
+	if p == nil {
+		return
+	}
 	p.done.Add(delta)
 	p.registry.notify()
 }
@@ -129,12 +142,18 @@ func (p *Process) AddDone(delta int64) {
 // Wait blocks while the process is paused. Workers should call this at
 // loop boundaries so pause requests take effect within one iteration.
 func (p *Process) Wait() {
+	if p == nil {
+		return
+	}
 	if p.gate != nil {
 		p.gate.Wait()
 	}
 }
 
 func (p *Process) Pause() {
+	if p == nil {
+		return
+	}
 	// A cancelled process must not re-close the gate: its AfterFunc already
 	// fired, so nothing would ever release the worker again (U5-03).
 	if p.gate != nil && p.ctx.Err() == nil {
@@ -146,6 +165,9 @@ func (p *Process) Pause() {
 }
 
 func (p *Process) Resume() {
+	if p == nil {
+		return
+	}
 	if p.gate != nil {
 		p.gate.Resume()
 	}
@@ -153,6 +175,9 @@ func (p *Process) Resume() {
 }
 
 func (p *Process) IsPaused() bool {
+	if p == nil {
+		return false
+	}
 	if p.gate == nil {
 		return false
 	}
@@ -163,6 +188,9 @@ func (p *Process) IsPaused() bool {
 // gate so any worker blocked inside Wait() can observe the cancellation
 // and exit promptly.
 func (p *Process) Cancel() {
+	if p == nil {
+		return
+	}
 	if p.gate != nil {
 		p.gate.Resume()
 	}
@@ -175,6 +203,9 @@ func (p *Process) Cancel() {
 // End removes the process from the registry. Safe to call from any
 // goroutine, typically from a defer in the worker.
 func (p *Process) End() {
+	if p == nil {
+		return
+	}
 	if p.stopResume != nil {
 		p.stopResume()
 	}
@@ -314,6 +345,9 @@ func (r *ProcessRegistry) forceNotify() {
 // the gate (context.AfterFunc), so a worker paused in Wait observes the
 // cancellation however it was cancelled — not just via Process.Cancel (U5-03).
 func (r *ProcessRegistry) Begin(ctx context.Context, kind ProcKind, title string, cancel func(), supportsPause bool) *Process {
+	if r == nil {
+		return nil
+	}
 	r.mu.Lock()
 	r.nextID++
 	id := r.nextID
@@ -357,6 +391,9 @@ func (r *ProcessRegistry) remove(id int64) {
 // Snapshot returns a sorted, read-only view of the current processes.
 // Ordering is by start time so the UI is stable across frames.
 func (r *ProcessRegistry) Snapshot() []ProcessSnapshot {
+	if r == nil {
+		return nil
+	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if len(r.procs) == 0 {
@@ -384,6 +421,9 @@ func (r *ProcessRegistry) Snapshot() []ProcessSnapshot {
 // finished. Used by the bar's Cancel/Pause buttons to find the live
 // Process for the snapshot row the user clicked.
 func (r *ProcessRegistry) Get(id int64) *Process {
+	if r == nil {
+		return nil
+	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	for _, p := range r.procs {
@@ -396,6 +436,9 @@ func (r *ProcessRegistry) Get(id int64) *Process {
 
 // Count returns the number of in-flight processes.
 func (r *ProcessRegistry) Count() int {
+	if r == nil {
+		return 0
+	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	return len(r.procs)

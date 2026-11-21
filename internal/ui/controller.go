@@ -255,6 +255,14 @@ func (c *Controller) DirCountsWithVersion() (map[string]int, uint64) {
 	return c.dirCounts, c.dirCountsVer
 }
 
+// cancelScanLocked cancels the in-flight scan, if any. The caller holds c.mu.
+func (c *Controller) cancelScanLocked() {
+	if c.scanCancel != nil {
+		c.scanCancel()
+		c.scanCancel = nil
+	}
+}
+
 // SelectDir switches the active directory: it cancels any in-flight scan,
 // refreshes from the index, then starts an incremental scan of path. The grid
 // and the sidebar tree both re-anchor on path; the Favorites and Trash views
@@ -262,19 +270,14 @@ func (c *Controller) DirCountsWithVersion() (map[string]int, uint64) {
 func (c *Controller) SelectDir(path string) {
 	if path == FavoritesView || path == TrashView {
 		c.mu.Lock()
-		if c.scanCancel != nil {
-			c.scanCancel()
-			c.scanCancel = nil
-		}
+		c.cancelScanLocked()
 		c.currentDir = path
 		c.mu.Unlock()
 		c.scheduleRefresh(path)
 		return
 	}
 	c.mu.Lock()
-	if c.scanCancel != nil {
-		c.scanCancel()
-	}
+	c.cancelScanLocked()
 	ctx, cancel := context.WithCancel(context.Background())
 	c.scanCancel = cancel
 	c.treeDir = path
@@ -349,10 +352,7 @@ var warnUser = func(title, msg string) {
 // the keyboard — j/k previews each dir; Enter/click commits via SelectDir.
 func (c *Controller) PreviewDir(path string) {
 	c.mu.Lock()
-	if c.scanCancel != nil {
-		c.scanCancel()
-		c.scanCancel = nil
-	}
+	c.cancelScanLocked()
 	c.currentDir = path
 	c.mu.Unlock()
 
@@ -366,10 +366,7 @@ func (c *Controller) PreviewDir(path string) {
 func (c *Controller) PreviewYear(year string) {
 	key := YearViewPrefix + year
 	c.mu.Lock()
-	if c.scanCancel != nil {
-		c.scanCancel()
-		c.scanCancel = nil
-	}
+	c.cancelScanLocked()
 	c.currentDir = key
 	c.mu.Unlock()
 

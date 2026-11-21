@@ -18,20 +18,13 @@ func (c *Controller) ExportSelection(paths []string, target string, done func(co
 	go func() {
 		ctx, cancel := context.WithCancel(context.Background())
 		defer cancel()
-		var proc *Process
-		if c.processes != nil {
-			proc = c.processes.Begin(ctx, ProcExportSelection, "Export selection", cancel, false)
-			proc.SetTotal(int64(len(paths)))
-			proc.SetStatus("Copying to " + target)
-		}
+		proc := c.processes.Begin(ctx, ProcExportSelection, "Export selection", cancel, false)
+		proc.SetTotal(int64(len(paths)))
+		proc.SetStatus("Copying to " + target)
 		copied, errs := exportSelection(ctx, paths, target, func() {
-			if proc != nil {
-				proc.AddDone(1)
-			}
+			proc.AddDone(1)
 		})
-		if proc != nil {
-			proc.End()
-		}
+		proc.End()
 		if done != nil {
 			done(copied, errs)
 		}
