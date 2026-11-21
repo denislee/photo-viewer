@@ -698,7 +698,7 @@ func TestStopForceClosesActiveConnections(t *testing.T) {
 	// WriteTimeout: 0 mirrors the production server (server.go:213) — the very
 	// setting that lets a stream run forever absent the hard close.
 	srv := &http.Server{Handler: handler, WriteTimeout: 0}
-	s := &Server{srv: srv, running: true, addr: ln.Addr().String()}
+	s := &Server{srv: srv, addr: ln.Addr().String()}
 	go func() { _ = srv.Serve(ln) }()
 
 	// Fire an in-flight request and wait until it's parked inside the handler.
@@ -1565,5 +1565,33 @@ func TestTrashUsesResolvedDirOnReadOnlyRoot(t *testing.T) {
 	}
 	if !strings.Contains(body, "1 items") {
 		t.Errorf("trash page does not show 1 item: %s", body)
+	}
+}
+
+// TestRestartDuringDrainStaysRunning covers W6-B2: a Start issued while the
+// previous server is still draining after Stop must not be marked stopped
+// when the old Serve goroutine finally returns.
+func TestRestartDuringDrainStaysRunning(t *testing.T) {
+	s := &Server{}
+	if err := s.Start("127.0.0.1", 0, ""); err != nil {
+		t.Fatal(err)
+	}
+	// First half of Stop: forget the server, but let it drain later.
+	s.mu.Lock()
+	old := s.srv
+	s.srv = nil
+	s.mu.Unlock()
+
+	if err := s.Start("127.0.0.1", 0, ""); err != nil {
+		t.Fatalf("restart: %v", err)
+	}
+	t.Cleanup(func() { _ = s.Stop() })
+	_ = old.Close() // the old Serve returns now and runs its cleanup
+
+	for range 20 {
+		if !s.Running() || s.Addr() == "" {
+			t.Fatalf("old server's exit marked the new one stopped (running=%v addr=%q)", s.Running(), s.Addr())
+		}
+		time.Sleep(5 * time.Millisecond)
 	}
 }

@@ -59,7 +59,6 @@ type Server struct {
 	mu      sync.Mutex
 	srv     *http.Server
 	addr    string // resolved listen address (host:port) once running
-	running bool
 
 	// HLS on-the-fly transcode state (see hls.go). Lazily initialised by
 	// hlsInit so New stays a plain literal. hlsSem bounds concurrent ffmpeg
@@ -108,7 +107,7 @@ func New(index *cache.Index, store, display *cache.ThumbStore, libraryRoot, tras
 func (s *Server) Running() bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.running
+	return s.srv != nil
 }
 
 // Addr returns the bound address (host:port) while running, or "" when stopped.
@@ -123,7 +122,7 @@ func (s *Server) Addr() string {
 // error if the listener can't be opened or the server is already running.
 func (s *Server) Start(host string, port int, password string) error {
 	s.mu.Lock()
-	if s.running {
+	if s.srv != nil {
 		s.mu.Unlock()
 		return errors.New("webserver already running")
 	}
@@ -170,14 +169,17 @@ func (s *Server) Start(host string, port int, password string) error {
 	}
 	s.srv = srv
 	s.addr = ln.Addr().String()
-	s.running = true
 	s.mu.Unlock()
 
 	go func() {
 		_ = srv.Serve(ln)
+		// Clear the state only if it is still ours: a Start issued while
+		// this server drained after Stop owns s.srv now (W6-B2).
 		s.mu.Lock()
-		s.running = false
-		s.addr = ""
+		if s.srv == srv {
+			s.srv = nil
+			s.addr = ""
+		}
 		s.mu.Unlock()
 	}()
 	return nil
@@ -202,7 +204,6 @@ func (s *Server) Stop() error {
 	s.mu.Lock()
 	srv := s.srv
 	s.srv = nil
-	s.running = false
 	s.addr = ""
 	s.mu.Unlock()
 	if srv == nil {
