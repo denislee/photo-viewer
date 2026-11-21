@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/dns/photo-viewer/internal/cache"
+	"github.com/dns/photo-viewer/internal/scan"
 )
 
 // syncBuffer is a mutex-guarded sink for the package logger. The refresh that
@@ -100,7 +101,7 @@ func TestPerformDeletionSurfacesIndexError(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	c.performDeletion([]string{victim})
+	c.performDeletion([]string{victim}, false)
 
 	// The file still left the library even though the row could not be dropped.
 	if _, err := os.Stat(victim); !os.IsNotExist(err) {
@@ -153,7 +154,7 @@ func TestPerformDeletionSurfacesIndexErrorNoTrash(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	c.performDeletion([]string{victim})
+	c.performDeletion([]string{victim}, false)
 
 	if _, err := os.Stat(victim); !os.IsNotExist(err) {
 		t.Errorf("victim still at original path (stat err = %v, want IsNotExist)", err)
@@ -164,4 +165,52 @@ func TestPerformDeletionSurfacesIndexErrorNoTrash(t *testing.T) {
 	if out := logBuf.String(); !strings.Contains(out, "index cleanup failed") {
 		t.Errorf("index cleanup failure not logged; got %q", out)
 	}
+}
+
+// TestDeleteOffGridPathRecounts covers U6-B3: a Duplicates delete usually
+// removes files outside the current grid, which the local count patch cannot
+// see, so the deletion must request a sidebar recount or the counts stay high.
+func TestDeleteOffGridPathRecounts(t *testing.T) {
+	tmp := t.TempDir()
+	root := filepath.Join(tmp, "lib")
+	a, b := filepath.Join(root, "a"), filepath.Join(root, "b")
+	for _, d := range []string{a, b} {
+		if err := os.MkdirAll(d, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	keep, victim := filepath.Join(a, "keep.jpg"), filepath.Join(b, "dup.jpg")
+	for _, p := range []string{keep, victim} {
+		if err := os.WriteFile(p, []byte("x"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	c := newTestController(t, root, filepath.Join(tmp, "cache"))
+	c.index.ReconcileBatch([]scan.Result{
+		{Path: keep, Type: scan.TypePhoto, Size: 1, ModTime: time.Unix(1000, 0)},
+		{Path: victim, Type: scan.TypePhoto, Size: 1, ModTime: time.Unix(1000, 0)},
+	})
+	c.mu.Lock()
+	c.currentDir = a
+	c.mu.Unlock()
+	c.refreshFromIndex(a, true)
+	if counts, _ := c.DirCountsWithVersion(); counts[root] != 2 {
+		t.Fatalf("baseline root count = %d, want 2", counts[root])
+	}
+
+	if err := c.DeletePaths([]string{victim}); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		counts, _ := c.DirCountsWithVersion()
+		if counts[root] == 1 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("root count = %d after deleting an off-grid file, want 1", counts[root])
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	waitRefreshSettled(t, c)
 }

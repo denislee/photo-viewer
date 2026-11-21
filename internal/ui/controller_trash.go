@@ -39,8 +39,8 @@ func (c *Controller) DeletePath(path string) error {
 		go c.restoreBatch([]string{path})
 		return nil
 	}
-	c.patchLocalDeletion([]string{path}, c.trashDir != "")
-	go c.performDeletion([]string{path})
+	allLocal := c.patchLocalDeletion([]string{path}, c.trashDir != "")
+	go c.performDeletion([]string{path}, !allLocal)
 	return nil
 }
 
@@ -67,8 +67,8 @@ func (c *Controller) DeletePaths(paths []string) error {
 		}
 	}
 	if len(toDelete) > 0 {
-		c.patchLocalDeletion(toDelete, c.trashDir != "")
-		go c.performDeletion(toDelete)
+		allLocal := c.patchLocalDeletion(toDelete, c.trashDir != "")
+		go c.performDeletion(toDelete, !allLocal)
 	}
 	if len(toRestore) > 0 {
 		go c.restoreBatch(toRestore)
@@ -132,9 +132,13 @@ func collectRestores(paths []string, store *cache.ThumbStore) (results []scan.Re
 // the same number. Wakes the UI. The actual filesystem + DB work runs
 // asynchronously in performDeletion; this function is what makes a
 // 10k-entry directory's delete feel instant.
-func (c *Controller) patchLocalDeletion(paths []string, intoTrash bool) {
+//
+// It reports whether every path was in the live entry list. A path that
+// wasn't (a Duplicates delete in another directory) decremented no count, so
+// the caller must ask performDeletion for a recount (U6-B3).
+func (c *Controller) patchLocalDeletion(paths []string, intoTrash bool) (allLocal bool) {
 	if len(paths) == 0 {
-		return
+		return true
 	}
 	deleted := make(map[string]bool, len(paths))
 	for _, p := range paths {
@@ -208,6 +212,7 @@ func (c *Controller) patchLocalDeletion(paths []string, intoTrash bool) {
 		c.dirCounts = next
 		c.dirCountsVer++
 	}
+	allLocal = len(present) == len(paths)
 	c.mu.Unlock()
 
 	if intoTrash {
@@ -216,6 +221,7 @@ func (c *Controller) patchLocalDeletion(paths []string, intoTrash bool) {
 	if c.invalidate != nil {
 		c.invalidate()
 	}
+	return allLocal
 }
 
 // performDeletion does the slow I/O work: a single batch DB delete plus
@@ -223,11 +229,18 @@ func (c *Controller) patchLocalDeletion(paths []string, intoTrash bool) {
 // items doesn't block the UI thread on 100 syscalls. Order is rename
 // first / DB delete second so an in-flight scan can't re-discover a path
 // whose row was already removed.
-func (c *Controller) performDeletion(paths []string) {
+//
+// recount asks for a sidebar recount once the index write lands; the caller
+// sets it when its local count patch could not cover every path. An index
+// failure forces one too, so the next paint resurfaces the index's truth
+// instead of phantom rows with broken cells.
+func (c *Controller) performDeletion(paths []string, recount bool) {
+	// failed collects the paths that must be unlinked: every path when there
+	// is no trash dir, otherwise those whose rename into the trash failed
+	// (e.g. EXDEV).
+	failed := paths
 	if c.trashDir != "" {
-		// Track paths whose rename failed; we'll have to undo the
-		// optimistic trash-count bump and fall through to os.Remove.
-		var failed []string
+		failed = nil
 		for _, p := range paths {
 			dst, err := cache.MoveToTrash(p, c.trashDir)
 			if err == nil {
@@ -239,30 +252,13 @@ func (c *Controller) performDeletion(paths []string) {
 			log.Printf("trash: rename failed for %s (%v); falling back to remove", p, err)
 			failed = append(failed, p)
 		}
-		if err := c.index.RemoveEntries(paths); err != nil {
-			// Files are already in the trash but their rows survive; log it and
-			// force a refresh so the next paint resurfaces the index's truth
-			// instead of phantom rows with broken cells.
-			log.Printf("trash: index cleanup failed for %d path(s): %v", len(paths), err)
-			c.scheduleRefreshRecount(c.activeDir())
-		}
-		for _, p := range failed {
-			if c.store != nil {
-				c.store.Forget(cache.ThumbIDFor(p))
-			}
-			if rmErr := os.Remove(p); rmErr != nil && !os.IsNotExist(rmErr) {
-				log.Printf("trash: remove failed for %s: %v", p, rmErr)
-			}
-		}
 		if len(failed) > 0 {
 			// Undo the optimistic trash bump for the items that didn't
 			// actually make it into the trash dir.
 			c.bumpTrashCount(-len(failed))
 		}
-		return
 	}
-	// No trash dir — straight unlink.
-	for _, p := range paths {
+	for _, p := range failed {
 		if c.store != nil {
 			c.store.Forget(cache.ThumbIDFor(p))
 		}
@@ -271,10 +267,10 @@ func (c *Controller) performDeletion(paths []string) {
 		}
 	}
 	if err := c.index.RemoveEntries(paths); err != nil {
-		// Files are already unlinked but their rows survive; log it and force a
-		// refresh so the next paint resurfaces the index's truth instead of
-		// phantom rows with broken cells.
 		log.Printf("delete: index cleanup failed for %d path(s): %v", len(paths), err)
+		recount = true
+	}
+	if recount {
 		c.scheduleRefreshRecount(c.activeDir())
 	}
 }
