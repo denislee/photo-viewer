@@ -8,6 +8,7 @@ import (
 	"log"
 	"os"
 	"sync"
+	"unicode/utf8"
 
 	"gioui.org/io/pointer"
 	"gioui.org/layout"
@@ -613,10 +614,10 @@ func (d *DuplicatesView) Layout(gtx layout.Context, th *Theme) layout.Dimensions
 			layout.Rigid(layout.Spacer{Height: unit.Dp(8)}.Layout),
 			layout.Rigid(func(gtx layout.Context) layout.Dimensions {
 				if confirmingAll {
-					lbl := material.Label(th.Theme, unit.Sp(13), "Delete ALL newer copies? This cannot be undone.")
+					lbl := material.Label(th.Theme, unit.Sp(13), "Move ALL newer copies to the trash?")
 					lbl.Color = color.NRGBA{R: 0xc0, G: 0x40, B: 0x40, A: 0xff}
 					lbl.Font.Weight = 700
-					yes := material.Button(th.Theme, &d.confirmAllBtn, "Yes, Delete All")
+					yes := material.Button(th.Theme, &d.confirmAllBtn, "Yes, Trash All")
 					yes.Background = color.NRGBA{R: 0xc0, G: 0x40, B: 0x40, A: 0xff}
 					no := material.Button(th.Theme, &d.cancelBtn, "Cancel")
 					return layout.Flex{Axis: layout.Horizontal, Alignment: layout.Middle}.Layout(gtx,
@@ -845,7 +846,7 @@ func (d *DuplicatesView) layoutDetail(gtx layout.Context, th *Theme, groups []ca
 		newer := len(g.Entries) - 1
 		rows = append(rows, layout.Rigid(func(gtx layout.Context) layout.Dimensions {
 			lbl := material.Label(th.Theme, unit.Sp(13),
-				fmt.Sprintf("Permanently delete %d newer copies? The oldest one will be kept.", newer))
+				fmt.Sprintf("Move %d newer copies to the trash? The oldest one will be kept.", newer))
 			lbl.Color = th.Foreground
 			lbl.Font.Weight = 600
 			return lbl.Layout(gtx)
@@ -973,8 +974,13 @@ func shortPath(p string) string {
 	if len(p) <= 48 {
 		return p
 	}
-	// Keep the last 45 chars plus a leading ellipsis.
-	return "…" + p[len(p)-47:]
+	// Keep (about) the last 47 bytes plus a leading ellipsis, cutting on a
+	// rune boundary so a multi-byte name never renders as U+FFFD (U6-B5).
+	cut := len(p) - 47
+	for cut < len(p) && !utf8.RuneStart(p[cut]) {
+		cut++
+	}
+	return "…" + p[cut:]
 }
 
 // formatBytesGio is the shared byte-size formatter for the UI overlays

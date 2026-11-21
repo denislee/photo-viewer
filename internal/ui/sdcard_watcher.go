@@ -314,7 +314,7 @@ func (v *SDPromptView) Layout(gtx layout.Context, th *Theme) layout.Dimensions {
 					}),
 					layout.Rigid(layout.Spacer{Width: unit.Dp(8)}.Layout),
 					layout.Rigid(func(gtx layout.Context) layout.Dimensions {
-						b := material.Button(th.Theme, &v.importDeleteBtn, "Import && delete source")
+						b := material.Button(th.Theme, &v.importDeleteBtn, "Import & delete source")
 						b.Background = th.Destructive
 						return b.Layout(gtx)
 					}),
