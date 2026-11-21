@@ -558,29 +558,12 @@ func TestPlanCountFavorites(t *testing.T) {
 
 // TestPlanCountChildDirsFiltered guards the sidebar's per-child-directory count
 // query: it must be a PK range SEARCH over the parent's subtree.
-//
-// The query below is a copy of CountChildDirsFiltered's SQL in index.go — keep
-// it in sync if that statement changes.
 func TestPlanCountChildDirsFiltered(t *testing.T) {
 	idx, cleanup := loadEmpty(t)
 	defer cleanup()
 	seed(t, idx, "/lib", 200)
 
-	parent := "/lib"
-	lower, upper := dirRange(parent)
-	startCol := len(lower) + 1
-	where, args := typeFilterClause("All", true)
-	q := `
-		SELECT
-			substr(path, ?, instr(substr(path, ?), '/') - 1) AS child,
-			COUNT(*)
-		FROM entries
-		WHERE path >= ? AND path < ?
-		  AND instr(substr(path, ?), '/') > 0` + where + `
-		GROUP BY child`
-	queryArgs := []any{startCol, startCol, lower, upper, startCol}
-	queryArgs = append(queryArgs, args...)
-
+	q, queryArgs := childDirsQuery("/lib", "All", true)
 	plan := explainPlan(t, idx, q, queryArgs...)
 	mustContain(t, "child dirs", plan, "SEARCH entries")
 	// The group-by b-tree is inherent to this query shape (the child name is a
@@ -602,13 +585,25 @@ func TestCountChildDirsFiltered(t *testing.T) {
 		{Path: "/lib/top.jpg", Type: scan.TypePhoto, Size: 4},
 	})
 
+	// Non-ASCII parent: len(lower) is a byte offset, so the SQL must cut
+	// on bytes too (C6-B1), or the child names come back shifted ("ub").
+	idx.ReconcileBatch([]scan.Result{
+		{Path: "/lib/Café/sub/x.jpg", Type: scan.TypePhoto, Size: 5},
+		{Path: "/lib/Café/sub2/y.jpg", Type: scan.TypePhoto, Size: 6},
+		{Path: "/lib/Café/日本/z.jpg", Type: scan.TypePhoto, Size: 7},
+	})
+	if got, want := idx.CountChildDirsFiltered("/lib/Café", "All", true),
+		(map[string]int{"/lib/Café/sub": 1, "/lib/Café/sub2": 1, "/lib/Café/日本": 1}); !reflect.DeepEqual(got, want) {
+		t.Errorf("CountChildDirsFiltered(/lib/Café) = %v, want %v", got, want)
+	}
+
 	for _, tc := range []struct {
 		filter  string
 		showRAW bool
 		want    map[string]int
 	}{
-		{"All", true, map[string]int{"/lib/a": 2, "/lib/c": 1}},
-		{"Photos", true, map[string]int{"/lib/a": 2}},
+		{"All", true, map[string]int{"/lib/a": 2, "/lib/c": 1, "/lib/Café": 3}},
+		{"Photos", true, map[string]int{"/lib/a": 2, "/lib/Café": 3}},
 		{"Videos", true, map[string]int{"/lib/c": 1}},
 	} {
 		got := idx.CountChildDirsFiltered("/lib", tc.filter, tc.showRAW)

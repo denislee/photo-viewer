@@ -1089,6 +1089,35 @@ func (i *Index) Close() error {
 	return nil
 }
 
+// childDirsQuery builds CountChildDirsFiltered's grouped scan. It is a
+// separate function so the query-plan test checks the real statement.
+//
+// SQLite uses 1-based positions for substr/instr. lower has a trailing
+// separator, so the child segment starts at byte len(lower)+1 and runs up to
+// the next '/' (which marks the boundary into the child's own subtree). Paths
+// directly under parent (no further '/') are not counted; those represent
+// files in parent and aren't subdirs.
+//
+// substr/instr count characters on TEXT but bytes on BLOB, and len(lower) is a
+// byte count, so path is cast to BLOB: otherwise any non-ASCII parent
+// (/lib/Café) shifts the cut and the child names come back truncated. The
+// range predicate stays on the TEXT column so the PK search is kept.
+func childDirsQuery(parent, filter string, showRAW bool) (string, []any) {
+	lower, upper := dirRange(parent)
+	startCol := len(lower) + 1
+	where, args := typeFilterClause(filter, showRAW)
+	q := `
+		SELECT
+			substr(CAST(path AS BLOB), ?, instr(substr(CAST(path AS BLOB), ?), X'2F') - 1) AS child,
+			COUNT(*)
+		FROM entries
+		WHERE path >= ? AND path < ?
+		  AND instr(substr(CAST(path AS BLOB), ?), X'2F') > 0` + where + `
+		GROUP BY child`
+	queryArgs := []any{startCol, startCol, lower, upper, startCol}
+	return q, append(queryArgs, args...)
+}
+
 // CountChildDirsFiltered returns, for each immediate child directory of
 // parent, the recursive count of entries that pass the given filter. The
 // whole result set is produced by a single grouped scan over the parent's
@@ -1098,25 +1127,7 @@ func (i *Index) Close() error {
 // Keys in the returned map are absolute paths matching what
 // listSubdirs returns.
 func (i *Index) CountChildDirsFiltered(parent, filter string, showRAW bool) map[string]int {
-	lower, upper := dirRange(parent)
-	// SQLite uses 1-based positions for substr/instr. lower has a trailing
-	// separator, so the child segment starts at column len(lower)+1 and
-	// runs up to the next '/' (which marks the boundary into the child's
-	// own subtree). Paths directly under parent (no further '/') are not
-	// counted; those represent files in parent and aren't subdirs.
-	startCol := len(lower) + 1
-	where, args := typeFilterClause(filter, showRAW)
-	q := `
-		SELECT
-			substr(path, ?, instr(substr(path, ?), '/') - 1) AS child,
-			COUNT(*)
-		FROM entries
-		WHERE path >= ? AND path < ?
-		  AND instr(substr(path, ?), '/') > 0` + where + `
-		GROUP BY child`
-	queryArgs := []any{startCol, startCol, lower, upper, startCol}
-	queryArgs = append(queryArgs, args...)
-
+	q, queryArgs := childDirsQuery(parent, filter, showRAW)
 	rows, err := i.db.Query(q, queryArgs...)
 	if err != nil {
 		return nil
