@@ -277,7 +277,7 @@ func Load(dbPath string) (*Index, error) {
 	// A failed read must not be taken as version 0: that would re-run the
 	// destructive migrations (v1 NULLs quick_hash, v4 deletes the faces).
 	if err := db.QueryRow("PRAGMA user_version").Scan(&userVersion); err != nil {
-		db.Close()
+		_ = db.Close()
 		return nil, fmt.Errorf("read schema version: %w", err)
 	}
 	if userVersion < 1 {
