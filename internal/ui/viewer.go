@@ -152,12 +152,10 @@ type Viewer struct {
 	// frame buffer, so it is dropped when playback stops. UI goroutine only.
 	lastVideoOp   paint.ImageOp
 	lastVideoPath string
-	lastVideoSize image.Point // render size the op was made for (cache key)
-	// lastVideoDraw is the size lastVideoOp should be painted at. It equals
-	// lastVideoSize except when a native-size render (V5-02) is painted scaled
-	// into the image area; keeping it separately means a cached frame is also
-	// drawn correctly.
-	lastVideoDraw image.Point
+	// lastVideoSize is the render size the op was requested at (the cache
+	// key). The op is painted at its own Size(): on the async path a resize
+	// briefly hands back the previous size's frame (G6-B2).
+	lastVideoSize image.Point
 
 	invalidate func()
 }
@@ -403,7 +401,7 @@ func (v *Viewer) Close() {
 // dropVideoFrame forgets the last video frame handed to Gio. The op aliases
 // the player's frame buffer, so it must go whenever playback stops.
 func (v *Viewer) dropVideoFrame() {
-	v.lastVideoOp, v.lastVideoPath, v.lastVideoSize, v.lastVideoDraw = paint.ImageOp{}, "", image.Point{}, image.Point{}
+	v.lastVideoOp, v.lastVideoPath, v.lastVideoSize = paint.ImageOp{}, "", image.Point{}
 }
 
 // SetVideoVisible tells the player whether its output is on screen. The window
@@ -665,7 +663,8 @@ func (v *Viewer) ensurePlayer() (p *video.Player, created bool) {
 
 // playVideo loads the current entry into mpv if it isn't already, renders the
 // current frame, and returns it wrapped as a paint.ImageOp together with the
-// pixel size it was rendered at, which is also the size to paint it at. A clip
+// frame's own pixel size, which is the size to paint it at (on the async path
+// that can still be the previous request's size for a frame or two). A clip
 // smaller than (w, h) is rendered at its native size and the returned size is
 // that smaller rect, so the caller must scale it up to the image area (V5-02);
 // a clip at least as large as the area keeps rendering at (w, h) where mpv
@@ -695,7 +694,7 @@ func (v *Viewer) playVideo(e cache.Entry, w, h int) (op paint.ImageOp, size imag
 	}
 	sz := image.Pt(rw, rh)
 	if !p.NeedsRedraw() && v.lastVideoPath == e.Path && v.lastVideoSize == sz {
-		return v.lastVideoOp, v.lastVideoDraw, true
+		return v.lastVideoOp, v.lastVideoOp.Size(), true
 	}
 	frame, ok := p.Render(rw, rh)
 	if !ok {
@@ -714,8 +713,8 @@ func (v *Viewer) playVideo(e cache.Entry, w, h int) (op paint.ImageOp, size imag
 		// chain on every frame upload (V5-01).
 		op.Filter = paint.FilterNearest
 	}
-	v.lastVideoOp, v.lastVideoPath, v.lastVideoSize, v.lastVideoDraw = op, e.Path, sz, sz
-	return op, sz, true
+	v.lastVideoOp, v.lastVideoPath, v.lastVideoSize = op, e.Path, sz
+	return op, frame.Bounds().Size(), true
 }
 
 // Layout fills gtx.Constraints with a black background and the active
