@@ -328,14 +328,18 @@ func GetMediaDate(path string) time.Time {
 	return time.Now()
 }
 
-// SameDateFolder returns true if the expected date matches the file's parent
-// directory's name (expected format: YYYY-MM-DD).
+// SameDateFolder reports whether path already sits in the folder for date. It
+// accepts both layouts the tools write: the GUI's Organize/Import files into
+// .../YYYY-MM-DD/, pv-organize into .../YYYY/MM/DD/. Accepting only the first
+// made everything pv-organize filed look misplaced, and Organize then nested it
+// as .../YYYY/MM/DD/YYYY-MM-DD/ (S6-03).
 func SameDateFolder(path string, date time.Time) bool {
-	parent := filepath.Base(filepath.Dir(path))
-	// We only check if the parent matches a YYYY-MM-DD pattern.
-	if len(parent) != 10 || parent[4] != '-' || parent[7] != '-' {
-		return false
+	dir := filepath.Dir(path)
+	if filepath.Base(dir) == date.Format("2006-01-02") {
+		return true
 	}
-
-	return date.Format("2006-01-02") == parent
+	day := filepath.Base(dir)
+	month := filepath.Base(filepath.Dir(dir))
+	year := filepath.Base(filepath.Dir(filepath.Dir(dir)))
+	return year+"/"+month+"/"+day == date.Format("2006/01/02")
 }
