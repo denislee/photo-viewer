@@ -474,7 +474,7 @@ func (v *Viewer) cachePut(e cache.Entry, d decodedImage) {
 	}
 	v.cacheDropLocked(e.Path)
 	r := recentImage{path: e.Path, mod: e.ModTime, op: d.op, sz: d.sz, native: d.native, full: d.full}
-	v.recent = append([]recentImage{r}, v.recent...)
+	v.recent = slices.Insert(v.recent, 0, r)
 	if len(v.recent) > viewerRecentCap {
 		v.recent = v.recent[:viewerRecentCap]
 	}
@@ -483,11 +483,8 @@ func (v *Viewer) cachePut(e cache.Entry, d decodedImage) {
 // cacheDropLocked removes the first recent entry for path. The caller holds
 // recentMu.
 func (v *Viewer) cacheDropLocked(path string) {
-	for i, r := range v.recent {
-		if r.path == path {
-			v.recent = append(v.recent[:i], v.recent[i+1:]...)
-			return
-		}
+	if i := slices.IndexFunc(v.recent, func(r recentImage) bool { return r.path == path }); i >= 0 {
+		v.recent = slices.Delete(v.recent, i, i+1)
 	}
 }
 
@@ -501,7 +498,7 @@ func (v *Viewer) cacheGet(e cache.Entry) (recentImage, bool) {
 			continue
 		}
 		if !r.mod.Equal(e.ModTime) {
-			v.recent = append(v.recent[:i], v.recent[i+1:]...)
+			v.recent = slices.Delete(v.recent, i, i+1)
 			return recentImage{}, false
 		}
 		if i != 0 {
@@ -518,12 +515,9 @@ func (v *Viewer) cacheGet(e cache.Entry) (recentImage, bool) {
 func (v *Viewer) cacheHasEntry(e cache.Entry) bool {
 	v.recentMu.Lock()
 	defer v.recentMu.Unlock()
-	for _, r := range v.recent {
-		if r.path == e.Path && r.mod.Equal(e.ModTime) {
-			return true
-		}
-	}
-	return false
+	return slices.ContainsFunc(v.recent, func(r recentImage) bool {
+		return r.path == e.Path && r.mod.Equal(e.ModTime)
+	})
 }
 
 // RequestDelete opens the delete-confirmation modal for the current entry.
