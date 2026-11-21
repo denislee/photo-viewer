@@ -63,6 +63,12 @@ func main() {
 		if err := ui.Run(w, ctrl); err != nil {
 			log.Fatal(err)
 		}
+		// Close runs PRAGMA optimize. Background goroutines (a scan, the
+		// warm-up, the web server) may still be mid-query; at worst one of
+		// them logs a "database is closed" error before the process exits.
+		if err := idx.Close(); err != nil {
+			log.Printf("close index: %v", err)
+		}
 		os.Exit(0)
 	}()
 	app.Main()

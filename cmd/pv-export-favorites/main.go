@@ -84,6 +84,11 @@ func main() {
 		JpegQuality: *jpegQ,
 		VideoCRF:    *videoCRF,
 	}, progress)
+	// Close (and its PRAGMA optimize) before any exit below: os.Exit skips
+	// defers. Nothing uses the index after Favorites returns.
+	if cerr := idx.Close(); cerr != nil {
+		log.Printf("close index: %v", cerr)
+	}
 	if err != nil {
 		if ctx.Err() != nil {
 			fmt.Printf("\nInterrupted after %d favorites (skipped %d, failed %d).\n", res.Done, res.Skipped, res.Failed)

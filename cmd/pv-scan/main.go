@@ -167,9 +167,13 @@ func main() {
 	}
 
 	if ctx.Err() != nil {
+		closeIndex(idx)
 		fmt.Println("interrupted: index saved; rerun to pick up where the scan stopped")
 		os.Exit(130)
 	}
+	// Every writer has stopped by now, so Close (and its PRAGMA optimize) runs
+	// against a quiet database.
+	defer closeIndex(idx)
 
 	if pipe == nil {
 		return // -no-faces
@@ -180,4 +184,11 @@ func main() {
 	}
 	clusters := idx.AllClusters()
 	fmt.Printf("face: %d clusters\n", len(clusters))
+}
+
+// closeIndex closes idx, which also runs PRAGMA optimize.
+func closeIndex(idx *cache.Index) {
+	if err := idx.Close(); err != nil {
+		log.Printf("pv-scan: close index: %v", err)
+	}
 }
