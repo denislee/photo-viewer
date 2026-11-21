@@ -56,9 +56,9 @@ type Server struct {
 	// segment request (W4-06). See hlsDuration.
 	hlsDurations ttlCache[hlsDurKey, float64]
 
-	mu      sync.Mutex
-	srv     *http.Server
-	addr    string // resolved listen address (host:port) once running
+	mu   sync.Mutex
+	srv  *http.Server
+	addr string // resolved listen address (host:port) once running
 
 	// HLS on-the-fly transcode state (see hls.go). Lazily initialised by
 	// hlsInit so New stays a plain literal. hlsSem bounds concurrent ffmpeg
