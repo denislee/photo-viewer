@@ -51,7 +51,6 @@ type removableDevice struct {
 	Vendor     string
 	Model      string
 	Mountpoint string // "" when not mounted
-	Tran       string
 }
 
 func (d removableDevice) Display() string {
@@ -135,7 +134,6 @@ func collectMountable(parent, dev blockDevice, out *[]removableDevice) {
 			Vendor:     strings.TrimSpace(coalesce(dev.Vendor, parent.Vendor)),
 			Model:      strings.TrimSpace(coalesce(dev.Model, parent.Model)),
 			Mountpoint: dev.Mountpoint,
-			Tran:       coalesce(dev.Tran, parent.Tran),
 		})
 	}
 	for _, ch := range dev.Children {

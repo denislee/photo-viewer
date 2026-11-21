@@ -84,9 +84,6 @@ func (pb *ProcessBar) Prune(snap []ProcessSnapshot) {
 // height and content agree within a frame.
 func (pb *ProcessBar) Layout(gtx layout.Context, th *Theme, snap []ProcessSnapshot) layout.Dimensions {
 	pb.Prune(snap)
-	if len(snap) == 0 {
-		return layout.Dimensions{Size: image.Pt(gtx.Constraints.Max.X, 0)}
-	}
 
 	for _, s := range snap {
 		if _, ok := pb.row[s.ID]; !ok {

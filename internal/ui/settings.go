@@ -310,9 +310,6 @@ func (v *SettingsView) trashRow(th *Theme) layout.Widget {
 		v.mu.Lock()
 		msg := v.trashMsg
 		v.mu.Unlock()
-		if msg == "" {
-			msg = v.trashStatus()
-		}
 		return layout.Flex{Axis: layout.Vertical}.Layout(gtx,
 			layout.Rigid(func(gtx layout.Context) layout.Dimensions {
 				lbl := material.Label(th.Theme, unit.Sp(12), "Deleted files (trash)")
@@ -348,9 +345,6 @@ func (v *SettingsView) exportFavoritesRow(th *Theme) layout.Widget {
 		v.mu.Lock()
 		msg := v.exportFavMsg
 		v.mu.Unlock()
-		if msg == "" {
-			msg = v.favoritesStatus()
-		}
 		return layout.Flex{Axis: layout.Vertical}.Layout(gtx,
 			layout.Rigid(func(gtx layout.Context) layout.Dimensions {
 				lbl := material.Label(th.Theme, unit.Sp(12), "Export favorites")

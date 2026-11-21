@@ -67,7 +67,6 @@ type FuzzySearchView struct {
 	// opens within countTTL doesn't re-hit SQLite once per open.
 	countCache int
 	countAt    time.Time
-	countValid bool
 
 	// activeCandidates is a UI-goroutine-only snapshot of candidates taken
 	// once per frame in recomputeResults. layoutResults and Activate use this
@@ -241,7 +240,7 @@ func (v *FuzzySearchView) candidatesFresh() bool {
 	cacheRows := v.cacheRows
 	v.mu.Unlock()
 
-	if !ready || builtAt.IsZero() {
+	if !ready {
 		return false
 	}
 	if time.Since(builtAt) > searchCacheTTL {
@@ -258,7 +257,7 @@ func (v *FuzzySearchView) candidatesFresh() bool {
 // the mutex so a slow count never serializes UI reads of the candidate slice.
 func (v *FuzzySearchView) rowCount() int {
 	v.mu.Lock()
-	if v.countValid && time.Since(v.countAt) < searchCountTTL {
+	if !v.countAt.IsZero() && time.Since(v.countAt) < searchCountTTL {
 		n := v.countCache
 		v.mu.Unlock()
 		return n
@@ -270,7 +269,6 @@ func (v *FuzzySearchView) rowCount() int {
 	v.mu.Lock()
 	v.countCache = n
 	v.countAt = time.Now()
-	v.countValid = true
 	v.mu.Unlock()
 	return n
 }
@@ -319,7 +317,7 @@ func (v *FuzzySearchView) rebuildCandidates(libraryRoot string) {
 	// staleness check after this build then re-counts, so an incremental scan
 	// that adds rows without bumping the generation is picked up promptly
 	// (within one COUNT(*), not one full searchCountTTL of blindness).
-	v.countValid = false
+	v.countAt = time.Time{}
 	v.mu.Unlock()
 }
 
@@ -732,7 +730,6 @@ func (v *FuzzySearchView) statusLine() string {
 }
 
 func (v *FuzzySearchView) layoutSearchBox(gtx layout.Context, th *Theme) layout.Dimensions {
-	v.editor.SingleLine = true
 	w2 := max(gtx.Constraints.Max.X, 200)
 	h := gtx.Dp(unit.Dp(40))
 	rect := image.Rectangle{Max: image.Pt(w2, h)}

@@ -105,14 +105,14 @@ func (g *Grid) CancelDelete() {
 
 // ConfirmDelete invokes deleter against the captured path. The grid's
 // selection is left clamped by the next Layout pass via SelectedIndex.
-func (g *Grid) ConfirmDelete(deleter func(path string) error) {
+func (g *Grid) ConfirmDelete(deleter func(path string)) {
 	path := g.ConfirmPath
 	g.Confirming = false
 	g.ConfirmPath = ""
 	if path == "" {
 		return
 	}
-	_ = deleter(path)
+	deleter(path)
 }
 
 func NewGrid() *Grid {

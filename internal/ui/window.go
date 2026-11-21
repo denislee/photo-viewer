@@ -2,6 +2,7 @@ package ui
 
 import (
 	"image"
+	"log"
 	"path/filepath"
 	"strings"
 	"time"
@@ -45,7 +46,6 @@ func Run(w *app.Window, ctrl *Controller) error {
 	viewer.SetInvalidate(w.Invalidate)
 	viewer.SetDisplayStore(ctrl.DisplayStore())
 	dups := NewDuplicatesView(ctrl.Index(), ctrl.Store(), ctrl.Thumbs(), w.Invalidate)
-	dups.SetDeleter(ctrl.DeletePath)
 	dups.SetBatchDeleter(ctrl.DeletePaths)
 	imports := NewImportView(w.Invalidate)
 	organize := NewOrganizeView(w.Invalidate)
@@ -208,7 +208,9 @@ func Run(w *app.Window, ctrl *Controller) error {
 		switch e := ev.(type) {
 		case app.DestroyEvent:
 			ctrl.FlushFavorites(3 * time.Second)
-			_ = FlushConfig(3 * time.Second)
+			if err := FlushConfig(3 * time.Second); err != nil {
+				log.Printf("config: flush on exit: %v", err)
+			}
 			return e.Err
 		case app.FrameEvent:
 			gtx := app.NewContext(&ops, e)

@@ -108,7 +108,7 @@ func TestFuzzySearchRebuildsAfterClear(t *testing.T) {
 
 // TestFuzzySearchRebuildsOnRowCountChange checks the incremental signal: adding
 // entries without bumping the generation still invalidates the cache via the
-// row-count probe. countValid is false right after a build, so the first probe
+// row-count probe. countAt is zero right after a build, so the first probe
 // re-counts and sees the change immediately (no searchCountTTL blindness).
 func TestFuzzySearchRebuildsOnRowCountChange(t *testing.T) {
 	idx, root := newSearchIndex(t, 4)
@@ -122,7 +122,7 @@ func TestFuzzySearchRebuildsOnRowCountChange(t *testing.T) {
 	// Add rows the way an incremental SelectDir scan would — no generation bump.
 	// Note: we must not probe candidatesFresh/rowCount before this, or the
 	// searchCountTTL cache would (by design) coalesce away the change for a few
-	// seconds. countValid is false straight after a build, so the probe below
+	// seconds. countAt is zero straight after a build, so the probe below
 	// re-counts and sees the new rows immediately.
 	seedSearchIndex(t, idx, root, 100, 3)
 

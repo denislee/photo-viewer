@@ -32,16 +32,11 @@ type DuplicatesView struct {
 	store  *cache.ThumbStore
 	thumbs *thumbCache
 
-	// deleter is the soft-delete function (Controller.DeletePath when wired
-	// from window.go). Nil falls back to plain os.Remove for tests and
-	// stand-alone use of the view.
-	deleter func(path string) error
 	// batchDeleter is the bulk variant — used by "Delete all newer"
 	// confirmations so 100 duplicates pay for one in-memory patch + one
 	// index transaction instead of N. Nil falls back to repeated calls
-	// to deleter (or removeOne) so tests can exercise the view without
-	// a Controller.
-	batchDeleter func(paths []string) error
+	// to removeOne so tests can exercise the view without a Controller.
+	batchDeleter func(paths []string)
 	// removeEntries is the index-side bulk removal used by pruneMissing to
 	// drop vanished rows in one transaction. Nil falls back to
 	// idx.RemoveEntries; tests swap it in to count how many batches a prune
@@ -100,32 +95,21 @@ func NewDuplicatesView(idx *cache.Index, store *cache.ThumbStore, thumbs *thumbC
 // the modal open.
 func (d *DuplicatesView) SetProcessRegistry(r *ProcessRegistry) { d.scope.reg = r }
 
-// SetDeleter wires the soft-delete callback so duplicate-removal goes
-// through the same trash flow as keyboard delete (rename → trash dir,
-// instant UI update). Without it, deletions fall back to a direct unlink.
-func (d *DuplicatesView) SetDeleter(f func(path string) error) { d.deleter = f }
-
 // SetBatchDeleter wires the bulk soft-delete callback. The bulk variant
 // matters for the "delete all newer" flow where dozens of duplicates need
 // removing — without it, each path goes through removeOne and pays for a
 // separate index DELETE and UI patch.
-func (d *DuplicatesView) SetBatchDeleter(f func(paths []string) error) { d.batchDeleter = f }
+func (d *DuplicatesView) SetBatchDeleter(f func(paths []string)) { d.batchDeleter = f }
 
-// removeOne soft-deletes path through the controller (if wired) or falls
-// back to a direct unlink, then drops the index row and forgets the thumb.
-// Returns true when the on-disk operation succeeded (or the file was
-// already gone) so the caller can keep the entry out of pruneMissing's
-// "live" list.
+// removeOne removes path with a direct unlink, then drops the index row and
+// forgets the thumb. Returns true when the on-disk operation succeeded (or
+// the file was already gone) so the caller can keep the entry out of
+// pruneMissing's "live" list.
 func (d *DuplicatesView) removeOne(path string) bool {
-	var err error
-	if d.deleter != nil {
-		err = d.deleter(path)
-	} else {
-		err = os.Remove(path)
-		_ = d.idx.RemoveEntry(path)
-		if d.store != nil {
-			d.store.Forget(cache.ThumbIDFor(path))
-		}
+	err := os.Remove(path)
+	_ = d.idx.RemoveEntry(path)
+	if d.store != nil {
+		d.store.Forget(cache.ThumbIDFor(path))
 	}
 	if err != nil && !os.IsNotExist(err) {
 		return false
@@ -516,7 +500,7 @@ func (d *DuplicatesView) removeBatch(paths []string) {
 		return
 	}
 	if d.batchDeleter != nil {
-		_ = d.batchDeleter(paths)
+		d.batchDeleter(paths)
 		return
 	}
 	for _, p := range paths {

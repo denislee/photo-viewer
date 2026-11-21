@@ -38,17 +38,13 @@ func TestCacheDropLocked(t *testing.T) {
 	v.recentMu.Lock()
 	defer v.recentMu.Unlock()
 
-	if !v.cacheDropLocked("/b") {
-		t.Fatal("cacheDropLocked should report dropping a present path")
-	}
+	v.cacheDropLocked("/b")
 	if len(v.recent) != 2 || v.recent[0].path != "/a" || v.recent[1].path != "/c" {
 		t.Fatalf("after dropping /b, recent = %v; want [/a /c]", recentPaths(v.recent))
 	}
-	if v.cacheDropLocked("/zz") {
-		t.Fatal("cacheDropLocked should report false for an absent path")
-	}
-	if len(v.recent) != 2 {
-		t.Fatalf("dropping an absent path changed recent to %v", recentPaths(v.recent))
+	v.cacheDropLocked("/zz")
+	if len(v.recent) != 2 || v.recent[0].path != "/a" || v.recent[1].path != "/c" {
+		t.Fatalf("dropping an absent path changed recent to %v; want [/a /c]", recentPaths(v.recent))
 	}
 }
 

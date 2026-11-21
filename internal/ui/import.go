@@ -100,7 +100,6 @@ type ImportView struct {
 // released via udisksctl so the user can safely pull the card.
 type sdMount struct {
 	DevicePath string
-	MountPath  string
 }
 
 // NewImportView wires the import overlay.
@@ -309,7 +308,7 @@ func (v *ImportView) handleSDDeviceClick(dev removableDevice) {
 		v.importDirs = append(v.importDirs, mountPath)
 	}
 	if mountedByUs {
-		v.sdMounts = append(v.sdMounts, sdMount{DevicePath: dev.Path, MountPath: mountPath})
+		v.sdMounts = append(v.sdMounts, sdMount{DevicePath: dev.Path})
 	}
 	// Refresh the device's mount state in the picker.
 	for i := range v.sdDevices {

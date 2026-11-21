@@ -482,16 +482,15 @@ func (v *Viewer) cachePut(e cache.Entry, d decodedImage) {
 	}
 }
 
-// cacheDropLocked removes the first recent entry for path, reporting whether
-// there was one. The caller holds recentMu.
-func (v *Viewer) cacheDropLocked(path string) bool {
+// cacheDropLocked removes the first recent entry for path. The caller holds
+// recentMu.
+func (v *Viewer) cacheDropLocked(path string) {
 	for i, r := range v.recent {
 		if r.path == path {
 			v.recent = append(v.recent[:i], v.recent[i+1:]...)
-			return true
+			return
 		}
 	}
-	return false
 }
 
 // cacheGet returns the cached image for e and moves it to MRU. An entry for
@@ -543,16 +542,14 @@ func (v *Viewer) CancelDelete() { v.Confirming = false }
 // ConfirmDelete invokes deleter for the current entry's path, removes it
 // from the local entry list, and advances to the next entry. If the list
 // becomes empty the viewer closes.
-func (v *Viewer) ConfirmDelete(deleter func(path string) error) {
+func (v *Viewer) ConfirmDelete(deleter func(path string)) {
 	if !v.Confirming || v.Index < 0 || v.Index >= len(v.entries) {
 		v.Confirming = false
 		return
 	}
 	e := v.entries[v.Index]
 	v.Confirming = false
-	if err := deleter(e.Path); err != nil {
-		return
-	}
+	deleter(e.Path)
 	v.removeEntry(v.Index)
 	if len(v.entries) == 0 {
 		v.Close()

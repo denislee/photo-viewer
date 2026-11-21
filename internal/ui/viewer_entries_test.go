@@ -83,7 +83,7 @@ func TestViewerConfirmDeleteKeepsCallerSlice(t *testing.T) {
 	var v Viewer
 	v.Show(entries, 1)
 	v.RequestDelete()
-	v.ConfirmDelete(func(string) error { return nil })
+	v.ConfirmDelete(func(string) {})
 
 	assertPaths(t, "caller entries", entries, wantCaller)
 	assertPaths(t, "viewer entries", v.entries, wantViewer)

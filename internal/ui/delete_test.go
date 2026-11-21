@@ -198,9 +198,7 @@ func TestDeleteOffGridPathRecounts(t *testing.T) {
 		t.Fatalf("baseline root count = %d, want 2", counts[root])
 	}
 
-	if err := c.DeletePaths([]string{victim}); err != nil {
-		t.Fatal(err)
-	}
+	c.DeletePaths([]string{victim})
 	deadline := time.Now().Add(2 * time.Second)
 	for {
 		counts, _ := c.DirCountsWithVersion()

@@ -133,7 +133,7 @@ func TestRestoreBatchReconcilesOnce(t *testing.T) {
 }
 
 // TestDeletePathRestoresAsync is the U4-11 guard for the single-item restore
-// entry point. DeletePath on a path inside the trash dir must return nil
+// entry point. DeletePath on a path inside the trash dir must return
 // immediately and hand the work to restoreBatch on a goroutine — the sidecar
 // read, MkdirAll, renames, stat and index write all happen off the frame
 // goroutine. Polling (rather than calling restoreBatch directly) is what proves
@@ -167,9 +167,7 @@ func TestDeletePathRestoresAsync(t *testing.T) {
 		t.Fatalf("cachedTrashCount before restore = %d, want 1", got)
 	}
 
-	if err := c.DeletePath(trashPaths[0]); err != nil {
-		t.Fatalf("DeletePath(%s) = %v, want nil", trashPaths[0], err)
-	}
+	c.DeletePath(trashPaths[0])
 
 	deadline := time.Now().Add(5 * time.Second)
 	for {
@@ -192,8 +190,8 @@ func TestDeletePathRestoresAsync(t *testing.T) {
 
 // TestDeletePathRestoreFailureKeepsCount pins the failure side of the same
 // path: a DeletePath for a path that looks trashed but isn't on disk any more
-// must still return nil (the UI has already advanced past it) while leaving
-// both the cached trash count and the real trashed file untouched.
+// must still return immediately (the UI has already advanced past it) while
+// leaving both the cached trash count and the real trashed file untouched.
 func TestDeletePathRestoreFailureKeepsCount(t *testing.T) {
 	dir := t.TempDir()
 	idx, err := cache.Load(filepath.Join(dir, "index.db"))
@@ -221,9 +219,7 @@ func TestDeletePathRestoreFailureKeepsCount(t *testing.T) {
 	}
 
 	missing := filepath.Join(trashDir, "missing.jpg")
-	if err := c.DeletePath(missing); err != nil {
-		t.Fatalf("DeletePath(%s) = %v, want nil", missing, err)
-	}
+	c.DeletePath(missing)
 
 	// Give the background goroutine time to run and (fail to) restore.
 	time.Sleep(50 * time.Millisecond)

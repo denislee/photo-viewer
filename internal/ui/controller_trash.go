@@ -28,29 +28,15 @@ import (
 // never run on the frame goroutine (U4-11). Callers patch their own view
 // optimistically (as for delete); restoreBatch's refresh repaints from the
 // index, which re-shows the entry if the restore failed.
-//
-// Always returns nil — errors from the deferred I/O are logged but the
-// UI has already advanced past the entry.
-func (c *Controller) DeletePath(path string) error {
-	if path == "" {
-		return nil
-	}
-	if c.isInTrash(path) {
-		go c.restoreBatch([]string{path})
-		return nil
-	}
-	allLocal := c.patchLocalDeletion([]string{path}, c.trashDir != "")
-	go c.performDeletion([]string{path}, !allLocal)
-	return nil
-}
+func (c *Controller) DeletePath(path string) { c.DeletePaths([]string{path}) }
 
 // DeletePaths soft-deletes every path in one batch: one in-memory patch +
 // one index transaction + a single background goroutine handling all the
 // renames. Matters for duplicate-removal and multi-select flows where the
 // per-item refresh + per-item DB write would otherwise dominate.
-func (c *Controller) DeletePaths(paths []string) error {
+func (c *Controller) DeletePaths(paths []string) {
 	if len(paths) == 0 {
-		return nil
+		return
 	}
 	// Split: trashed items take the restore branch, the rest the delete
 	// branch. Both run their heavy I/O on a background goroutine and
@@ -73,7 +59,6 @@ func (c *Controller) DeletePaths(paths []string) error {
 	if len(toRestore) > 0 {
 		go c.restoreBatch(toRestore)
 	}
-	return nil
 }
 
 // restoreBatch moves a batch of trashed files back to their recorded original

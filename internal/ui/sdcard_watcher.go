@@ -234,8 +234,7 @@ type SDPromptView struct {
 	Open   bool
 	Device removableDevice
 
-	OnImport  func(dev removableDevice, deleteSource bool)
-	OnDismiss func()
+	OnImport func(dev removableDevice, deleteSource bool)
 
 	importBtn       widget.Clickable
 	importDeleteBtn widget.Clickable
@@ -251,9 +250,6 @@ func (v *SDPromptView) Show(dev removableDevice) {
 // Close hides the prompt.
 func (v *SDPromptView) Close() {
 	v.Open = false
-	if v.OnDismiss != nil {
-		v.OnDismiss()
-	}
 }
 
 // Layout draws the prompt as a centered card-style modal.

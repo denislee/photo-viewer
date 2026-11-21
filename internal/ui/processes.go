@@ -87,10 +87,9 @@ func (g *PauseGate) IsPaused() bool {
 // Process is a single tracked background task. Workers update Done/Total/
 // Status from any goroutine; the UI reads via ProcessRegistry.Snapshot.
 type Process struct {
-	ID      int64
-	Kind    ProcKind
-	Title   string
-	Started time.Time
+	ID    int64
+	Kind  ProcKind
+	Title string
 
 	mu     sync.Mutex
 	status string
@@ -99,7 +98,7 @@ type Process struct {
 
 	gate       *PauseGate
 	cancel     func()
-	ctx        context.Context // nil when Begin got none
+	ctx        context.Context // used by Pause to avoid re-closing a cancelled gate
 	stopResume func() bool
 
 	registry *ProcessRegistry
@@ -138,7 +137,7 @@ func (p *Process) Wait() {
 func (p *Process) Pause() {
 	// A cancelled process must not re-close the gate: its AfterFunc already
 	// fired, so nothing would ever release the worker again (U5-03).
-	if p.gate != nil && (p.ctx == nil || p.ctx.Err() == nil) {
+	if p.gate != nil && p.ctx.Err() == nil {
 		p.gate.Pause()
 	}
 	// User-driven one-shot: force an immediate repaint so the paused state
@@ -191,14 +190,13 @@ func (p *Process) End() {
 // ProcessSnapshot is a read-only copy of a Process used by the UI so
 // rendering doesn't need to hold the registry lock.
 type ProcessSnapshot struct {
-	ID      int64
-	Kind    ProcKind
-	Title   string
-	Status  string
-	Done    int64
-	Total   int64
-	Paused  bool
-	Started time.Time
+	ID     int64
+	Kind   ProcKind
+	Title  string
+	Status string
+	Done   int64
+	Total  int64
+	Paused bool
 }
 
 // processNotifyInterval is the minimum spacing between frame-loop wakeups
@@ -323,15 +321,14 @@ func (r *ProcessRegistry) Begin(ctx context.Context, kind ProcKind, title string
 		ID:       id,
 		Kind:     kind,
 		Title:    title,
-		Started:  time.Now(),
 		cancel:   cancel,
 		registry: r,
 	}
 	if supportsPause {
 		p.gate = NewPauseGate()
 	}
-	if ctx != nil && p.gate != nil {
-		p.ctx = ctx
+	p.ctx = ctx
+	if p.gate != nil {
 		p.stopResume = context.AfterFunc(ctx, p.gate.Resume)
 	}
 	r.procs = append(r.procs, p)
@@ -371,14 +368,13 @@ func (r *ProcessRegistry) Snapshot() []ProcessSnapshot {
 		status := p.status
 		p.mu.Unlock()
 		out[i] = ProcessSnapshot{
-			ID:      p.ID,
-			Kind:    p.Kind,
-			Title:   p.Title,
-			Status:  status,
-			Done:    p.done.Load(),
-			Total:   p.total.Load(),
-			Paused:  p.IsPaused(),
-			Started: p.Started,
+			ID:     p.ID,
+			Kind:   p.Kind,
+			Title:  p.Title,
+			Status: status,
+			Done:   p.done.Load(),
+			Total:  p.total.Load(),
+			Paused: p.IsPaused(),
 		}
 	}
 	return out

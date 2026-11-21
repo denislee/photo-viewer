@@ -317,7 +317,7 @@ func TestConfirmDeletePrefetchesNeighbours(t *testing.T) {
 	}
 
 	v.Confirming = true
-	v.ConfirmDelete(func(string) error { return nil }) // now on c: +2 is e
+	v.ConfirmDelete(func(string) {}) // now on c: +2 is e
 	if v.Index != 1 || v.entries[v.Index].Path != entries[2].Path {
 		t.Fatalf("after delete on %d (%s), want c", v.Index, v.entries[v.Index].Path)
 	}
