@@ -113,9 +113,7 @@ func NewSidebar() *Sidebar {
 func visibleRange(first, count, n int) (start, end int) {
 	start = max(first-1, 0)
 	end = min(first+count+1, n)
-	if start > end {
-		start = end
-	}
+	start = min(start, end)
 	return start, end
 }
 
@@ -438,12 +436,7 @@ func (s *Sidebar) Move(delta int) bool {
 	}
 	old := s.Selected
 	s.Selected += delta
-	if s.Selected < 0 {
-		s.Selected = 0
-	}
-	if s.Selected >= n {
-		s.Selected = n - 1
-	}
+	s.Selected = min(max(s.Selected, 0), n-1)
 	if s.Selected != old {
 		s.ensureVisible = true
 		return true
@@ -525,8 +518,7 @@ func drawSidebarRow(gtx layout.Context, th *Theme, label, countLabel string, act
 					return layout.Dimensions{}
 				}
 				side := gtx.Dp(unit.Dp(16))
-				gtx.Constraints.Min = image.Pt(side, side)
-				gtx.Constraints.Max = image.Pt(side, side)
+				gtx.Constraints = layout.Exact(image.Pt(side, side))
 				return layout.Inset{Right: unit.Dp(6)}.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
 					return ic.Layout(gtx, color)
 				})

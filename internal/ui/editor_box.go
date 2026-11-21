@@ -13,10 +13,7 @@ import (
 // drawBackground fills the available constraint area with a flat color.
 func drawBackground(gtx layout.Context, c color.NRGBA) {
 	rect := image.Rectangle{Max: gtx.Constraints.Max}
-	ca := clip.Rect(rect).Push(gtx.Ops)
-	paint.ColorOp{Color: c}.Add(gtx.Ops)
-	paint.PaintOp{}.Add(gtx.Ops)
-	ca.Pop()
+	paint.FillShape(gtx.Ops, c, clip.Rect(rect).Op())
 }
 
 // drawEditorBox renders an editor inside a tinted rectangle that fills the
@@ -28,9 +25,7 @@ func drawEditorBox(gtx layout.Context, bg color.NRGBA, pad layout.Inset, w layou
 	if w2 == 0 {
 		w2 = gtx.Constraints.Min.X
 	}
-	if w2 < 200 {
-		w2 = 200
-	}
+	w2 = max(w2, 200)
 	cgtx := gtx
 	cgtx.Constraints.Max.X = w2
 	cgtx.Constraints.Min.X = w2
@@ -41,10 +36,7 @@ func drawEditorBox(gtx layout.Context, bg color.NRGBA, pad layout.Inset, w layou
 	call := macro.Stop()
 
 	rect := image.Rectangle{Max: image.Pt(w2, dims.Size.Y)}
-	ca := clip.Rect(rect).Push(gtx.Ops)
-	paint.ColorOp{Color: bg}.Add(gtx.Ops)
-	paint.PaintOp{}.Add(gtx.Ops)
-	ca.Pop()
+	paint.FillShape(gtx.Ops, bg, clip.Rect(rect).Op())
 	call.Add(gtx.Ops)
 	return layout.Dimensions{Size: image.Pt(w2, dims.Size.Y)}
 }

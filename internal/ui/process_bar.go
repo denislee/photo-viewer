@@ -123,16 +123,12 @@ func (pb *ProcessBar) Layout(gtx layout.Context, th *Theme, snap []ProcessSnapsh
 	totalH := pb.HeightDp(snap)
 	totalPx := gtx.Dp(unit.Dp(totalH))
 	bg := image.Rect(0, 0, w, totalPx)
-	ca := clip.Rect(bg).Push(gtx.Ops)
-	paint.ColorOp{Color: th.CellBG}.Add(gtx.Ops)
-	paint.PaintOp{}.Add(gtx.Ops)
-	ca.Pop()
+	paint.FillShape(gtx.Ops, th.CellBG, clip.Rect(bg).Op())
 
 	// Header row (always present).
 	{
 		gtx2 := gtx
-		gtx2.Constraints.Max = image.Pt(w, headerH)
-		gtx2.Constraints.Min = image.Pt(w, headerH)
+		gtx2.Constraints = layout.Exact(image.Pt(w, headerH))
 		pb.layoutHeader(gtx2, th, snap)
 	}
 
@@ -142,8 +138,7 @@ func (pb *ProcessBar) Layout(gtx layout.Context, th *Theme, snap []ProcessSnapsh
 		for _, s := range snap {
 			stack := op.Offset(image.Pt(0, y)).Push(gtx.Ops)
 			gtx2 := gtx
-			gtx2.Constraints.Max = image.Pt(w, rowH)
-			gtx2.Constraints.Min = image.Pt(w, rowH)
+			gtx2.Constraints = layout.Exact(image.Pt(w, rowH))
 			pb.layoutRow(gtx2, th, s, pb.row[s.ID])
 			stack.Pop()
 			y += rowH
@@ -202,10 +197,7 @@ func (pb *ProcessBar) layoutRow(gtx layout.Context, th *Theme, s ProcessSnapshot
 	w := gtx.Constraints.Max.X
 	h := gtx.Constraints.Max.Y
 	bg := image.Rect(0, 0, w, h)
-	ca := clip.Rect(bg).Push(gtx.Ops)
-	paint.ColorOp{Color: th.Background}.Add(gtx.Ops)
-	paint.PaintOp{}.Add(gtx.Ops)
-	ca.Pop()
+	paint.FillShape(gtx.Ops, th.Background, clip.Rect(bg).Op())
 
 	pauseGlyph := "⏸"
 	if s.Paused {
@@ -292,14 +284,10 @@ const processBarIconSizeDp = 26
 // the row without the min-size padding that material.Button enforces.
 func layoutIconButton(gtx layout.Context, th *Theme, click *widget.Clickable, glyph string, bg, fg color.NRGBA) layout.Dimensions {
 	side := gtx.Dp(unit.Dp(processBarIconSizeDp))
-	gtx.Constraints.Min = image.Pt(side, side)
-	gtx.Constraints.Max = image.Pt(side, side)
+	gtx.Constraints = layout.Exact(image.Pt(side, side))
 	return click.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
 		rect := image.Rectangle{Max: image.Pt(side, side)}
-		rr := clip.UniformRRect(rect, gtx.Dp(unit.Dp(4))).Push(gtx.Ops)
-		paint.ColorOp{Color: bg}.Add(gtx.Ops)
-		paint.PaintOp{}.Add(gtx.Ops)
-		rr.Pop()
+		paint.FillShape(gtx.Ops, bg, clip.UniformRRect(rect, gtx.Dp(unit.Dp(4))).Op(gtx.Ops))
 		return layout.Center.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
 			lbl := material.Label(th.Theme, unit.Sp(13), glyph)
 			lbl.Color = fg
@@ -316,10 +304,7 @@ func drawProcessBar(gtx layout.Context, th *Theme, s ProcessSnapshot) layout.Dim
 	w := gtx.Constraints.Max.X
 	barH := gtx.Dp(unit.Dp(6))
 	bg := image.Rect(0, 0, w, barH)
-	ca := clip.Rect(bg).Push(gtx.Ops)
-	paint.ColorOp{Color: th.CellBG}.Add(gtx.Ops)
-	paint.PaintOp{}.Add(gtx.Ops)
-	ca.Pop()
+	paint.FillShape(gtx.Ops, th.CellBG, clip.Rect(bg).Op())
 
 	fill := th.Accent
 	if s.Paused {
@@ -328,22 +313,14 @@ func drawProcessBar(gtx layout.Context, th *Theme, s ProcessSnapshot) layout.Dim
 
 	if s.Total > 0 {
 		frac := float32(s.Done) / float32(s.Total)
-		if frac > 1 {
-			frac = 1
-		}
+		frac = min(frac, 1)
 		fg := image.Rect(0, 0, int(float32(w)*frac), barH)
-		cf := clip.Rect(fg).Push(gtx.Ops)
-		paint.ColorOp{Color: fill}.Add(gtx.Ops)
-		paint.PaintOp{}.Add(gtx.Ops)
-		cf.Pop()
+		paint.FillShape(gtx.Ops, fill, clip.Rect(fg).Op())
 	} else {
 		// Indeterminate: faint full-width stripe.
 		col := fill
 		col.A = 0x55
-		cf := clip.Rect(bg).Push(gtx.Ops)
-		paint.ColorOp{Color: col}.Add(gtx.Ops)
-		paint.PaintOp{}.Add(gtx.Ops)
-		cf.Pop()
+		paint.FillShape(gtx.Ops, col, clip.Rect(bg).Op())
 	}
 	return layout.Dimensions{Size: image.Pt(w, barH)}
 }

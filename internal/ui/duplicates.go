@@ -360,12 +360,7 @@ func (d *DuplicatesView) Move(delta int) bool {
 	} else {
 		d.selected += delta
 	}
-	if d.selected < 0 {
-		d.selected = 0
-	}
-	if d.selected >= n {
-		d.selected = n - 1
-	}
+	d.selected = min(max(d.selected, 0), n-1)
 	if d.selected != old {
 		d.confirming = false
 		// Keep the selected row visible. Snap First if the selection moved
@@ -666,21 +661,13 @@ func (d *DuplicatesView) layoutProgress(gtx layout.Context, th *Theme, done, tot
 				w := gtx.Constraints.Max.X
 				barH := gtx.Dp(unit.Dp(14))
 				bg := image.Rect(0, 0, w, barH)
-				ca := clip.Rect(bg).Push(gtx.Ops)
-				paint.ColorOp{Color: th.CellBG}.Add(gtx.Ops)
-				paint.PaintOp{}.Add(gtx.Ops)
-				ca.Pop()
+				paint.FillShape(gtx.Ops, th.CellBG, clip.Rect(bg).Op())
 				if total > 0 {
 					frac := float32(done) / float32(total)
-					if frac > 1 {
-						frac = 1
-					}
+					frac = min(frac, 1)
 					if frac > 0 {
 						fg := image.Rect(0, 0, int(float32(w)*frac), barH)
-						cf := clip.Rect(fg).Push(gtx.Ops)
-						paint.ColorOp{Color: th.Accent}.Add(gtx.Ops)
-						paint.PaintOp{}.Add(gtx.Ops)
-						cf.Pop()
+						paint.FillShape(gtx.Ops, th.Accent, clip.Rect(fg).Op())
 					}
 				}
 				return layout.Dimensions{Size: image.Pt(w, barH)}
@@ -707,19 +694,13 @@ func (d *DuplicatesView) layoutSplit(gtx layout.Context, th *Theme, groups []cac
 	totalH := gtx.Constraints.Max.Y
 	listW := totalW * 35 / 100
 	gap := gtx.Dp(unit.Dp(8))
-	if listW < gtx.Dp(unit.Dp(260)) {
-		listW = gtx.Dp(unit.Dp(260))
-	}
-	if listW > totalW-gap {
-		listW = totalW - gap
-	}
+	listW = min(max(listW, gtx.Dp(unit.Dp(260))), totalW-gap)
 	rightW := totalW - listW - gap
 
 	// Left list
 	{
 		gtx2 := gtx
-		gtx2.Constraints.Max = image.Pt(listW, totalH)
-		gtx2.Constraints.Min = image.Pt(listW, totalH)
+		gtx2.Constraints = layout.Exact(image.Pt(listW, totalH))
 		d.groupList.Layout(gtx2, len(groups), func(gtx layout.Context, i int) layout.Dimensions {
 			return d.layoutGroupRow(gtx, th, groups[i], i == selected, d.groupClicks[i])
 		})
@@ -728,8 +709,7 @@ func (d *DuplicatesView) layoutSplit(gtx layout.Context, th *Theme, groups []cac
 	// Right detail
 	{
 		gtx2 := gtx
-		gtx2.Constraints.Max = image.Pt(rightW, totalH)
-		gtx2.Constraints.Min = image.Pt(rightW, totalH)
+		gtx2.Constraints = layout.Exact(image.Pt(rightW, totalH))
 		stack := op.Offset(image.Pt(listW+gap, 0)).Push(gtx.Ops)
 		d.detailList.Layout(gtx2, 1, func(gtx layout.Context, _ int) layout.Dimensions {
 			return d.layoutDetail(gtx, th, groups, selected)
@@ -927,10 +907,7 @@ func (d *DuplicatesView) layoutEntryCard(gtx layout.Context, th *Theme, e cache.
 // to a placeholder rectangle while the decode is pending or unavailable.
 func (d *DuplicatesView) layoutThumbBox(gtx layout.Context, th *Theme, e cache.Entry, sizePx int) layout.Dimensions {
 	rect := image.Rect(0, 0, sizePx, sizePx)
-	ca := clip.Rect(rect).Push(gtx.Ops)
-	paint.ColorOp{Color: th.CellBG}.Add(gtx.Ops)
-	paint.PaintOp{}.Add(gtx.Ops)
-	ca.Pop()
+	paint.FillShape(gtx.Ops, th.CellBG, clip.Rect(rect).Op())
 	if d.thumbs != nil {
 		if img, sz, ok := d.thumbs.Get(e); ok {
 			drawFitted(gtx, img, sz, rect)

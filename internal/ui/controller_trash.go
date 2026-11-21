@@ -177,9 +177,7 @@ func (c *Controller) patchLocalDeletion(paths []string, intoTrash bool) (allLoca
 				}
 				if _, ok := next[cur]; ok {
 					next[cur]--
-					if next[cur] < 0 {
-						next[cur] = 0
-					}
+					next[cur] = max(next[cur], 0)
 				}
 				parent := filepath.Dir(cur)
 				if parent == cur {
@@ -190,9 +188,7 @@ func (c *Controller) patchLocalDeletion(paths []string, intoTrash bool) (allLoca
 		}
 		if favCount > 0 {
 			next[FavoritesView] -= favCount
-			if next[FavoritesView] < 0 {
-				next[FavoritesView] = 0
-			}
+			next[FavoritesView] = max(next[FavoritesView], 0)
 		}
 		c.dirCounts = next
 		c.dirCountsVer++
@@ -320,9 +316,7 @@ func (c *Controller) bumpTrashCount(delta int) {
 	c.cachedTrashCount()
 	c.mu.Lock()
 	c.trashCount += delta
-	if c.trashCount < 0 {
-		c.trashCount = 0
-	}
+	c.trashCount = max(c.trashCount, 0)
 	if c.dirCounts != nil {
 		// Clone-swap: the published map is read lock-free by the sidebar
 		// every frame, so writing TrashView in place would race that reader.

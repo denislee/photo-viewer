@@ -420,8 +420,8 @@ func (tc *thumbCache) touchOrCreate(sh *thumbCacheShard, key thumbKey) *thumbEnt
 // evictIfNeeded drops the least-recently-used ready entries from sh until
 // it's within capacity. Caller must hold sh.mu.
 func (tc *thumbCache) evictIfNeeded(sh *thumbCacheShard) {
-	cap := int(tc.capPerShard.Load())
-	for sh.lru.Len() > cap {
+	limit := int(tc.capPerShard.Load())
+	for sh.lru.Len() > limit {
 		oldest := sh.lru.Back()
 		if oldest == nil {
 			return

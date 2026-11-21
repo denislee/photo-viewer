@@ -119,12 +119,7 @@ func NewGrid() *Grid {
 	size := unit.Dp(defaultCellDp)
 	if v := GetConfig().GridCellDp; v > 0 {
 		size = unit.Dp(v)
-		if size < minCellDp {
-			size = minCellDp
-		}
-		if size > maxCellDp {
-			size = maxCellDp
-		}
+		size = min(max(size, minCellDp), maxCellDp)
 	}
 	g := &Grid{cellSize: size, lastSelByDir: map[string]int{}}
 	g.list.Axis = layout.Vertical
@@ -217,16 +212,10 @@ func (g *Grid) Move(dx, dy, total int) bool {
 	col := old % cols
 	col += dx
 	row += dy
-	if col < 0 {
-		col = 0
-	}
-	if row < 0 {
-		row = 0
-	}
+	col = max(col, 0)
+	row = max(row, 0)
 	idx := row*cols + col
-	if idx >= total {
-		idx = total - 1
-	}
+	idx = min(idx, total-1)
 	if idx == old {
 		return false
 	}
@@ -244,12 +233,7 @@ func (g *Grid) Zoom(dir int) bool {
 	} else if dir < 0 {
 		g.cellSize -= zoomStepDp
 	}
-	if g.cellSize < minCellDp {
-		g.cellSize = minCellDp
-	}
-	if g.cellSize > maxCellDp {
-		g.cellSize = maxCellDp
-	}
+	g.cellSize = min(max(g.cellSize, minCellDp), maxCellDp)
 	if g.cellSize != old {
 		if g.zoomSaveTimer != nil {
 			g.zoomSaveTimer.Stop()
@@ -466,8 +450,7 @@ func (g *Grid) layoutRow(gtx layout.Context, th *Theme, entries []cache.Entry, t
 	yOff := gapPx / 2
 	cellSize := image.Pt(cellPx, cellPx)
 	cellGtx := gtx
-	cellGtx.Constraints.Max = cellSize
-	cellGtx.Constraints.Min = cellSize
+	cellGtx.Constraints = layout.Exact(cellSize)
 	selected := g.Selected
 	for i := start; i < end; i++ {
 		x := (i - start) * stride
@@ -652,10 +635,7 @@ func drawGlyphBadge(gtx layout.Context, th *Theme, cell image.Rectangle, corner 
 	bg := image.Rect(x0, y0, x1, y1)
 
 	// Dark backdrop so the glyph reads on bright thumbs.
-	ca := clip.Rect(bg).Push(gtx.Ops)
-	paint.ColorOp{Color: favoriteShadow}.Add(gtx.Ops)
-	paint.PaintOp{}.Add(gtx.Ops)
-	ca.Pop()
+	paint.FillShape(gtx.Ops, favoriteShadow, clip.Rect(bg).Op())
 
 	// Glyph, sized to roughly fill the badge. The label layout is cached and
 	// replayed as a recorded op — shaping text every frame for every badge
@@ -668,8 +648,7 @@ func drawGlyphBadge(gtx layout.Context, th *Theme, cell image.Rectangle, corner 
 		metric: gtx.Metric,
 	}, func(gtx layout.Context) layout.Dimensions {
 		gtx2 := gtx
-		gtx2.Constraints.Max = image.Pt(size, size)
-		gtx2.Constraints.Min = image.Pt(size, size)
+		gtx2.Constraints = layout.Exact(image.Pt(size, size))
 		return layout.Center.Layout(gtx2, func(gtx layout.Context) layout.Dimensions {
 			lbl := material.Label(th.Theme, sp, glyph)
 			lbl.Color = col
@@ -753,10 +732,7 @@ func drawDurationBadge(gtx layout.Context, th *Theme, cell image.Rectangle, badg
 	y0 := y1 - pillH
 	rect := image.Rect(x0, y0, x1, y1)
 
-	ca := clip.UniformRRect(rect, gtx.Dp(unit.Dp(4))).Push(gtx.Ops)
-	paint.ColorOp{Color: favoriteShadow}.Add(gtx.Ops)
-	paint.PaintOp{}.Add(gtx.Ops)
-	ca.Pop()
+	paint.FillShape(gtx.Ops, favoriteShadow, clip.UniformRRect(rect, gtx.Dp(unit.Dp(4))).Op(gtx.Ops))
 
 	textY := max(y0+(pillH-lblDims.Size.Y)/2, y0)
 	stack := op.Offset(image.Pt(x0+padX, textY)).Push(gtx.Ops)
@@ -832,10 +808,7 @@ func fmtDur3(h, m, s int64) string {
 // rect using four filled rectangles. Used to highlight the keyboard-selected cell.
 func drawBorder(gtx layout.Context, rect image.Rectangle, width int, col color.NRGBA) {
 	stroke := func(r image.Rectangle) {
-		ca := clip.Rect(r).Push(gtx.Ops)
-		paint.ColorOp{Color: col}.Add(gtx.Ops)
-		paint.PaintOp{}.Add(gtx.Ops)
-		ca.Pop()
+		paint.FillShape(gtx.Ops, col, clip.Rect(r).Op())
 	}
 	stroke(image.Rect(rect.Min.X, rect.Min.Y, rect.Max.X, rect.Min.Y+width))
 	stroke(image.Rect(rect.Min.X, rect.Max.Y-width, rect.Max.X, rect.Max.Y))
@@ -853,10 +826,7 @@ func drawFitted(gtx layout.Context, img paint.ImageOp, imgSz image.Point, dst im
 	}
 	sx := float32(dstW) / float32(imgSz.X)
 	sy := float32(dstH) / float32(imgSz.Y)
-	s := sx
-	if sy < s {
-		s = sy
-	}
+	s := min(sx, sy)
 	drawnW := int(float32(imgSz.X) * s)
 	drawnH := int(float32(imgSz.Y) * s)
 	offX := dst.Min.X + (dstW-drawnW)/2

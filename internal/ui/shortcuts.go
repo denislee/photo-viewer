@@ -83,10 +83,7 @@ func drawShortcutBar(gtx layout.Context, th *Theme, viewerOpen, sidebarFocus, se
 	h := gtx.Constraints.Max.Y
 
 	bg := image.Rect(0, 0, w, h)
-	clipArea := clip.Rect(bg).Push(gtx.Ops)
-	paint.ColorOp{Color: th.CellBG}.Add(gtx.Ops)
-	paint.PaintOp{}.Add(gtx.Ops)
-	clipArea.Pop()
+	paint.FillShape(gtx.Ops, th.CellBG, clip.Rect(bg).Op())
 
 	text := shortcutHints(viewerOpen, sidebarFocus, selectionMode)
 

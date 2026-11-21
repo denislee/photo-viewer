@@ -599,12 +599,7 @@ func (v *FuzzySearchView) Move(delta int) bool {
 	}
 	old := v.selected
 	v.selected += delta
-	if v.selected < 0 {
-		v.selected = 0
-	}
-	if v.selected >= n {
-		v.selected = n - 1
-	}
+	v.selected = min(max(v.selected, 0), n-1)
 	return v.selected != old
 }
 
@@ -679,10 +674,7 @@ func (v *FuzzySearchView) Layout(gtx layout.Context, th *Theme) layout.Dimension
 	totalW := gtx.Constraints.Max.X
 	totalH := gtx.Constraints.Max.Y
 	rect := image.Rectangle{Max: image.Pt(totalW, totalH)}
-	bg := clip.Rect(rect).Push(gtx.Ops)
-	paint.ColorOp{Color: th.Background}.Add(gtx.Ops)
-	paint.PaintOp{}.Add(gtx.Ops)
-	bg.Pop()
+	paint.FillShape(gtx.Ops, th.Background, clip.Rect(rect).Op())
 
 	pad := layout.Inset{Top: unit.Dp(16), Bottom: unit.Dp(16), Left: unit.Dp(20), Right: unit.Dp(20)}
 	return pad.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
@@ -733,12 +725,8 @@ func (v *FuzzySearchView) layoutSearchBox(gtx layout.Context, th *Theme) layout.
 	w2 := max(gtx.Constraints.Max.X, 200)
 	h := gtx.Dp(unit.Dp(40))
 	rect := image.Rectangle{Max: image.Pt(w2, h)}
-	ca := clip.Rect(rect).Push(gtx.Ops)
-	paint.ColorOp{Color: th.CellBG}.Add(gtx.Ops)
-	paint.PaintOp{}.Add(gtx.Ops)
-	ca.Pop()
-	gtx.Constraints.Min = image.Pt(w2, h)
-	gtx.Constraints.Max = image.Pt(w2, h)
+	paint.FillShape(gtx.Ops, th.CellBG, clip.Rect(rect).Op())
+	gtx.Constraints = layout.Exact(image.Pt(w2, h))
 	return layout.Inset{Top: unit.Dp(10), Bottom: unit.Dp(10), Left: unit.Dp(12), Right: unit.Dp(12)}.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
 		gtx.Constraints.Min = image.Pt(gtx.Constraints.Max.X, 0)
 		ed := material.Editor(th.Theme, &v.editor, "Type to fuzzy-search files and folders…")
@@ -761,9 +749,7 @@ func (v *FuzzySearchView) layoutResults(gtx layout.Context, th *Theme) layout.Di
 	if len(v.results) == 0 {
 		return layout.Dimensions{Size: gtx.Constraints.Min}
 	}
-	if v.selected >= len(v.results) {
-		v.selected = len(v.results) - 1
-	}
+	v.selected = min(v.selected, len(v.results)-1)
 	cands := v.activeCandidates
 	return v.list.Layout(gtx, len(v.results), func(gtx layout.Context, i int) layout.Dimensions {
 		idx := v.results[i].idx

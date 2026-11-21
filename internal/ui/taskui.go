@@ -133,17 +133,11 @@ func layoutProgressBar(gtx layout.Context, th *Theme, done, max int64) layout.Di
 	w := gtx.Constraints.Max.X
 	barH := gtx.Dp(unit.Dp(6))
 	bg := image.Rect(0, 0, w, barH)
-	clipBg := clip.Rect(bg).Push(gtx.Ops)
-	paint.ColorOp{Color: th.CellBG}.Add(gtx.Ops)
-	paint.PaintOp{}.Add(gtx.Ops)
-	clipBg.Pop()
+	paint.FillShape(gtx.Ops, th.CellBG, clip.Rect(bg).Op())
 	if max > 0 {
 		frac := float32(done) / float32(max)
 		fg := image.Rect(0, 0, int(float32(w)*frac), barH)
-		clipFg := clip.Rect(fg).Push(gtx.Ops)
-		paint.ColorOp{Color: th.Accent}.Add(gtx.Ops)
-		paint.PaintOp{}.Add(gtx.Ops)
-		clipFg.Pop()
+		paint.FillShape(gtx.Ops, th.Accent, clip.Rect(fg).Op())
 	}
 	return layout.Dimensions{Size: image.Pt(w, barH)}
 }

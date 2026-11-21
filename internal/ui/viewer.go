@@ -554,9 +554,7 @@ func (v *Viewer) ConfirmDelete(deleter func(path string)) {
 		v.Close()
 		return
 	}
-	if v.Index >= len(v.entries) {
-		v.Index = len(v.entries) - 1
-	}
+	v.Index = min(v.Index, len(v.entries)-1)
 	v.syncIndex()
 	// Drop the deleted entry from the recent cache too — the path no
 	// longer exists, and the cache entry would never get evicted otherwise.
@@ -787,15 +785,10 @@ func (v *Viewer) Layout(gtx layout.Context, th *Theme, tc *thumbCache) layout.Di
 // When restore is true the prompt asks about restoring an item out of the
 // trash instead of deleting it, since the same key binding handles both.
 func drawDeleteConfirm(gtx layout.Context, th *Theme, filename string, rect image.Rectangle, restore bool) {
-	dimStack := clip.Rect(rect).Push(gtx.Ops)
-	paint.ColorOp{Color: color.NRGBA{A: 0xb0}}.Add(gtx.Ops)
-	paint.PaintOp{}.Add(gtx.Ops)
-	dimStack.Pop()
+	paint.FillShape(gtx.Ops, color.NRGBA{A: 0xb0}, clip.Rect(rect).Op())
 
 	boxW := gtx.Dp(unit.Dp(420))
-	if boxW > rect.Dx()-gtx.Dp(unit.Dp(40)) {
-		boxW = rect.Dx() - gtx.Dp(unit.Dp(40))
-	}
+	boxW = min(boxW, rect.Dx()-gtx.Dp(unit.Dp(40)))
 	pad := gtx.Dp(unit.Dp(20))
 
 	macro := op.Record(gtx.Ops)
@@ -838,10 +831,7 @@ func drawDeleteConfirm(gtx layout.Context, th *Theme, filename string, rect imag
 		Min: image.Pt(rect.Min.X+(rect.Dx()-boxW)/2, rect.Min.Y+(rect.Dy()-boxH)/2),
 		Max: image.Pt(rect.Min.X+(rect.Dx()-boxW)/2+boxW, rect.Min.Y+(rect.Dy()-boxH)/2+boxH),
 	}
-	bg := clip.UniformRRect(boxRect, gtx.Dp(unit.Dp(8))).Push(gtx.Ops)
-	paint.ColorOp{Color: color.NRGBA{R: 0x1c, G: 0x1f, B: 0x26, A: 0xff}}.Add(gtx.Ops)
-	paint.PaintOp{}.Add(gtx.Ops)
-	bg.Pop()
+	paint.FillShape(gtx.Ops, color.NRGBA{R: 0x1c, G: 0x1f, B: 0x26, A: 0xff}, clip.UniformRRect(boxRect, gtx.Dp(unit.Dp(8))).Op(gtx.Ops))
 	drawBorder(gtx, boxRect, 1, color.NRGBA{R: 0xc0, G: 0x40, B: 0x40, A: 0xff})
 
 	off := op.Offset(image.Pt(boxRect.Min.X+pad, boxRect.Min.Y+pad)).Push(gtx.Ops)
@@ -853,10 +843,7 @@ func drawDeleteConfirm(gtx layout.Context, th *Theme, filename string, rect imag
 // dark background to keep it readable over photo content.
 func (v *Viewer) layoutInfoPanel(gtx layout.Context, th *Theme, e cache.Entry, rect image.Rectangle) {
 	// Background fill.
-	bg := clip.Rect(rect).Push(gtx.Ops)
-	paint.ColorOp{Color: color.NRGBA{R: 0x14, G: 0x16, B: 0x1a, A: 0xee}}.Add(gtx.Ops)
-	paint.PaintOp{}.Add(gtx.Ops)
-	bg.Pop()
+	paint.FillShape(gtx.Ops, color.NRGBA{R: 0x14, G: 0x16, B: 0x1a, A: 0xee}, clip.Rect(rect).Op())
 
 	dims := v.dimensionsFor(e)
 	info := v.mediaInfoFor(e)

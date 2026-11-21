@@ -201,9 +201,7 @@ func (c *Controller) patchFavorite(path string, newVal bool) {
 			next[FavoritesView]++
 		} else {
 			next[FavoritesView]--
-			if next[FavoritesView] < 0 {
-				next[FavoritesView] = 0
-			}
+			next[FavoritesView] = max(next[FavoritesView], 0)
 		}
 		c.dirCounts = next
 		c.dirCountsVer++

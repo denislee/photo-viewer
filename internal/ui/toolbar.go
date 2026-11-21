@@ -167,10 +167,7 @@ func (t *Toolbar) Layout(gtx layout.Context, th *Theme, path string, count int) 
 	items := t.itemsText(count)
 
 	bg := image.Rect(0, 0, w, h)
-	clipArea := clip.Rect(bg).Push(gtx.Ops)
-	paint.ColorOp{Color: th.CellBG}.Add(gtx.Ops)
-	paint.PaintOp{}.Add(gtx.Ops)
-	clipArea.Pop()
+	paint.FillShape(gtx.Ops, th.CellBG, clip.Rect(bg).Op())
 
 	// Reset the hover tooltip; each button below sets it if hovered.
 	t.tooltipText = ""
@@ -259,8 +256,7 @@ func (t *Toolbar) Layout(gtx layout.Context, th *Theme, path string, count int) 
 // background. The clickable consumes pointer events for click and hover.
 func (t *Toolbar) layoutIconCell(gtx layout.Context, th *Theme, btn *widget.Clickable, ic *widget.Icon, active, disabled bool) layout.Dimensions {
 	side := gtx.Dp(unit.Dp(toolbarIconCellDp))
-	gtx.Constraints.Min = image.Pt(side, side)
-	gtx.Constraints.Max = image.Pt(side, side)
+	gtx.Constraints = layout.Exact(image.Pt(side, side))
 
 	fg := th.Foreground
 	bg := th.CellBG
@@ -275,10 +271,7 @@ func (t *Toolbar) layoutIconCell(gtx layout.Context, th *Theme, btn *widget.Clic
 
 	return btn.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
 		rect := image.Rectangle{Max: image.Pt(side, side)}
-		rr := clip.UniformRRect(rect, gtx.Dp(unit.Dp(5))).Push(gtx.Ops)
-		paint.ColorOp{Color: bg}.Add(gtx.Ops)
-		paint.PaintOp{}.Add(gtx.Ops)
-		rr.Pop()
+		paint.FillShape(gtx.Ops, bg, clip.UniformRRect(rect, gtx.Dp(unit.Dp(5))).Op(gtx.Ops))
 
 		if !disabled {
 			pointer.CursorPointer.Add(gtx.Ops)
@@ -289,8 +282,7 @@ func (t *Toolbar) layoutIconCell(gtx layout.Context, th *Theme, btn *widget.Clic
 			return layout.Dimensions{Size: image.Pt(side, side)}
 		}
 		return layout.Center.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
-			gtx.Constraints.Min = image.Pt(iconSide, iconSide)
-			gtx.Constraints.Max = image.Pt(iconSide, iconSide)
+			gtx.Constraints = layout.Exact(image.Pt(iconSide, iconSide))
 			return ic.Layout(gtx, fg)
 		})
 	})
@@ -312,10 +304,7 @@ func groupSep(th *Theme) layout.FlexChild {
 		rect := image.Rect(pad, yTop, pad+lineW, yTop+lineH)
 		col := th.Muted
 		col.A = 0x55
-		stack := clip.Rect(rect).Push(gtx.Ops)
-		paint.ColorOp{Color: col}.Add(gtx.Ops)
-		paint.PaintOp{}.Add(gtx.Ops)
-		stack.Pop()
+		paint.FillShape(gtx.Ops, col, clip.Rect(rect).Op())
 		return layout.Dimensions{Size: image.Pt(total, rowH)}
 	})
 }
@@ -348,12 +337,9 @@ func (t *Toolbar) DrawTooltipOverlay(gtx layout.Context, th *Theme, anchorRight 
 
 	// Background.
 	rect := image.Rect(x0, 0, x0+w, h)
-	rr := clip.UniformRRect(rect, gtx.Dp(unit.Dp(4))).Push(gtx.Ops)
 	bg := th.Background
 	bg.A = 0xee
-	paint.ColorOp{Color: bg}.Add(gtx.Ops)
-	paint.PaintOp{}.Add(gtx.Ops)
-	rr.Pop()
+	paint.FillShape(gtx.Ops, bg, clip.UniformRRect(rect, gtx.Dp(unit.Dp(4))).Op(gtx.Ops))
 
 	// Place the recorded label inside the box.
 	tr := op.Offset(image.Pt(x0+padH, padV)).Push(gtx.Ops)

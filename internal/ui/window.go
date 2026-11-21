@@ -273,8 +273,7 @@ func drawRoot(gtx layout.Context, th *Theme, ctrl *Controller, views *appViews, 
 			return
 		}
 		gtx2 := gtx
-		gtx2.Constraints.Max = image.Pt(totalW, sbH)
-		gtx2.Constraints.Min = image.Pt(totalW, sbH)
+		gtx2.Constraints = layout.Exact(image.Pt(totalW, sbH))
 		stack := op.Offset(image.Pt(0, totalH-sbH)).Push(gtx.Ops)
 		drawShortcutBar(gtx2, th, v.Open, sidebarFocus, ctrl.SelectionMode())
 		stack.Pop()
@@ -287,8 +286,7 @@ func drawRoot(gtx layout.Context, th *Theme, ctrl *Controller, views *appViews, 
 			return
 		}
 		gtx2 := gtx
-		gtx2.Constraints.Max = image.Pt(totalW, pbH)
-		gtx2.Constraints.Min = image.Pt(totalW, pbH)
+		gtx2.Constraints = layout.Exact(image.Pt(totalW, pbH))
 		stack := op.Offset(image.Pt(0, totalH-sbH-pbH)).Push(gtx.Ops)
 		processBar.Layout(gtx2, th, procSnap)
 		stack.Pop()
@@ -304,8 +302,7 @@ func drawRoot(gtx layout.Context, th *Theme, ctrl *Controller, views *appViews, 
 			v.SetVideoVisible(false)
 		}
 		gtx2 := gtx
-		gtx2.Constraints.Max = image.Pt(totalW, totalH-sbH)
-		gtx2.Constraints.Min = image.Pt(totalW, totalH-sbH)
+		gtx2.Constraints = layout.Exact(image.Pt(totalW, totalH-sbH))
 		m.layout(gtx2, th)
 		drawShortcut()
 		return
@@ -316,8 +313,7 @@ func drawRoot(gtx layout.Context, th *Theme, ctrl *Controller, views *appViews, 
 	// root key handler.
 	if v.Open {
 		gtx2 := gtx
-		gtx2.Constraints.Max = image.Pt(totalW, totalH-sbH)
-		gtx2.Constraints.Min = image.Pt(totalW, totalH-sbH)
+		gtx2.Constraints = layout.Exact(image.Pt(totalW, totalH-sbH))
 		v.InTrash = currentDir == TrashView
 		v.Layout(gtx2, th, ctrl.Thumbs())
 		drawShortcut()
@@ -329,8 +325,7 @@ func drawRoot(gtx layout.Context, th *Theme, ctrl *Controller, views *appViews, 
 	// Toolbar at top
 	{
 		gtx2 := gtx
-		gtx2.Constraints.Max = image.Pt(totalW, tbH)
-		gtx2.Constraints.Min = image.Pt(totalW, tbH)
+		gtx2.Constraints = layout.Exact(image.Pt(totalW, tbH))
 		dispDir := currentDir
 		switch {
 		case dispDir == FavoritesView:
@@ -360,20 +355,14 @@ func drawRoot(gtx layout.Context, th *Theme, ctrl *Controller, views *appViews, 
 	if leftW <= 0 {
 		leftW = totalW * 22 / 100
 	}
-	if leftW < minW {
-		leftW = minW
-	}
-	if leftW > maxW {
-		leftW = maxW
-	}
+	leftW = min(max(leftW, minW), maxW)
 	splitW := gtx.Dp(unit.Dp(splitterWidthDp))
 	rightW := totalW - leftW - splitW
 
 	// Sidebar
 	{
 		gtx2 := gtx
-		gtx2.Constraints.Max = image.Pt(leftW, bodyH)
-		gtx2.Constraints.Min = image.Pt(leftW, bodyH)
+		gtx2.Constraints = layout.Exact(image.Pt(leftW, bodyH))
 		stack := op.Offset(image.Pt(0, bodyY)).Push(gtx.Ops)
 		counts, countsVer := ctrl.DirCountsWithVersion()
 		sb.Layout(gtx2, th, ctrl.LibraryRoot(), treeDir, currentDir, subdirs, counts, countsVer, GetConfig().GroupByYear)
@@ -390,8 +379,7 @@ func drawRoot(gtx layout.Context, th *Theme, ctrl *Controller, views *appViews, 
 	// Grid
 	{
 		gtx2 := gtx
-		gtx2.Constraints.Max = image.Pt(rightW, bodyH)
-		gtx2.Constraints.Min = image.Pt(rightW, bodyH)
+		gtx2.Constraints = layout.Exact(image.Pt(rightW, bodyH))
 		stack := op.Offset(image.Pt(leftW+splitW, bodyY)).Push(gtx.Ops)
 		g.Layout(gtx2, th, entries, ctrl)
 		stack.Pop()
@@ -407,8 +395,7 @@ func drawRoot(gtx layout.Context, th *Theme, ctrl *Controller, views *appViews, 
 	// shortcut bar so it's prominent regardless of grid scroll position.
 	if g.Confirming {
 		gtx2 := gtx
-		gtx2.Constraints.Max = image.Pt(totalW, totalH-sbH)
-		gtx2.Constraints.Min = image.Pt(totalW, totalH-sbH)
+		gtx2.Constraints = layout.Exact(image.Pt(totalW, totalH-sbH))
 		drawDeleteConfirm(gtx2, th, filepath.Base(g.ConfirmPath), image.Rectangle{Max: gtx2.Constraints.Max}, currentDir == TrashView)
 	}
 
@@ -441,10 +428,7 @@ func layoutSplitter(gtx layout.Context, th *Theme, sp *sidebarSplitter, w, h, le
 	// Thin visible line in the middle of the hit strip.
 	lineX := w / 2
 	line := image.Rect(lineX, 0, lineX+1, h)
-	cl := clip.Rect(line).Push(gtx.Ops)
-	paint.ColorOp{Color: th.Muted}.Add(gtx.Ops)
-	paint.PaintOp{}.Add(gtx.Ops)
-	cl.Pop()
+	paint.FillShape(gtx.Ops, th.Muted, clip.Rect(line).Op())
 
 	pointer.CursorColResize.Add(gtx.Ops)
 	event.Op(gtx.Ops, sp)
@@ -474,13 +458,9 @@ func layoutSplitter(gtx layout.Context, th *Theme, sp *sidebarSplitter, w, h, le
 			}
 			delta := int(pe.Position.X - sp.startX)
 			newW := max(sp.startW+delta, minW)
-			cap := max(totalW-minW-w, minW)
-			if newW > maxW {
-				newW = maxW
-			}
-			if newW > cap {
-				newW = cap
-			}
+			limit := max(totalW-minW-w, minW)
+			newW = min(newW, maxW)
+			newW = min(newW, limit)
 			if newW != sp.pendingW {
 				sp.pendingW = newW
 				win.Invalidate()
