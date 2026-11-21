@@ -84,7 +84,7 @@ func Image(ctx context.Context, src, dst string, size int) error {
 
 // ffmpegScaleFilter builds the `-vf` scale expression that fits the longest
 // edge to size while preserving aspect ratio. Shared by every ffmpeg
-// thumbnail run (see ffmpegThumbArgs).
+// thumbnail run (see ffmpegThumbArgsFilter).
 func ffmpegScaleFilter(size int) string {
 	return fmt.Sprintf("scale='if(gt(iw,ih),%d,-2)':'if(gt(iw,ih),-2,%d)'", size, size)
 }
@@ -98,20 +98,14 @@ func ffmpegError(err error, stderr *bytes.Buffer) error {
 	return err
 }
 
-// ffmpegThumbArgs builds the argument list of a single-frame thumbnail run:
-// inArgs (input options ending in -i <input>) followed by a one-frame
-// scale-to-size JPEG written to dst. -threads 1 sits before the input so it caps
-// the *decoder* (C-06): a one-frame grab needs no parallel decode, yet without
-// the cap each child defaults to ~NumCPU threads, and the store runs an
-// extSem-worth (3×NumCPU) of these at once — HEIC's HEVC decoder included.
-func ffmpegThumbArgs(dst string, size int, inArgs ...string) []string {
-	return ffmpegThumbArgsFilter(dst, []string{"-vf", ffmpegScaleFilter(size)}, inArgs...)
-}
-
-// ffmpegThumbArgsFilter is ffmpegThumbArgs with the output-filter arguments
-// supplied by the caller. It exists because tiled HEIC (see heicViaFfmpeg)
-// can't use -vf at all: ffmpeg >= 7.1 exposes the grid as a stream group, so
-// the filter must be written as -filter_complex "[0:g:0]…" instead.
+// ffmpegThumbArgsFilter builds the argument list of a single-frame thumbnail
+// run: inArgs (input options ending in -i <input>), then one frame through
+// filterArgs written as a JPEG to dst. The filter is the caller's because tiled
+// HEIC (see heicViaFfmpeg) can't use -vf at all: ffmpeg >= 7.1 exposes the grid
+// as a stream group, so the filter must be -filter_complex "[0:g:0]…" instead.
+// -threads 1 sits before the input so it caps the *decoder* (C-06): a one-frame
+// grab needs no parallel decode, yet without the cap each child defaults to
+// ~NumCPU threads, and the store runs an extSem-worth (3×NumCPU) at once.
 func ffmpegThumbArgsFilter(dst string, filterArgs []string, inArgs ...string) []string {
 	args := []string{"-loglevel", "error", "-y", "-threads", "1"}
 	args = append(args, inArgs...)
@@ -123,7 +117,7 @@ func ffmpegThumbArgsFilter(dst string, filterArgs []string, inArgs ...string) []
 	)
 }
 
-// runFfmpegThumb runs ffmpeg with ffmpegThumbArgs, feeding stdin when non-nil.
+// runFfmpegThumb runs a -vf scale-to-size thumbnail, feeding stdin when non-nil.
 // On failure it removes any partial dst and returns ffmpeg's stderr as the
 // error; on success it confirms dst exists.
 func runFfmpegThumb(ctx context.Context, dst string, size int, stdin io.Reader, inArgs ...string) error {

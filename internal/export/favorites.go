@@ -246,11 +246,10 @@ func Favorites(ctx context.Context, idx *cache.Index, opts Options, progress Pro
 		}
 		if opts.DryRun {
 			enqueue(&pendingItem{
-				step:   step,
-				action: action,
-				src:    src,
-				dest:   dest,
-				out:    pendingOutcome{action: action},
+				step: step,
+				src:  src,
+				dest: dest,
+				out:  pendingOutcome{action: action},
 			})
 			continue
 		}
@@ -269,7 +268,7 @@ func Favorites(ctx context.Context, idx *cache.Index, opts Options, progress Pro
 			// Only image recompresses are parallel: every other action would
 			// either fork a tool, stream a whole file, or mutate the source, and
 			// keeping those inline makes their progress ordering obvious.
-			it := &pendingItem{step: step, action: action, src: src, dest: dest, ch: make(chan pendingOutcome, 1)}
+			it := &pendingItem{step: step, src: src, dest: dest, ch: make(chan pendingOutcome, 1)}
 			go func(it *pendingItem, typ scan.MediaType, src, dest, action string) {
 				sem <- struct{}{}
 				handled, err := recompressFile(ctx, typ, src, dest, opts.MaxLongEdge, jpegQ, crf)
@@ -302,11 +301,10 @@ func Favorites(ctx context.Context, idx *cache.Index, opts Options, progress Pro
 			opErr = copyFile(src, dest)
 		}
 		enqueue(&pendingItem{
-			step:   step,
-			action: action,
-			src:    src,
-			dest:   dest,
-			out:    pendingOutcome{action: action, err: opErr},
+			step: step,
+			src:  src,
+			dest: dest,
+			out:  pendingOutcome{action: action, err: opErr},
 		})
 	}
 	drain()
@@ -317,12 +315,11 @@ func Favorites(ctx context.Context, idx *cache.Index, opts Options, progress Pro
 // recompress carries its outcome on ch; every other item (copy, move,
 // transcode, skip, planning failure) is already complete and stores it in out.
 type pendingItem struct {
-	step   int
-	action string
-	src    string
-	dest   string
-	out    pendingOutcome
-	ch     chan pendingOutcome
+	step int
+	src  string
+	dest string
+	out  pendingOutcome
+	ch   chan pendingOutcome
 }
 
 // pendingOutcome is the result of one planned item. msg, when non-empty, is the

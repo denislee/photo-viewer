@@ -50,7 +50,7 @@ func rawDaemonFixture(t *testing.T) string {
 	base := filepath.Join(dir, "base.tif")
 	writeTIFFWithThumbnail(t, base, 320, 240, 6, thumb)
 
-	// The extension only matters to scan; LoadRAWPreview sniffs magic bytes.
+	// The extension only matters to scan; loadRAWPreview sniffs magic bytes.
 	src := filepath.Join(dir, "x.nef")
 	data, err := os.ReadFile(base)
 	if err != nil {

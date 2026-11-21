@@ -116,7 +116,7 @@ func TestImageAppliesOrientationAfterScale(t *testing.T) {
 // TestLoadRAWImageReportsPreviewOrientation is the S-21 guard: an embedded RAW
 // preview is stored in sensor orientation, so LoadRAWImage must hand back the
 // RAW's Orientation tag for the viewer to apply after its downscale. A
-// JPEG-bodied ".cr2" takes LoadRAWPreview's whole-file fast path, so no
+// JPEG-bodied ".cr2" takes loadRAWPreview's whole-file fast path, so no
 // exiftool or ffmpeg is needed.
 func TestLoadRAWImageReportsPreviewOrientation(t *testing.T) {
 	dir := t.TempDir()

@@ -134,12 +134,6 @@ func decodeRAWViaFfmpeg(ctx context.Context, src string, fit func(w, h int) (int
 	return img, err
 }
 
-// LoadRAWPreview returns the bytes of an embedded JPEG/TIFF preview.
-func LoadRAWPreview(ctx context.Context, src string) ([]byte, error) {
-	data, _, err := loadRAWPreview(ctx, src)
-	return data, err
-}
-
 // loadRAWPreview returns the bytes of an embedded JPEG/TIFF preview together
 // with the EXIF Orientation still to be applied to it. The orientation rides
 // the same daemon probe that classifies the preview tags, so the common path

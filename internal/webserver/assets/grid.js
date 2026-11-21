@@ -142,7 +142,7 @@
       method: 'POST',
       credentials: 'same-origin',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ id: id, toggle: true }),
+      body: JSON.stringify({ id: id }),
     }).then(function(r){ return r.json(); })
       .then(function(d){
         var star = cell.querySelector('.star');

@@ -68,10 +68,8 @@ func handleViewerKey(ke key.Event, viewer *Viewer, grid *Grid, ctrl *Controller,
 		viewer.Prev()
 		w.Invalidate()
 	case "D":
-		if !ke.Modifiers.Contain(key.ModCtrl) {
-			viewer.RequestDelete()
-			w.Invalidate()
-		}
+		viewer.RequestDelete()
+		w.Invalidate()
 	case "I":
 		viewer.ShowInfo = !viewer.ShowInfo
 		w.Invalidate()

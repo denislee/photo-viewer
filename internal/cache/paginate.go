@@ -193,21 +193,11 @@ func (i *Index) ListPage(v View, offset, limit int) []Entry {
 		return nil
 	}
 	defer rows.Close()
-	out := scanEntries(rows, hintFor(limit))
+	out := scanEntries(rows, limit)
 	if prependExact {
 		out = append([]Entry{*exact}, out...)
 	}
 	return out
-}
-
-// hintFor turns a page limit into scanEntries' capacity hint: a positive limit
-// is the expected row count; a no-limit query passes 0 so the drain falls back
-// to its default and grows by doubling.
-func hintFor(limit int) int {
-	if limit > 0 {
-		return limit
-	}
-	return 0
 }
 
 // NeighborsWithTotal returns (prev, next) entries adjacent to path within v,
@@ -426,7 +416,7 @@ func (i *Index) ListPageAfter(v View, afterPath string, limit int) []Entry {
 		return nil
 	}
 	defer rows.Close()
-	out := scanEntries(rows, hintFor(limit))
+	out := scanEntries(rows, limit)
 	if exact != nil {
 		out = append([]Entry{*exact}, out...)
 	}

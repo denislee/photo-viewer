@@ -165,9 +165,6 @@ func handleGridKey(ke key.Event, grid *Grid, sidebarFocus *bool, viewer *Viewer,
 			}
 		}
 	case "D":
-		if ke.Modifiers.Contain(key.ModCtrl) {
-			return
-		}
 		if total > 0 {
 			grid.RequestDelete(entries, grid.SelectedIndex(total))
 			w.Invalidate()

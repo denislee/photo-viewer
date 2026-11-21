@@ -72,7 +72,7 @@ func Run(w *app.Window, ctrl *Controller) error {
 		case ProcDuplicates:
 			dups.Show()
 		case ProcOrganize:
-			organize.Show(ctrl.Index(), ctrl.LibraryRoot())
+			organize.Show(ctrl.Index())
 		}
 		w.Invalidate()
 	}
@@ -143,7 +143,7 @@ func Run(w *app.Window, ctrl *Controller) error {
 		w.Invalidate()
 	}
 	toolbar.OnOrganize = func() {
-		organize.Show(ctrl.Index(), ctrl.LibraryRoot())
+		organize.Show(ctrl.Index())
 		w.Invalidate()
 	}
 	toolbar.OnExportFavorites = func() {
@@ -186,10 +186,6 @@ func Run(w *app.Window, ctrl *Controller) error {
 		ctrl.SetSort(mode)
 		w.Invalidate()
 	}
-	toolbar.Filter = ctrl.Filter()
-	toolbar.ShowRAW = ctrl.ShowRAW()
-	toolbar.GroupByYear = GetConfig().GroupByYear
-	toolbar.SortByLength = ctrl.Sort() == SortByDuration
 
 	views := &appViews{
 		toolbar: toolbar, sidebar: sidebar, grid: grid, viewer: viewer,

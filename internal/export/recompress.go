@@ -6,17 +6,11 @@ import (
 	"errors"
 	"fmt"
 	"image"
-	_ "image/gif"
-	_ "image/png"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
-
-	_ "golang.org/x/image/bmp"
-	_ "golang.org/x/image/tiff"
-	_ "golang.org/x/image/webp"
 
 	"github.com/dns/photo-viewer/internal/imgfit"
 	"github.com/dns/photo-viewer/internal/imgorient"

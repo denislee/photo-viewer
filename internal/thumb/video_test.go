@@ -29,7 +29,7 @@ func TestFfmpegThumbArgsThreadCap(t *testing.T) {
 		{"preview-pipe", []string{"-f", "image2pipe", "-i", "pipe:0"}},
 	}
 	for _, tc := range cases {
-		args := ffmpegThumbArgs("out.jpg", 256, tc.inArgs...)
+		args := ffmpegThumbArgsFilter("out.jpg", []string{"-vf", ffmpegScaleFilter(256)}, tc.inArgs...)
 
 		ti := indexOfThreadsOne(args)
 		if ti < 0 {

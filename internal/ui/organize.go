@@ -74,7 +74,7 @@ func (v *OrganizeView) SetMover(f func(old, new string) error) { v.applyMove = f
 // whole move pass finishes.
 func (v *OrganizeView) SetRefresh(f func()) { v.refreshActive = f }
 
-func (v *OrganizeView) Show(idx *cache.Index, root string) {
+func (v *OrganizeView) Show(idx *cache.Index) {
 	v.mu.Lock()
 	// Running-guard: if a scan or move pass is already in flight (e.g. the user
 	// reopened the modal from the process bar), just re-surface the existing
