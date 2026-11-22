@@ -39,6 +39,13 @@ func handleViewerKey(ke key.Event, viewer *Viewer, grid *Grid, ctrl *Controller,
 		}
 	}
 
+	// Esc first backs out of a zoom, then closes the viewer.
+	if ke.Name == key.NameEscape && viewer.Zoomed() {
+		viewer.ResetZoom()
+		w.Invalidate()
+		return
+	}
+
 	switch ke.Name {
 	case key.NameEscape, "Q":
 		syncGrid()

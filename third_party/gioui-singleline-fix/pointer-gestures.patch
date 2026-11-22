@@ -1,0 +1,1175 @@
+--- a/app/os_wayland.go
++++ b/app/os_wayland.go
+@@ -49,6 +49,11 @@
+ //go:generate sed -i "1s;^;//go:build ((linux \\&\\& !android) || freebsd) \\&\\& !nowayland\\n// +build linux,!android freebsd\\n// +build !nowayland\\n\\n;" wayland_xdg_decoration.c
+ //go:generate sed -i "1s;^;//go:build ((linux \\&\\& !android) || freebsd) \\&\\& !nowayland\\n// +build linux,!android freebsd\\n// +build !nowayland\\n\\n;" wayland_text_input.c
+ 
++// Local fork addition: touchpad pinch gestures (see pinch.go).
++//go:generate wayland-scanner client-header /usr/share/wayland-protocols/unstable/pointer-gestures/pointer-gestures-unstable-v1.xml wayland_pointer_gestures.h
++//go:generate wayland-scanner private-code /usr/share/wayland-protocols/unstable/pointer-gestures/pointer-gestures-unstable-v1.xml wayland_pointer_gestures.c
++//go:generate sed -i "1s;^;//go:build ((linux \\&\\& !android) || freebsd) \\&\\& !nowayland\\n// +build linux,!android freebsd\\n// +build !nowayland\\n\\n;" wayland_pointer_gestures.c
++
+ /*
+ #cgo linux pkg-config: wayland-client wayland-cursor
+ #cgo freebsd openbsd LDFLAGS: -lwayland-client -lwayland-cursor
+@@ -61,6 +66,7 @@
+ #include "wayland_text_input.h"
+ #include "wayland_xdg_shell.h"
+ #include "wayland_xdg_decoration.h"
++#include "wayland_pointer_gestures.h"
+ 
+ extern const struct wl_registry_listener gio_registry_listener;
+ extern const struct wl_surface_listener gio_surface_listener;
+@@ -73,6 +79,7 @@
+ extern const struct wl_seat_listener gio_seat_listener;
+ extern const struct wl_pointer_listener gio_pointer_listener;
+ extern const struct wl_touch_listener gio_touch_listener;
++extern const struct zwp_pointer_gesture_pinch_v1_listener gio_pinch_listener;
+ extern const struct wl_keyboard_listener gio_keyboard_listener;
+ extern const struct zwp_text_input_v3_listener gio_zwp_text_input_v3_listener;
+ extern const struct wl_data_device_listener gio_data_device_listener;
+@@ -90,6 +97,7 @@
+ 	shm               *C.struct_wl_shm
+ 	dataDeviceManager *C.struct_wl_data_device_manager
+ 	decor             *C.struct_zxdg_decoration_manager_v1
++	gestures          *C.struct_zwp_pointer_gestures_v1
+ 	seat              *wlSeat
+ 	xkb               *xkb.Context
+ 	outputMap         map[C.uint32_t]*C.struct_wl_output
+@@ -114,6 +122,13 @@
+ 	keyboard *C.struct_wl_keyboard
+ 	im       *C.struct_zwp_text_input_v3
+ 
++	// pinch is the touchpad pinch gesture object of pointer (nil when the
++	// compositor lacks zwp_pointer_gestures_v1). pinchScale is the gesture's
++	// cumulative scale at the last update, pinchFocus the window it began in.
++	pinch      *C.struct_zwp_pointer_gesture_pinch_v1
++	pinchScale float32
++	pinchFocus *window
++
+ 	// The most recent input serial.
+ 	serial C.uint32_t
+ 	// The most recent pointer enter serial.
+@@ -488,6 +503,7 @@
+ 		C.zwp_text_input_v3_destroy(s.im)
+ 		s.im = nil
+ 	}
++	s.releasePinch()
+ 	if s.pointer != nil {
+ 		C.wl_pointer_release(s.pointer)
+ 	}
+@@ -517,7 +533,9 @@
+ 	case s.pointer == nil && caps&C.WL_SEAT_CAPABILITY_POINTER != 0:
+ 		s.pointer = C.wl_seat_get_pointer(s.seat)
+ 		C.wl_pointer_add_listener(s.pointer, &C.gio_pointer_listener, unsafe.Pointer(s.seat))
++		s.bindPinch()
+ 	case s.pointer != nil && caps&C.WL_SEAT_CAPABILITY_POINTER == 0:
++		s.releasePinch()
+ 		C.wl_pointer_release(s.pointer)
+ 		s.pointer = nil
+ 	}
+@@ -539,6 +557,80 @@
+ 	}
+ }
+ 
++// bindPinch subscribes to touchpad pinch gestures on the seat's pointer, once
++// both the pointer and the gestures global exist (they arrive in either order).
++func (s *wlSeat) bindPinch() {
++	if s.pinch != nil || s.pointer == nil || s.disp.gestures == nil {
++		return
++	}
++	s.pinch = C.zwp_pointer_gestures_v1_get_pinch_gesture(s.disp.gestures, s.pointer)
++	C.zwp_pointer_gesture_pinch_v1_add_listener(s.pinch, &C.gio_pinch_listener, unsafe.Pointer(s.seat))
++}
++
++func (s *wlSeat) releasePinch() {
++	if s.pinch != nil {
++		C.zwp_pointer_gesture_pinch_v1_destroy(s.pinch)
++		s.pinch = nil
++	}
++	s.pinchFocus = nil
++}
++
++//export gio_onPinchBegin
++func gio_onPinchBegin(data unsafe.Pointer, p *C.struct_zwp_pointer_gesture_pinch_v1, serial, t C.uint32_t, surf *C.struct_wl_surface, fingers C.uint32_t) {
++	s := callbackLoad(data).(*wlSeat)
++	s.serial = serial
++	s.pinchScale = 1
++	s.pinchFocus = nil
++	if surf == nil {
++		return
++	}
++	w, ok := callbackLoad(unsafe.Pointer(surf)).(*window)
++	if !ok {
++		return
++	}
++	s.pinchFocus = w
++	w.flushScroll()
++	w.resetFling()
++	w.ProcessEvent(PinchEvent{Kind: PinchBegin, Position: w.lastPos, Scale: 1})
++}
++
++//export gio_onPinchUpdate
++func gio_onPinchUpdate(data unsafe.Pointer, p *C.struct_zwp_pointer_gesture_pinch_v1, t C.uint32_t, dx, dy, scale, rotation C.wl_fixed_t) {
++	s := callbackLoad(data).(*wlSeat)
++	w := s.pinchFocus
++	if w == nil {
++		return
++	}
++	sc := fromFixed(scale)
++	if sc <= 0 || s.pinchScale <= 0 {
++		return
++	}
++	rel := sc / s.pinchScale
++	s.pinchScale = sc
++	w.ProcessEvent(PinchEvent{
++		Kind:     PinchUpdate,
++		Position: w.lastPos,
++		Scale:    rel,
++		Pan:      f32.Point{X: fromFixed(dx) * float32(w.scale), Y: fromFixed(dy) * float32(w.scale)},
++	})
++}
++
++//export gio_onPinchEnd
++func gio_onPinchEnd(data unsafe.Pointer, p *C.struct_zwp_pointer_gesture_pinch_v1, serial, t C.uint32_t, cancelled C.int32_t) {
++	s := callbackLoad(data).(*wlSeat)
++	s.serial = serial
++	w := s.pinchFocus
++	s.pinchFocus = nil
++	if w == nil {
++		return
++	}
++	kind := PinchEnd
++	if cancelled != 0 {
++		kind = PinchCancel
++	}
++	w.ProcessEvent(PinchEvent{Kind: kind, Position: w.lastPos, Scale: 1})
++}
++
+ //export gio_onSeatName
+ func gio_onSeatName(data unsafe.Pointer, seat *C.struct_wl_seat, name *C.char) {
+ }
+@@ -696,6 +788,11 @@
+ 		d.wm = (*C.struct_xdg_wm_base)(C.wl_registry_bind(reg, name, &C.xdg_wm_base_interface, 1))
+ 	case "zxdg_decoration_manager_v1":
+ 		d.decor = (*C.struct_zxdg_decoration_manager_v1)(C.wl_registry_bind(reg, name, &C.zxdg_decoration_manager_v1_interface, 1))
++	case "zwp_pointer_gestures_v1":
++		d.gestures = (*C.struct_zwp_pointer_gestures_v1)(C.wl_registry_bind(reg, name, &C.zwp_pointer_gestures_v1_interface, 1))
++		if d.seat != nil {
++			d.seat.bindPinch()
++		}
+ 		// TODO: Implement and test text-input support.
+ 		/*case "zwp_text_input_manager_v3":
+ 		d.imm = (*C.struct_zwp_text_input_manager_v3)(C.wl_registry_bind(reg, name, &C.zwp_text_input_manager_v3_interface, 1))*/
+@@ -865,6 +962,9 @@
+ 	s := callbackLoad(data).(*wlSeat)
+ 	s.serial = serial
+ 	s.pointerFocus = nil
++	if s.pinchFocus == w {
++		s.pinchFocus = nil
++	}
+ 	if w.inCompositor {
+ 		w.inCompositor = false
+ 		w.ProcessEvent(pointer.Event{Kind: pointer.Cancel})
+@@ -1913,6 +2013,9 @@
+ 	if d.decor != nil {
+ 		C.zxdg_decoration_manager_v1_destroy(d.decor)
+ 	}
++	if d.gestures != nil {
++		C.zwp_pointer_gestures_v1_destroy(d.gestures)
++	}
+ 	if d.shm != nil {
+ 		C.wl_shm_destroy(d.shm)
+ 	}
+--- a/app/os_wayland.c
++++ b/app/os_wayland.c
+@@ -8,6 +8,7 @@
+ #include "wayland_xdg_shell.h"
+ #include "wayland_xdg_decoration.h"
+ #include "wayland_text_input.h"
++#include "wayland_pointer_gestures.h"
+ #include "_cgo_export.h"
+ 
+ const struct wl_registry_listener gio_registry_listener = {
+@@ -72,6 +73,12 @@
+ 	.axis_discrete = gio_onPointerAxisDiscrete,
+ };
+ 
++const struct zwp_pointer_gesture_pinch_v1_listener gio_pinch_listener = {
++	.begin = gio_onPinchBegin,
++	.update = gio_onPinchUpdate,
++	.end = gio_onPinchEnd,
++};
++
+ const struct wl_touch_listener gio_touch_listener = {
+ 	.down = gio_onTouchDown,
+ 	.up = gio_onTouchUp,
+--- a/app/window.go
++++ b/app/window.go
+@@ -116,6 +116,9 @@
+ 	frame        *frameEvent
+ 	framePending bool
+ 	destroy      *DestroyEvent
++	// pinch queues touchpad pinch steps (local fork addition, see pinch.go);
++	// consecutive updates are merged into one.
++	pinch []PinchEvent
+ }
+ 
+ type callbacks struct {
+@@ -583,6 +586,10 @@
+ 		e := *s.cfg
+ 		s.cfg = nil
+ 		return e, true
++	case len(s.pinch) > 0:
++		e := s.pinch[0]
++		s.pinch = s.pinch[1:]
++		return e, true
+ 	case s.frame != nil:
+ 		e := *s.frame
+ 		s.frame = nil
+@@ -657,6 +664,12 @@
+ 			w.ctx.Unlock()
+ 		}
+ 		w.coalesced.view = &e2
++	case PinchEvent:
++		if n := len(w.coalesced.pinch); n > 0 && e2.Kind == PinchUpdate && w.coalesced.pinch[n-1].Kind == PinchUpdate {
++			w.coalesced.pinch[n-1] = w.coalesced.pinch[n-1].merge(e2)
++		} else {
++			w.coalesced.pinch = append(w.coalesced.pinch, e2)
++		}
+ 	case ConfigEvent:
+ 		w.decorations.Decorations.Maximized = e2.Config.Mode == Maximized
+ 		wasFocused := w.decorations.Config.Focused
+--- a/app/pinch.go
++++ b/app/pinch.go
+@@ -0,0 +1,42 @@
++// SPDX-License-Identifier: Unlicense OR MIT
++
++package app
++
++import "gioui.org/f32"
++
++// PinchEvent is one step of a touchpad pinch gesture, returned by
++// [Window.Event]. Local fork addition: only the Wayland driver emits it, on
++// compositors that implement zwp_pointer_gestures_v1.
++type PinchEvent struct {
++	Kind PinchKind
++	// Position is the pointer position in window pixels.
++	Position f32.Point
++	// Scale is the zoom factor since the previous event of the gesture
++	// (1 means no change); multiply successive values to get the total.
++	Scale float32
++	// Pan is how far the fingers' centre moved since the previous event, in
++	// pixels.
++	Pan f32.Point
++}
++
++// PinchKind is the phase of a [PinchEvent].
++type PinchKind uint8
++
++const (
++	PinchBegin PinchKind = iota
++	PinchUpdate
++	PinchEnd
++	// PinchCancel ends a gesture the compositor cancelled.
++	PinchCancel
++)
++
++func (PinchEvent) ImplementsEvent() {}
++
++// merge folds the update n into e, so updates queued between two reads of
++// Window.Event arrive as one.
++func (e PinchEvent) merge(n PinchEvent) PinchEvent {
++	e.Position = n.Position
++	e.Scale *= n.Scale
++	e.Pan = e.Pan.Add(n.Pan)
++	return e
++}
+--- a/app/pinch_test.go
++++ b/app/pinch_test.go
+@@ -0,0 +1,33 @@
++// SPDX-License-Identifier: Unlicense OR MIT
++
++package app
++
++import (
++	"testing"
++
++	"gioui.org/f32"
++)
++
++func TestPinchUpdatesCoalesce(t *testing.T) {
++	w := new(Window)
++	w.processEvent(PinchEvent{Kind: PinchBegin, Scale: 1})
++	w.processEvent(PinchEvent{Kind: PinchUpdate, Scale: 2, Pan: f32.Pt(1, 2)})
++	w.processEvent(PinchEvent{Kind: PinchUpdate, Scale: 1.5, Pan: f32.Pt(3, 4)})
++	w.processEvent(PinchEvent{Kind: PinchEnd, Scale: 1})
++	var got []PinchEvent
++	for {
++		e, ok := w.nextEvent()
++		if !ok {
++			break
++		}
++		if p, ok := e.(PinchEvent); ok {
++			got = append(got, p)
++		}
++	}
++	if len(got) != 3 || got[0].Kind != PinchBegin || got[2].Kind != PinchEnd {
++		t.Fatalf("events = %+v", got)
++	}
++	if u := got[1]; u.Kind != PinchUpdate || u.Scale != 3 || u.Pan != f32.Pt(4, 6) {
++		t.Fatalf("merged update = %+v", u)
++	}
++}
+--- a/app/wayland_pointer_gestures.h
++++ b/app/wayland_pointer_gestures.h
+@@ -0,0 +1,708 @@
++/* Generated by wayland-scanner 1.26.0 */
++
++#ifndef POINTER_GESTURES_UNSTABLE_V1_CLIENT_PROTOCOL_H
++#define POINTER_GESTURES_UNSTABLE_V1_CLIENT_PROTOCOL_H
++
++#include <stdint.h>
++#include <stddef.h>
++#include "wayland-client.h"
++
++#ifdef  __cplusplus
++extern "C" {
++#endif
++
++/**
++ * @page page_pointer_gestures_unstable_v1 The pointer_gestures_unstable_v1 protocol
++ * @section page_ifaces_pointer_gestures_unstable_v1 Interfaces
++ * - @subpage page_iface_zwp_pointer_gestures_v1 - touchpad gestures
++ * - @subpage page_iface_zwp_pointer_gesture_swipe_v1 - a swipe gesture object
++ * - @subpage page_iface_zwp_pointer_gesture_pinch_v1 - a pinch gesture object
++ * - @subpage page_iface_zwp_pointer_gesture_hold_v1 - a hold gesture object
++ * @section page_copyright_pointer_gestures_unstable_v1 Copyright
++ * <pre>
++ *
++ * Copyright © 2015, 2021 Red Hat Inc.
++ *
++ * Permission to use, copy, modify, distribute, and sell this
++ * software and its documentation for any purpose is hereby granted
++ * without fee, provided that the above copyright notice appear in
++ * all copies and that both that copyright notice and this permission
++ * notice appear in supporting documentation, and that the name of
++ * the copyright holders not be used in advertising or publicity
++ * pertaining to distribution of the software without specific,
++ * written prior permission.  The copyright holders make no
++ * representations about the suitability of this software for any
++ * purpose.  It is provided "as is" without express or implied
++ * warranty.
++ *
++ * THE COPYRIGHT HOLDERS DISCLAIM ALL WARRANTIES WITH REGARD TO THIS
++ * SOFTWARE, INCLUDING ALL IMPLIED WARRANTIES OF MERCHANTABILITY AND
++ * FITNESS, IN NO EVENT SHALL THE COPYRIGHT HOLDERS BE LIABLE FOR ANY
++ * SPECIAL, INDIRECT OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
++ * WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN
++ * AN ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION,
++ * ARISING OUT OF OR IN CONNECTION WITH THE USE OR PERFORMANCE OF
++ * THIS SOFTWARE.
++ * </pre>
++ */
++struct wl_pointer;
++struct wl_surface;
++struct zwp_pointer_gesture_hold_v1;
++struct zwp_pointer_gesture_pinch_v1;
++struct zwp_pointer_gesture_swipe_v1;
++struct zwp_pointer_gestures_v1;
++
++#ifndef ZWP_POINTER_GESTURES_V1_INTERFACE
++#define ZWP_POINTER_GESTURES_V1_INTERFACE
++/**
++ * @page page_iface_zwp_pointer_gestures_v1 zwp_pointer_gestures_v1
++ * @section page_iface_zwp_pointer_gestures_v1_desc Description
++ *
++ * A global interface to provide semantic touchpad gestures for a given
++ * pointer.
++ *
++ * Three gestures are currently supported: swipe, pinch, and hold.
++ * Pinch and swipe gestures follow a three-stage cycle: begin, update,
++ * end. Hold gestures follow a two-stage cycle: begin and end. All
++ * gestures are identified by a unique id.
++ *
++ * Warning! The protocol described in this file is experimental and
++ * backward incompatible changes may be made. Backward compatible changes
++ * may be added together with the corresponding interface version bump.
++ * Backward incompatible changes are done by bumping the version number in
++ * the protocol and interface names and resetting the interface version.
++ * Once the protocol is to be declared stable, the 'z' prefix and the
++ * version number in the protocol and interface names are removed and the
++ * interface version number is reset.
++ * @section page_iface_zwp_pointer_gestures_v1_api API
++ * See @ref iface_zwp_pointer_gestures_v1.
++ */
++/**
++ * @defgroup iface_zwp_pointer_gestures_v1 The zwp_pointer_gestures_v1 interface
++ *
++ * A global interface to provide semantic touchpad gestures for a given
++ * pointer.
++ *
++ * Three gestures are currently supported: swipe, pinch, and hold.
++ * Pinch and swipe gestures follow a three-stage cycle: begin, update,
++ * end. Hold gestures follow a two-stage cycle: begin and end. All
++ * gestures are identified by a unique id.
++ *
++ * Warning! The protocol described in this file is experimental and
++ * backward incompatible changes may be made. Backward compatible changes
++ * may be added together with the corresponding interface version bump.
++ * Backward incompatible changes are done by bumping the version number in
++ * the protocol and interface names and resetting the interface version.
++ * Once the protocol is to be declared stable, the 'z' prefix and the
++ * version number in the protocol and interface names are removed and the
++ * interface version number is reset.
++ */
++extern const struct wl_interface zwp_pointer_gestures_v1_interface;
++#endif
++#ifndef ZWP_POINTER_GESTURE_SWIPE_V1_INTERFACE
++#define ZWP_POINTER_GESTURE_SWIPE_V1_INTERFACE
++/**
++ * @page page_iface_zwp_pointer_gesture_swipe_v1 zwp_pointer_gesture_swipe_v1
++ * @section page_iface_zwp_pointer_gesture_swipe_v1_desc Description
++ *
++ * A swipe gesture object notifies a client about a multi-finger swipe
++ * gesture detected on an indirect input device such as a touchpad.
++ * The gesture is usually initiated by multiple fingers moving in the
++ * same direction but once initiated the direction may change.
++ * The precise conditions of when such a gesture is detected are
++ * implementation-dependent.
++ *
++ * A gesture consists of three stages: begin, update (optional) and end.
++ * There cannot be multiple simultaneous hold, pinch or swipe gestures on a
++ * same pointer/seat, how compositors prevent these situations is
++ * implementation-dependent.
++ *
++ * A gesture may be cancelled by the compositor or the hardware.
++ * Clients should not consider performing permanent or irreversible
++ * actions until the end of a gesture has been received.
++ * @section page_iface_zwp_pointer_gesture_swipe_v1_api API
++ * See @ref iface_zwp_pointer_gesture_swipe_v1.
++ */
++/**
++ * @defgroup iface_zwp_pointer_gesture_swipe_v1 The zwp_pointer_gesture_swipe_v1 interface
++ *
++ * A swipe gesture object notifies a client about a multi-finger swipe
++ * gesture detected on an indirect input device such as a touchpad.
++ * The gesture is usually initiated by multiple fingers moving in the
++ * same direction but once initiated the direction may change.
++ * The precise conditions of when such a gesture is detected are
++ * implementation-dependent.
++ *
++ * A gesture consists of three stages: begin, update (optional) and end.
++ * There cannot be multiple simultaneous hold, pinch or swipe gestures on a
++ * same pointer/seat, how compositors prevent these situations is
++ * implementation-dependent.
++ *
++ * A gesture may be cancelled by the compositor or the hardware.
++ * Clients should not consider performing permanent or irreversible
++ * actions until the end of a gesture has been received.
++ */
++extern const struct wl_interface zwp_pointer_gesture_swipe_v1_interface;
++#endif
++#ifndef ZWP_POINTER_GESTURE_PINCH_V1_INTERFACE
++#define ZWP_POINTER_GESTURE_PINCH_V1_INTERFACE
++/**
++ * @page page_iface_zwp_pointer_gesture_pinch_v1 zwp_pointer_gesture_pinch_v1
++ * @section page_iface_zwp_pointer_gesture_pinch_v1_desc Description
++ *
++ * A pinch gesture object notifies a client about a multi-finger pinch
++ * gesture detected on an indirect input device such as a touchpad.
++ * The gesture is usually initiated by multiple fingers moving towards
++ * each other or away from each other, or by two or more fingers rotating
++ * around a logical center of gravity. The precise conditions of when
++ * such a gesture is detected are implementation-dependent.
++ *
++ * A gesture consists of three stages: begin, update (optional) and end.
++ * There cannot be multiple simultaneous hold, pinch or swipe gestures on a
++ * same pointer/seat, how compositors prevent these situations is
++ * implementation-dependent.
++ *
++ * A gesture may be cancelled by the compositor or the hardware.
++ * Clients should not consider performing permanent or irreversible
++ * actions until the end of a gesture has been received.
++ * @section page_iface_zwp_pointer_gesture_pinch_v1_api API
++ * See @ref iface_zwp_pointer_gesture_pinch_v1.
++ */
++/**
++ * @defgroup iface_zwp_pointer_gesture_pinch_v1 The zwp_pointer_gesture_pinch_v1 interface
++ *
++ * A pinch gesture object notifies a client about a multi-finger pinch
++ * gesture detected on an indirect input device such as a touchpad.
++ * The gesture is usually initiated by multiple fingers moving towards
++ * each other or away from each other, or by two or more fingers rotating
++ * around a logical center of gravity. The precise conditions of when
++ * such a gesture is detected are implementation-dependent.
++ *
++ * A gesture consists of three stages: begin, update (optional) and end.
++ * There cannot be multiple simultaneous hold, pinch or swipe gestures on a
++ * same pointer/seat, how compositors prevent these situations is
++ * implementation-dependent.
++ *
++ * A gesture may be cancelled by the compositor or the hardware.
++ * Clients should not consider performing permanent or irreversible
++ * actions until the end of a gesture has been received.
++ */
++extern const struct wl_interface zwp_pointer_gesture_pinch_v1_interface;
++#endif
++#ifndef ZWP_POINTER_GESTURE_HOLD_V1_INTERFACE
++#define ZWP_POINTER_GESTURE_HOLD_V1_INTERFACE
++/**
++ * @page page_iface_zwp_pointer_gesture_hold_v1 zwp_pointer_gesture_hold_v1
++ * @section page_iface_zwp_pointer_gesture_hold_v1_desc Description
++ *
++ * A hold gesture object notifies a client about a single- or
++ * multi-finger hold gesture detected on an indirect input device such as
++ * a touchpad. The gesture is usually initiated by one or more fingers
++ * being held down without significant movement. The precise conditions
++ * of when such a gesture is detected are implementation-dependent.
++ *
++ * In particular, this gesture may be used to cancel kinetic scrolling.
++ *
++ * A hold gesture consists of two stages: begin and end. Unlike pinch and
++ * swipe there is no update stage.
++ * There cannot be multiple simultaneous hold, pinch or swipe gestures on a
++ * same pointer/seat, how compositors prevent these situations is
++ * implementation-dependent.
++ *
++ * A gesture may be cancelled by the compositor or the hardware.
++ * Clients should not consider performing permanent or irreversible
++ * actions until the end of a gesture has been received.
++ * @section page_iface_zwp_pointer_gesture_hold_v1_api API
++ * See @ref iface_zwp_pointer_gesture_hold_v1.
++ */
++/**
++ * @defgroup iface_zwp_pointer_gesture_hold_v1 The zwp_pointer_gesture_hold_v1 interface
++ *
++ * A hold gesture object notifies a client about a single- or
++ * multi-finger hold gesture detected on an indirect input device such as
++ * a touchpad. The gesture is usually initiated by one or more fingers
++ * being held down without significant movement. The precise conditions
++ * of when such a gesture is detected are implementation-dependent.
++ *
++ * In particular, this gesture may be used to cancel kinetic scrolling.
++ *
++ * A hold gesture consists of two stages: begin and end. Unlike pinch and
++ * swipe there is no update stage.
++ * There cannot be multiple simultaneous hold, pinch or swipe gestures on a
++ * same pointer/seat, how compositors prevent these situations is
++ * implementation-dependent.
++ *
++ * A gesture may be cancelled by the compositor or the hardware.
++ * Clients should not consider performing permanent or irreversible
++ * actions until the end of a gesture has been received.
++ */
++extern const struct wl_interface zwp_pointer_gesture_hold_v1_interface;
++#endif
++
++#define ZWP_POINTER_GESTURES_V1_GET_SWIPE_GESTURE 0
++#define ZWP_POINTER_GESTURES_V1_GET_PINCH_GESTURE 1
++#define ZWP_POINTER_GESTURES_V1_RELEASE 2
++#define ZWP_POINTER_GESTURES_V1_GET_HOLD_GESTURE 3
++
++
++/**
++ * @ingroup iface_zwp_pointer_gestures_v1
++ */
++#define ZWP_POINTER_GESTURES_V1_GET_SWIPE_GESTURE_SINCE_VERSION 1
++/**
++ * @ingroup iface_zwp_pointer_gestures_v1
++ */
++#define ZWP_POINTER_GESTURES_V1_GET_PINCH_GESTURE_SINCE_VERSION 1
++/**
++ * @ingroup iface_zwp_pointer_gestures_v1
++ */
++#define ZWP_POINTER_GESTURES_V1_RELEASE_SINCE_VERSION 2
++/**
++ * @ingroup iface_zwp_pointer_gestures_v1
++ */
++#define ZWP_POINTER_GESTURES_V1_GET_HOLD_GESTURE_SINCE_VERSION 3
++
++/** @ingroup iface_zwp_pointer_gestures_v1 */
++static inline void
++zwp_pointer_gestures_v1_set_user_data(struct zwp_pointer_gestures_v1 *zwp_pointer_gestures_v1, void *user_data)
++{
++	wl_proxy_set_user_data((struct wl_proxy *) zwp_pointer_gestures_v1, user_data);
++}
++
++/** @ingroup iface_zwp_pointer_gestures_v1 */
++static inline void *
++zwp_pointer_gestures_v1_get_user_data(struct zwp_pointer_gestures_v1 *zwp_pointer_gestures_v1)
++{
++	return wl_proxy_get_user_data((struct wl_proxy *) zwp_pointer_gestures_v1);
++}
++
++static inline uint32_t
++zwp_pointer_gestures_v1_get_version(struct zwp_pointer_gestures_v1 *zwp_pointer_gestures_v1)
++{
++	return wl_proxy_get_version((struct wl_proxy *) zwp_pointer_gestures_v1);
++}
++
++/** @ingroup iface_zwp_pointer_gestures_v1 */
++static inline void
++zwp_pointer_gestures_v1_destroy(struct zwp_pointer_gestures_v1 *zwp_pointer_gestures_v1)
++{
++	wl_proxy_destroy((struct wl_proxy *) zwp_pointer_gestures_v1);
++}
++
++/**
++ * @ingroup iface_zwp_pointer_gestures_v1
++ *
++ * Create a swipe gesture object. See the
++ * wl_pointer_gesture_swipe interface for details.
++ */
++static inline struct zwp_pointer_gesture_swipe_v1 *
++zwp_pointer_gestures_v1_get_swipe_gesture(struct zwp_pointer_gestures_v1 *zwp_pointer_gestures_v1, struct wl_pointer *pointer)
++{
++	struct wl_proxy *id;
++
++	id = wl_proxy_marshal_flags((struct wl_proxy *) zwp_pointer_gestures_v1,
++			 ZWP_POINTER_GESTURES_V1_GET_SWIPE_GESTURE, &zwp_pointer_gesture_swipe_v1_interface, wl_proxy_get_version((struct wl_proxy *) zwp_pointer_gestures_v1), 0, NULL, pointer);
++
++	return (struct zwp_pointer_gesture_swipe_v1 *) id;
++}
++
++/**
++ * @ingroup iface_zwp_pointer_gestures_v1
++ *
++ * Create a pinch gesture object. See the
++ * wl_pointer_gesture_pinch interface for details.
++ */
++static inline struct zwp_pointer_gesture_pinch_v1 *
++zwp_pointer_gestures_v1_get_pinch_gesture(struct zwp_pointer_gestures_v1 *zwp_pointer_gestures_v1, struct wl_pointer *pointer)
++{
++	struct wl_proxy *id;
++
++	id = wl_proxy_marshal_flags((struct wl_proxy *) zwp_pointer_gestures_v1,
++			 ZWP_POINTER_GESTURES_V1_GET_PINCH_GESTURE, &zwp_pointer_gesture_pinch_v1_interface, wl_proxy_get_version((struct wl_proxy *) zwp_pointer_gestures_v1), 0, NULL, pointer);
++
++	return (struct zwp_pointer_gesture_pinch_v1 *) id;
++}
++
++/**
++ * @ingroup iface_zwp_pointer_gestures_v1
++ *
++ * Destroy the pointer gesture object. Swipe, pinch and hold objects
++ * created via this gesture object remain valid.
++ */
++static inline void
++zwp_pointer_gestures_v1_release(struct zwp_pointer_gestures_v1 *zwp_pointer_gestures_v1)
++{
++	wl_proxy_marshal_flags((struct wl_proxy *) zwp_pointer_gestures_v1,
++			 ZWP_POINTER_GESTURES_V1_RELEASE, NULL, wl_proxy_get_version((struct wl_proxy *) zwp_pointer_gestures_v1), WL_MARSHAL_FLAG_DESTROY);
++}
++
++/**
++ * @ingroup iface_zwp_pointer_gestures_v1
++ *
++ * Create a hold gesture object. See the
++ * wl_pointer_gesture_hold interface for details.
++ */
++static inline struct zwp_pointer_gesture_hold_v1 *
++zwp_pointer_gestures_v1_get_hold_gesture(struct zwp_pointer_gestures_v1 *zwp_pointer_gestures_v1, struct wl_pointer *pointer)
++{
++	struct wl_proxy *id;
++
++	id = wl_proxy_marshal_flags((struct wl_proxy *) zwp_pointer_gestures_v1,
++			 ZWP_POINTER_GESTURES_V1_GET_HOLD_GESTURE, &zwp_pointer_gesture_hold_v1_interface, wl_proxy_get_version((struct wl_proxy *) zwp_pointer_gestures_v1), 0, NULL, pointer);
++
++	return (struct zwp_pointer_gesture_hold_v1 *) id;
++}
++
++/**
++ * @ingroup iface_zwp_pointer_gesture_swipe_v1
++ * @struct zwp_pointer_gesture_swipe_v1_listener
++ */
++struct zwp_pointer_gesture_swipe_v1_listener {
++	/**
++	 * multi-finger swipe begin
++	 *
++	 * This event is sent when a multi-finger swipe gesture is
++	 * detected on the device.
++	 * @param time timestamp with millisecond granularity
++	 * @param fingers number of fingers
++	 */
++	void (*begin)(void *data,
++		      struct zwp_pointer_gesture_swipe_v1 *zwp_pointer_gesture_swipe_v1,
++		      uint32_t serial,
++		      uint32_t time,
++		      struct wl_surface *surface,
++		      uint32_t fingers);
++	/**
++	 * multi-finger swipe motion
++	 *
++	 * This event is sent when a multi-finger swipe gesture changes
++	 * the position of the logical center.
++	 *
++	 * The dx and dy coordinates are relative coordinates of the
++	 * logical center of the gesture compared to the previous event.
++	 * @param time timestamp with millisecond granularity
++	 * @param dx delta x coordinate in surface coordinate space
++	 * @param dy delta y coordinate in surface coordinate space
++	 */
++	void (*update)(void *data,
++		       struct zwp_pointer_gesture_swipe_v1 *zwp_pointer_gesture_swipe_v1,
++		       uint32_t time,
++		       wl_fixed_t dx,
++		       wl_fixed_t dy);
++	/**
++	 * multi-finger swipe end
++	 *
++	 * This event is sent when a multi-finger swipe gesture ceases to
++	 * be valid. This may happen when one or more fingers are lifted or
++	 * the gesture is cancelled.
++	 *
++	 * When a gesture is cancelled, the client should undo state
++	 * changes caused by this gesture. What causes a gesture to be
++	 * cancelled is implementation-dependent.
++	 * @param time timestamp with millisecond granularity
++	 * @param cancelled 1 if the gesture was cancelled, 0 otherwise
++	 */
++	void (*end)(void *data,
++		    struct zwp_pointer_gesture_swipe_v1 *zwp_pointer_gesture_swipe_v1,
++		    uint32_t serial,
++		    uint32_t time,
++		    int32_t cancelled);
++};
++
++/**
++ * @ingroup iface_zwp_pointer_gesture_swipe_v1
++ */
++static inline int
++zwp_pointer_gesture_swipe_v1_add_listener(struct zwp_pointer_gesture_swipe_v1 *zwp_pointer_gesture_swipe_v1,
++					  const struct zwp_pointer_gesture_swipe_v1_listener *listener, void *data)
++{
++	return wl_proxy_add_listener((struct wl_proxy *) zwp_pointer_gesture_swipe_v1,
++				     (void (**)(void)) listener, data);
++}
++
++#define ZWP_POINTER_GESTURE_SWIPE_V1_DESTROY 0
++
++/**
++ * @ingroup iface_zwp_pointer_gesture_swipe_v1
++ */
++#define ZWP_POINTER_GESTURE_SWIPE_V1_BEGIN_SINCE_VERSION 1
++/**
++ * @ingroup iface_zwp_pointer_gesture_swipe_v1
++ */
++#define ZWP_POINTER_GESTURE_SWIPE_V1_UPDATE_SINCE_VERSION 1
++/**
++ * @ingroup iface_zwp_pointer_gesture_swipe_v1
++ */
++#define ZWP_POINTER_GESTURE_SWIPE_V1_END_SINCE_VERSION 1
++
++/**
++ * @ingroup iface_zwp_pointer_gesture_swipe_v1
++ */
++#define ZWP_POINTER_GESTURE_SWIPE_V1_DESTROY_SINCE_VERSION 1
++
++/** @ingroup iface_zwp_pointer_gesture_swipe_v1 */
++static inline void
++zwp_pointer_gesture_swipe_v1_set_user_data(struct zwp_pointer_gesture_swipe_v1 *zwp_pointer_gesture_swipe_v1, void *user_data)
++{
++	wl_proxy_set_user_data((struct wl_proxy *) zwp_pointer_gesture_swipe_v1, user_data);
++}
++
++/** @ingroup iface_zwp_pointer_gesture_swipe_v1 */
++static inline void *
++zwp_pointer_gesture_swipe_v1_get_user_data(struct zwp_pointer_gesture_swipe_v1 *zwp_pointer_gesture_swipe_v1)
++{
++	return wl_proxy_get_user_data((struct wl_proxy *) zwp_pointer_gesture_swipe_v1);
++}
++
++static inline uint32_t
++zwp_pointer_gesture_swipe_v1_get_version(struct zwp_pointer_gesture_swipe_v1 *zwp_pointer_gesture_swipe_v1)
++{
++	return wl_proxy_get_version((struct wl_proxy *) zwp_pointer_gesture_swipe_v1);
++}
++
++/**
++ * @ingroup iface_zwp_pointer_gesture_swipe_v1
++ */
++static inline void
++zwp_pointer_gesture_swipe_v1_destroy(struct zwp_pointer_gesture_swipe_v1 *zwp_pointer_gesture_swipe_v1)
++{
++	wl_proxy_marshal_flags((struct wl_proxy *) zwp_pointer_gesture_swipe_v1,
++			 ZWP_POINTER_GESTURE_SWIPE_V1_DESTROY, NULL, wl_proxy_get_version((struct wl_proxy *) zwp_pointer_gesture_swipe_v1), WL_MARSHAL_FLAG_DESTROY);
++}
++
++/**
++ * @ingroup iface_zwp_pointer_gesture_pinch_v1
++ * @struct zwp_pointer_gesture_pinch_v1_listener
++ */
++struct zwp_pointer_gesture_pinch_v1_listener {
++	/**
++	 * multi-finger pinch begin
++	 *
++	 * This event is sent when a multi-finger pinch gesture is
++	 * detected on the device.
++	 * @param time timestamp with millisecond granularity
++	 * @param fingers number of fingers
++	 */
++	void (*begin)(void *data,
++		      struct zwp_pointer_gesture_pinch_v1 *zwp_pointer_gesture_pinch_v1,
++		      uint32_t serial,
++		      uint32_t time,
++		      struct wl_surface *surface,
++		      uint32_t fingers);
++	/**
++	 * multi-finger pinch motion
++	 *
++	 * This event is sent when a multi-finger pinch gesture changes
++	 * the position of the logical center, the rotation or the relative
++	 * scale.
++	 *
++	 * The dx and dy coordinates are relative coordinates in the
++	 * surface coordinate space of the logical center of the gesture.
++	 *
++	 * The scale factor is an absolute scale compared to the
++	 * pointer_gesture_pinch.begin event, e.g. a scale of 2 means the
++	 * fingers are now twice as far apart as on
++	 * pointer_gesture_pinch.begin.
++	 *
++	 * The rotation is the relative angle in degrees clockwise compared
++	 * to the previous pointer_gesture_pinch.begin or
++	 * pointer_gesture_pinch.update event.
++	 * @param time timestamp with millisecond granularity
++	 * @param dx delta x coordinate in surface coordinate space
++	 * @param dy delta y coordinate in surface coordinate space
++	 * @param scale scale relative to the initial finger position
++	 * @param rotation angle in degrees cw relative to the previous event
++	 */
++	void (*update)(void *data,
++		       struct zwp_pointer_gesture_pinch_v1 *zwp_pointer_gesture_pinch_v1,
++		       uint32_t time,
++		       wl_fixed_t dx,
++		       wl_fixed_t dy,
++		       wl_fixed_t scale,
++		       wl_fixed_t rotation);
++	/**
++	 * multi-finger pinch end
++	 *
++	 * This event is sent when a multi-finger pinch gesture ceases to
++	 * be valid. This may happen when one or more fingers are lifted or
++	 * the gesture is cancelled.
++	 *
++	 * When a gesture is cancelled, the client should undo state
++	 * changes caused by this gesture. What causes a gesture to be
++	 * cancelled is implementation-dependent.
++	 * @param time timestamp with millisecond granularity
++	 * @param cancelled 1 if the gesture was cancelled, 0 otherwise
++	 */
++	void (*end)(void *data,
++		    struct zwp_pointer_gesture_pinch_v1 *zwp_pointer_gesture_pinch_v1,
++		    uint32_t serial,
++		    uint32_t time,
++		    int32_t cancelled);
++};
++
++/**
++ * @ingroup iface_zwp_pointer_gesture_pinch_v1
++ */
++static inline int
++zwp_pointer_gesture_pinch_v1_add_listener(struct zwp_pointer_gesture_pinch_v1 *zwp_pointer_gesture_pinch_v1,
++					  const struct zwp_pointer_gesture_pinch_v1_listener *listener, void *data)
++{
++	return wl_proxy_add_listener((struct wl_proxy *) zwp_pointer_gesture_pinch_v1,
++				     (void (**)(void)) listener, data);
++}
++
++#define ZWP_POINTER_GESTURE_PINCH_V1_DESTROY 0
++
++/**
++ * @ingroup iface_zwp_pointer_gesture_pinch_v1
++ */
++#define ZWP_POINTER_GESTURE_PINCH_V1_BEGIN_SINCE_VERSION 1
++/**
++ * @ingroup iface_zwp_pointer_gesture_pinch_v1
++ */
++#define ZWP_POINTER_GESTURE_PINCH_V1_UPDATE_SINCE_VERSION 1
++/**
++ * @ingroup iface_zwp_pointer_gesture_pinch_v1
++ */
++#define ZWP_POINTER_GESTURE_PINCH_V1_END_SINCE_VERSION 1
++
++/**
++ * @ingroup iface_zwp_pointer_gesture_pinch_v1
++ */
++#define ZWP_POINTER_GESTURE_PINCH_V1_DESTROY_SINCE_VERSION 1
++
++/** @ingroup iface_zwp_pointer_gesture_pinch_v1 */
++static inline void
++zwp_pointer_gesture_pinch_v1_set_user_data(struct zwp_pointer_gesture_pinch_v1 *zwp_pointer_gesture_pinch_v1, void *user_data)
++{
++	wl_proxy_set_user_data((struct wl_proxy *) zwp_pointer_gesture_pinch_v1, user_data);
++}
++
++/** @ingroup iface_zwp_pointer_gesture_pinch_v1 */
++static inline void *
++zwp_pointer_gesture_pinch_v1_get_user_data(struct zwp_pointer_gesture_pinch_v1 *zwp_pointer_gesture_pinch_v1)
++{
++	return wl_proxy_get_user_data((struct wl_proxy *) zwp_pointer_gesture_pinch_v1);
++}
++
++static inline uint32_t
++zwp_pointer_gesture_pinch_v1_get_version(struct zwp_pointer_gesture_pinch_v1 *zwp_pointer_gesture_pinch_v1)
++{
++	return wl_proxy_get_version((struct wl_proxy *) zwp_pointer_gesture_pinch_v1);
++}
++
++/**
++ * @ingroup iface_zwp_pointer_gesture_pinch_v1
++ */
++static inline void
++zwp_pointer_gesture_pinch_v1_destroy(struct zwp_pointer_gesture_pinch_v1 *zwp_pointer_gesture_pinch_v1)
++{
++	wl_proxy_marshal_flags((struct wl_proxy *) zwp_pointer_gesture_pinch_v1,
++			 ZWP_POINTER_GESTURE_PINCH_V1_DESTROY, NULL, wl_proxy_get_version((struct wl_proxy *) zwp_pointer_gesture_pinch_v1), WL_MARSHAL_FLAG_DESTROY);
++}
++
++/**
++ * @ingroup iface_zwp_pointer_gesture_hold_v1
++ * @struct zwp_pointer_gesture_hold_v1_listener
++ */
++struct zwp_pointer_gesture_hold_v1_listener {
++	/**
++	 * multi-finger hold begin
++	 *
++	 * This event is sent when a hold gesture is detected on the
++	 * device.
++	 * @param time timestamp with millisecond granularity
++	 * @param fingers number of fingers
++	 * @since 3
++	 */
++	void (*begin)(void *data,
++		      struct zwp_pointer_gesture_hold_v1 *zwp_pointer_gesture_hold_v1,
++		      uint32_t serial,
++		      uint32_t time,
++		      struct wl_surface *surface,
++		      uint32_t fingers);
++	/**
++	 * multi-finger hold end
++	 *
++	 * This event is sent when a hold gesture ceases to be valid.
++	 * This may happen when the holding fingers are lifted or the
++	 * gesture is cancelled, for example if the fingers move past an
++	 * implementation-defined threshold, the finger count changes or
++	 * the hold gesture changes into a different type of gesture.
++	 *
++	 * When a gesture is cancelled, the client may need to undo state
++	 * changes caused by this gesture. What causes a gesture to be
++	 * cancelled is implementation-dependent.
++	 * @param time timestamp with millisecond granularity
++	 * @param cancelled 1 if the gesture was cancelled, 0 otherwise
++	 * @since 3
++	 */
++	void (*end)(void *data,
++		    struct zwp_pointer_gesture_hold_v1 *zwp_pointer_gesture_hold_v1,
++		    uint32_t serial,
++		    uint32_t time,
++		    int32_t cancelled);
++};
++
++/**
++ * @ingroup iface_zwp_pointer_gesture_hold_v1
++ */
++static inline int
++zwp_pointer_gesture_hold_v1_add_listener(struct zwp_pointer_gesture_hold_v1 *zwp_pointer_gesture_hold_v1,
++					 const struct zwp_pointer_gesture_hold_v1_listener *listener, void *data)
++{
++	return wl_proxy_add_listener((struct wl_proxy *) zwp_pointer_gesture_hold_v1,
++				     (void (**)(void)) listener, data);
++}
++
++#define ZWP_POINTER_GESTURE_HOLD_V1_DESTROY 0
++
++/**
++ * @ingroup iface_zwp_pointer_gesture_hold_v1
++ */
++#define ZWP_POINTER_GESTURE_HOLD_V1_BEGIN_SINCE_VERSION 3
++/**
++ * @ingroup iface_zwp_pointer_gesture_hold_v1
++ */
++#define ZWP_POINTER_GESTURE_HOLD_V1_END_SINCE_VERSION 3
++
++/**
++ * @ingroup iface_zwp_pointer_gesture_hold_v1
++ */
++#define ZWP_POINTER_GESTURE_HOLD_V1_DESTROY_SINCE_VERSION 3
++
++/** @ingroup iface_zwp_pointer_gesture_hold_v1 */
++static inline void
++zwp_pointer_gesture_hold_v1_set_user_data(struct zwp_pointer_gesture_hold_v1 *zwp_pointer_gesture_hold_v1, void *user_data)
++{
++	wl_proxy_set_user_data((struct wl_proxy *) zwp_pointer_gesture_hold_v1, user_data);
++}
++
++/** @ingroup iface_zwp_pointer_gesture_hold_v1 */
++static inline void *
++zwp_pointer_gesture_hold_v1_get_user_data(struct zwp_pointer_gesture_hold_v1 *zwp_pointer_gesture_hold_v1)
++{
++	return wl_proxy_get_user_data((struct wl_proxy *) zwp_pointer_gesture_hold_v1);
++}
++
++static inline uint32_t
++zwp_pointer_gesture_hold_v1_get_version(struct zwp_pointer_gesture_hold_v1 *zwp_pointer_gesture_hold_v1)
++{
++	return wl_proxy_get_version((struct wl_proxy *) zwp_pointer_gesture_hold_v1);
++}
++
++/**
++ * @ingroup iface_zwp_pointer_gesture_hold_v1
++ */
++static inline void
++zwp_pointer_gesture_hold_v1_destroy(struct zwp_pointer_gesture_hold_v1 *zwp_pointer_gesture_hold_v1)
++{
++	wl_proxy_marshal_flags((struct wl_proxy *) zwp_pointer_gesture_hold_v1,
++			 ZWP_POINTER_GESTURE_HOLD_V1_DESTROY, NULL, wl_proxy_get_version((struct wl_proxy *) zwp_pointer_gesture_hold_v1), WL_MARSHAL_FLAG_DESTROY);
++}
++
++#ifdef  __cplusplus
++}
++#endif
++
++#endif
+--- a/app/wayland_pointer_gestures.c
++++ b/app/wayland_pointer_gestures.c
+@@ -0,0 +1,138 @@
++//go:build ((linux && !android) || freebsd) && !nowayland
++// +build linux,!android freebsd
++// +build !nowayland
++
++/* Generated by wayland-scanner 1.26.0 */
++
++/*
++ * Copyright © 2015, 2021 Red Hat Inc.
++ *
++ * Permission to use, copy, modify, distribute, and sell this
++ * software and its documentation for any purpose is hereby granted
++ * without fee, provided that the above copyright notice appear in
++ * all copies and that both that copyright notice and this permission
++ * notice appear in supporting documentation, and that the name of
++ * the copyright holders not be used in advertising or publicity
++ * pertaining to distribution of the software without specific,
++ * written prior permission.  The copyright holders make no
++ * representations about the suitability of this software for any
++ * purpose.  It is provided "as is" without express or implied
++ * warranty.
++ *
++ * THE COPYRIGHT HOLDERS DISCLAIM ALL WARRANTIES WITH REGARD TO THIS
++ * SOFTWARE, INCLUDING ALL IMPLIED WARRANTIES OF MERCHANTABILITY AND
++ * FITNESS, IN NO EVENT SHALL THE COPYRIGHT HOLDERS BE LIABLE FOR ANY
++ * SPECIAL, INDIRECT OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
++ * WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN
++ * AN ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION,
++ * ARISING OUT OF OR IN CONNECTION WITH THE USE OR PERFORMANCE OF
++ * THIS SOFTWARE.
++ */
++
++#include <stdbool.h>
++#include <stdlib.h>
++#include <stdint.h>
++#include "wayland-util.h"
++
++#ifndef __has_attribute
++# define __has_attribute(x) 0  /* Compatibility with non-clang compilers. */
++#endif
++
++#if (__has_attribute(visibility) || defined(__GNUC__) && __GNUC__ >= 4)
++#define WL_PRIVATE __attribute__ ((visibility("hidden")))
++#else
++#define WL_PRIVATE
++#endif
++
++extern const struct wl_interface wl_pointer_interface;
++extern const struct wl_interface wl_surface_interface;
++extern const struct wl_interface zwp_pointer_gesture_hold_v1_interface;
++extern const struct wl_interface zwp_pointer_gesture_pinch_v1_interface;
++extern const struct wl_interface zwp_pointer_gesture_swipe_v1_interface;
++
++static const struct wl_interface *pointer_gestures_unstable_v1_types[] = {
++	NULL,
++	NULL,
++	NULL,
++	NULL,
++	NULL,
++	&zwp_pointer_gesture_swipe_v1_interface,
++	&wl_pointer_interface,
++	&zwp_pointer_gesture_pinch_v1_interface,
++	&wl_pointer_interface,
++	&zwp_pointer_gesture_hold_v1_interface,
++	&wl_pointer_interface,
++	NULL,
++	NULL,
++	&wl_surface_interface,
++	NULL,
++	NULL,
++	NULL,
++	&wl_surface_interface,
++	NULL,
++	NULL,
++	NULL,
++	&wl_surface_interface,
++	NULL,
++};
++
++static const struct wl_message zwp_pointer_gestures_v1_requests[] = {
++	{ "get_swipe_gesture", "no", pointer_gestures_unstable_v1_types + 5 },
++	{ "get_pinch_gesture", "no", pointer_gestures_unstable_v1_types + 7 },
++	{ "release", "2", pointer_gestures_unstable_v1_types + 0 },
++	{ "get_hold_gesture", "3no", pointer_gestures_unstable_v1_types + 9 },
++};
++
++WL_PRIVATE const struct wl_interface zwp_pointer_gestures_v1_interface = {
++	"zwp_pointer_gestures_v1", 3,
++	4, zwp_pointer_gestures_v1_requests,
++	0, NULL,
++};
++
++static const struct wl_message zwp_pointer_gesture_swipe_v1_requests[] = {
++	{ "destroy", "", pointer_gestures_unstable_v1_types + 0 },
++};
++
++static const struct wl_message zwp_pointer_gesture_swipe_v1_events[] = {
++	{ "begin", "uuou", pointer_gestures_unstable_v1_types + 11 },
++	{ "update", "uff", pointer_gestures_unstable_v1_types + 0 },
++	{ "end", "uui", pointer_gestures_unstable_v1_types + 0 },
++};
++
++WL_PRIVATE const struct wl_interface zwp_pointer_gesture_swipe_v1_interface = {
++	"zwp_pointer_gesture_swipe_v1", 3,
++	1, zwp_pointer_gesture_swipe_v1_requests,
++	3, zwp_pointer_gesture_swipe_v1_events,
++};
++
++static const struct wl_message zwp_pointer_gesture_pinch_v1_requests[] = {
++	{ "destroy", "", pointer_gestures_unstable_v1_types + 0 },
++};
++
++static const struct wl_message zwp_pointer_gesture_pinch_v1_events[] = {
++	{ "begin", "uuou", pointer_gestures_unstable_v1_types + 15 },
++	{ "update", "uffff", pointer_gestures_unstable_v1_types + 0 },
++	{ "end", "uui", pointer_gestures_unstable_v1_types + 0 },
++};
++
++WL_PRIVATE const struct wl_interface zwp_pointer_gesture_pinch_v1_interface = {
++	"zwp_pointer_gesture_pinch_v1", 3,
++	1, zwp_pointer_gesture_pinch_v1_requests,
++	3, zwp_pointer_gesture_pinch_v1_events,
++};
++
++static const struct wl_message zwp_pointer_gesture_hold_v1_requests[] = {
++	{ "destroy", "3", pointer_gestures_unstable_v1_types + 0 },
++};
++
++static const struct wl_message zwp_pointer_gesture_hold_v1_events[] = {
++	{ "begin", "3uuou", pointer_gestures_unstable_v1_types + 19 },
++	{ "end", "3uui", pointer_gestures_unstable_v1_types + 0 },
++};
++
++WL_PRIVATE const struct wl_interface zwp_pointer_gesture_hold_v1_interface = {
++	"zwp_pointer_gesture_hold_v1", 3,
++	1, zwp_pointer_gesture_hold_v1_requests,
++	2, zwp_pointer_gesture_hold_v1_events,
++};
++

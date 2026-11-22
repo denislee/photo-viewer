@@ -1,6 +1,6 @@
 # Local Gio fork
 
-This directory is an unmodified copy of upstream Gio plus two patches. `go.mod`
+This directory is an unmodified copy of upstream Gio plus three patches. `go.mod`
 points `gioui.org` here with a `replace` directive.
 
 - **Base:** `gioui.org v0.9.0`, commit `3f4f8ba7c1fae349f97621f1f623ef47e4da3e25`
@@ -21,6 +21,13 @@ points `gioui.org` here with a `replace` directive.
   released at once, so dead video frames don't fill that budget and evict grid thumbnails
   (G5-03). This is a performance patch, not a fix, so it can be dropped at any time; see G6 in
   `PLAN.md`.
+- **Patch:** [`pointer-gestures.patch`](pointer-gestures.patch), which touches only `app/`.
+  Upstream Gio ignores touchpad pinch gestures on Wayland. The patch binds
+  `zwp_pointer_gestures_v1` (generated `app/wayland_pointer_gestures.{c,h}`, see the
+  `go:generate` lines in `os_wayland.go`) and delivers each pinch step as an
+  `app.PinchEvent` (`app/pinch.go`) from `Window.Event`, merging updates that queue up
+  between two reads. The photo viewer uses it for pinch to zoom. This is a feature, not a
+  fix: dropping the fork means dropping pinch to zoom unless upstream gains gesture support.
 - **Known upstream issue:** `go test gioui.org/gpu` doesn't build at v0.9.0, because
   `clip_test.go` and `pack_test.go` call `testing.B.Loop` while the module declares go1.23.
 
@@ -31,7 +38,8 @@ The fork should differ from the base only by the patches. To confirm:
 ```sh
 go mod download gioui.org@v0.9.0   # run outside this module, e.g. in a temp dir
 diff -ru "$(go env GOMODCACHE)/gioui.org@v0.9.0" third_party/gioui-singleline-fix \
-  -x .builds -x .gitattributes -x FORK.md -x singleline-fix.patch -x texture-retention.patch
+  -x .builds -x .gitattributes -x FORK.md -x singleline-fix.patch -x texture-retention.patch \
+  -x pointer-gestures.patch
 ```
 
 ## Can the fork be dropped?
@@ -45,8 +53,10 @@ As of 2026-09-28, upstream `v0.10.2` still sets `maxWidth = math.MaxInt` in
    Check that single-line editors, such as the settings fields, render on one line, then
    delete this directory.
 3. If it hasn't, rebase the fork: copy the new release in, apply
-   `patch -p1 < singleline-fix.patch` and `patch -p1 < texture-retention.patch`, and update
+   `patch -p1 < singleline-fix.patch`, `patch -p1 < texture-retention.patch` and
+   `patch -p1 < pointer-gestures.patch`, and update
    the base line above.
 
 If the singleline fix lands upstream, the texture-retention patch alone doesn't justify
-keeping the fork: drop it along with the fork.
+keeping the fork: drop it along with the fork. The pointer-gestures patch does, unless
+upstream has added pinch support by then.

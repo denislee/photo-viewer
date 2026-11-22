@@ -157,6 +157,9 @@ type Viewer struct {
 	// briefly hands back the previous size's frame (G6-B2).
 	lastVideoSize image.Point
 
+	// zoom is the pinch-zoom state of the current photo (viewer_zoom.go).
+	zoom viewerZoom
+
 	invalidate func()
 }
 
@@ -337,6 +340,7 @@ func (v *Viewer) Show(entries []cache.Entry, idx int) {
 	v.Index = idx
 	v.syncIndex()
 	v.Open = true
+	v.ResetZoom()
 	v.rapidNav = false
 	v.navAt = time.Now()
 	v.cancelLoading()
@@ -381,6 +385,7 @@ func (v *Viewer) removeEntry(i int) {
 func (v *Viewer) Close() {
 	v.Open = false
 	v.Confirming = false
+	v.ResetZoom()
 	v.loadingPath = ""
 	v.cancelLoading()
 	// Keep v.recent (V7): reopening a photo just viewed is instant. Cancel
@@ -595,6 +600,7 @@ func (v *Viewer) step(dir int) {
 	v.init()
 	v.Index += dir
 	v.syncIndex()
+	v.ResetZoom()
 	v.navigated()
 	v.cancelLoading()
 	v.loadingPath = ""
@@ -753,9 +759,11 @@ func (v *Viewer) Layout(gtx layout.Context, th *Theme, tc *thumbCache) layout.Di
 		}
 	} else {
 		v.setTarget(imgArea.Size())
-		imgOp, imgSz, ok := v.imageFor(e, tc, v.targetSize())
+		v.zoom.area = imgArea
+		v.handleZoomPointer(gtx, imgArea)
+		imgOp, imgSz, ok := v.imageFor(e, tc, v.zoomTarget(v.targetSize()))
 		if ok {
-			drawFitted(gtx, imgOp, imgSz, imgArea)
+			v.drawZoomed(gtx, imgOp, imgSz, imgArea)
 		}
 	}
 

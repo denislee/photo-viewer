@@ -8,6 +8,7 @@
 #include "wayland_xdg_shell.h"
 #include "wayland_xdg_decoration.h"
 #include "wayland_text_input.h"
+#include "wayland_pointer_gestures.h"
 #include "_cgo_export.h"
 
 const struct wl_registry_listener gio_registry_listener = {
@@ -70,6 +71,12 @@ const struct wl_pointer_listener gio_pointer_listener = {
 	.axis_source = gio_onPointerAxisSource,
 	.axis_stop = gio_onPointerAxisStop,
 	.axis_discrete = gio_onPointerAxisDiscrete,
+};
+
+const struct zwp_pointer_gesture_pinch_v1_listener gio_pinch_listener = {
+	.begin = gio_onPinchBegin,
+	.update = gio_onPinchUpdate,
+	.end = gio_onPinchEnd,
 };
 
 const struct wl_touch_listener gio_touch_listener = {

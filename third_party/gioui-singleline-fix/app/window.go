@@ -116,6 +116,9 @@ type eventSummary struct {
 	frame        *frameEvent
 	framePending bool
 	destroy      *DestroyEvent
+	// pinch queues touchpad pinch steps (local fork addition, see pinch.go);
+	// consecutive updates are merged into one.
+	pinch []PinchEvent
 }
 
 type callbacks struct {
@@ -583,6 +586,10 @@ func (w *Window) nextEvent() (event.Event, bool) {
 		e := *s.cfg
 		s.cfg = nil
 		return e, true
+	case len(s.pinch) > 0:
+		e := s.pinch[0]
+		s.pinch = s.pinch[1:]
+		return e, true
 	case s.frame != nil:
 		e := *s.frame
 		s.frame = nil
@@ -657,6 +664,12 @@ func (w *Window) processEvent(e event.Event) bool {
 			w.ctx.Unlock()
 		}
 		w.coalesced.view = &e2
+	case PinchEvent:
+		if n := len(w.coalesced.pinch); n > 0 && e2.Kind == PinchUpdate && w.coalesced.pinch[n-1].Kind == PinchUpdate {
+			w.coalesced.pinch[n-1] = w.coalesced.pinch[n-1].merge(e2)
+		} else {
+			w.coalesced.pinch = append(w.coalesced.pinch, e2)
+		}
 	case ConfigEvent:
 		w.decorations.Decorations.Maximized = e2.Config.Mode == Maximized
 		wasFocused := w.decorations.Config.Focused

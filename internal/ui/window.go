@@ -212,6 +212,10 @@ func Run(w *app.Window, ctrl *Controller) error {
 				log.Printf("config: flush on exit: %v", err)
 			}
 			return e.Err
+		case app.PinchEvent:
+			if viewer.Pinch(e) {
+				w.Invalidate()
+			}
 		case app.FrameEvent:
 			gtx := app.NewContext(&ops, e)
 			for _, r := range ctrl.TakeFavoriteReverts() {

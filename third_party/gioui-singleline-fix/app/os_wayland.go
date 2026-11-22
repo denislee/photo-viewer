@@ -49,6 +49,11 @@ import (
 //go:generate sed -i "1s;^;//go:build ((linux \\&\\& !android) || freebsd) \\&\\& !nowayland\\n// +build linux,!android freebsd\\n// +build !nowayland\\n\\n;" wayland_xdg_decoration.c
 //go:generate sed -i "1s;^;//go:build ((linux \\&\\& !android) || freebsd) \\&\\& !nowayland\\n// +build linux,!android freebsd\\n// +build !nowayland\\n\\n;" wayland_text_input.c
 
+// Local fork addition: touchpad pinch gestures (see pinch.go).
+//go:generate wayland-scanner client-header /usr/share/wayland-protocols/unstable/pointer-gestures/pointer-gestures-unstable-v1.xml wayland_pointer_gestures.h
+//go:generate wayland-scanner private-code /usr/share/wayland-protocols/unstable/pointer-gestures/pointer-gestures-unstable-v1.xml wayland_pointer_gestures.c
+//go:generate sed -i "1s;^;//go:build ((linux \\&\\& !android) || freebsd) \\&\\& !nowayland\\n// +build linux,!android freebsd\\n// +build !nowayland\\n\\n;" wayland_pointer_gestures.c
+
 /*
 #cgo linux pkg-config: wayland-client wayland-cursor
 #cgo freebsd openbsd LDFLAGS: -lwayland-client -lwayland-cursor
@@ -61,6 +66,7 @@ import (
 #include "wayland_text_input.h"
 #include "wayland_xdg_shell.h"
 #include "wayland_xdg_decoration.h"
+#include "wayland_pointer_gestures.h"
 
 extern const struct wl_registry_listener gio_registry_listener;
 extern const struct wl_surface_listener gio_surface_listener;
@@ -73,6 +79,7 @@ extern const struct wl_output_listener gio_output_listener;
 extern const struct wl_seat_listener gio_seat_listener;
 extern const struct wl_pointer_listener gio_pointer_listener;
 extern const struct wl_touch_listener gio_touch_listener;
+extern const struct zwp_pointer_gesture_pinch_v1_listener gio_pinch_listener;
 extern const struct wl_keyboard_listener gio_keyboard_listener;
 extern const struct zwp_text_input_v3_listener gio_zwp_text_input_v3_listener;
 extern const struct wl_data_device_listener gio_data_device_listener;
@@ -90,6 +97,7 @@ type wlDisplay struct {
 	shm               *C.struct_wl_shm
 	dataDeviceManager *C.struct_wl_data_device_manager
 	decor             *C.struct_zxdg_decoration_manager_v1
+	gestures          *C.struct_zwp_pointer_gestures_v1
 	seat              *wlSeat
 	xkb               *xkb.Context
 	outputMap         map[C.uint32_t]*C.struct_wl_output
@@ -113,6 +121,13 @@ type wlSeat struct {
 	touch    *C.struct_wl_touch
 	keyboard *C.struct_wl_keyboard
 	im       *C.struct_zwp_text_input_v3
+
+	// pinch is the touchpad pinch gesture object of pointer (nil when the
+	// compositor lacks zwp_pointer_gestures_v1). pinchScale is the gesture's
+	// cumulative scale at the last update, pinchFocus the window it began in.
+	pinch      *C.struct_zwp_pointer_gesture_pinch_v1
+	pinchScale float32
+	pinchFocus *window
 
 	// The most recent input serial.
 	serial C.uint32_t
@@ -488,6 +503,7 @@ func (s *wlSeat) destroy() {
 		C.zwp_text_input_v3_destroy(s.im)
 		s.im = nil
 	}
+	s.releasePinch()
 	if s.pointer != nil {
 		C.wl_pointer_release(s.pointer)
 	}
@@ -517,7 +533,9 @@ func (s *wlSeat) updateCaps(caps C.uint32_t) {
 	case s.pointer == nil && caps&C.WL_SEAT_CAPABILITY_POINTER != 0:
 		s.pointer = C.wl_seat_get_pointer(s.seat)
 		C.wl_pointer_add_listener(s.pointer, &C.gio_pointer_listener, unsafe.Pointer(s.seat))
+		s.bindPinch()
 	case s.pointer != nil && caps&C.WL_SEAT_CAPABILITY_POINTER == 0:
+		s.releasePinch()
 		C.wl_pointer_release(s.pointer)
 		s.pointer = nil
 	}
@@ -537,6 +555,80 @@ func (s *wlSeat) updateCaps(caps C.uint32_t) {
 		C.wl_keyboard_release(s.keyboard)
 		s.keyboard = nil
 	}
+}
+
+// bindPinch subscribes to touchpad pinch gestures on the seat's pointer, once
+// both the pointer and the gestures global exist (they arrive in either order).
+func (s *wlSeat) bindPinch() {
+	if s.pinch != nil || s.pointer == nil || s.disp.gestures == nil {
+		return
+	}
+	s.pinch = C.zwp_pointer_gestures_v1_get_pinch_gesture(s.disp.gestures, s.pointer)
+	C.zwp_pointer_gesture_pinch_v1_add_listener(s.pinch, &C.gio_pinch_listener, unsafe.Pointer(s.seat))
+}
+
+func (s *wlSeat) releasePinch() {
+	if s.pinch != nil {
+		C.zwp_pointer_gesture_pinch_v1_destroy(s.pinch)
+		s.pinch = nil
+	}
+	s.pinchFocus = nil
+}
+
+//export gio_onPinchBegin
+func gio_onPinchBegin(data unsafe.Pointer, p *C.struct_zwp_pointer_gesture_pinch_v1, serial, t C.uint32_t, surf *C.struct_wl_surface, fingers C.uint32_t) {
+	s := callbackLoad(data).(*wlSeat)
+	s.serial = serial
+	s.pinchScale = 1
+	s.pinchFocus = nil
+	if surf == nil {
+		return
+	}
+	w, ok := callbackLoad(unsafe.Pointer(surf)).(*window)
+	if !ok {
+		return
+	}
+	s.pinchFocus = w
+	w.flushScroll()
+	w.resetFling()
+	w.ProcessEvent(PinchEvent{Kind: PinchBegin, Position: w.lastPos, Scale: 1})
+}
+
+//export gio_onPinchUpdate
+func gio_onPinchUpdate(data unsafe.Pointer, p *C.struct_zwp_pointer_gesture_pinch_v1, t C.uint32_t, dx, dy, scale, rotation C.wl_fixed_t) {
+	s := callbackLoad(data).(*wlSeat)
+	w := s.pinchFocus
+	if w == nil {
+		return
+	}
+	sc := fromFixed(scale)
+	if sc <= 0 || s.pinchScale <= 0 {
+		return
+	}
+	rel := sc / s.pinchScale
+	s.pinchScale = sc
+	w.ProcessEvent(PinchEvent{
+		Kind:     PinchUpdate,
+		Position: w.lastPos,
+		Scale:    rel,
+		Pan:      f32.Point{X: fromFixed(dx) * float32(w.scale), Y: fromFixed(dy) * float32(w.scale)},
+	})
+}
+
+//export gio_onPinchEnd
+func gio_onPinchEnd(data unsafe.Pointer, p *C.struct_zwp_pointer_gesture_pinch_v1, serial, t C.uint32_t, cancelled C.int32_t) {
+	s := callbackLoad(data).(*wlSeat)
+	s.serial = serial
+	w := s.pinchFocus
+	s.pinchFocus = nil
+	if w == nil {
+		return
+	}
+	kind := PinchEnd
+	if cancelled != 0 {
+		kind = PinchCancel
+	}
+	w.ProcessEvent(PinchEvent{Kind: kind, Position: w.lastPos, Scale: 1})
 }
 
 //export gio_onSeatName
@@ -696,6 +788,11 @@ func gio_onRegistryGlobal(data unsafe.Pointer, reg *C.struct_wl_registry, name C
 		d.wm = (*C.struct_xdg_wm_base)(C.wl_registry_bind(reg, name, &C.xdg_wm_base_interface, 1))
 	case "zxdg_decoration_manager_v1":
 		d.decor = (*C.struct_zxdg_decoration_manager_v1)(C.wl_registry_bind(reg, name, &C.zxdg_decoration_manager_v1_interface, 1))
+	case "zwp_pointer_gestures_v1":
+		d.gestures = (*C.struct_zwp_pointer_gestures_v1)(C.wl_registry_bind(reg, name, &C.zwp_pointer_gestures_v1_interface, 1))
+		if d.seat != nil {
+			d.seat.bindPinch()
+		}
 		// TODO: Implement and test text-input support.
 		/*case "zwp_text_input_manager_v3":
 		d.imm = (*C.struct_zwp_text_input_manager_v3)(C.wl_registry_bind(reg, name, &C.zwp_text_input_manager_v3_interface, 1))*/
@@ -865,6 +962,9 @@ func gio_onPointerLeave(data unsafe.Pointer, p *C.struct_wl_pointer, serial C.ui
 	s := callbackLoad(data).(*wlSeat)
 	s.serial = serial
 	s.pointerFocus = nil
+	if s.pinchFocus == w {
+		s.pinchFocus = nil
+	}
 	if w.inCompositor {
 		w.inCompositor = false
 		w.ProcessEvent(pointer.Event{Kind: pointer.Cancel})
@@ -1912,6 +2012,9 @@ func (d *wlDisplay) destroy() {
 	}
 	if d.decor != nil {
 		C.zxdg_decoration_manager_v1_destroy(d.decor)
+	}
+	if d.gestures != nil {
+		C.zwp_pointer_gestures_v1_destroy(d.gestures)
 	}
 	if d.shm != nil {
 		C.wl_shm_destroy(d.shm)
