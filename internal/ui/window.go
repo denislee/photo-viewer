@@ -63,6 +63,7 @@ func Run(w *app.Window, ctrl *Controller) error {
 	ctrl.SetProcessRegistry(processes)
 	dups.SetProcessRegistry(processes)
 	imports.SetProcessRegistry(processes)
+	imports.OnFinished = ctrl.IndexImported
 	organize.SetProcessRegistry(processes)
 	processBar := NewProcessBar(processes)
 	processBar.OnOpen = func(kind ProcKind) {

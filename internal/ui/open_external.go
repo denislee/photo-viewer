@@ -1,15 +1,23 @@
 package ui
 
 import (
+	"fmt"
+	"log"
 	"os/exec"
 
 	"github.com/dns/photo-viewer/internal/cache"
 	"github.com/dns/photo-viewer/internal/scan"
 )
 
+// maxExternalOpens caps how many xdg-open processes one gesture launches. A
+// large selection would otherwise spawn one desktop app window per file with
+// no prompt. The all-videos case is a single mpv playlist and is not capped.
+const maxExternalOpens = 20
+
 // externalOpenCmds builds the external-viewer commands for entries: one mpv
 // looping over them when they are all videos, otherwise one xdg-open per file
-// (the desktop's default app, which also handles mixed selections).
+// (the desktop's default app, which also handles mixed selections), for at
+// most maxExternalOpens files.
 func externalOpenCmds(entries []cache.Entry) []*exec.Cmd {
 	if len(entries) == 0 {
 		return nil
@@ -29,17 +37,25 @@ func externalOpenCmds(entries []cache.Entry) []*exec.Cmd {
 		}
 		return []*exec.Cmd{exec.Command("mpv", args...)}
 	}
-	cmds := make([]*exec.Cmd, len(paths))
-	for i, p := range paths {
+	cmds := make([]*exec.Cmd, min(len(paths), maxExternalOpens))
+	for i, p := range paths[:len(cmds)] {
 		cmds[i] = exec.Command("xdg-open", p)
 	}
 	return cmds
 }
 
-// openExternally launches externalOpenCmds(entries) in the background.
+// openExternally launches externalOpenCmds(entries) in the background and
+// tells the user when the maxExternalOpens cap left files unopened.
 func openExternally(entries []cache.Entry) {
-	for _, cmd := range externalOpenCmds(entries) {
+	cmds := externalOpenCmds(entries)
+	for _, cmd := range cmds {
 		go runDetached(cmd)
+	}
+	if len(cmds) > 1 && len(cmds) < len(entries) {
+		msg := fmt.Sprintf("Opened the first %d of %d selected files; the other %d were skipped.",
+			len(cmds), len(entries), len(entries)-len(cmds))
+		log.Printf("open externally: %s", msg)
+		go warnUser("Open externally", msg)
 	}
 }
 

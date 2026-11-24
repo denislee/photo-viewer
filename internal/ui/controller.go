@@ -426,6 +426,26 @@ func (c *Controller) ApplyMove(oldPath, newPath string) error {
 	return c.index.RemoveEntry(oldPath)
 }
 
+// IndexImported incrementally scans dir, an import's outbox, so the files an
+// import just filed show up in the grid and sidebar without a manual rescan
+// (I-03 step 4). The scan registers in the process bar like any other and
+// refreshes the active directory as it commits. A dir outside the library
+// root is ignored: the index only covers the library.
+func (c *Controller) IndexImported(dir string) {
+	if dir == "" {
+		return
+	}
+	abs, err := filepath.Abs(dir)
+	if err != nil {
+		return
+	}
+	rel, err := filepath.Rel(c.libraryRoot, abs)
+	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return
+	}
+	go c.scanInto(context.Background(), abs)
+}
+
 // RefreshActive re-queries the index for the directory currently shown in the
 // grid and repaints. Exposed so flows that mutate the index outside the normal
 // scan path (the organize move pass via ApplyMove) can surface their changes

@@ -121,7 +121,9 @@ func (v *WebServerView) Layout(gtx layout.Context, th *Theme) layout.Dimensions 
 			layout.Rigid(func(gtx layout.Context) layout.Dimensions {
 				lbl := material.Label(th.Theme, unit.Sp(12),
 					"Serve every indexed photo and video over HTTP. Anyone with the URL "+
-						"(and the password, if set) will be able to browse and download the library.")
+						"(and the password, if set) will be able to browse and download the library. "+
+						"The connection is not encrypted: the password is sent in clear text, so "+
+						"anyone on the same network can read it. Use a password you use nowhere else.")
 				lbl.Color = th.Muted
 				return lbl.Layout(gtx)
 			}),

@@ -48,6 +48,11 @@ var inboxProbe = inboxHasFiles
 type ImportView struct {
 	Open    bool
 	OnClose func()
+	// OnFinished, when set, runs on the import goroutine once an import that
+	// filed at least one file has ended, with the outbox it filed into. The
+	// window wires it to Controller.IndexImported so the new photos appear
+	// without a manual rescan (I-03 step 4). Set once, before the first Show.
+	OnFinished func(outboxDir string)
 
 	// Shared task plumbing (taskui.go): mu, statusMsg, log, progress, scope, invalidate, logList.
 	taskView
@@ -903,6 +908,9 @@ func (v *ImportView) startImport(cfg Config) {
 			proc.End()
 			if len(mounts) > 0 {
 				v.unmountAll(mounts)
+			}
+			if v.OnFinished != nil && atomic.LoadInt64(&v.statMoved) > 0 {
+				v.OnFinished(cfg.OutboxDir)
 			}
 			if v.invalidate != nil {
 				v.invalidate()

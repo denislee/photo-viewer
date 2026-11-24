@@ -1,6 +1,7 @@
 package ui
 
 import (
+	"fmt"
 	"reflect"
 	"testing"
 
@@ -35,5 +36,23 @@ func TestExternalOpenCmds(t *testing.T) {
 		if !reflect.DeepEqual(got, tc.want) {
 			t.Errorf("%s: got %v, want %v", tc.name, got, tc.want)
 		}
+	}
+}
+
+// TestExternalOpenCmdsCapsXdgOpen: a large mixed selection launches at most
+// maxExternalOpens xdg-open processes (round-4 openExternally decision); an
+// all-video selection stays one mpv playlist with every file.
+func TestExternalOpenCmdsCapsXdgOpen(t *testing.T) {
+	var photos, videos []cache.Entry
+	for i := range maxExternalOpens + 5 {
+		photos = append(photos, cache.Entry{Path: fmt.Sprintf("/lib/p%d.jpg", i), Type: scan.TypePhoto})
+		videos = append(videos, cache.Entry{Path: fmt.Sprintf("/lib/v%d.mp4", i), Type: scan.TypeVideo})
+	}
+	if got := len(externalOpenCmds(photos)); got != maxExternalOpens {
+		t.Errorf("xdg-open commands = %d, want %d", got, maxExternalOpens)
+	}
+	cmds := externalOpenCmds(videos)
+	if len(cmds) != 1 || len(cmds[0].Args) != 2+len(videos) {
+		t.Errorf("all-video selection: %d commands, args %v; want one mpv with every file", len(cmds), cmds[0].Args)
 	}
 }
