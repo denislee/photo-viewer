@@ -233,9 +233,10 @@ func (i *Index) WriteFacesForPath(path string, thumbMtime int64, ops []FaceOp) (
 // in ApplyMove avoids) while the old rows orphan. The embeddings and thumb_mtime
 // stay valid because the thumbnail file was renamed, not regenerated.
 //
-// The face-detection freshness (entries.face_thumb_mtime) moves too: it is
-// taken from the old row when there is one, else from the moved face rows, so
-// the relocated file isn't re-detected (F5-01).
+// Its one caller (ApplyMove) runs it only after MovePath found no row for
+// oldPath, so there is no old entries row to carry face_thumb_mtime from or to
+// clear (C6-03). The moved file's freshness is seeded from the relocated face
+// rows instead, so it isn't re-detected (F5-01).
 func (i *Index) MoveFaces(oldPath, newPath string) error {
 	tx, err := i.db.Begin()
 	if err != nil {
@@ -246,14 +247,8 @@ func (i *Index) MoveFaces(oldPath, newPath string) error {
 		return err
 	}
 	if _, err := tx.Exec(`UPDATE entries SET face_thumb_mtime = COALESCE(
-			(SELECT face_thumb_mtime FROM entries WHERE path = ?),
-			(SELECT MAX(thumb_mtime) FROM faces WHERE path = ?),
-			face_thumb_mtime)
-		WHERE path = ?`, oldPath, newPath, newPath); err != nil {
-		return err
-	}
-	// The old path's faces are gone, so it no longer counts as scanned.
-	if _, err := tx.Exec("UPDATE entries SET face_thumb_mtime = NULL WHERE path = ?", oldPath); err != nil {
+			(SELECT MAX(thumb_mtime) FROM faces WHERE path = ?), face_thumb_mtime)
+		WHERE path = ?`, newPath, newPath); err != nil {
 		return err
 	}
 	return tx.Commit()

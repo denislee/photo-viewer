@@ -86,6 +86,11 @@ func TestMoveFacesRelocatesRows(t *testing.T) {
 	oldPath := root + "/000000.jpg"
 	newPath := root + "/2024-01-01/000000.jpg"
 	writeFace(t, idx, oldPath)
+	// ApplyMove calls MoveFaces only when MovePath found no oldPath row, so
+	// drop it here: only the orphaned face rows remain under oldPath.
+	if _, err := idx.db.Exec("DELETE FROM entries WHERE path = ?", oldPath); err != nil {
+		t.Fatal(err)
+	}
 	// ApplyMove indexes newPath before relocating its faces.
 	reconcilePath(t, idx, newPath)
 

@@ -2,9 +2,11 @@ package thumb
 
 import (
 	"context"
+	"errors"
 	"image"
 	"image/color"
 	"image/jpeg"
+	"io/fs"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -67,8 +69,7 @@ func TestPresentPreviewTags(t *testing.T) {
 }
 
 // TestExtractEmbeddedCapturesStderr checks that a failed embedded-preview
-// extraction (S-17) surfaces exiftool's stderr detail instead of a bare
-// "exit status 1".
+// extraction (S-17) surfaces the reason instead of a bare "exit status 1".
 func TestExtractEmbeddedCapturesStderr(t *testing.T) {
 	if _, err := exec.LookPath("exiftool"); err != nil {
 		t.Skip("exiftool not installed; skipping stderr-capture test")
@@ -82,9 +83,11 @@ func TestExtractEmbeddedCapturesStderr(t *testing.T) {
 	if !strings.Contains(err.Error(), "exiftool:") {
 		t.Errorf("error should carry the exiftool prefix, got: %v", err)
 	}
-	// The stderr detail must survive into the error, not be dropped for a bare
-	// "exit status 1".
-	if !strings.Contains(err.Error(), "File not found") {
-		t.Errorf("error should carry exiftool's stderr detail, got: %v", err)
+	// The reason must survive into the error, not be dropped for a bare
+	// "exit status 1" or a misleading "not present". Since S6-10 the
+	// unreadable-source case reports the stat error rather than forking a
+	// second, one-shot exiftool for its stderr.
+	if !errors.Is(err, fs.ErrNotExist) {
+		t.Errorf("error should say the file does not exist, got: %v", err)
 	}
 }

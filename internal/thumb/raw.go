@@ -260,26 +260,28 @@ func extractEmbedded(ctx context.Context, src, tag string) ([]byte, error) {
 	out := filepath.Join(dir, "preview.bin")
 	// exiftool reads '%' in the -W argument as a format code, so escape it: a
 	// temp dir path is normally '%'-free, but $TMPDIR is caller-controlled.
+	// RunExiftool already falls back to a one-shot exiftool with the same
+	// arguments when the daemon fails, so a second fork here would fail the
+	// same way (S6-10).
 	if _, err := scan.RunExiftool("-b", tag, "-W!", strings.ReplaceAll(out, "%", "%%"), src); err != nil {
-		return extractEmbeddedOneShot(ctx, src, tag)
+		return nil, err
 	}
 	if data, err := os.ReadFile(out); err == nil {
 		return data, nil
 	}
 	// The daemon discards exiftool's stderr, so a missing output file means
 	// either "this file has no such tag" or "the source couldn't be read at
-	// all". When the source itself is the problem, rerun it one-shot so the
-	// caller gets exiftool's reason instead of a misleading "not present".
+	// all". The stat error explains the second case.
 	if _, statErr := os.Stat(src); statErr != nil {
-		return extractEmbeddedOneShot(ctx, src, tag)
+		return nil, fmt.Errorf("exiftool: %w", statErr)
 	}
 	// No file means the tag is absent from this file rather than a failure.
 	return nil, fmt.Errorf("exiftool: %s not present", tag)
 }
 
 // extractEmbeddedOneShot is the original fork-per-tag extraction: exiftool
-// writes the tag's bytes to stdout. It is the fallback both when the temp dir
-// can't be created and when the daemon request fails.
+// writes the tag's bytes to stdout. It is the fallback for when the temp dir
+// the daemon's -W output needs can't be created.
 func extractEmbeddedOneShot(ctx context.Context, src, tag string) ([]byte, error) {
 	cmd := exec.CommandContext(ctx, "exiftool", "-b", tag, src)
 	var buf, stderr bytes.Buffer
