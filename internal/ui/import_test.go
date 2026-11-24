@@ -401,10 +401,11 @@ func TestRunImportSkipsHiddenCardFiles(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("walk outbox: %v", err)
 	}
-	// Only the base name is checked: the Inbox copy doesn't keep the source
-	// mtime yet (S3-01/H4-01), so the date folder depends on that fix.
-	if len(filed) != 1 || filepath.Base(filed[0]) != "a.jpg" {
-		t.Errorf("outbox files = %v, want exactly one <date>/a.jpg", filed)
+	// The Inbox copy keeps the source mtime (fc6715a), so with no EXIF date
+	// the file is filed under the card file's own date.
+	want := filepath.Join(when.Format("2006-01-02"), "a.jpg")
+	if len(filed) != 1 || filed[0] != want {
+		t.Errorf("outbox files = %v, want exactly [%s]", filed, want)
 	}
 	if m := atomic.LoadInt64(&v.statMoved); m != 1 {
 		t.Errorf("statMoved = %d, want 1", m)

@@ -273,10 +273,10 @@ func Load(dbPath string) (*Index, error) {
 	// v8 (F5-01) adds face_thumb_mtime and backfills it once from the face rows
 	// (the only freshness record before v8).
 	const schemaVersion = 8
-	var userVersion int
 	// A failed read must not be taken as version 0: that would re-run the
 	// destructive migrations (v1 NULLs quick_hash, v4 deletes the faces).
-	if err := db.QueryRow("PRAGMA user_version").Scan(&userVersion); err != nil {
+	userVersion, err := readUserVersion(db)
+	if err != nil {
 		_ = db.Close()
 		return nil, fmt.Errorf("read schema version: %w", err)
 	}
@@ -398,6 +398,13 @@ func Load(dbPath string) (*Index, error) {
 	}
 
 	return &Index{db: db}, nil
+}
+
+// readUserVersion reads PRAGMA user_version. A package var so a test can
+// force the read to fail (C6-B2).
+var readUserVersion = func(db *sql.DB) (v int, err error) {
+	err = db.QueryRow("PRAGMA user_version").Scan(&v)
+	return v, err
 }
 
 // reconcileChunkSize is the maximum number of rows per transaction in

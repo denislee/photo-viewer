@@ -72,7 +72,8 @@ race:
 test-video:
 	@clip=$$(mktemp --suffix=.mp4) && trap 'rm -f "$$clip"' EXIT && \
 	ffmpeg -loglevel error -y -f lavfi -i testsrc=duration=3:size=640x360:rate=30 -pix_fmt yuv420p "$$clip" && \
-	PV_CROP_VIDEO="$$clip" go test -race -count=1 -run 'TestClose' -v ./internal/video/
+	PV_CROP_VIDEO="$$clip" go test -race -count=1 -run 'TestClose' -v ./internal/video/ && \
+	PV_CROP_VIDEO="$$clip" go test -race -count=1 -run 'TestPlayVideoPaintSizeMatchesFrame' -v ./internal/ui/
 
 lint:
 	$(GOLANGCI_LINT) run ./...

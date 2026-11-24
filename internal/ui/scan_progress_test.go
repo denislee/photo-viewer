@@ -63,4 +63,9 @@ func TestScanIntoReportsTotal(t *testing.T) {
 	}
 	scanProc.Load().Resume()
 	<-done
+	// scanInto's final flush schedules a refresh goroutine that outlives it
+	// and still queries the index. Let it finish before the TempDir cleanups
+	// run; a refresh still in flight during RemoveAll is the likely source of
+	// the one-off "TempDir RemoveAll cleanup: directory not empty" flake.
+	waitRefreshSettled(t, c)
 }
