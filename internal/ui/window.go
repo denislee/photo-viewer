@@ -207,6 +207,9 @@ func Run(w *app.Window, ctrl *Controller) error {
 		ev := w.Event()
 		switch e := ev.(type) {
 		case app.DestroyEvent:
+			if !ctrl.DrainDeletions(3 * time.Second) {
+				log.Printf("delete: exiting with deletions still in flight")
+			}
 			ctrl.FlushFavorites(3 * time.Second)
 			if err := FlushConfig(3 * time.Second); err != nil {
 				log.Printf("config: flush on exit: %v", err)

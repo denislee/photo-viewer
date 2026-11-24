@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/dns/photo-viewer/internal/cache"
 	"github.com/dns/photo-viewer/internal/scan"
@@ -54,10 +55,27 @@ func (c *Controller) DeletePaths(paths []string) {
 	}
 	if len(toDelete) > 0 {
 		allLocal := c.patchLocalDeletion(toDelete, c.trashDir != "")
-		go c.performDeletion(toDelete, !allLocal)
+		c.deletions.Go(func() { c.performDeletion(toDelete, !allLocal) })
 	}
 	if len(toRestore) > 0 {
-		go c.restoreBatch(toRestore)
+		c.deletions.Go(func() { c.restoreBatch(toRestore) })
+	}
+}
+
+// DrainDeletions waits up to timeout for every delete/restore goroutine that
+// DeletePaths started, so their index writes land before the index is closed
+// on exit. It reports whether they all finished in time.
+func (c *Controller) DrainDeletions(timeout time.Duration) bool {
+	done := make(chan struct{})
+	go func() {
+		c.deletions.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+		return true
+	case <-time.After(timeout):
+		return false
 	}
 }
 

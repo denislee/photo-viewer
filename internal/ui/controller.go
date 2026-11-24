@@ -160,6 +160,12 @@ type Controller struct {
 
 	displayOnce sync.Once
 	display     *cache.ThumbStore
+
+	// deletions tracks the background delete/restore goroutines started by
+	// DeletePaths, so the exit path can wait for their index writes to land
+	// (I-19 item 6). Without it, os.Exit could run after the trash renames
+	// but before RemoveEntries, leaving ghost rows until a Rebuild.
+	deletions sync.WaitGroup
 }
 
 func NewController(root string, idx *cache.Index, store *cache.ThumbStore, cacheDir string) *Controller {
