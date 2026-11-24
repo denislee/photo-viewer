@@ -21,7 +21,7 @@ func TestTaskViewSetStatusCoalescesWithLiveProc(t *testing.T) {
 
 	proc := reg.Begin(context.Background(), ProcOrganize, "t", nil, true)
 	v.mu.Lock()
-	v.scope.attachLocked(proc, nil)
+	v.scope.proc = proc
 	v.mu.Unlock()
 
 	for i := range 100 {

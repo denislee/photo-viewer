@@ -18,14 +18,12 @@ import (
 // Duplicates) used to hand-roll a copy of each:
 //
 //   - taskLog       — a bounded log buffer with a UI-thread drain (Import, Organize)
-//   - progressModel — done/max progress state + the thin-bar painter (Import, Organize)
-//   - procScope     — the Process begin/attach/nil-on-end lifecycle (all three)
+//   - progressModel — done/max progress state (Import, Organize) and the bar
+//     painter layoutProgressBar (all three; Duplicates draws it 14dp tall)
+//   - procScope     — the Process begin/publish/end lifecycle (all three)
 //
 // Extracting them (finding U-15) kills the drift that had already crept in
 // between the copies — e.g. organize's logBuf growing unbounded before U-16.
-// The Duplicates view keeps its own int-based, centred progress display
-// (layoutProgress) because it is genuinely different from the thin Import/
-// Organize bar; only its Process lifecycle is shared via procScope.
 
 const (
 	// taskLogPendingCap bounds the not-yet-drained buffer so a long pass whose
@@ -124,14 +122,15 @@ func (p *progressModel) load() (done, max int64) {
 	return p.done.Load(), p.max.Load()
 }
 
-// layoutProgressBar paints the thin 6dp progress bar shared by the Import and
-// Organize modals: a full-width CellBG track with an Accent fill proportional to
-// done/max. done is clamped to [0,max] so a pass that overshoots its total (both
-// views can) never paints past the track width or backwards into the track.
-func layoutProgressBar(gtx layout.Context, th *Theme, done, max int64) layout.Dimensions {
+// layoutProgressBar paints the thin progress bar shared by the Import and
+// Organize modals (6dp) and by the Duplicates hashing screen (14dp): a
+// full-width CellBG track with an Accent fill proportional to done/max. done is
+// clamped to [0,max] so a pass that overshoots its total (both views can) never
+// paints past the track width or backwards into the track.
+func layoutProgressBar(gtx layout.Context, th *Theme, done, max int64, height unit.Dp) layout.Dimensions {
 	done = clampProgressDone(done, max)
 	w := gtx.Constraints.Max.X
-	barH := gtx.Dp(unit.Dp(6))
+	barH := gtx.Dp(height)
 	bg := image.Rect(0, 0, w, barH)
 	paint.FillShape(gtx.Ops, th.CellBG, clip.Rect(bg).Op())
 	if max > 0 {
@@ -152,46 +151,46 @@ func clampProgressDone(done, total int64) int64 {
 }
 
 // procScope owns the single "live Process" slot a modal task view publishes to
-// the process bar. The slot is guarded by the owning view's own mutex, not one
-// of its own: attach/detach/current all assume the caller holds it, matching the
-// explicit lock/unlock each view already wrote around its v.proc writes. begin
-// registers with the registry (or returns nil when none is wired, e.g. tests)
-// and takes no lock — the caller configures status/total and then attaches,
-// preserving each view's begin→configure→attach order exactly.
+// the process bar. The slot is guarded by the owning view's own mutex (s.mu),
+// which is why every access goes through beginProc and its returned end func
+// rather than raw field writes. beginProc registers with the registry (nil when
+// none is wired, e.g. tests), sets the status, and publishes the process, all in
+// one call that takes the lock itself.
 type procScope struct {
 	reg  *ProcessRegistry
-	proc *Process // guarded by the owning view's mutex
+	mu   *sync.Mutex // the owning view's mutex
+	proc *Process    // guarded by the owning view's mutex
 }
 
-// begin registers a process with the bar, or returns nil when no registry is
-// wired. ctx is the context the worker observes, so cancelling it also releases
-// the pause gate (U5-03). supportsPause is always true for the modal views.
-// Takes no lock.
-func (s *procScope) begin(ctx context.Context, kind ProcKind, title string, cancel func()) *Process {
-	return s.reg.Begin(ctx, kind, title, cancel, true)
-}
-
-// attachLocked publishes proc as the live process. keep, when non-nil, gates the
-// store on the caller's generation guard (the Duplicates Rescan supersession
-// check); a nil keep always stores. The caller must hold the view mutex.
-func (s *procScope) attachLocked(proc *Process, keep func() bool) {
+// beginProc registers a process with the bar, sets its status, and publishes it
+// as the live process under s.mu. keep, when non-nil, gates both the publish and
+// the later clear on the caller's generation guard (the Duplicates Rescan
+// supersession check). It returns the process (nil when no registry is wired,
+// e.g. tests; *Process methods are nil-safe) and an end func that clears the
+// slot (same keep gate) and then calls proc.End() outside the lock. The caller
+// must NOT hold s.mu.
+func (s *procScope) beginProc(ctx context.Context, kind ProcKind, title string, cancel func(), status string, keep func() bool) (*Process, func()) {
+	proc := s.reg.Begin(ctx, kind, title, cancel, true)
+	if proc == nil {
+		return nil, func() {}
+	}
+	if status != "" {
+		proc.SetStatus(status)
+	}
+	s.mu.Lock()
 	if keep == nil || keep() {
 		s.proc = proc
 	}
-}
-
-// detachLocked clears the live-process slot under the same keep guard. The
-// caller must hold the view mutex, then call proc.End() outside the lock.
-func (s *procScope) detachLocked(keep func() bool) {
-	if keep == nil || keep() {
-		s.proc = nil
+	s.mu.Unlock()
+	end := func() {
+		s.mu.Lock()
+		if (keep == nil || keep()) && s.proc == proc {
+			s.proc = nil
+		}
+		s.mu.Unlock()
+		proc.End()
 	}
-}
-
-// currentLocked returns the live process (nil when none). The caller must hold
-// the view mutex.
-func (s *procScope) currentLocked() *Process {
-	return s.proc
+	return proc, end
 }
 
 // taskView is the plumbing the Import and Organize modals share: the view
@@ -216,6 +215,7 @@ type taskView struct {
 // list's vertical, pinned-to-bottom layout.
 func (t *taskView) initTaskView(invalidate func()) {
 	t.invalidate = invalidate
+	t.scope.mu = &t.mu
 	t.logList.Axis = layout.Vertical
 	// Stick the log to the bottom so newly-appended lines stay visible. Once
 	// the user manually scrolls up, BeforeEnd flips and Gio stops auto-pinning.
@@ -230,7 +230,7 @@ func (t *taskView) SetProcessRegistry(r *ProcessRegistry) { t.scope.reg = r }
 // registered (e.g. tests). Safe to call from any goroutine.
 func (t *taskView) currentProc() *Process {
 	t.mu.Lock()
-	proc := t.scope.currentLocked()
+	proc := t.scope.proc
 	t.mu.Unlock()
 	return proc
 }
@@ -243,7 +243,7 @@ func (t *taskView) currentProc() *Process {
 func (t *taskView) setStatus(msg string) {
 	t.mu.Lock()
 	t.statusMsg = msg
-	proc := t.scope.currentLocked()
+	proc := t.scope.proc
 	t.mu.Unlock()
 	if proc != nil {
 		// SetStatus notifies through the registry coalescer; skip the direct

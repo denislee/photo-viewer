@@ -194,43 +194,52 @@ func TestProgressModelConcurrentBump(t *testing.T) {
 }
 
 // TestProcScopeBeginNilRegistry: with no registry wired (tests, standalone use)
-// begin returns nil so the caller's `if proc != nil` block is skipped.
+// beginProc returns a nil process and a no-op end.
 func TestProcScopeBeginNilRegistry(t *testing.T) {
-	var s procScope
-	if proc := s.begin(context.Background(), ProcImport, "x", nil); proc != nil {
-		t.Fatalf("begin with no registry = %v, want nil", proc)
+	var mu sync.Mutex
+	s := procScope{mu: &mu}
+	proc, end := s.beginProc(context.Background(), ProcImport, "x", nil, "status", nil)
+	if proc != nil {
+		t.Fatalf("beginProc with no registry = %v, want nil", proc)
+	}
+	end()
+	if s.proc != nil {
+		t.Fatal("slot set with no registry")
 	}
 }
 
-// TestProcScopeAttachDetach: begin registers a process, attachLocked publishes
-// it to the slot, and detachLocked nils it — the lifecycle Import and Organize
-// share (keep==nil, always store/clear).
-func TestProcScopeAttachDetach(t *testing.T) {
+// TestProcScopeBeginEnd: beginProc registers and publishes the process with its
+// status, and end clears the slot and ends it — the lifecycle Import and
+// Organize share (keep==nil, always store/clear).
+func TestProcScopeBeginEnd(t *testing.T) {
 	var mu sync.Mutex
 	reg := NewProcessRegistry(func() {})
-	s := &procScope{reg: reg}
+	s := &procScope{reg: reg, mu: &mu}
 
-	proc := s.begin(context.Background(), ProcImport, "test", nil)
+	proc, end := s.beginProc(context.Background(), ProcImport, "test", nil, "working", nil)
 	if proc == nil {
-		t.Fatal("begin with a registry returned nil")
+		t.Fatal("beginProc with a registry returned nil")
 	}
-
 	mu.Lock()
-	s.attachLocked(proc, nil)
-	got := s.currentLocked()
+	got := s.proc
 	mu.Unlock()
 	if got != proc {
-		t.Fatalf("currentLocked after attach = %v, want the begun proc", got)
+		t.Fatalf("slot after beginProc = %v, want the begun proc", got)
+	}
+	if snap := reg.Snapshot(); len(snap) != 1 || snap[0].Status != "working" {
+		t.Fatalf("registry snapshot = %+v, want one process with status %q", snap, "working")
 	}
 
+	end()
 	mu.Lock()
-	s.detachLocked(nil)
-	got = s.currentLocked()
+	got = s.proc
 	mu.Unlock()
 	if got != nil {
-		t.Fatalf("currentLocked after detach = %v, want nil", got)
+		t.Fatalf("slot after end = %v, want nil", got)
 	}
-	proc.End()
+	if n := reg.Count(); n != 0 {
+		t.Fatalf("registry has %d live processes after end, want 0", n)
+	}
 }
 
 // TestProcScopeGenGuard mirrors the Duplicates Rescan supersession: a stale pass
@@ -239,74 +248,49 @@ func TestProcScopeAttachDetach(t *testing.T) {
 func TestProcScopeGenGuard(t *testing.T) {
 	var mu sync.Mutex
 	reg := NewProcessRegistry(func() {})
-	s := &procScope{reg: reg}
+	s := &procScope{reg: reg, mu: &mu}
+	current := true
 
-	live := s.begin(context.Background(), ProcDuplicates, "live", nil)
-	stale := s.begin(context.Background(), ProcDuplicates, "stale", nil)
-
-	// The live pass claims the slot.
-	mu.Lock()
-	s.attachLocked(live, func() bool { return true })
-	mu.Unlock()
-
-	// A superseded pass must not overwrite it.
-	mu.Lock()
-	s.attachLocked(stale, func() bool { return false })
-	got := s.currentLocked()
-	mu.Unlock()
-	if got != live {
-		t.Fatalf("stale attach overwrote the slot: got %v, want the live proc", got)
+	live, endLive := s.beginProc(context.Background(), ProcDuplicates, "live", nil, "", func() bool { return current })
+	// A superseded pass must not overwrite the live pass's slot.
+	_, endStale := s.beginProc(context.Background(), ProcDuplicates, "stale", nil, "", func() bool { return false })
+	if s.proc != live {
+		t.Fatalf("stale beginProc overwrote the slot: got %v, want the live proc", s.proc)
 	}
-
-	// A superseded pass tearing down must not clear the live slot.
-	mu.Lock()
-	s.detachLocked(func() bool { return false })
-	got = s.currentLocked()
-	mu.Unlock()
-	if got != live {
-		t.Fatal("stale detach cleared the live pass's slot")
+	// ...nor clear it on the way down.
+	endStale()
+	if s.proc != live {
+		t.Fatal("stale end cleared the live pass's slot")
 	}
-
 	// The live pass clears its own slot.
-	mu.Lock()
-	s.detachLocked(func() bool { return true })
-	got = s.currentLocked()
-	mu.Unlock()
-	if got != nil {
-		t.Fatal("live detach did not clear the slot")
+	endLive()
+	if s.proc != nil {
+		t.Fatal("live end did not clear the slot")
 	}
-
-	live.End()
-	stale.End()
+	if n := reg.Count(); n != 0 {
+		t.Fatalf("registry left with %d live processes, want 0", n)
+	}
 }
 
 // TestProcScopeConcurrent is the -race net for the lifecycle under load: many
-// passes begin, attach, read, drive progress (notify), detach, and end against
-// one scope+registry. The view mutex serializes the slot writes exactly as the
-// real views do.
+// passes begin, read, drive progress (notify) and end against one
+// scope+registry, with the view mutex serializing the slot writes exactly as
+// the real views do.
 func TestProcScopeConcurrent(t *testing.T) {
 	var mu sync.Mutex
 	reg := NewProcessRegistry(func() {})
-	s := &procScope{reg: reg}
+	s := &procScope{reg: reg, mu: &mu}
 
 	var wg sync.WaitGroup
 	const goroutines = 40
 	for range goroutines {
 		wg.Go(func() {
-			proc := s.begin(context.Background(), ProcImport, "t", nil)
+			_, end := s.beginProc(context.Background(), ProcImport, "t", nil, "", nil)
 			mu.Lock()
-			s.attachLocked(proc, nil)
+			cur := s.proc
 			mu.Unlock()
-			mu.Lock()
-			cur := s.currentLocked()
-			mu.Unlock()
-			if cur != nil {
-				cur.AddDone(1) // routes through registry.notify()
-			}
-			mu.Lock()
-			s.detachLocked(nil)
-			mu.Unlock()
-			proc.End()
+			cur.AddDone(1) // nil-safe; routes through registry.notify()
+			end()
 		})
 	}
 	wg.Wait()

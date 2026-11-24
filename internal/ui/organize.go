@@ -99,7 +99,7 @@ func (v *OrganizeView) Show(idx *cache.Index) {
 	v.scanCancel = cancel
 	v.mu.Unlock()
 
-	go v.scanForMismatched(ctx, idx)
+	go v.scanForMismatched(ctx, cancel, idx)
 }
 
 func (v *OrganizeView) Close() {
@@ -116,27 +116,9 @@ func (v *OrganizeView) Close() {
 	}
 }
 
-func (v *OrganizeView) scanForMismatched(ctx context.Context, idx *cache.Index) {
-	proc := v.scope.begin(ctx, ProcOrganize, "Organize: scan", func() {
-		v.mu.Lock()
-		c := v.scanCancel
-		v.mu.Unlock()
-		if c != nil {
-			c()
-		}
-	})
-	if proc != nil {
-		proc.SetStatus("Scanning videos…")
-		v.mu.Lock()
-		v.scope.attachLocked(proc, nil)
-		v.mu.Unlock()
-		defer func() {
-			v.mu.Lock()
-			v.scope.detachLocked(nil)
-			v.mu.Unlock()
-			proc.End()
-		}()
-	}
+func (v *OrganizeView) scanForMismatched(ctx context.Context, cancel context.CancelFunc, idx *cache.Index) {
+	proc, end := v.scope.beginProc(ctx, ProcOrganize, "Organize: scan", cancel, "Scanning videos…", nil)
+	defer end()
 
 	total := idx.CountByType(scan.TypeVideo)
 	v.progress.set(0, int64(total))
@@ -244,30 +226,16 @@ func (v *OrganizeView) startOrganize(root string) {
 
 	go func() {
 		defer cancel()
-		proc := v.scope.begin(ctx, ProcOrganize, "Organize: move", func() {
-			v.mu.Lock()
-			c := v.moveCancel
-			v.mu.Unlock()
-			if c != nil {
-				c()
-			}
-		})
-		if proc != nil {
-			proc.SetStatus(fmt.Sprintf("Moving %d videos…", len(mismatched)))
-			proc.SetTotal(int64(len(mismatched)))
-			v.mu.Lock()
-			v.scope.attachLocked(proc, nil)
-			v.mu.Unlock()
-		}
+		proc, end := v.scope.beginProc(ctx, ProcOrganize, "Organize: move", cancel, fmt.Sprintf("Moving %d videos…", len(mismatched)), nil)
+		proc.SetTotal(int64(len(mismatched)))
 		movedAny := false
 		var moved, errs, warns int
 		defer func() {
 			v.mu.Lock()
 			v.running = false
 			v.moveCancel = nil
-			v.scope.detachLocked(nil)
 			v.mu.Unlock()
-			proc.End()
+			end()
 			// One refresh at the end (not per file): the index rows were already
 			// relocated in lockstep with each rename by applyMove, so a single
 			// coalesced repaint surfaces the whole batch. Skipped when nothing
@@ -406,9 +374,7 @@ func (v *OrganizeView) Layout(gtx layout.Context, th *Theme, root string) layout
 			layout.Rigid(layout.Spacer{Height: unit.Dp(16)}.Layout),
 			layout.Rigid(func(gtx layout.Context) layout.Dimensions {
 				if scanning || running {
-					// clamp=false preserves organize's original bar rendering,
-					// which never clamped frac (its done never exceeds max).
-					return layoutProgressBar(gtx, th, progressDone, progressMax)
+					return layoutProgressBar(gtx, th, progressDone, progressMax, unit.Dp(6))
 				}
 				return layout.Dimensions{}
 			}),

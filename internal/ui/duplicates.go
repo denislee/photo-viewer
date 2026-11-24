@@ -86,6 +86,7 @@ type DuplicatesView struct {
 // goroutines.
 func NewDuplicatesView(idx *cache.Index, store *cache.ThumbStore, thumbs *thumbCache, invalidate func()) *DuplicatesView {
 	d := &DuplicatesView{idx: idx, store: store, thumbs: thumbs, invalidate: invalidate, selected: -1}
+	d.scope.mu = &d.mu
 	d.groupList.Axis = layout.Vertical
 	d.detailList.Axis = layout.Vertical
 	return d
@@ -188,23 +189,13 @@ func (d *DuplicatesView) hashAndScan(ctx context.Context, gen int, cancel contex
 	// pass's own ctx, not whatever d.cancel holds by the time it is clicked:
 	// after a Rescan the old row is still on screen until EnsureHashes
 	// unwinds, and its Cancel must not stop the new pass (U6-14).
-	proc := d.scope.begin(ctx, ProcDuplicates, "Duplicates", cancel)
-	if proc != nil {
-		proc.SetStatus("Hashing files…")
-		// Only claim the shared proc slot if we're still the current pass — a
-		// superseded goroutine must not overwrite the live pass's proc, nor nil
-		// it out on the way down (that's why the defer's keep is gen-gated too).
-		keep := func() bool { return d.gen == gen }
-		d.mu.Lock()
-		d.scope.attachLocked(proc, keep)
-		d.mu.Unlock()
-		defer func() {
-			d.mu.Lock()
-			d.scope.detachLocked(keep)
-			d.mu.Unlock()
-			proc.End()
-		}()
-	}
+	//
+	// Only claim the shared proc slot if we're still the current pass — a
+	// superseded goroutine must not overwrite the live pass's proc, nor nil
+	// it out on the way down (that's why the end func's keep is gen-gated too).
+	keep := func() bool { return d.gen == gen }
+	proc, end := d.scope.beginProc(ctx, ProcDuplicates, "Duplicates", cancel, "Hashing files…", keep)
+	defer end()
 
 	err := d.idx.EnsureHashes(ctx, func(done, total int) {
 		d.mu.Lock()
@@ -658,19 +649,7 @@ func (d *DuplicatesView) layoutProgress(gtx layout.Context, th *Theme, done, tot
 			}),
 			layout.Rigid(layout.Spacer{Height: unit.Dp(10)}.Layout),
 			layout.Rigid(func(gtx layout.Context) layout.Dimensions {
-				w := gtx.Constraints.Max.X
-				barH := gtx.Dp(unit.Dp(14))
-				bg := image.Rect(0, 0, w, barH)
-				paint.FillShape(gtx.Ops, th.CellBG, clip.Rect(bg).Op())
-				if total > 0 {
-					frac := float32(done) / float32(total)
-					frac = min(frac, 1)
-					if frac > 0 {
-						fg := image.Rect(0, 0, int(float32(w)*frac), barH)
-						paint.FillShape(gtx.Ops, th.Accent, clip.Rect(fg).Op())
-					}
-				}
-				return layout.Dimensions{Size: image.Pt(w, barH)}
+				return layoutProgressBar(gtx, th, int64(done), int64(total), unit.Dp(14))
 			}),
 			layout.Rigid(layout.Spacer{Height: unit.Dp(8)}.Layout),
 			layout.Rigid(func(gtx layout.Context) layout.Dimensions {

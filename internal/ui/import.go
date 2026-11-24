@@ -464,7 +464,7 @@ func (v *ImportView) Layout(gtx layout.Context, th *Theme) layout.Dimensions {
 			}),
 			layout.Rigid(layout.Spacer{Height: unit.Dp(8)}.Layout),
 			layout.Rigid(func(gtx layout.Context) layout.Dimensions {
-				return layoutProgressBar(gtx, th, progressDone, progressMax)
+				return layoutProgressBar(gtx, th, progressDone, progressMax, unit.Dp(6))
 			}),
 			layout.Rigid(layout.Spacer{Height: unit.Dp(4)}.Layout),
 			layout.Rigid(func(gtx layout.Context) layout.Dimensions {
@@ -870,22 +870,11 @@ func (v *ImportView) startImport(cfg Config) {
 	importDirs := append([]string(nil), v.importDirs...)
 	zipFiles := append([]string(nil), v.zipFiles...)
 	deleteSrc := v.deleteSource
-	// Register with the process bar so the user can pause / cancel the import
-	// even when the modal is closed. Begin only touches the registry's own
-	// locks (the cancel callback runs later, on user click), so it is safe to
-	// call while holding v.mu — and attachLocked keeps the one proc-slot write
-	// guarded like every other access.
-	if proc := v.scope.begin(ctx, ProcImport, "Import", func() {
-		v.mu.Lock()
-		c := v.cancelImport
-		v.mu.Unlock()
-		if c != nil {
-			c()
-		}
-	}); proc != nil {
-		v.scope.attachLocked(proc, nil)
-	}
 	v.mu.Unlock()
+	// Register with the process bar (outside v.mu — beginProc takes the view
+	// mutex itself) so the user can pause / cancel the import even when the
+	// modal is closed.
+	_, endProc := v.scope.beginProc(ctx, ProcImport, "Import", cancel, "", nil)
 	atomic.StoreInt64(&v.statMoved, 0)
 	atomic.StoreInt64(&v.statSkipped, 0)
 	atomic.StoreInt64(&v.statErrors, 0)
@@ -902,10 +891,8 @@ func (v *ImportView) startImport(cfg Config) {
 			// reading from them. The user can then safely pull the card.
 			mounts := v.sdMounts
 			v.sdMounts = nil
-			proc := v.scope.currentLocked()
-			v.scope.detachLocked(nil)
 			v.mu.Unlock()
-			proc.End()
+			endProc()
 			if len(mounts) > 0 {
 				v.unmountAll(mounts)
 			}
