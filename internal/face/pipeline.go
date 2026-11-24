@@ -424,6 +424,22 @@ func (p *Pipeline) assignAndPersist(j Job, dets []Detection) (changed bool) {
 		p.clusterCacheOK = true
 	}
 
+	// A re-detection replaces the path's previous faces, and WriteFacesForPath
+	// takes those out of their clusters' stored centroids. Mirror that here so
+	// the centroids the ops carry start from the same corrected base and the
+	// old faces aren't counted twice (I-04 6c).
+	for _, old := range p.idx.FacesForPath(j.Entry.Path) {
+		for k := range p.cachedClusters {
+			c := &p.cachedClusters[k]
+			if c.ID != old.ClusterID.Int64 {
+				continue
+			}
+			c.Centroid = cache.CentroidWithout(c.Centroid, old.Embedding, c.Count)
+			c.Count = max(c.Count-1, 0)
+			break
+		}
+	}
+
 	// p.cachedClusters is updated in place below (centroid and count of a
 	// matched cluster, or a newly appended one), so a later face in the same
 	// image is compared against the just-updated state.

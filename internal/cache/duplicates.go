@@ -450,8 +450,12 @@ func (i *Index) FindDuplicates() []DuplicateGroup {
 // RemoveEntry deletes a single row from the index by path, together with any
 // face rows keyed to that path. faces.path references entries.path with no
 // foreign key, so without this the face rows orphan forever: they keep loading
-// on every pipeline start (LoadFaceFreshness) and keep weighting cluster
-// centroids toward files that no longer exist, degrading future clustering.
+// on every pipeline start (LoadFaceFreshness). Deleting the rows alone is not
+// enough to fix the clustering: each removed face is also taken out of its
+// cluster's running-mean centroid (subtractFacesTx), otherwise the centroid
+// keeps weighting toward files that no longer exist (I-04 6c). A running face
+// pipeline's in-memory cluster cache is not told; only pv-scan runs one, and
+// it never deletes.
 func (i *Index) RemoveEntry(path string) error {
 	tx, err := i.db.Begin()
 	if err != nil {
@@ -459,6 +463,9 @@ func (i *Index) RemoveEntry(path string) error {
 	}
 	defer tx.Rollback()
 	if _, err := tx.Exec("DELETE FROM entries WHERE path = ?", path); err != nil {
+		return err
+	}
+	if err := subtractFacesTx(tx, path); err != nil {
 		return err
 	}
 	if _, err := tx.Exec("DELETE FROM faces WHERE path = ?", path); err != nil {
@@ -491,6 +498,9 @@ func (i *Index) RemoveEntries(paths []string) error {
 		return err
 	}
 	defer delFaces.Close()
+	if err := subtractFacesTx(tx, paths...); err != nil {
+		return err
+	}
 	for _, p := range paths {
 		_, _ = delEntry.Exec(p)
 		_, _ = delFaces.Exec(p)

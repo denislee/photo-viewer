@@ -94,7 +94,8 @@ type FaceOpResult struct {
 	ClusterID int64
 }
 
-// WriteFacesForPath wipes existing face rows for path and writes the given
+// WriteFacesForPath wipes existing face rows for path (taking them out of their
+// clusters' centroids first) and writes the given
 // ops in a single transaction (1 fsync per image instead of ~3 per face).
 // thumbMtime, the mtime of the thumbnail detection ran on, is recorded on the
 // entries row in the same transaction, so an image with no faces (nil ops) is
@@ -143,6 +144,12 @@ func (i *Index) WriteFacesForPath(path string, thumbMtime int64, ops []FaceOp) (
 	}
 	defer tx.Rollback()
 
+	// Take the path's previous faces out of their clusters' centroids before
+	// dropping the rows; the ops' UpdatedCentroid values were computed by the
+	// pipeline against the same corrected base (I-04 6c).
+	if err := subtractFacesTx(tx, path); err != nil {
+		return nil, err
+	}
 	del := tx.Stmt(delStmt)
 	defer del.Close()
 	if _, err := del.Exec(path); err != nil {

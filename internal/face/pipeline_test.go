@@ -210,3 +210,36 @@ func TestConcurrentSubmitDuringStopNoPanic(t *testing.T) {
 	}
 	wg.Wait()
 }
+
+// TestReDetectionDoesNotDoubleCount pins I-04 6c on the pipeline side: when a
+// path is re-detected, its previous faces leave the cluster before the new
+// ones join, so the centroid (stored and cached) stays the mean of the
+// distinct faces instead of drifting toward the re-detected one.
+func TestReDetectionDoesNotDoubleCount(t *testing.T) {
+	idx := testIndex(t)
+	p := NewPipeline(idx, nil)
+	job := func(path string, mod int64) Job {
+		return Job{Entry: cache.Entry{Type: scan.TypePhoto, Path: path}, ThumbMod: mod}
+	}
+	p.assignAndPersist(job("/a.jpg", 1), []Detection{{Embedding: axisVec(0)}})
+	p.assignAndPersist(job("/b.jpg", 1), []Detection{{Embedding: axisVec(0.2)}})
+	// Re-detect /a.jpg (e.g. a refreshed thumbnail) with the same face.
+	p.assignAndPersist(job("/a.jpg", 2), []Detection{{Embedding: axisVec(0)}})
+
+	cl := idx.AllClusters()
+	if len(cl) != 1 {
+		t.Fatalf("clusters = %d, want 1", len(cl))
+	}
+	if cl[0].Count != 2 {
+		t.Errorf("count = %d, want 2", cl[0].Count)
+	}
+	if got := cl[0].Centroid[0]; got < 0.0999 || got > 0.1001 {
+		t.Errorf("stored centroid[0] = %v, want 0.1 (the mean of 0 and 0.2)", got)
+	}
+	p.clusterMu.Lock()
+	cached := p.cachedClusters[0]
+	p.clusterMu.Unlock()
+	if cached.Count != 2 || cached.Centroid[0] < 0.0999 || cached.Centroid[0] > 0.1001 {
+		t.Errorf("cached cluster = count %d centroid[0] %v, want 2 / 0.1", cached.Count, cached.Centroid[0])
+	}
+}
