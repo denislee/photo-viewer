@@ -272,7 +272,10 @@ func Load(dbPath string) (*Index, error) {
 	//
 	// v8 (F5-01) adds face_thumb_mtime and backfills it once from the face rows
 	// (the only freshness record before v8).
-	const schemaVersion = 8
+	//
+	// v9 (face recognition plan) adds the durable people/face_tags tables and
+	// the faces/face_clusters identity columns — see migrateV9 (migrate_v9.go).
+	const schemaVersion = 9
 	// A failed read must not be taken as version 0: that would re-run the
 	// destructive migrations (v1 NULLs quick_hash, v4 deletes the faces).
 	userVersion, err := readUserVersion(db)
@@ -391,6 +394,11 @@ func Load(dbPath string) (*Index, error) {
 		_, _ = db.Exec(`UPDATE entries SET face_thumb_mtime =
 			(SELECT MAX(thumb_mtime) FROM faces WHERE faces.path = entries.path)
 			WHERE face_thumb_mtime IS NULL AND path IN (SELECT path FROM faces)`)
+	}
+
+	if err := migrateV9(db, userVersion); err != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("schema v9: %w", err)
 	}
 
 	if userVersion < schemaVersion {

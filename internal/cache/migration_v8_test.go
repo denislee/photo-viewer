@@ -58,8 +58,8 @@ func TestMigrationV8BackfillsFaceFreshness(t *testing.T) {
 		t.Fatalf("v7 -> v8 upgrade: %v", err)
 	}
 	defer idx2.Close()
-	if uv := userVersion(t, idx2); uv != 8 {
-		t.Errorf("user_version = %d after upgrade, want 8", uv)
+	if uv := userVersion(t, idx2); uv != 9 {
+		t.Errorf("user_version = %d after upgrade, want 9", uv)
 	}
 	if !hasColumn(t, idx2, "entries", "face_thumb_mtime") {
 		t.Error("entries.face_thumb_mtime should exist after v7 -> v8 upgrade")
