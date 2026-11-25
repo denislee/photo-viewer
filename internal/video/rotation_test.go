@@ -15,8 +15,8 @@ func TestRotationVF(t *testing.T) {
 		{"45", ""},
 		{"-90", ""},
 	} {
-		if got := rotationVF(tc.rot); got != tc.want {
-			t.Errorf("rotationVF(%q) = %q, want %q", tc.rot, got, tc.want)
+		if got := rotationFilters[tc.rot]; got != tc.want {
+			t.Errorf("rotationFilters[%q] = %q, want %q", tc.rot, got, tc.want)
 		}
 	}
 }

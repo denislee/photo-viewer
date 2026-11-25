@@ -127,24 +127,6 @@ func (a *asyncRender) reset() {
 	a.mu.Unlock()
 }
 
-// sizeRGBA returns buf resized to w×h, reusing its backing array when it is
-// big enough, with the alpha bytes set to 0xff (see ensureBuf).
-func sizeRGBA(buf *image.RGBA, w, h int) *image.RGBA {
-	if buf != nil && buf.Rect.Dx() == w && buf.Rect.Dy() == h {
-		return buf
-	}
-	need := 4 * w * h
-	if buf != nil && cap(buf.Pix) >= need {
-		buf = &image.RGBA{Pix: buf.Pix[:need], Stride: 4 * w, Rect: image.Rect(0, 0, w, h)}
-	} else {
-		buf = image.NewRGBA(image.Rect(0, 0, w, h))
-	}
-	for i := 3; i < len(buf.Pix); i += 4 {
-		buf.Pix[i] = 0xff
-	}
-	return buf
-}
-
 // renderLoop is the dedicated render goroutine. It is locked to one OS
 // thread so the EGL make-current / restore pair in render_gl never touches a
 // thread Gio renders on.
@@ -176,7 +158,7 @@ func (p *Player) renderLoop(a *asyncRender) {
 func (p *Player) renderAsyncFrame(a *asyncRender) bool {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if p.closed.Load() || !p.loaded.Load() || p.ctx == nil || p.gl == nil {
+	if p.closed.Load() || !p.isLoaded() || p.ctx == nil || p.gl == nil {
 		return false
 	}
 	slot, buf, w, h, ok := a.beginWrite()

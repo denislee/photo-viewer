@@ -347,10 +347,6 @@ static int render_gl(pv_gl *g, mpv_render_context *ctx, int w, int h, void *dst)
     return rc;
 }
 
-static int command_str(mpv_handle *h, const char *s) {
-    return mpv_command_string(h, s);
-}
-
 static int loadfile(mpv_handle *h, const char *path) {
     const char *cmd[3];
     cmd[0] = "loadfile";
@@ -366,20 +362,6 @@ static int seek_async(mpv_handle *h, const char *amount) {
     const char *cmd[4];
     cmd[0] = "seek"; cmd[1] = amount; cmd[2] = "relative+exact"; cmd[3] = NULL;
     return mpv_command_async(h, 0, cmd);
-}
-
-// get_int64 reads an int64 mpv property. Used for the decoded frame size on
-// MPV_EVENT_VIDEO_RECONFIG.
-static int get_int64(mpv_handle *h, const char *name, int64_t *out) {
-    return mpv_get_property(h, name, MPV_FORMAT_INT64, out);
-}
-
-// request_log asks mpv to deliver log messages at min_level and above as
-// MPV_EVENT_LOG_MESSAGE events on the normal event queue, where drainEvents
-// picks them up. Used purely for crash diagnostics: an internal libmpv
-// assertion is usually preceded by an error-level log line.
-static int request_log(mpv_handle *h, const char *min_level) {
-    return mpv_request_log_messages(h, min_level);
 }
 */
 import "C"
@@ -414,7 +396,7 @@ type Player struct {
 
 	invalidate func()
 
-	// mu guards buf / current / loaded / ctx / gl and serialises Render (and
+	// mu guards buf / current / ctx / gl and serialises Render (and
 	// the async render goroutine, which writes buf's sibling slots) against
 	// Load / Stop / Close. It is deliberately NOT held around mpv commands:
 	// libmpv's client API is thread-safe, and holding it there would block the
@@ -425,12 +407,11 @@ type Player struct {
 	mu        sync.Mutex
 	buf       *image.RGBA // reused across frames; Pix capacity reused across size changes, freed on Stop
 	closed    atomic.Bool
-	loaded    atomic.Bool
 	drainDone chan struct{} // closed when drainEvents returns
 
 	// cmdMu guards the lifetime of p.h against the command helpers. It is
-	// read-held by TogglePause, ToggleMute and SeekRelative around their mpv
-	// call so the handle can't be destroyed under them; Close takes the write
+	// read-held by command and SeekRelative around their mpv call so the
+	// handle can't be destroyed under them; Close takes the write
 	// side (after setting closed, before mpv_terminate_destroy) to wait them
 	// out. Load and Stop also read-hold it while they hold mu and call into
 	// p.h. Lock order is mu then cmdMu, never the other way round.
@@ -633,7 +614,7 @@ func New(invalidate func()) (*Player, error) {
 	// it logs first lands in the log immediately above the Go crash dump,
 	// which is the only breadcrumb a C-side abort() leaves behind.
 	lvl := C.CString("warn")
-	C.request_log(h, lvl)
+	C.mpv_request_log_messages(h, lvl)
 	C.free(unsafe.Pointer(lvl))
 
 	p := &Player{h: h, invalidate: invalidate, drainDone: make(chan struct{})}
@@ -701,7 +682,7 @@ func (p *Player) Load(path string) error {
 	// Idempotent: the UI goroutine (playVideo) and the background preload
 	// goroutine both call Load for the same entry, so without this guard a
 	// race between their Current() checks would issue two loadfile commands
-	// and double-write current/loaded. Holding mu makes the check-and-load
+	// and double-write current. Holding mu makes the check-and-load
 	// atomic and collapses the duplicate into a no-op.
 	if cur := p.current.Load(); cur != nil && *cur == path {
 		return nil
@@ -718,7 +699,6 @@ func (p *Player) Load(path string) error {
 	}
 	pathCopy := path
 	p.current.Store(&pathCopy)
-	p.loaded.Store(true)
 	p.updatePending.Store(true)
 	if p.async != nil {
 		p.async.kick()
@@ -734,15 +714,10 @@ func (p *Player) Stop() {
 	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	p.cmdMu.RLock()
-	defer p.cmdMu.RUnlock()
-	if p.closed.Load() || !p.loaded.Load() {
+	if p.closed.Load() || !p.isLoaded() {
 		return
 	}
-	cs := C.CString("stop")
-	defer C.free(unsafe.Pointer(cs))
-	C.command_str(p.h, cs)
-	p.loaded.Store(false)
+	p.command("stop")
 	p.current.Store(nil)
 	p.nativeW.Store(0)
 	p.nativeH.Store(0)
@@ -755,34 +730,35 @@ func (p *Player) Stop() {
 	}
 }
 
-// TogglePause toggles the pause property.
-func (p *Player) TogglePause() {
+// command runs an mpv command string under cmdMu's read lock, unless the
+// player is closed. It reports whether the command was issued.
+func (p *Player) command(s string) bool {
 	if p == nil {
-		return
+		return false
 	}
 	p.cmdMu.RLock()
 	defer p.cmdMu.RUnlock()
 	if p.closed.Load() {
-		return
+		return false
 	}
-	cs := C.CString("cycle pause")
+	cs := C.CString(s)
 	defer C.free(unsafe.Pointer(cs))
-	C.command_str(p.h, cs)
+	return C.mpv_command_string(p.h, cs) >= 0
+}
+
+// isLoaded reports whether a file is currently loaded into mpv.
+func (p *Player) isLoaded() bool {
+	return p.current.Load() != nil
+}
+
+// TogglePause toggles the pause property.
+func (p *Player) TogglePause() {
+	p.command("cycle pause")
 }
 
 // ToggleMute toggles the mute property.
 func (p *Player) ToggleMute() {
-	if p == nil {
-		return
-	}
-	p.cmdMu.RLock()
-	defer p.cmdMu.RUnlock()
-	if p.closed.Load() {
-		return
-	}
-	cs := C.CString("cycle mute")
-	defer C.free(unsafe.Pointer(cs))
-	C.command_str(p.h, cs)
+	p.command("cycle mute")
 }
 
 // SeekRelative seeks by delta seconds relative to the current position.
@@ -820,7 +796,7 @@ func (p *Player) Current() string {
 // again. Returns (nil, false) when nothing is loaded or the buffer can't
 // be sized.
 func (p *Player) Render(w, h int) (*image.RGBA, bool) {
-	if p == nil || p.closed.Load() || !p.loaded.Load() {
+	if p == nil || p.closed.Load() || !p.isLoaded() {
 		return nil, false
 	}
 	if w <= 0 || h <= 0 {
@@ -879,27 +855,33 @@ func (p *Player) renderGLInto(buf *image.RGBA, w, h int) int {
 // to 0xff once per (re)size — the per-frame loop that used to scan every pixel
 // (~480 MB/s of writes at 1080p60) is gone. Caller must hold p.mu.
 func (p *Player) ensureBuf(w, h int) {
-	if p.buf != nil && p.buf.Rect.Dx() == w && p.buf.Rect.Dy() == h {
-		return // already the right size; alpha column already 0xff
+	p.buf = sizeRGBA(p.buf, w, h)
+}
+
+// sizeRGBA returns buf resized to w×h, reusing its backing array when it is
+// big enough, with the alpha bytes set to 0xff (see ensureBuf).
+func sizeRGBA(buf *image.RGBA, w, h int) *image.RGBA {
+	if buf != nil && buf.Rect.Dx() == w && buf.Rect.Dy() == h {
+		return buf // already the right size; alpha column already 0xff
 	}
 	// RGBA with no row padding: stride is exactly 4*w and the buffer is
 	// 4*w*h bytes, matching image.NewRGBA's own layout.
 	need := 4 * w * h
-	if p.buf != nil && cap(p.buf.Pix) >= need {
+	if buf != nil && cap(buf.Pix) >= need {
 		// Reslice the existing backing array (valid since need <= cap) and
 		// rebuild the header for the new dimensions.
-		p.buf = &image.RGBA{
-			Pix:    p.buf.Pix[:need],
+		buf = &image.RGBA{
+			Pix:    buf.Pix[:need],
 			Stride: 4 * w,
 			Rect:   image.Rect(0, 0, w, h),
 		}
 	} else {
-		p.buf = image.NewRGBA(image.Rect(0, 0, w, h))
+		buf = image.NewRGBA(image.Rect(0, 0, w, h))
 	}
-	pix := p.buf.Pix
-	for i := 3; i < len(pix); i += 4 {
-		pix[i] = 0xff
+	for i := 3; i < len(buf.Pix); i += 4 {
+		buf.Pix[i] = 0xff
 	}
+	return buf
 }
 
 // NeedsRedraw reports whether mpv has signalled a new frame since the
@@ -1058,7 +1040,7 @@ func (p *Player) readNativeSize() {
 		cn := C.CString(name)
 		defer C.free(unsafe.Pointer(cn))
 		var v C.int64_t
-		if rc := C.get_int64(p.h, cn, &v); rc < 0 {
+		if rc := C.mpv_get_property(p.h, cn, C.MPV_FORMAT_INT64, unsafe.Pointer(&v)); rc < 0 {
 			return 0, false
 		}
 		return int64(v), true
@@ -1090,13 +1072,6 @@ var rotationFilters = map[string]string{
 	"270": "lavfi=[transpose=cclock]",
 }
 
-// rotationVF returns the vf value applyRotation sets for a demux-rotation
-// property value: the transpose chain for a right angle, "" (clear the
-// chain) for everything else.
-func rotationVF(rot string) string {
-	return rotationFilters[rot]
-}
-
 // applyRotation replaces the vf chain with the transpose matching the
 // current video track's rotation metadata (see the video-rotate=no comment
 // in New for why mpv can't do this itself). Always sets vf, so a rotated
@@ -1113,7 +1088,7 @@ func (p *Player) applyRotation() {
 	}
 	vfName := C.CString("vf")
 	defer C.free(unsafe.Pointer(vfName))
-	vf := C.CString(rotationVF(rot))
+	vf := C.CString(rotationFilters[rot])
 	defer C.free(unsafe.Pointer(vf))
 	if rc := C.mpv_set_property_string(p.h, vfName, vf); rc < 0 {
 		log.Printf("video: set vf for rotation %q: %s", rot, C.GoString(C.mpv_error_string(rc)))
