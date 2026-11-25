@@ -116,16 +116,11 @@ type Viewer struct {
 	// stale-checks load it instead of touching Index.
 	curIdx atomic.Int64
 
-	// Decoded dimensions are cached per path. Decoding happens off the UI
-	// goroutine so opening the viewer doesn't stutter on big originals.
-	dimMu    sync.Mutex
-	dimCache map[string]string
-	dimAsked map[string]bool
-
-	// Media info (created, camera, lens) is fetched in the background.
-	infoMu    sync.Mutex
-	infoCache map[string]cachedInfo
-	infoAsked map[string]bool
+	// Decoded dimensions and media info (created, camera, lens) are cached
+	// per path and fetched off the UI goroutine, each memo by one shared
+	// worker, so opening the viewer doesn't stutter on big originals.
+	dims asyncMemo[string]
+	info asyncMemo[cachedInfo]
 
 	// infoRows is the info panel's formatted text, rebuilt only when infoKey
 	// changes (G3-03); infoBuilds counts rebuilds for tests. UI goroutine only.
@@ -197,9 +192,8 @@ const (
 // behind the current index before the prefetch is cancelled.
 const viewerStaleDistance = 2
 
-// viewerMetaCap is the soft cap on entries in dimCache/infoCache (and their
-// "already asked" sidecars). The maps are bulk-cleared when they exceed the
-// cap so the viewer's metadata cache can't grow unboundedly as the user
+// viewerMetaCap is the soft cap on entries in the viewer's dims/info memos.
+// Their ready values are bulk-cleared when they reach the cap so the viewer's metadata cache can't grow unboundedly as the user
 // pages through a large library. Recomputing is cheap (one ExifTool / image
 // header read) so a periodic clear is preferable to running a full LRU.
 const viewerMetaCap = 1024
@@ -947,42 +941,12 @@ func buildInfoRows(e cache.Entry, info cachedInfo, dims string) []infoRow {
 }
 
 // dimensionsFor returns a "WxH" string for image entries, "—" for video/RAW/
-// HEIC, or "…" while a background decode is still running. The decode is
-// kicked off lazily once per path.
+// HEIC, or "…" while the background decode is still running.
 func (v *Viewer) dimensionsFor(e cache.Entry) string {
 	if e.Type == scan.TypeRAW || e.Type == scan.TypeHEIC || e.Type == scan.TypeVideo {
 		return "—"
 	}
-	v.dimMu.Lock()
-	if v.dimCache == nil {
-		v.dimCache = map[string]string{}
-		v.dimAsked = map[string]bool{}
-	}
-	if cached, ok := v.dimCache[e.Path]; ok {
-		v.dimMu.Unlock()
-		return cached
-	}
-	if v.dimAsked[e.Path] {
-		v.dimMu.Unlock()
-		return "…"
-	}
-	v.dimAsked[e.Path] = true
-	v.dimMu.Unlock()
-
-	go func(path string) {
-		dim := decodeDimensions(path)
-		v.dimMu.Lock()
-		if len(v.dimCache) >= viewerMetaCap {
-			v.dimCache = map[string]string{}
-			v.dimAsked = map[string]bool{}
-		}
-		v.dimCache[path] = dim
-		v.dimMu.Unlock()
-		if v.invalidate != nil {
-			v.invalidate()
-		}
-	}(e.Path)
-	return "…"
+	return v.dims.get(e.Path, "…", decodeDimensions, v.invalidate)
 }
 
 func decodeDimensions(path string) string {
@@ -1023,48 +987,24 @@ func decodeDimensions(path string) string {
 // pendingInfo is shown while the background metadata fetch runs.
 var pendingInfo = cachedInfo{Created: "…", Camera: "…", Lens: "…", Aperture: "…", ShutterSpeed: "…", ISO: "…", FocalLength: "…"}
 
-// mediaInfoFor returns the extended metadata for the entry, or empty/placeholder
-// values while a background fetch is still running.
+// mediaInfoFor returns the extended metadata for the entry, or pendingInfo
+// while the background fetch is still running.
 func (v *Viewer) mediaInfoFor(e cache.Entry) cachedInfo {
-	v.infoMu.Lock()
-	if v.infoCache == nil {
-		v.infoCache = map[string]cachedInfo{}
-		v.infoAsked = map[string]bool{}
-	}
-	if cached, ok := v.infoCache[e.Path]; ok {
-		v.infoMu.Unlock()
-		return cached
-	}
-	if v.infoAsked[e.Path] {
-		v.infoMu.Unlock()
-		return pendingInfo
-	}
-	v.infoAsked[e.Path] = true
-	v.infoMu.Unlock()
+	return v.info.get(e.Path, pendingInfo, fetchMediaInfo, v.invalidate)
+}
 
-	go func(path string) {
-		info := scan.GetMediaInfo(path)
-		c := cachedInfo{
-			Created:      info.Created.Local().Format("2006-01-02 15:04:05"),
-			Camera:       cmp.Or(info.Camera, "—"),
-			Lens:         cmp.Or(info.Lens, "—"),
-			Aperture:     cmp.Or(info.Aperture, "—"),
-			ShutterSpeed: cmp.Or(info.ShutterSpeed, "—"),
-			ISO:          cmp.Or(info.ISO, "—"),
-			FocalLength:  cmp.Or(info.FocalLength, "—"),
-		}
-		v.infoMu.Lock()
-		if len(v.infoCache) >= viewerMetaCap {
-			v.infoCache = map[string]cachedInfo{}
-			v.infoAsked = map[string]bool{}
-		}
-		v.infoCache[path] = c
-		v.infoMu.Unlock()
-		if v.invalidate != nil {
-			v.invalidate()
-		}
-	}(e.Path)
-	return pendingInfo
+// fetchMediaInfo reads path's metadata into the info panel's display form.
+func fetchMediaInfo(path string) cachedInfo {
+	info := scan.GetMediaInfo(path)
+	return cachedInfo{
+		Created:      info.Created.Local().Format("2006-01-02 15:04:05"),
+		Camera:       cmp.Or(info.Camera, "—"),
+		Lens:         cmp.Or(info.Lens, "—"),
+		Aperture:     cmp.Or(info.Aperture, "—"),
+		ShutterSpeed: cmp.Or(info.ShutterSpeed, "—"),
+		ISO:          cmp.Or(info.ISO, "—"),
+		FocalLength:  cmp.Or(info.FocalLength, "—"),
+	}
 }
 
 // opOffset is a thin wrapper around op.Offset so defer Pop() reads cleanly

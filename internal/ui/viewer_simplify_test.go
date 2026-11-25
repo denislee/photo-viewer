@@ -84,7 +84,7 @@ func TestHEICStageDirUnderCacheDir(t *testing.T) {
 
 func TestMediaInfoPlaceholder(t *testing.T) {
 	v := &Viewer{}
-	// The first call primes infoAsked and starts the background fetch; the
+	// The first call queues the path for the info memo's worker; the
 	// value it returns is the shared placeholder.
 	if got := v.mediaInfoFor(cache.Entry{Path: "/nonexistent/x.jpg"}); got != pendingInfo {
 		t.Fatalf("first mediaInfoFor = %+v; want pendingInfo %+v", got, pendingInfo)

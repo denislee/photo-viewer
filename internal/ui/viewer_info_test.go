@@ -20,8 +20,7 @@ func TestInfoPanelRowsMemoized(t *testing.T) {
 	e := cache.Entry{Path: "/lib/clip.mp4", Type: scan.TypeVideo, Size: 1 << 20, ModTime: time.Unix(1700000000, 0)}
 	v := &Viewer{}
 	// Seed the metadata so no background fetch runs.
-	v.infoCache = map[string]cachedInfo{e.Path: {Created: "2024-01-01 00:00:00", Camera: "—", Lens: "—", Aperture: "—", ShutterSpeed: "—", ISO: "—", FocalLength: "—"}}
-	v.infoAsked = map[string]bool{}
+	v.info.set(e.Path, cachedInfo{Created: "2024-01-01 00:00:00", Camera: "—", Lens: "—", Aperture: "—", ShutterSpeed: "—", ISO: "—", FocalLength: "—"})
 
 	frame := func(e cache.Entry) {
 		gtx := layout.Context{
