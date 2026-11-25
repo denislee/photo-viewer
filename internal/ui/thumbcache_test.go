@@ -49,7 +49,7 @@ func entrySnapshot(tc *thumbCache, path string) (exists, failed, queued bool, fa
 		return false, false, false, 0, time.Time{}
 	}
 	te := el.Value.(*thumbEntry)
-	return true, te.failed, te.queued, te.failCount, te.retryAfter
+	return true, te.failCount > 0, te.queued, te.failCount, te.retryAfter
 }
 
 // TestThumbCacheFailureBackoff verifies that a thumbnail whose generation fails
@@ -170,7 +170,7 @@ func TestThumbCacheGetLargeReadyAllocFree(t *testing.T) {
 	tc.capPerShard.Store(64)
 
 	p := "/x/large.jpg"
-	k := tierKey(p, tierLarge)
+	k := thumbKey{path: p, tier: tierLarge}
 	sh := tc.shardFor(k)
 	sh.mu.Lock()
 	te := tc.touchOrCreate(sh, k)
@@ -238,11 +238,11 @@ func newBareThumbCache(capPerShard int) *thumbCache {
 
 // sameShardKeys returns n small-tier keys that all hash to one shard.
 func sameShardKeys(tc *thumbCache, n int) []thumbKey {
-	first := tierKey(fmt.Sprintf("/x/%d.jpg", 0), tierSmall)
+	first := thumbKey{path: fmt.Sprintf("/x/%d.jpg", 0), tier: tierSmall}
 	sh := tc.shardFor(first)
 	keys := []thumbKey{first}
 	for i := 1; len(keys) < n; i++ {
-		k := tierKey(fmt.Sprintf("/x/%d.jpg", i), tierSmall)
+		k := thumbKey{path: fmt.Sprintf("/x/%d.jpg", i), tier: tierSmall}
 		if tc.shardFor(k) == sh {
 			keys = append(keys, k)
 		}
@@ -367,7 +367,7 @@ func TestThumbCacheEnsureCapacityShrinks(t *testing.T) {
 // entry was evicted mid-flight is reinserted ready, sized and un-queued.
 func TestThumbCacheFinishReinsertsEvicted(t *testing.T) {
 	tc := newBareThumbCache(4)
-	k := tierKey("/x/finished.jpg", tierSmall)
+	k := thumbKey{path: "/x/finished.jpg", tier: tierSmall}
 	if has(tc, k) {
 		t.Fatal("key present before finish")
 	}
@@ -398,7 +398,7 @@ func TestThumbCacheCoalescesInvalidates(t *testing.T) {
 	// race with finish's non-blocking send, so let the goroutine leak.
 
 	for i := range 50 {
-		k := tierKey(fmt.Sprintf("/x/coalesce/%d.jpg", i), tierSmall)
+		k := thumbKey{path: fmt.Sprintf("/x/coalesce/%d.jpg", i), tier: tierSmall}
 		tc.finish(thumbJob{key: k}, paint.ImageOp{}, image.Pt(1, 1), true)
 	}
 	deadline := time.Now().Add(2 * time.Second)

@@ -3,6 +3,7 @@ package ui
 import (
 	"image"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -160,7 +161,11 @@ type searchResult struct {
 	score int
 }
 
-type searchRowTag struct{ idx int }
+// searchRowTag is the pointer target for one result row. It carries no state:
+// the row it belongs to is identified by its index in rowTags, and the click
+// loop reads the selection straight from that index. Not zero-size, for the
+// same pointer-identity reason as sidebarTag.
+type searchRowTag struct{ _ byte }
 
 // NewFuzzySearchView wires the palette to the index. The index is read
 // lazily on Show, so the view stays cheap to construct.
@@ -441,8 +446,10 @@ func scoreCandidate(ql string, c searchCandidate) (int, bool) {
 }
 
 // appendFuzzyResult scores candidate c (at index i) against the lowercased
-// query ql and appends a searchResult to out when it matches. Used by the
-// incremental narrowing path, which reuses the scores' idx values.
+// query ql and appends a searchResult to out when it matches. Since G5-01 only
+// the incremental narrowing path uses it: it re-scores the previous pass's
+// results, keeping their idx values, where the full scan scores in place and
+// keeps a bounded heap (see topSearchResults).
 func appendFuzzyResult(out []searchResult, ql string, i int, c searchCandidate) []searchResult {
 	if sc, ok := scoreCandidate(ql, c); ok {
 		return append(out, searchResult{idx: i, score: sc})
@@ -499,18 +506,11 @@ func siftDownWorst(h []searchResult, i int, candidates []searchCandidate) {
 
 // topSearchResults returns the k best matches for the lowercased query ql, in
 // sortSearchResults order, plus the total number of matches seen (which may
-// exceed k). It scores every candidate once and keeps a bounded max-heap whose
-// root is the worst kept result, so a broad query costs O(n log k) instead of
-// O(n log n) (G5-01).
+// exceed k). k must be positive — every caller passes searchResultCap. It
+// scores every candidate once and keeps a bounded max-heap whose root is the
+// worst kept result, so a broad query costs O(n log k) instead of O(n log n)
+// (G5-01).
 func topSearchResults(ql string, candidates []searchCandidate, k int) (top []searchResult, matched int) {
-	if k <= 0 {
-		for _, c := range candidates {
-			if _, ok := scoreCandidate(ql, c); ok {
-				matched++
-			}
-		}
-		return nil, matched
-	}
 	heap := make([]searchResult, 0, min(k, len(candidates)))
 	for i, c := range candidates {
 		sc, ok := scoreCandidate(ql, c)
@@ -539,11 +539,15 @@ func topSearchResults(ql string, candidates []searchCandidate, k int) (top []sea
 // deterministic). Shared so the incremental and full scans produce identical
 // ordering.
 func sortSearchResults(out []searchResult, candidates []searchCandidate) {
-	sort.Slice(out, func(i, j int) bool {
-		if out[i].score != out[j].score {
-			return out[i].score < out[j].score
+	slices.SortFunc(out, func(a, b searchResult) int {
+		switch {
+		case betterResult(a, b, candidates):
+			return -1
+		case betterResult(b, a, candidates):
+			return 1
+		default:
+			return 0
 		}
-		return candidates[out[i].idx].rel < candidates[out[j].idx].rel
 	})
 }
 
@@ -648,7 +652,6 @@ func (v *FuzzySearchView) Layout(gtx layout.Context, th *Theme) layout.Dimension
 		if v.rowTags[i] == nil {
 			v.rowTags[i] = &searchRowTag{}
 		}
-		v.rowTags[i].idx = i
 	}
 	// Drain click events only for the rows laid out last frame. Results
 	// outside the visible window can't have received new pointer events (they
@@ -665,7 +668,7 @@ func (v *FuzzySearchView) Layout(gtx layout.Context, th *Theme) layout.Dimension
 				break
 			}
 			if pe, ok := ev.(pointer.Event); ok && pe.Kind == pointer.Release && pe.Buttons == pointer.ButtonPrimary {
-				v.selected = t.idx
+				v.selected = i
 				v.Activate()
 			}
 		}

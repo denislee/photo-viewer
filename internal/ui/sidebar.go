@@ -89,11 +89,12 @@ const (
 	rowYear
 )
 
-type sidebarTag struct {
-	path string
-	kind sidebarRowKind
-	year string // populated for rowYear, identifies which bucket to toggle
-}
+// sidebarTag is the pointer target for one row. It carries no row state: the
+// row it belongs to is identified by its index in tags, and the click loop
+// reads the row straight from the rows slice. It must not be zero-size: Go may
+// give every new zero-size value the same address, and Gio routes pointer
+// events by tag identity, so all rows would share one click target.
+type sidebarTag struct{ _ byte }
 
 func NewSidebar() *Sidebar {
 	s := &Sidebar{expandedYears: map[string]bool{}}
@@ -122,18 +123,8 @@ type sidebarRow struct {
 	// indent is the visual indent in 12dp units; used so date subdirs nested
 	// under a year header are clearly children.
 	indent int
-	// favorite is true for the synthetic Favorites row so the renderer can
-	// draw a star icon (the unicode glyph rendered as an empty box on some
-	// systems).
-	favorite bool
-	// trash is true for the synthetic Trash row so the renderer can draw
-	// a trash-can icon instead of a star.
-	trash bool
-	// hasCount/count is precomputed so the renderer doesn't need the counts
-	// map at draw time (year totals are summed across child date folders).
-	hasCount bool
-	count    int
-	// countLabel is strconv.Itoa(count) when hasCount, built once per
+	// countLabel is the formatted recursive file count, or "" when the row has
+	// no count (the renderer then draws no count at all). Built once per
 	// buildRows slow path so the renderer doesn't format per row per frame.
 	countLabel string
 	// yearDirs lists the date subdirs grouped under a rowYear header,
@@ -141,6 +132,15 @@ type sidebarRow struct {
 	// into the grid without expanding the bucket.
 	yearDirs []string
 }
+
+// isFavorite reports whether r is the synthetic Favorites row, which the
+// renderer draws with a star icon (the unicode glyph rendered as an empty box
+// on some systems). FavoritesView is a sentinel no real path can equal.
+func (r sidebarRow) isFavorite() bool { return r.path == FavoritesView }
+
+// isTrash reports whether r is the synthetic Trash row, drawn with a
+// trash-can icon instead of a star.
+func (r sidebarRow) isTrash() bool { return r.path == TrashView }
 
 // Layout draws the sidebar entries. treeDir is the path the tree is rendered
 // around (parent + listed subdirs). highlight is the path to render with the
@@ -162,9 +162,6 @@ func (s *Sidebar) Layout(gtx layout.Context, th *Theme, root, treeDir, highlight
 		if s.tags[i] == nil {
 			s.tags[i] = &sidebarTag{}
 		}
-		s.tags[i].path = rows[i].path
-		s.tags[i].kind = rows[i].kind
-		s.tags[i].year = rows[i].year
 	}
 	if s.Selected >= len(rows) {
 		s.Selected = len(rows) - 1
@@ -189,12 +186,13 @@ func (s *Sidebar) Layout(gtx layout.Context, th *Theme, root, treeDir, highlight
 				break
 			}
 			if pe, ok := ev.(pointer.Event); ok && pe.Kind == pointer.Release && pe.Buttons == pointer.ButtonPrimary {
-				switch t.kind {
+				r := rows[i]
+				switch r.kind {
 				case rowYear:
-					s.toggleYear(t.year)
+					s.toggleYear(r.year)
 				default:
 					if s.OnPick != nil {
-						s.OnPick(t.path)
+						s.OnPick(r.path)
 					}
 				}
 			}
@@ -210,7 +208,7 @@ func (s *Sidebar) Layout(gtx layout.Context, th *Theme, root, treeDir, highlight
 		focused := s.KeyboardFocus && i == s.Selected
 		r := rows[i]
 		active := r.kind == rowPath && r.path == highlight
-		return drawSidebarRow(gtx, th, r.label, r.countLabel, active, focused, r.indent, r.favorite, r.trash, s.tags[i])
+		return drawSidebarRow(gtx, th, r, active, focused, s.tags[i])
 	})
 }
 
@@ -244,11 +242,6 @@ func (s *Sidebar) buildRows(root, treeDir string, subdirs []string, counts map[s
 	// Store a clone of subdirs (the caller may mutate/reuse its backing array)
 	// so the stored key reflects exactly the input that produced these rows.
 	defer func() {
-		for i := range rows {
-			if rows[i].hasCount {
-				rows[i].countLabel = strconv.Itoa(rows[i].count)
-			}
-		}
 		s.memoRoot, s.memoTreeDir = root, treeDir
 		s.memoSubdirs = slices.Clone(subdirs)
 		s.memoCountsVer = countsVer
@@ -258,8 +251,8 @@ func (s *Sidebar) buildRows(root, treeDir string, subdirs []string, counts map[s
 	}()
 
 	rows = []sidebarRow{
-		{label: "Favorites", path: FavoritesView, kind: rowPath, favorite: true},
-		{label: "Trash", path: TrashView, kind: rowPath, trash: true},
+		{label: "Favorites", path: FavoritesView, kind: rowPath},
+		{label: "Trash", path: TrashView, kind: rowPath},
 		{label: filepath.Base(root), path: root, kind: rowPath},
 	}
 	// Count for synthetic rows comes from the same counts map the controller
@@ -267,10 +260,10 @@ func (s *Sidebar) buildRows(root, treeDir string, subdirs []string, counts map[s
 	// inlining further down for subdirs; do the same for our two sentinels.
 	if counts != nil {
 		if n, ok := counts[FavoritesView]; ok {
-			rows[0].hasCount, rows[0].count = true, n
+			rows[0].countLabel = strconv.Itoa(n)
 		}
 		if n, ok := counts[TrashView]; ok {
-			rows[1].hasCount, rows[1].count = true, n
+			rows[1].countLabel = strconv.Itoa(n)
 		}
 	}
 	if treeDir != root {
@@ -280,7 +273,7 @@ func (s *Sidebar) buildRows(root, treeDir string, subdirs []string, counts map[s
 		r := sidebarRow{label: label, path: path, kind: rowPath, indent: indent}
 		if counts != nil {
 			if n, ok := counts[path]; ok {
-				r.hasCount, r.count = true, n
+				r.countLabel = strconv.Itoa(n)
 			}
 		}
 		return r
@@ -343,9 +336,10 @@ func (s *Sidebar) buildRows(root, treeDir string, subdirs []string, counts map[s
 			label:    marker + "  " + y,
 			kind:     rowYear,
 			year:     y,
-			hasCount: b.hasAny,
-			count:    b.total,
 			yearDirs: append([]string(nil), b.dirs...),
+		}
+		if b.hasAny {
+			header.countLabel = strconv.Itoa(b.total)
 		}
 		rows = append(rows, header)
 		if !expanded {
@@ -360,9 +354,6 @@ func (s *Sidebar) buildRows(root, treeDir string, subdirs []string, counts map[s
 
 // toggleYear flips the expansion state for the given year header.
 func (s *Sidebar) toggleYear(year string) {
-	if s.expandedYears == nil {
-		s.expandedYears = map[string]bool{}
-	}
 	s.expandedYears[year] = !s.expandedYears[year]
 	s.expandedRev++
 }
@@ -482,8 +473,10 @@ func (s *Sidebar) Activate() bool {
 	}
 }
 
-func drawSidebarRow(gtx layout.Context, th *Theme, label, countLabel string, active, focused bool, indent int, favorite, trash bool, tag *sidebarTag) layout.Dimensions {
-	leftDp := 10 + indent*14
+// drawSidebarRow renders one sidebar row: its label, count and (for the
+// synthetic Favorites/Trash rows) an icon, over the active/focused background.
+func drawSidebarRow(gtx layout.Context, th *Theme, r sidebarRow, active, focused bool, tag *sidebarTag) layout.Dimensions {
+	leftDp := 10 + r.indent*14
 	pad := layout.Inset{Top: unit.Dp(6), Bottom: unit.Dp(6), Left: unit.Dp(float32(leftDp)), Right: unit.Dp(10)}
 
 	totalW := gtx.Constraints.Max.X
@@ -505,10 +498,10 @@ func drawSidebarRow(gtx layout.Context, th *Theme, label, countLabel string, act
 				var ic *widget.Icon
 				color := th.Muted
 				switch {
-				case favorite && th.Icons.Star != nil:
+				case r.isFavorite() && th.Icons.Star != nil:
 					ic = th.Icons.Star
 					color = favoriteGold
-				case trash && th.Icons.Trash != nil:
+				case r.isTrash() && th.Icons.Trash != nil:
 					ic = th.Icons.Trash
 				}
 				if ic == nil {
@@ -521,17 +514,17 @@ func drawSidebarRow(gtx layout.Context, th *Theme, label, countLabel string, act
 				})
 			}),
 			layout.Flexed(1, func(gtx layout.Context) layout.Dimensions {
-				lbl := material.Label(th.Theme, unit.Sp(13), label)
+				lbl := material.Label(th.Theme, unit.Sp(13), r.label)
 				lbl.Color = th.Foreground
 				lbl.MaxLines = 1
 				return lbl.Layout(gtx)
 			}),
 			layout.Rigid(func(gtx layout.Context) layout.Dimensions {
-				if countLabel == "" {
+				if r.countLabel == "" {
 					return layout.Dimensions{}
 				}
 				return layout.Inset{Left: unit.Dp(8)}.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
-					lbl := material.Label(th.Theme, unit.Sp(11), countLabel)
+					lbl := material.Label(th.Theme, unit.Sp(11), r.countLabel)
 					lbl.Color = th.Muted
 					return lbl.Layout(gtx)
 				})

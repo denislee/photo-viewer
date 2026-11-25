@@ -35,12 +35,11 @@ const thumbCacheShards = 16
 
 // A thumbnail whose generation fails (corrupt file, or a missing external tool
 // in the supported degraded mode) must not be re-queued every frame: each
-// attempt re-enters the thumbnail pipeline, and ThumbStore's failure memo
-// (C5-06) only skips the external-tool fork — the request and its bookkeeping
-// still cost a queue slot and a worker wake-up per frame. Instead a failed
-// entry is marked and retried no sooner than an exponential backoff from
-// thumbRetryBase up to thumbRetryMax, so a transient failure still heals while
-// a permanent one costs one attempt per (growing) interval.
+// attempt re-enters the thumbnail pipeline and costs a queue slot and a worker
+// wake-up. Instead a failed entry is marked and retried no sooner than an
+// exponential backoff from thumbRetryBase up to thumbRetryMax, so a transient
+// failure still heals while a permanent one is retried only once per (growing)
+// interval rather than on every frame.
 const (
 	thumbRetryBase = 3 * time.Second
 	thumbRetryMax  = 5 * time.Minute
@@ -82,11 +81,11 @@ const (
 	prioPrefetch                  // just outside the viewport (G3)
 )
 
-// thumbJob is one queued thumbnail request.
+// thumbJob is one queued thumbnail request. Its key already carries the tier,
+// so storeFor needs no separate copy of it.
 type thumbJob struct {
 	e    cache.Entry
 	key  thumbKey
-	tier thumbTier
 	prio thumbPrio
 }
 
@@ -195,10 +194,10 @@ type thumbEntry struct {
 	prio    thumbPrio
 	// lastWanted is the frame of the latest Get/Prefetch for the entry.
 	lastWanted uint64
-	// failed is set when the last decode attempt failed; retryAfter is the
-	// earliest time the entry may be re-queued, and failCount drives the
-	// exponential backoff. A successful decode clears all three.
-	failed     bool
+	// failCount drives both the "recently failed" check and the exponential
+	// backoff: greater than zero means the last decode failed, and retryAfter
+	// is the earliest time the entry may be re-queued. A successful decode
+	// clears both.
 	failCount  int
 	retryAfter time.Time
 }
@@ -262,11 +261,6 @@ func (tc *thumbCache) shardFor(key thumbKey) *thumbCacheShard {
 	return &tc.shards[h%thumbCacheShards]
 }
 
-// tierKey is the cache key for path at tier.
-func tierKey(path string, tier thumbTier) thumbKey {
-	return thumbKey{path, tier}
-}
-
 func (tc *thumbCache) storeFor(tier thumbTier) *cache.ThumbStore {
 	if tier == tierLarge && tc.large != nil {
 		return tc.large
@@ -317,7 +311,7 @@ func (tc *thumbCache) Prefetch(e cache.Entry, large bool) {
 }
 
 func (tc *thumbCache) get(e cache.Entry, tier thumbTier, prio thumbPrio) (paint.ImageOp, image.Point, bool) {
-	key := tierKey(e.Path, tier)
+	key := thumbKey{path: e.Path, tier: tier}
 	sh := tc.shardFor(key)
 	sh.mu.Lock()
 	te := tc.touchOrCreate(sh, key)
@@ -329,7 +323,7 @@ func (tc *thumbCache) get(e cache.Entry, tier thumbTier, prio thumbPrio) (paint.
 	}
 	// A previously-failed entry stays on the placeholder until its backoff
 	// window elapses, so a broken file isn't re-forked every frame.
-	if te.failed && time.Now().Before(te.retryAfter) {
+	if te.failCount > 0 && time.Now().Before(te.retryAfter) {
 		sh.mu.Unlock()
 		return paint.ImageOp{}, image.Point{}, false
 	}
@@ -344,7 +338,7 @@ func (tc *thumbCache) get(e cache.Entry, tier thumbTier, prio thumbPrio) (paint.
 	}
 	sh.mu.Unlock()
 	if push {
-		tc.enqueue(tc.fast, thumbJob{e: e, key: key, tier: tier, prio: prio})
+		tc.enqueue(tc.fast, thumbJob{e: e, key: key, prio: prio})
 	}
 	return paint.ImageOp{}, image.Point{}, false
 }
@@ -459,7 +453,7 @@ func (tc *thumbCache) fastWorker() {
 		if !tc.claim(j) {
 			continue
 		}
-		store := tc.storeFor(j.tier)
+		store := tc.storeFor(j.key.tier)
 		if store.Has(j.e) {
 			if op, sz, ok := decodeThumbFile(store, j.e); ok {
 				tc.finish(j, op, sz, true)
@@ -482,7 +476,7 @@ func (tc *thumbCache) genWorker() {
 		if !tc.claim(j) {
 			continue
 		}
-		store := tc.storeFor(j.tier)
+		store := tc.storeFor(j.key.tier)
 		op, sz, ok := decodeThumbFile(store, j.e)
 		if !ok && store.Has(j.e) {
 			store.Discard(j.e.ThumbID)
@@ -513,11 +507,9 @@ func (tc *thumbCache) finish(j thumbJob, op paint.ImageOp, sz image.Point, ok bo
 		te.op = op
 		te.size = sz
 		te.ready = true
-		te.failed = false
 		te.failCount = 0
 	} else {
 		te.failCount++
-		te.failed = true
 		te.retryAfter = time.Now().Add(thumbBackoff(te.failCount))
 	}
 	sh.mu.Unlock()
@@ -531,16 +523,17 @@ func (tc *thumbCache) finish(j thumbJob, op paint.ImageOp, sz image.Point, ok bo
 }
 
 // thumbBackoff returns the retry delay for the failCount-th consecutive decode
-// failure: thumbRetryBase doubled each attempt, capped at thumbRetryMax.
+// failure (failCount >= 1): thumbRetryBase doubled each attempt, capped at
+// thumbRetryMax.
 func thumbBackoff(failCount int) time.Duration {
-	d := thumbRetryBase
-	for i := 1; i < failCount; i++ {
-		d *= 2
-		if d >= thumbRetryMax {
-			return thumbRetryMax
-		}
+	if failCount < 1 {
+		failCount = 1
 	}
-	return d
+	// Cap the shift at 16. thumbRetryMax is reached after 7 doublings, so any
+	// larger shift only has to saturate — and an uncapped one would overflow
+	// time.Duration.
+	shift := min(failCount-1, 16)
+	return min(thumbRetryBase<<shift, thumbRetryMax)
 }
 
 // decodeThumbFile returns e's thumbnail from store, generating it first if it

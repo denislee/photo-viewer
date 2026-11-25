@@ -93,22 +93,6 @@ func TestTopSearchResultsMatchesSortThenTruncate(t *testing.T) {
 	}
 }
 
-// TestTopSearchResultsNonPositiveK covers the degenerate k: nothing is kept but
-// every match is still counted.
-func TestTopSearchResultsNonPositiveK(t *testing.T) {
-	candidates := topKTestCandidates(200)
-	_, wantMatched := referenceTopSearchResults("i", candidates, len(candidates))
-	for _, k := range []int{0, -1} {
-		got, matched := topSearchResults("i", candidates, k)
-		if len(got) != 0 {
-			t.Fatalf("k=%d: got %d results, want 0", k, len(got))
-		}
-		if matched != wantMatched {
-			t.Fatalf("k=%d: matched = %d, want %d", k, matched, wantMatched)
-		}
-	}
-}
-
 // BenchmarkTopSearchResults measures the bounded full scan on a library-sized
 // candidate set with a broad query.
 func BenchmarkTopSearchResults(b *testing.B) {

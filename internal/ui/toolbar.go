@@ -3,6 +3,7 @@ package ui
 import (
 	"fmt"
 	"image"
+	"image/color"
 
 	"gioui.org/io/pointer"
 	"gioui.org/layout"
@@ -20,6 +21,9 @@ const (
 	toolbarTooltipPadH = 8
 	toolbarTooltipPadV = 4
 )
+
+// iconGap separates adjacent toolbar icon buttons.
+var iconGap = layout.Spacer{Width: unit.Dp(2)}
 
 // Toolbar is the slim top bar above the main split. Shows the active path, the
 // entry count, and an icon-button row: filters, RAW, grouping, sort, import,
@@ -101,22 +105,20 @@ func (t *Toolbar) HoveredLabel() string { return t.tooltipText }
 // Layout draws the toolbar background, labels, and icon buttons. Drains
 // click events on each call so callbacks fire on the same frame.
 func (t *Toolbar) Layout(gtx layout.Context, th *Theme, path string, count int) layout.Dimensions {
-	if t.allBtn.Clicked(gtx) {
-		t.Filter = "All"
-		if t.OnFilter != nil {
-			t.OnFilter("All")
-		}
-	}
-	if t.photosBtn.Clicked(gtx) {
-		t.Filter = "Photos"
-		if t.OnFilter != nil {
-			t.OnFilter("Photos")
-		}
-	}
-	if t.videosBtn.Clicked(gtx) {
-		t.Filter = "Videos"
-		if t.OnFilter != nil {
-			t.OnFilter("Videos")
+	// Filter group: one table for the segmented All / Photos / Videos buttons.
+	for _, f := range [...]struct {
+		btn  *widget.Clickable
+		name string
+	}{
+		{&t.allBtn, "All"},
+		{&t.photosBtn, "Photos"},
+		{&t.videosBtn, "Videos"},
+	} {
+		if f.btn.Clicked(gtx) {
+			t.Filter = f.name
+			if t.OnFilter != nil {
+				t.OnFilter(f.name)
+			}
 		}
 	}
 	if t.rawBtn.Clicked(gtx) {
@@ -174,7 +176,18 @@ func (t *Toolbar) Layout(gtx layout.Context, th *Theme, path string, count int) 
 
 	icon := func(btn *widget.Clickable, ic *widget.Icon, label string, active, disabled bool) layout.FlexChild {
 		return layout.Rigid(func(gtx layout.Context) layout.Dimensions {
-			dims := t.layoutIconCell(gtx, th, btn, ic, active, disabled)
+			fg := th.Foreground
+			bg := th.CellBG
+			switch {
+			case disabled:
+				fg = th.Muted
+			case active:
+				bg = th.Accent
+			case btn.Hovered():
+				bg = th.SelectionBG
+			}
+			side := gtx.Dp(unit.Dp(toolbarIconCellDp))
+			dims := squareButton(gtx, th, btn, side, gtx.Dp(unit.Dp(5)), bg, fg, ic, "", gtx.Dp(unit.Dp(20)), !disabled)
 			if btn.Hovered() {
 				t.tooltipText = label
 			}
@@ -208,38 +221,38 @@ func (t *Toolbar) Layout(gtx layout.Context, th *Theme, path string, count int) 
 
 			// Filter group: segmented All / Photos / Videos.
 			icon(&t.allBtn, th.Icons.All, "All", t.Filter == "All", false),
-			layout.Rigid(layout.Spacer{Width: unit.Dp(2)}.Layout),
+			layout.Rigid(iconGap.Layout),
 			icon(&t.photosBtn, th.Icons.Photos, "Photos", t.Filter == "Photos", false),
-			layout.Rigid(layout.Spacer{Width: unit.Dp(2)}.Layout),
+			layout.Rigid(iconGap.Layout),
 			icon(&t.videosBtn, th.Icons.Videos, "Videos", t.Filter == "Videos", false),
 
 			groupSep(th),
 
 			// Display toggles.
 			icon(&t.rawBtn, th.Icons.RAW, rawTooltip(t.ShowRAW), t.ShowRAW, false),
-			layout.Rigid(layout.Spacer{Width: unit.Dp(2)}.Layout),
+			layout.Rigid(iconGap.Layout),
 			icon(&t.yearsBtn, th.Icons.Years, yearsTooltip(t.GroupByYear), t.GroupByYear, false),
-			layout.Rigid(layout.Spacer{Width: unit.Dp(2)}.Layout),
+			layout.Rigid(iconGap.Layout),
 			icon(&t.sortDurBtn, th.Icons.SortDur, sortDurTooltip(t.SortByLength), t.SortByLength, false),
 
 			groupSep(th),
 
 			// Library actions.
 			icon(&t.importBtn, th.Icons.Import, "Import", false, false),
-			layout.Rigid(layout.Spacer{Width: unit.Dp(2)}.Layout),
+			layout.Rigid(iconGap.Layout),
 			icon(&t.duplicatesBtn, th.Icons.Duplicates, "Find duplicates", false, false),
-			layout.Rigid(layout.Spacer{Width: unit.Dp(2)}.Layout),
+			layout.Rigid(iconGap.Layout),
 			icon(&t.organizeBtn, th.Icons.Organize, "Organize", false, false),
-			layout.Rigid(layout.Spacer{Width: unit.Dp(2)}.Layout),
+			layout.Rigid(iconGap.Layout),
 			icon(&t.exportFavBtn, th.Icons.ExportFav, "Export favorites to folder…", false, false),
 
 			groupSep(th),
 
 			// Index maintenance.
 			icon(&t.rebuildBtn, th.Icons.Rebuild, "Rebuild index", false, t.AnyProcess),
-			layout.Rigid(layout.Spacer{Width: unit.Dp(2)}.Layout),
+			layout.Rigid(iconGap.Layout),
 			icon(&t.warmUpBtn, th.Icons.WarmUp, "Warm up thumbnails", false, false),
-			layout.Rigid(layout.Spacer{Width: unit.Dp(2)}.Layout),
+			layout.Rigid(iconGap.Layout),
 			icon(&t.webBtn, th.Icons.WebServer, webServerTooltip(t.WebServerRunning), t.WebServerRunning, false),
 
 			groupSep(th),
@@ -252,39 +265,37 @@ func (t *Toolbar) Layout(gtx layout.Context, th *Theme, path string, count int) 
 	return layout.Dimensions{Size: image.Pt(w, h)}
 }
 
-// layoutIconCell renders a single square icon button with a hover/active
-// background. The clickable consumes pointer events for click and hover.
-func (t *Toolbar) layoutIconCell(gtx layout.Context, th *Theme, btn *widget.Clickable, ic *widget.Icon, active, disabled bool) layout.Dimensions {
-	side := gtx.Dp(unit.Dp(toolbarIconCellDp))
+// squareButton renders a fixed-size square clickable cell with a rounded
+// background and, inside it, either an icon or a centered glyph. It is the one
+// square-button layout shared by the toolbar's icon row and the process bar's
+// per-row Pause/Cancel/Open buttons. side, radius and iconSide are pixels;
+// callers convert their dp metrics with gtx.Dp. cursor adds the pointer hand
+// (the toolbar wants it, the process bar's buttons don't).
+func squareButton(gtx layout.Context, th *Theme, click *widget.Clickable, side, radius int, bg, fg color.NRGBA, ic *widget.Icon, glyph string, iconSide int, cursor bool) layout.Dimensions {
 	gtx.Constraints = layout.Exact(image.Pt(side, side))
-
-	fg := th.Foreground
-	bg := th.CellBG
-	switch {
-	case disabled:
-		fg = th.Muted
-	case active:
-		bg = th.Accent
-	case btn.Hovered():
-		bg = th.SelectionBG
-	}
-
-	return btn.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
+	return click.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
 		rect := image.Rectangle{Max: image.Pt(side, side)}
-		paint.FillShape(gtx.Ops, bg, clip.UniformRRect(rect, gtx.Dp(unit.Dp(5))).Op(gtx.Ops))
+		paint.FillShape(gtx.Ops, bg, clip.UniformRRect(rect, radius).Op(gtx.Ops))
 
-		if !disabled {
+		if cursor {
 			pointer.CursorPointer.Add(gtx.Ops)
 		}
 
-		iconSide := gtx.Dp(unit.Dp(20))
-		if ic == nil {
-			return layout.Dimensions{Size: image.Pt(side, side)}
+		switch {
+		case ic != nil:
+			return layout.Center.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
+				gtx.Constraints = layout.Exact(image.Pt(iconSide, iconSide))
+				return ic.Layout(gtx, fg)
+			})
+		case glyph != "":
+			return layout.Center.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
+				lbl := material.Label(th.Theme, unit.Sp(13), glyph)
+				lbl.Color = fg
+				lbl.MaxLines = 1
+				return lbl.Layout(gtx)
+			})
 		}
-		return layout.Center.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
-			gtx.Constraints = layout.Exact(image.Pt(iconSide, iconSide))
-			return ic.Layout(gtx, fg)
-		})
+		return layout.Dimensions{Size: image.Pt(side, side)}
 	})
 }
 

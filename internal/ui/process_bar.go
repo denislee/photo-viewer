@@ -199,15 +199,23 @@ func (pb *ProcessBar) layoutRow(gtx layout.Context, th *Theme, s ProcessSnapshot
 	bg := image.Rect(0, 0, w, h)
 	paint.FillShape(gtx.Ops, th.Background, clip.Rect(bg).Op())
 
-	pauseGlyph := "⏸"
+	// Pause/Resume share one branch: both the glyph and the background flip
+	// together when the process is paused.
+	pauseGlyph, pauseBG := "⏸", th.CellBG
 	if s.Paused {
-		pauseGlyph = "▶"
-	}
-	pauseBG := th.CellBG
-	if s.Paused {
-		pauseBG = th.Accent
+		pauseGlyph, pauseBG = "▶", th.Accent
 	}
 	countText := processCountText(s) // used twice below; format it once (G4-12)
+
+	// Square icon buttons sized to fit the row height, shared with the
+	// toolbar's icon cells.
+	btnSide := gtx.Dp(unit.Dp(processBarIconSizeDp))
+	btnRadius := gtx.Dp(unit.Dp(4))
+	button := func(click *widget.Clickable, glyph string, bg color.NRGBA) layout.FlexChild {
+		return layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+			return squareButton(gtx, th, click, btnSide, btnRadius, bg, th.Foreground, nil, glyph, 0, false)
+		})
+	}
 
 	return layout.Inset{Left: unit.Dp(10), Right: unit.Dp(10), Top: unit.Dp(4), Bottom: unit.Dp(4)}.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
 		return layout.Flex{Axis: layout.Horizontal, Alignment: layout.Middle}.Layout(gtx,
@@ -259,17 +267,11 @@ func (pb *ProcessBar) layoutRow(gtx layout.Context, th *Theme, s ProcessSnapshot
 			}),
 			layout.Rigid(layout.Spacer{Width: unit.Dp(8)}.Layout),
 			// Square icon buttons sized to fit the row height.
-			layout.Rigid(func(gtx layout.Context) layout.Dimensions {
-				return layoutIconButton(gtx, th, &rb.pause, pauseGlyph, pauseBG, th.Foreground)
-			}),
+			button(&rb.pause, pauseGlyph, pauseBG),
 			layout.Rigid(layout.Spacer{Width: unit.Dp(4)}.Layout),
-			layout.Rigid(func(gtx layout.Context) layout.Dimensions {
-				return layoutIconButton(gtx, th, &rb.cancel, "✕", th.Destructive, th.Foreground)
-			}),
+			button(&rb.cancel, "✕", th.Destructive),
 			layout.Rigid(layout.Spacer{Width: unit.Dp(4)}.Layout),
-			layout.Rigid(func(gtx layout.Context) layout.Dimensions {
-				return layoutIconButton(gtx, th, &rb.open, "↗", th.CellBG, th.Foreground)
-			}),
+			button(&rb.open, "↗", th.CellBG),
 		)
 	})
 }
@@ -278,24 +280,6 @@ func (pb *ProcessBar) layoutRow(gtx layout.Context, th *Theme, s ProcessSnapshot
 // process bar. Chosen to fit inside processBarRowDp minus the row's top and
 // bottom inset (4dp each) so glyphs aren't clipped.
 const processBarIconSizeDp = 26
-
-// layoutIconButton renders a square, fixed-size clickable cell with a centered
-// glyph. Used in the process bar so Pause/Resume/Cancel/Open fit cleanly inside
-// the row without the min-size padding that material.Button enforces.
-func layoutIconButton(gtx layout.Context, th *Theme, click *widget.Clickable, glyph string, bg, fg color.NRGBA) layout.Dimensions {
-	side := gtx.Dp(unit.Dp(processBarIconSizeDp))
-	gtx.Constraints = layout.Exact(image.Pt(side, side))
-	return click.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
-		rect := image.Rectangle{Max: image.Pt(side, side)}
-		paint.FillShape(gtx.Ops, bg, clip.UniformRRect(rect, gtx.Dp(unit.Dp(4))).Op(gtx.Ops))
-		return layout.Center.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
-			lbl := material.Label(th.Theme, unit.Sp(13), glyph)
-			lbl.Color = fg
-			lbl.MaxLines = 1
-			return lbl.Layout(gtx)
-		})
-	})
-}
 
 // drawProcessBar renders a thin progress bar. Indeterminate (Total=0)
 // renders as a muted full-width stripe so the user still sees an active
@@ -325,10 +309,15 @@ func drawProcessBar(gtx layout.Context, th *Theme, s ProcessSnapshot) layout.Dim
 	return layout.Dimensions{Size: image.Pt(w, barH)}
 }
 
+// percentOf returns done as a whole percentage of total, clamped to 100. Both
+// callers only ask for it when total > 0.
+func percentOf(done, total int64) int {
+	return min(int(float32(done)/float32(total)*100), 100)
+}
+
 func processCountText(s ProcessSnapshot) string {
 	if s.Total > 0 {
-		pct := min(int(float32(s.Done)/float32(s.Total)*100), 100)
-		return fmt.Sprintf("%d / %d  (%d%%)", s.Done, s.Total, pct)
+		return fmt.Sprintf("%d / %d  (%d%%)", s.Done, s.Total, percentOf(s.Done, s.Total))
 	}
 	if s.Done > 0 {
 		return fmt.Sprintf("%d processed", s.Done)
@@ -347,8 +336,7 @@ func summarizeProcesses(snap []ProcessSnapshot) string {
 			label = "⏸ " + label
 		}
 		if s.Total > 0 {
-			pct := min(int(float32(s.Done)/float32(s.Total)*100), 100)
-			fmt.Fprintf(&b, "%s %d%%", label, pct)
+			fmt.Fprintf(&b, "%s %d%%", label, percentOf(s.Done, s.Total))
 		} else if s.Done > 0 {
 			fmt.Fprintf(&b, "%s %d", label, s.Done)
 		} else {

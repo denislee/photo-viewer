@@ -47,16 +47,11 @@ func TestSidebarCountLabels(t *testing.T) {
 		switch {
 		case r.path == "/lib/x":
 			found = true
-			if !r.hasCount {
-				t.Fatalf("row %q hasCount = false, want true", r.path)
-			}
 			if r.countLabel != "7" {
 				t.Errorf("row %q countLabel = %q, want %q", r.path, r.countLabel, "7")
 			}
-		case !r.hasCount:
-			if r.countLabel != "" {
-				t.Errorf("row %q countLabel = %q, want empty", r.path, r.countLabel)
-			}
+		case r.countLabel != "":
+			t.Errorf("row %q countLabel = %q, want empty", r.path, r.countLabel)
 		}
 	}
 	if !found {

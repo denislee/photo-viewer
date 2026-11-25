@@ -138,9 +138,6 @@ func (g *Grid) RememberFor(dir string) {
 	if dir == "" {
 		return
 	}
-	if g.lastSelByDir == nil {
-		g.lastSelByDir = map[string]int{}
-	}
 	if _, ok := g.lastSelByDir[dir]; !ok && len(g.lastSelByDir) >= gridSelMemCap {
 		// Drop one arbitrary entry. Map iteration order is randomized, so
 		// this is effectively random eviction — cheap and good enough for
@@ -157,10 +154,8 @@ func (g *Grid) RememberFor(dir string) {
 // if none. A pending scroll is queued so the next Layout brings it into view.
 func (g *Grid) RestoreFor(dir string) {
 	idx := 0
-	if g.lastSelByDir != nil {
-		if v, ok := g.lastSelByDir[dir]; ok {
-			idx = v
-		}
+	if v, ok := g.lastSelByDir[dir]; ok {
+		idx = v
 	}
 	g.Selected = idx
 	g.pendingScroll = true
@@ -445,7 +440,6 @@ func (g *Grid) layoutRow(gtx layout.Context, th *Theme, entries []cache.Entry, t
 	// Hoist loop-invariants so the inner loop only does per-cell work.
 	// thumbs, selectionMode and selectedSnap are read once per frame by the
 	// caller, so a row takes no Controller.mu at all.
-	rowH := cellPx + gapPx
 	stride := cellPx + gapPx
 	yOff := gapPx / 2
 	cellSize := image.Pt(cellPx, cellPx)
@@ -462,7 +456,7 @@ func (g *Grid) layoutRow(gtx layout.Context, th *Theme, entries []cache.Entry, t
 		}
 		stack.Pop()
 	}
-	return layout.Dimensions{Size: image.Pt(gtx.Constraints.Max.X, rowH)}
+	return layout.Dimensions{Size: image.Pt(gtx.Constraints.Max.X, stride)}
 }
 
 // drawCell draws one grid cell and reports whether its thumbnail was ready.
