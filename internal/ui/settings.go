@@ -37,6 +37,18 @@ type SettingsView struct {
 	sdAutoDetect       widget.Bool
 	showShortcuts      widget.Bool
 
+	// Face recognition section (settings_faces.go).
+	facesOn         widget.Bool
+	facesRecheck    widget.Clickable
+	strictness      widget.Enum
+	forgetBtn       widget.Clickable
+	forgetKeepBtn   widget.Clickable
+	forgetAllBtn    widget.Clickable
+	forgetCancelBtn widget.Clickable
+	// forgetStage is the two-step "Forget all face data" confirmation:
+	// 0 idle, 1 confirming. Reset by Show.
+	forgetStage int
+
 	// ctrl is wired by window.go so the Empty Trash button can read trash
 	// stats and trigger the wipe. Optional — when nil, the trash row is
 	// hidden.
@@ -90,6 +102,9 @@ func (v *SettingsView) Show() {
 	v.outboxEditor.SetText(c.OutboxDir)
 	v.sdAutoDetect.Value = c.SDCardAutoDetect
 	v.showShortcuts.Value = c.ShowShortcutHints
+	v.facesOn.Value = FacesEnabled()
+	v.strictness.Value = normaliseStrictness(c.FaceStrictness)
+	v.forgetStage = 0
 	// statusMsg/trashMsg/exportFavMsg are also written from background
 	// goroutines (pickDir, EmptyTrash, setExportMsg), so every access goes
 	// through mu.
@@ -292,6 +307,8 @@ func (v *SettingsView) Layout(gtx layout.Context, th *Theme) layout.Dimensions {
 			}),
 			layout.Rigid(layout.Spacer{Height: unit.Dp(16)}.Layout),
 			layout.Rigid(v.trashRow(th)),
+			layout.Rigid(layout.Spacer{Height: unit.Dp(16)}.Layout),
+			layout.Rigid(v.facesRow(th)),
 			layout.Rigid(layout.Spacer{Height: unit.Dp(16)}.Layout),
 			layout.Rigid(v.exportFavoritesRow(th)),
 			layout.Rigid(layout.Spacer{Height: unit.Dp(16)}.Layout),

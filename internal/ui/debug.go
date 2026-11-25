@@ -14,7 +14,7 @@ var debugTiming = os.Getenv("PV_DEBUG_TIMING") != ""
 
 // debugStartView opens a People view at startup when PV_DEBUG_START_VIEW is
 // set, so the People UI can be driven and screenshotted headlessly (no seat
-// keyboard needed): "people", "person:<id>" or "group:<id>", optionally with
+// keyboard needed): "settings", "people", "person:<id>" or "group:<id>", optionally with
 // "+review" to open the Review faces overlay on that person/group. The
 // library scan is let finish first (SelectDir would cancel it).
 func debugStartView(ctrl *Controller, views *appViews, invalidate interface{ Invalidate() }) {
@@ -27,6 +27,13 @@ func debugStartView(ctrl *Controller, views *appViews, invalidate interface{ Inv
 	var dir string
 	var target ReviewTarget
 	switch {
+	case spec == "settings":
+		go func() {
+			time.Sleep(3 * time.Second)
+			views.settings.Show()
+			invalidate.Invalidate()
+		}()
+		return
 	case spec == "people":
 		dir = PeopleView
 	case strings.HasPrefix(spec, "person:"):
