@@ -63,10 +63,11 @@ type evalFace struct {
 	Box    evalBox
 }
 
-// evalDet is one detector output: its box and embedding.
+// evalDet is one detector output: its box, embedding and helper quality.
 type evalDet struct {
 	Box       evalBox
 	Embedding []float32
+	Quality   float64
 }
 
 // evalMetrics is the result of one evaluation run.
@@ -349,6 +350,12 @@ type evalResult struct {
 	PairRecall     float64 `json:"pair_recall"`
 	Clusters       int     `json:"clusters"`
 	ImpureClusters int     `json:"impure_clusters"`
+	// The same corpus grouped by the regroup pass instead of the streaming
+	// assigner, so the two modes can be compared run to run.
+	RegroupPairPrecision float64 `json:"regroup_pair_precision"`
+	RegroupPairRecall    float64 `json:"regroup_pair_recall"`
+	RegroupClusters      int     `json:"regroup_clusters"`
+	RegroupImpure        int     `json:"regroup_impure"`
 }
 
 // TestFaceEval is the gated end-to-end evaluation. It is a measurement, not an
@@ -394,6 +401,7 @@ func TestFaceEval(t *testing.T) {
 	var (
 		persons    []string
 		embeddings [][]float32
+		qualities  []float64
 		labelled   int
 		detected   int
 		matched    int
@@ -430,7 +438,7 @@ func TestFaceEval(t *testing.T) {
 		}
 		boxes := make([]evalDet, len(dets))
 		for j, det := range dets {
-			boxes[j] = evalDet{Box: normaliseDetBox(det.BBox, cfg.Width, cfg.Height), Embedding: det.Embedding}
+			boxes[j] = evalDet{Box: normaliseDetBox(det.BBox, cfg.Width, cfg.Height), Embedding: det.Embedding, Quality: det.Quality}
 		}
 
 		match := matchDetections(faces, boxes)
@@ -443,11 +451,40 @@ func TestFaceEval(t *testing.T) {
 			matched++
 			persons = append(persons, faces[labelIdx].Person)
 			embeddings = append(embeddings, boxes[j].Embedding)
+			qualities = append(qualities, boxes[j].Quality)
 		}
 	}
 
 	cluster := streamCluster(embeddings)
 	pairPrecision, pairRecall, clusters, impure := groupingMetrics(persons, cluster)
+
+	// The same matched faces through the production regroup pass, so the
+	// report shows whether re-clustering from the stored embeddings beats the
+	// streaming assigner on this corpus.
+	regroupFaces := make([]cache.RegroupFace, len(embeddings))
+	for i, emb := range embeddings {
+		regroupFaces[i] = cache.RegroupFace{ID: int64(i + 1), Embedding: emb, Quality: qualities[i]}
+	}
+	regrouped, err := regroupCore(context.Background(), regroupFaces, nil, RegroupOptions{})
+	if err != nil {
+		t.Fatalf("regroupCore: %v", err)
+	}
+	regroupClusterOf := make(map[int64]int, len(regroupFaces))
+	for ci, c := range regrouped {
+		for _, id := range c.Members {
+			regroupClusterOf[id] = ci
+		}
+	}
+	regroupCluster := make([]int, len(regroupFaces))
+	for i, f := range regroupFaces {
+		if ci, ok := regroupClusterOf[f.ID]; ok {
+			regroupCluster[i] = ci
+		} else {
+			// Unclustered faces are singletons, not one shared "cluster".
+			regroupCluster[i] = -1 - i
+		}
+	}
+	regroupPrecision, regroupRecall, regroupClusters, regroupImpure := groupingMetrics(persons, regroupCluster)
 
 	recall := 1.0
 	if labelled > 0 {
@@ -467,18 +504,24 @@ func TestFaceEval(t *testing.T) {
 	t.Logf("face eval: size=%d labelled=%d detected=%d matched=%d recall=%.3f pair_precision=%.3f pair_recall=%.3f clusters=%d impure=%d",
 		size, m.LabelledFaces, m.DetectedFaces, m.MatchedFaces, m.Recall,
 		m.PairPrecision, m.PairRecall, m.Clusters, m.ImpureClusters)
+	t.Logf("face eval (regroup): pair_precision=%.3f pair_recall=%.3f clusters=%d impure=%d",
+		regroupPrecision, regroupRecall, regroupClusters, regroupImpure)
 
 	if os.Getenv("PV_FACE_EVAL_WRITE") == "1" {
 		out := evalResult{
-			Size:           size,
-			LabelledFaces:  m.LabelledFaces,
-			DetectedFaces:  m.DetectedFaces,
-			MatchedFaces:   m.MatchedFaces,
-			Recall:         m.Recall,
-			PairPrecision:  m.PairPrecision,
-			PairRecall:     m.PairRecall,
-			Clusters:       m.Clusters,
-			ImpureClusters: m.ImpureClusters,
+			Size:                 size,
+			LabelledFaces:        m.LabelledFaces,
+			DetectedFaces:        m.DetectedFaces,
+			MatchedFaces:         m.MatchedFaces,
+			Recall:               m.Recall,
+			PairPrecision:        m.PairPrecision,
+			PairRecall:           m.PairRecall,
+			Clusters:             m.Clusters,
+			ImpureClusters:       m.ImpureClusters,
+			RegroupPairPrecision: regroupPrecision,
+			RegroupPairRecall:    regroupRecall,
+			RegroupClusters:      regroupClusters,
+			RegroupImpure:        regroupImpure,
 		}
 		data, err := json.MarshalIndent(out, "", "  ")
 		if err != nil {
