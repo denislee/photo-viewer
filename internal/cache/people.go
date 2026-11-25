@@ -234,6 +234,7 @@ func (i *Index) MergePeople(srcID, dstID int64) (*Undo, error) {
 			"UPDATE face_clusters SET person_id = ? WHERE person_id = ?",
 			"UPDATE face_tags SET person_id = ? WHERE person_id = ?",
 			"UPDATE faces SET person_id = ? WHERE person_id = ?",
+			"UPDATE person_anchors SET person_id = ? WHERE person_id = ?",
 		} {
 			if _, err := tx.Exec(q, dstID, srcID); err != nil {
 				return err
@@ -275,6 +276,7 @@ func (i *Index) DeletePerson(id int64) (*Undo, error) {
 		for _, q := range []string{
 			"UPDATE face_clusters SET person_id = NULL WHERE person_id = ?",
 			"DELETE FROM face_tags WHERE person_id = ?",
+			"DELETE FROM person_anchors WHERE person_id = ?",
 			"DELETE FROM people WHERE id = ?",
 		} {
 			if _, err := tx.Exec(q, id); err != nil {
@@ -964,6 +966,9 @@ func (i *Index) ForgetFaces(alsoPeople bool) error {
 		"DELETE FROM faces",
 		"DELETE FROM face_clusters",
 		"UPDATE entries SET face_thumb_mtime = NULL WHERE face_thumb_mtime IS NOT NULL",
+		// Anchors are centroids of face embeddings: biometric data, machine
+		// derived, so they go with the machine layer.
+		"DELETE FROM person_anchors",
 	}
 	if alsoPeople {
 		stmts = append(stmts, "DELETE FROM face_tags", "DELETE FROM people")
