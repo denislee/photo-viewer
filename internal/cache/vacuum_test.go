@@ -102,3 +102,21 @@ func dbSize(t *testing.T, path string) int64 {
 	}
 	return fi.Size()
 }
+
+// TestVacuumAnalyzes pins C-09: the post-Rebuild Vacuum also runs ANALYZE, so
+// sqlite_stat1 holds current stats for the entries indexes.
+func TestVacuumAnalyzes(t *testing.T) {
+	idx, cleanup := loadEmpty(t)
+	defer cleanup()
+	seed(t, idx, "/lib", 50)
+	if err := idx.Vacuum(); err != nil {
+		t.Fatalf("Vacuum: %v", err)
+	}
+	var n int
+	if err := idx.db.QueryRow("SELECT COUNT(*) FROM sqlite_stat1 WHERE tbl = 'entries'").Scan(&n); err != nil {
+		t.Fatalf("read sqlite_stat1: %v", err)
+	}
+	if n == 0 {
+		t.Error("no sqlite_stat1 rows for entries after Vacuum; ANALYZE did not run")
+	}
+}

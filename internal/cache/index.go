@@ -1057,8 +1057,16 @@ func (i *Index) Clear() error {
 // exclusive lock while it rewrites, so the caller only invokes it when the
 // rebuild's scan writes are finished, never racing them. Best-effort at the call
 // site: the error is returned so the caller can log it, never fatal.
+//
+// It then runs ANALYZE once (C-09): a rebuild replaced every row, so the
+// planner's stats describe a library that no longer exists until the
+// PRAGMA optimize on Close catches up. One full ANALYZE right after the rescan
+// gives the next session's queries current row estimates from the start.
 func (i *Index) Vacuum() error {
-	_, err := i.db.Exec("VACUUM")
+	if _, err := i.db.Exec("VACUUM"); err != nil {
+		return err
+	}
+	_, err := i.db.Exec("ANALYZE")
 	return err
 }
 
