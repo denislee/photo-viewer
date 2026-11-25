@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"runtime"
 	"sync"
 	"time"
 
@@ -17,6 +16,7 @@ import (
 	"github.com/dns/photo-viewer/internal/cache"
 	"github.com/dns/photo-viewer/internal/fsutil"
 	"github.com/dns/photo-viewer/internal/scan"
+	"github.com/dns/photo-viewer/internal/workpool"
 )
 
 type MismatchedVideo struct {
@@ -121,77 +121,46 @@ func (v *OrganizeView) scanForMismatched(ctx context.Context, cancel context.Can
 	defer end()
 
 	total := idx.CountByType(scan.TypeVideo)
-	v.progress.set(0, int64(total))
-	proc.SetTotal(int64(total))
+	v.setProgress(0, int64(total))
 
 	v.setStatus(fmt.Sprintf("Scanning %d videos for mismatched dates...", total))
 
-	// Use a worker pool to speed up metadata extraction (exiftool is slow). The
-	// videos are streamed straight out of SQLite (ListByType pushes the type
-	// filter into the query and pages internally) instead of loading the whole
-	// index into RAM and filtering — a large library no longer spikes memory
-	// just to enumerate a handful of clips. The jobs channel is only lightly
-	// buffered so the streaming producer back-pressures against the slow workers
-	// rather than buffering every video up front; results is likewise bounded.
-	numWorkers := min(runtime.NumCPU(), 4) // Don't overwhelm the system with too many exiftool processes
-	jobs := make(chan cache.Entry, numWorkers*2)
-	results := make(chan MismatchedVideo, numWorkers)
-	var wg sync.WaitGroup
-
-	for range numWorkers {
-		wg.Go(func() {
-			for e := range jobs {
-				proc.Wait()
-				if ctx.Err() != nil {
-					return
-				}
-				// Prefer the media date persisted on a previous open. It's keyed
-				// to the file's size/mtime (ReconcileBatch NULLs it on change), so
-				// a hit is always fresh for the current bytes and spares the
-				// ~50–200ms exiftool round-trip. On a miss (never probed, or an
-				// edited file whose cache was invalidated) probe once and persist
-				// so later opens skip it (U-14).
-				date, cached, err := idx.ProbedMediaDate(e.Path)
-				if err != nil || !cached {
-					date = mediaDateProber(e.Path)
-					_ = idx.SetProbedMediaDate(e.Path, date)
-				}
-				if !scan.SameDateFolder(e.Path, date) {
-					results <- MismatchedVideo{Entry: e, ExpectedDate: date}
-				}
-				// One tick per item; bumpProgress coalesces the redraw through
-				// the registry's ~30Hz throttle (trailing flush included).
-				v.bumpProgress()
-			}
-		})
-	}
-
-	// Producer: stream the video rows into the bounded jobs channel on its own
-	// goroutine. The select keeps it cancel-safe — once the workers have all
-	// returned on ctx cancel nobody drains jobs, so an unguarded send would
-	// block forever (and leak this goroutine); the ctx.Done() arm stops the
-	// stream and closes jobs instead.
-	go func() {
-		idx.ListByType(scan.TypeVideo, func(e cache.Entry) bool {
-			select {
-			case jobs <- e:
-				return true
-			case <-ctx.Done():
-				return false
-			}
-		})
-		close(jobs)
-	}()
-
-	go func() {
-		wg.Wait()
-		close(results)
-	}()
-
+	// Use workpool.RunStream to speed up metadata extraction (exiftool is
+	// slow). The videos are streamed straight out of SQLite (ListByType pushes
+	// the type filter into the query and pages internally) instead of loading
+	// the whole index into RAM and filtering — a large library no longer spikes
+	// memory just to enumerate a handful of clips. RunStream's hand-off channel
+	// is only lightly buffered, so the streaming producer back-pressures
+	// against the slow workers rather than buffering every video up front.
+	var mu sync.Mutex
 	var mismatched []MismatchedVideo
-	for res := range results {
-		mismatched = append(mismatched, res)
-	}
+	workpool.RunStream(ctx, scan.ExiftoolPoolSize(), func(yield func(cache.Entry) bool) {
+		idx.ListByType(scan.TypeVideo, yield)
+	}, func(e cache.Entry) {
+		proc.Wait()
+		if ctx.Err() != nil {
+			return
+		}
+		// Prefer the media date persisted on a previous open. It's keyed
+		// to the file's size/mtime (ReconcileBatch NULLs it on change), so
+		// a hit is always fresh for the current bytes and spares the
+		// ~50–200ms exiftool round-trip. On a miss (never probed, or an
+		// edited file whose cache was invalidated) probe once and persist
+		// so later opens skip it (U-14).
+		date, cached, err := idx.ProbedMediaDate(e.Path)
+		if err != nil || !cached {
+			date = mediaDateProber(e.Path)
+			_ = idx.SetProbedMediaDate(e.Path, date)
+		}
+		if !scan.SameDateFolder(e.Path, date) {
+			mu.Lock()
+			mismatched = append(mismatched, MismatchedVideo{Entry: e, ExpectedDate: date})
+			mu.Unlock()
+		}
+		// One tick per item; bumpProgress coalesces the redraw through
+		// the registry's ~30Hz throttle (trailing flush included).
+		v.bumpProgress()
+	})
 
 	v.mu.Lock()
 	defer v.mu.Unlock()
@@ -228,7 +197,6 @@ func (v *OrganizeView) startOrganize(root string) {
 		defer cancel()
 		proc, end := v.scope.beginProc(ctx, ProcOrganize, "Organize: move", cancel, fmt.Sprintf("Moving %d videos…", len(mismatched)), nil)
 		proc.SetTotal(int64(len(mismatched)))
-		movedAny := false
 		var moved, errs, warns int
 		defer func() {
 			v.mu.Lock()
@@ -240,7 +208,7 @@ func (v *OrganizeView) startOrganize(root string) {
 			// relocated in lockstep with each rename by applyMove, so a single
 			// coalesced repaint surfaces the whole batch. Skipped when nothing
 			// moved so a cancelled/no-op pass doesn't churn the grid.
-			if movedAny && v.refreshActive != nil {
+			if moved > 0 && v.refreshActive != nil {
 				v.refreshActive()
 			}
 			if v.invalidate != nil {
@@ -291,7 +259,6 @@ func (v *OrganizeView) startOrganize(root string) {
 					}
 				}
 				moved++
-				movedAny = true
 				v.appendLog(fmt.Sprintf("[OK] Moved %s -> %s", baseName, dateFolder))
 			}
 			v.bumpProgress()

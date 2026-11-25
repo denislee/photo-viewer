@@ -9,14 +9,13 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
-	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/dns/photo-viewer/internal/cliutil"
 	"github.com/dns/photo-viewer/internal/fsutil"
 	"github.com/dns/photo-viewer/internal/scan"
 	"github.com/dns/photo-viewer/internal/tools"
+	"github.com/dns/photo-viewer/internal/workpool"
 )
 
 func main() {
@@ -96,23 +95,11 @@ func organize(ctx context.Context, srcDir, absDst string, dryRun bool, workers i
 	// ExiftoolPoolSize concurrent callers resolve ~8x faster than a serial loop
 	// (S4-05); each worker writes only its own slot.
 	dates := make([]time.Time, len(files))
-	var next atomic.Int64
-	var wg sync.WaitGroup
-	for range min(workers, len(files)) {
-		wg.Go(func() {
-			for {
-				i := int(next.Add(1) - 1)
-				if i >= len(files) || ctx.Err() != nil {
-					return
-				}
-				// GetMediaDate already falls back to the file's mtime when no
-				// metadata date exists, so the old per-file exec + manual mtime
-				// fallback is gone.
-				dates[i] = mediaDate(files[i])
-			}
-		})
-	}
-	wg.Wait()
+	// GetMediaDate already falls back to the file's mtime when no metadata date
+	// exists, so the old per-file exec + manual mtime fallback is gone.
+	workpool.RunIndexed(ctx, len(files), workers, func(i int) {
+		dates[i] = mediaDate(files[i])
+	})
 	if ctx.Err() != nil {
 		return count, failures
 	}

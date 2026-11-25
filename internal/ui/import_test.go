@@ -215,7 +215,7 @@ func TestProcessBatchNeverDeletesAlreadyFiled(t *testing.T) {
 		if !bytes.Equal(got, content) {
 			t.Fatalf("filed copy changed: %q", got)
 		}
-		if s, m := atomic.LoadInt64(&v.statSkipped), atomic.LoadInt64(&v.statMoved); s != 1 || m != 0 {
+		if s, m := v.statSkipped.Load(), v.statMoved.Load(); s != 1 || m != 0 {
 			t.Errorf("skipped=%d moved=%d, want skipped=1 moved=0", s, m)
 		}
 	}
@@ -285,8 +285,8 @@ func TestProcessBatchCollisionNeverOverwrites(t *testing.T) {
 	v := &ImportView{}
 	v.processBatch(context.Background(), outbox, []string{src})
 
-	if m := atomic.LoadInt64(&v.statMoved); m != 1 {
-		t.Fatalf("statMoved = %d, want 1 (errors=%d)", m, atomic.LoadInt64(&v.statErrors))
+	if m := v.statMoved.Load(); m != 1 {
+		t.Fatalf("statMoved = %d, want 1 (errors=%d)", m, v.statErrors.Load())
 	}
 	for name, want := range occupants {
 		if got, _ := os.ReadFile(filepath.Join(dateDir, name)); string(got) != want {
@@ -323,7 +323,7 @@ func TestProcessBatchProgressReachesMaxOnMkdirError(t *testing.T) {
 	v := &ImportView{}
 	v.processBatch(context.Background(), outbox, entries)
 
-	if e := atomic.LoadInt64(&v.statErrors); e != int64(len(entries)) {
+	if e := v.statErrors.Load(); e != int64(len(entries)) {
 		t.Fatalf("statErrors = %d, want %d", e, len(entries))
 	}
 	if done, max := v.progress.load(); done != max || max != int64(2*len(entries)) {
@@ -407,7 +407,7 @@ func TestRunImportSkipsHiddenCardFiles(t *testing.T) {
 	if len(filed) != 1 || filed[0] != want {
 		t.Errorf("outbox files = %v, want exactly [%s]", filed, want)
 	}
-	if m := atomic.LoadInt64(&v.statMoved); m != 1 {
+	if m := v.statMoved.Load(); m != 1 {
 		t.Errorf("statMoved = %d, want 1", m)
 	}
 	for _, name := range []string{"a.jpg", "._a.jpg", filepath.Join(".Trashes", "x.jpg")} {
@@ -494,8 +494,8 @@ func TestProcessBatchWorkerPoolCapped(t *testing.T) {
 	if got := maxInFlight.Load(); got < 2 || got > 4 {
 		t.Errorf("max concurrent date probes = %d, want 2..4", got)
 	}
-	if m := atomic.LoadInt64(&v.statMoved); m != nFiles {
-		t.Errorf("statMoved = %d, want %d (errors=%d)", m, nFiles, atomic.LoadInt64(&v.statErrors))
+	if m := v.statMoved.Load(); m != nFiles {
+		t.Errorf("statMoved = %d, want %d (errors=%d)", m, nFiles, v.statErrors.Load())
 	}
 	if done, max := v.progress.load(); done != 2*nFiles || max != 2*nFiles {
 		t.Errorf("progress = %d/%d, want %d/%d", done, max, 2*nFiles, 2*nFiles)
@@ -589,7 +589,7 @@ func TestCopyToInboxKeepsSourcesWhenSyncFails(t *testing.T) {
 			t.Errorf("source %s should be kept after a failed fsync: %v", p, err)
 		}
 	}
-	if e := atomic.LoadInt64(&v.statErrors); e != 1 {
+	if e := v.statErrors.Load(); e != 1 {
 		t.Errorf("statErrors = %d, want 1", e)
 	}
 	if len(batch) != 3 {

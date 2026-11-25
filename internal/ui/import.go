@@ -8,10 +8,8 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"runtime"
 	"slices"
 	"strings"
-	"sync"
 	"sync/atomic"
 	"time"
 
@@ -22,6 +20,7 @@ import (
 
 	"github.com/dns/photo-viewer/internal/fsutil"
 	"github.com/dns/photo-viewer/internal/scan"
+	"github.com/dns/photo-viewer/internal/workpool"
 )
 
 // Date probe and rewrite used by processBatch, indirected so tests can stub exiftool.
@@ -59,9 +58,9 @@ type ImportView struct {
 
 	importDirs   []string
 	zipFiles     []string
-	statMoved    int64
-	statSkipped  int64
-	statErrors   int64
+	statMoved    atomic.Int64
+	statSkipped  atomic.Int64
+	statErrors   atomic.Int64
 	running      bool
 	starting     bool // a Start click's background inbox probe is in flight.
 	finished     bool // at least one import has completed since the overlay opened
@@ -119,7 +118,8 @@ func NewImportView(invalidate func()) *ImportView {
 // previous Close just hid the window) the existing state — log, progress
 // counters, SD mounts — is preserved so the user can keep watching it.
 // Otherwise state is reset and the inbox/outbox status line refreshed from
-// config.
+// config. The per-run counters are not reset here: they keep showing the last
+// run's totals until the next Start (resetStats in startImport).
 func (v *ImportView) Show() {
 	v.mu.Lock()
 	if v.running {
@@ -132,10 +132,6 @@ func (v *ImportView) Show() {
 	v.zipFiles = nil
 	v.log.reset()
 	v.progress.reset()
-	v.statMoved = 0
-	v.statSkipped = 0
-	v.statErrors = 0
-	v.running = false
 	v.finished = false
 	v.sdShown = false
 	v.sdDevices = nil
@@ -416,9 +412,9 @@ func (v *ImportView) Layout(gtx layout.Context, th *Theme) layout.Dimensions {
 	statusMsg := v.statusMsg
 	importDirs := append([]string(nil), v.importDirs...)
 	zipFiles := append([]string(nil), v.zipFiles...)
-	moved := atomic.LoadInt64(&v.statMoved)
-	skipped := atomic.LoadInt64(&v.statSkipped)
-	errs := atomic.LoadInt64(&v.statErrors)
+	moved := v.statMoved.Load()
+	skipped := v.statSkipped.Load()
+	errs := v.statErrors.Load()
 	running := v.running
 	starting := v.starting
 	finished := v.finished
@@ -781,57 +777,33 @@ func (v *ImportView) requestStart() {
 	cfg := GetConfig()
 	problem := importDirsProblem(cfg.InboxDir, cfg.OutboxDir)
 	inboxHas := cfg.InboxDir != "" && cfg.OutboxDir != "" && problem == "" && inboxProbe(cfg.InboxDir)
-	if v.haveSomethingToImport(cfg, problem, inboxHas) {
-		v.startImport(cfg)
-	} else {
-		v.explainCantStart(cfg, problem, inboxHas)
+	if reason := v.cannotStartReason(cfg, problem, inboxHas); reason != "" {
+		v.setStatus(reason)
+		v.appendLog("[ERROR] " + reason)
+		return
 	}
+	v.startImport(cfg)
 }
 
-// explainCantStart logs (and posts to the status line) why a Start Import
-// click had no effect — usually because inbox/outbox are not configured, or
-// no sources have been added. Without this feedback the button looks broken.
-// cfg, problem and inboxHas are computed once by the Start-click handler and
-// threaded in so this never re-reads config, re-runs importDirsProblem or
-// re-walks the inbox (U3-06).
-func (v *ImportView) explainCantStart(cfg Config, problem string, inboxHas bool) {
+// cannotStartReason returns why a Start Import click cannot start, or "" when
+// it can. cfg, problem and inboxHas are computed once by the Start-click
+// handler (requestStart) and threaded in so this never re-reads config,
+// re-runs importDirsProblem or re-walks the inbox (U3-06).
+func (v *ImportView) cannotStartReason(cfg Config, problem string, inboxHas bool) string {
 	if cfg.InboxDir == "" || cfg.OutboxDir == "" {
-		msg := "Set Inbox and Outbox directories in Settings first (config: " + configPath() + ")."
-		v.setStatus(msg)
-		v.appendLog("[ERROR] " + msg)
-		return
+		return "Set Inbox and Outbox directories in Settings first (config: " + configPath() + ")."
 	}
 	if problem != "" {
-		msg := problem + " Fix it in Settings before importing."
-		v.setStatus(msg)
-		v.appendLog("[ERROR] " + msg)
-		return
+		return problem + " Fix it in Settings before importing."
 	}
 	v.mu.Lock()
 	hasDirs := len(v.importDirs) > 0
 	hasZips := len(v.zipFiles) > 0
 	v.mu.Unlock()
 	if !hasDirs && !hasZips && !inboxHas {
-		msg := "Nothing to import — add a folder, ZIP, or SD card and try again."
-		v.setStatus(msg)
-		v.appendLog("[ERROR] " + msg)
+		return "Nothing to import — add a folder, ZIP, or SD card and try again."
 	}
-}
-
-// haveSomethingToImport reports whether a Start Import click has anything to
-// act on. problem and inboxHas are supplied by the caller (which already ran
-// importDirsProblem and probed the inbox once) so the decision costs no extra
-// walk or symlink resolution.
-func (v *ImportView) haveSomethingToImport(cfg Config, problem string, inboxHas bool) bool {
-	if cfg.InboxDir == "" || cfg.OutboxDir == "" {
-		return false
-	}
-	if problem != "" {
-		return false
-	}
-	v.mu.Lock()
-	defer v.mu.Unlock()
-	return len(v.importDirs) > 0 || len(v.zipFiles) > 0 || inboxHas
+	return ""
 }
 
 // inboxHasFiles reports whether dir holds at least one importable media file.
@@ -851,6 +823,15 @@ func inboxHasFiles(dir string) bool {
 		return fs.SkipAll
 	})
 	return found
+}
+
+// resetStats zeroes the per-run counters at the start of an import. Show does
+// not reset them, so a closed-and-reopened overlay keeps showing the last run's
+// counts until the next Start.
+func (v *ImportView) resetStats() {
+	v.statMoved.Store(0)
+	v.statSkipped.Store(0)
+	v.statErrors.Store(0)
 }
 
 // startImport kicks off a background goroutine that runs the same three-phase
@@ -875,9 +856,7 @@ func (v *ImportView) startImport(cfg Config) {
 	// mutex itself) so the user can pause / cancel the import even when the
 	// modal is closed.
 	_, endProc := v.scope.beginProc(ctx, ProcImport, "Import", cancel, "", nil)
-	atomic.StoreInt64(&v.statMoved, 0)
-	atomic.StoreInt64(&v.statSkipped, 0)
-	atomic.StoreInt64(&v.statErrors, 0)
+	v.resetStats()
 	v.progress.reset()
 
 	go func() {
@@ -896,7 +875,7 @@ func (v *ImportView) startImport(cfg Config) {
 			if len(mounts) > 0 {
 				v.unmountAll(mounts)
 			}
-			if v.OnFinished != nil && atomic.LoadInt64(&v.statMoved) > 0 {
+			if v.OnFinished != nil && v.statMoved.Load() > 0 {
 				v.OnFinished(cfg.OutboxDir)
 			}
 			if v.invalidate != nil {
@@ -993,7 +972,7 @@ func (v *ImportView) runImport(ctx context.Context, cfg Config, importDirs, zipF
 			v.processBatch(ctx, cfg.OutboxDir, extracted)
 			if deleteSrc {
 				if err := os.Remove(z); err != nil {
-					atomic.AddInt64(&v.statErrors, 1)
+					v.statErrors.Add(1)
 					v.appendLog("[ERROR] Failed to delete source ZIP " + z + ": " + err.Error())
 				}
 			}
@@ -1038,9 +1017,9 @@ func (v *ImportView) runImport(ctx context.Context, cfg Config, importDirs, zipF
 		}
 	}
 
-	moved := atomic.LoadInt64(&v.statMoved)
-	skipped := atomic.LoadInt64(&v.statSkipped)
-	errs := atomic.LoadInt64(&v.statErrors)
+	moved := v.statMoved.Load()
+	skipped := v.statSkipped.Load()
+	errs := v.statErrors.Load()
 	if ctx.Err() != nil {
 		summary := fmt.Sprintf("Cancelled. Moved %d • skipped %d • errors %d.", moved, skipped, errs)
 		v.appendLog(summary)
@@ -1072,7 +1051,7 @@ func (v *ImportView) copyToInbox(ctx context.Context, files []string, inboxDir s
 		}
 		dest, err := fsutil.CopyUnique(ctx, srcFile, inboxDir, filepath.Base(srcFile))
 		if err != nil {
-			atomic.AddInt64(&v.statErrors, 1)
+			v.statErrors.Add(1)
 			v.appendLog("[ERROR] Copy failed for " + srcFile + ": " + err.Error())
 			v.bumpProgress()
 			continue
@@ -1086,18 +1065,42 @@ func (v *ImportView) copyToInbox(ctx context.Context, files []string, inboxDir s
 		// directory here makes every copy's entry durable before any source
 		// (the only other copy) is removed.
 		if err := syncDir(inboxDir); err != nil {
-			atomic.AddInt64(&v.statErrors, 1)
+			v.statErrors.Add(1)
 			v.appendLog("[ERROR] Failed to fsync Inbox before deleting sources: " + err.Error() + " (sources kept)")
 		} else {
 			for _, srcFile := range copied {
 				if err := os.Remove(srcFile); err != nil {
-					atomic.AddInt64(&v.statErrors, 1)
+					v.statErrors.Add(1)
 					v.appendLog("[ERROR] Failed to delete source " + srcFile + ": " + err.Error())
 				}
 			}
 		}
 	}
 	return batch
+}
+
+// mtimeFix names one file whose mtime predates its declared EXIF/metadata
+// date — rewrite the metadata to mtime after we've decided the destination so
+// subsequent scans see consistent dates.
+type mtimeFix struct {
+	path string
+	when time.Time
+}
+
+// dateResult is one file's phase-1 date read, indexed by input position.
+type dateResult struct {
+	oldest     time.Time
+	mtimeOlder bool
+}
+
+// pendingMove is a cross-device move whose destination entry still needs a
+// directory fsync before its source is unlinked.
+type pendingMove struct {
+	src        string
+	dest       string
+	destDir    string
+	baseName   string
+	dateFolder string
 }
 
 // processBatch imports one batch: read EXIF, group by base name, move into the
@@ -1108,153 +1111,114 @@ func (v *ImportView) processBatch(ctx context.Context, outboxDir string, entries
 	}
 	// The batch is visited twice — once to read every file's date, once to move
 	// it — so the progress bar spans 2*len(entries), plus one extra tick per
-	// file that needs its mtime fixed (U3-07). The date probes fork exiftool per
-	// file (~50–200 ms each); running them strictly sequentially stalled a
-	// multi-thousand-file card at 0% for minutes, so they go through a small
-	// worker pool (mirroring internal/ui/organize.go's scan pass) that bumps the
-	// bar as it reads.
+	// file that needs its mtime fixed (U3-07).
 	v.setProgress(0, int64(2*len(entries)))
 	v.setStatus(fmt.Sprintf("Reading dates from %d files…", len(entries)))
 
-	baseDates := make(map[string]time.Time)
-	// Files whose mtime predates their declared EXIF/metadata date — rewrite
-	// the metadata to mtime after we've decided the destination so subsequent
-	// scans see consistent dates.
-	type mtimeFix struct {
-		path string
-		when time.Time
-	}
-	var mtimeFixes []mtimeFix
-
-	// Phase 1: read every file's date concurrently. Results are indexed by
-	// input position so the fold below stays deterministic.
-	type dateResult struct {
-		oldest     time.Time
-		mtimeOlder bool
-	}
-	results := make([]dateResult, len(entries))
-	numWorkers := runtime.NumCPU()
-	numWorkers = min(numWorkers, 4) // cap the concurrent exiftool forks
-	// Bounded queue with a cancel-aware producer, the same shape as organize's
-	// scan pass, so a cancel stops queuing at once (U3-04).
-	jobs := make(chan int, numWorkers*2)
-	var wg sync.WaitGroup
-	for range numWorkers {
-		wg.Go(func() {
-			for idx := range jobs {
-				v.waitIfPaused()
-				if ctx.Err() != nil {
-					return
-				}
-				oldest, _, mtimeOlder := importDateProber(entries[idx])
-				results[idx] = dateResult{oldest: oldest, mtimeOlder: mtimeOlder}
-				v.bumpProgress()
-			}
-		})
-	}
-	go func() {
-		defer close(jobs)
-		for i := range entries {
-			select {
-			case jobs <- i:
-			case <-ctx.Done():
-				return
-			}
-		}
-	}()
-	wg.Wait()
-	if ctx.Err() != nil {
+	baseDates, fixes, ok := v.readDates(ctx, entries)
+	if !ok {
 		return
 	}
+	if len(fixes) > 0 {
+		// The mtime-fix pass gets its own slice of the bar so it doesn't freeze
+		// mid-import while it shells out per file.
+		v.setProgress(int64(len(entries)), int64(2*len(entries)+len(fixes)))
+	}
+	v.setStatus(fmt.Sprintf("Filing %d files into %s…", len(entries), filepath.Base(outboxDir)))
+	if len(fixes) > 0 && !v.fixMtimes(ctx, fixes) {
+		return
+	}
+	v.fileEntries(ctx, outboxDir, entries, baseDates)
+}
+
+// readDates is phase 1 of a batch: read every file's date concurrently, then
+// fold the results into baseDates and the list of files needing an mtime fix.
+// ok is false when the batch was cancelled.
+func (v *ImportView) readDates(ctx context.Context, entries []string) (baseDates map[string]time.Time, fixes []mtimeFix, ok bool) {
+	// The date probes fork exiftool per file (~50–200 ms each); running them
+	// strictly sequentially stalled a multi-thousand-file card at 0% for
+	// minutes, so they go through a small worker pool (mirroring
+	// internal/ui/organize.go's scan pass) that bumps the bar as it reads.
+	// Results are indexed by input position so the fold below stays
+	// deterministic.
+	results := make([]dateResult, len(entries))
+	workpool.RunIndexed(ctx, len(entries), scan.ExiftoolPoolSize(), func(idx int) {
+		v.waitIfPaused()
+		if ctx.Err() != nil {
+			return
+		}
+		oldest, _, mtimeOlder := importDateProber(entries[idx])
+		results[idx] = dateResult{oldest: oldest, mtimeOlder: mtimeOlder}
+		v.bumpProgress()
+	})
+	if ctx.Err() != nil {
+		return nil, nil, false
+	}
+	baseDates = make(map[string]time.Time)
 	// Fold per-file results in input order so the "oldest date wins per base
 	// name" tie-break is deterministic.
 	for i, src := range entries {
 		r := results[i]
 		if r.mtimeOlder {
-			mtimeFixes = append(mtimeFixes, mtimeFix{path: src, when: r.oldest})
+			fixes = append(fixes, mtimeFix{path: src, when: r.oldest})
 		}
 		baseName := filepath.Base(src)
 		base := strings.TrimSuffix(baseName, filepath.Ext(baseName))
-		if existing, ok := baseDates[base]; !ok || r.oldest.Before(existing) {
+		if existing, exists := baseDates[base]; !exists || r.oldest.Before(existing) {
 			baseDates[base] = r.oldest
 		}
 	}
-	if len(mtimeFixes) > 0 {
-		// The mtime-fix pass gets its own slice of the bar so it doesn't freeze
-		// mid-import while it shells out per file.
-		v.setProgress(int64(len(entries)), int64(2*len(entries)+len(mtimeFixes)))
+	return baseDates, fixes, true
+}
+
+// fixMtimes is the mtime-fix pass (U5-06): rewrite each file's metadata date to
+// its mtime. It returns false when the batch was cancelled.
+func (v *ImportView) fixMtimes(ctx context.Context, fixes []mtimeFix) bool {
+	// U5-06: each fix shells out to exiftool (~9 ms), so run them through the
+	// same bounded, cancel-aware pool as the date-read pass above — scan's
+	// exiftool pool has 4 daemons, so cap there. Errors and "ran" flags are
+	// indexed by input position; the log lines are emitted in input order
+	// after the pool drains so the log stays deterministic.
+	workers := scan.ExiftoolPoolSize()
+	if len(fixes) < 4 {
+		// A handful of fixes is cheaper serially than through the pool
+		// (and keeps their progress ticks strictly ordered).
+		workers = 1
 	}
-	v.setStatus(fmt.Sprintf("Filing %d files into %s…", len(entries), filepath.Base(outboxDir)))
-	if len(mtimeFixes) > 0 {
-		// U5-06: each fix shells out to exiftool (~9 ms), so run them through
-		// the same bounded, cancel-aware pool as the date-read pass above —
-		// scan's exiftool pool has 4 daemons, so cap there. Errors and "ran"
-		// flags are indexed by input position; the log lines are emitted in
-		// input order after the pool drains so the log stays deterministic.
-		fixErrs := make([]error, len(mtimeFixes))
-		fixRan := make([]bool, len(mtimeFixes))
-		fixWorkers := min(runtime.NumCPU(), 4)
-		if len(mtimeFixes) < 4 {
-			// A handful of fixes is cheaper serially than through the pool
-			// (and keeps their progress ticks strictly ordered).
-			fixWorkers = 1
-		}
-		fixJobs := make(chan int, fixWorkers*2)
-		var fixWG sync.WaitGroup
-		for range fixWorkers {
-			fixWG.Go(func() {
-				for idx := range fixJobs {
-					v.waitIfPaused()
-					if ctx.Err() != nil {
-						return
-					}
-					fixRan[idx] = true
-					fixErrs[idx] = importSetMediaDate(mtimeFixes[idx].path, mtimeFixes[idx].when)
-					v.bumpProgress()
-				}
-			})
-		}
-		go func() {
-			defer close(fixJobs)
-			for i := range mtimeFixes {
-				select {
-				case fixJobs <- i:
-				case <-ctx.Done():
-					return
-				}
-			}
-		}()
-		fixWG.Wait()
-		// A cancelled batch logs only the fixes that actually ran; the move
-		// pass below still returns at its own ctx check.
-		for i, fix := range mtimeFixes {
-			if !fixRan[i] {
-				continue
-			}
-			if err := fixErrs[i]; err != nil {
-				v.appendLog("[WARN] Could not rewrite creation date on " + filepath.Base(fix.path) + ": " + err.Error())
-			} else {
-				v.appendLog("Rewrote creation date on " + filepath.Base(fix.path) + " to " + fix.when.Format("2006-01-02"))
-			}
-		}
+	fixErrs := make([]error, len(fixes))
+	fixRan := make([]bool, len(fixes))
+	workpool.RunIndexed(ctx, len(fixes), workers, func(idx int) {
+		v.waitIfPaused()
 		if ctx.Err() != nil {
 			return
 		}
+		fixRan[idx] = true
+		fixErrs[idx] = importSetMediaDate(fixes[idx].path, fixes[idx].when)
+		v.bumpProgress()
+	})
+	// A cancelled batch logs only the fixes that actually ran; the move
+	// pass below still returns at its own ctx check.
+	for i, fix := range fixes {
+		if !fixRan[i] {
+			continue
+		}
+		if err := fixErrs[i]; err != nil {
+			v.appendLog("[WARN] Could not rewrite creation date on " + filepath.Base(fix.path) + ": " + err.Error())
+		} else {
+			v.appendLog("Rewrote creation date on " + filepath.Base(fix.path) + " to " + fix.when.Format("2006-01-02"))
+		}
 	}
+	return ctx.Err() == nil
+}
 
+// fileEntries is the move pass: file every entry into outboxDir/YYYY-MM-DD.
+func (v *ImportView) fileEntries(ctx context.Context, outboxDir string, entries []string, baseDates map[string]time.Time) {
 	// Cross-device moves are copies first: MoveUniqueDeferred fsyncs nothing
 	// and removes no source, so the copied entries are batched here and their
 	// destination directories fsynced once each before any source is unlinked
-	// (U5-09). pending is flushed every 64 files, after the loop, and by the
-	// deferred call on an early return, so a cancelled run still makes what it
-	// copied durable and removes the sources.
-	type pendingMove struct {
-		src        string
-		dest       string
-		destDir    string
-		baseName   string
-		dateFolder string
-	}
+	// (U5-09). pending is flushed every 64 files and by the deferred call on an
+	// early return, so a cancelled run still makes what it copied durable and
+	// removes the sources.
 	var pending []pendingMove
 	flush := func() {
 		if len(pending) == 0 {
@@ -1274,18 +1238,18 @@ func (v *ImportView) processBatch(ctx context.Context, outboxDir string, entries
 				// Without the directory fsync the new entries may not survive
 				// a power loss, so keep every source of this directory.
 				for _, pm := range group {
-					atomic.AddInt64(&v.statErrors, 1)
+					v.statErrors.Add(1)
 					v.appendLog("[ERROR] Could not move " + pm.baseName + ": " + err.Error())
 				}
 				continue
 			}
 			for _, pm := range group {
 				if err := os.Remove(pm.src); err != nil {
-					atomic.AddInt64(&v.statErrors, 1)
+					v.statErrors.Add(1)
 					v.appendLog("[ERROR] Could not remove source " + pm.src + " after copying to " + pm.dest + ": " + err.Error())
 					continue
 				}
-				atomic.AddInt64(&v.statMoved, 1)
+				v.statMoved.Add(1)
 				v.appendLog(fmt.Sprintf("[OK] Moved %s -> %s", pm.baseName, filepath.Join(pm.dateFolder, filepath.Base(pm.dest))))
 			}
 		}
@@ -1303,7 +1267,7 @@ func (v *ImportView) processBatch(ctx context.Context, outboxDir string, entries
 		dateFolder := baseDates[base].Format("2006-01-02")
 		destDir := filepath.Join(outboxDir, dateFolder)
 		if err := os.MkdirAll(destDir, 0o755); err != nil {
-			atomic.AddInt64(&v.statErrors, 1)
+			v.statErrors.Add(1)
 			v.appendLog(fmt.Sprintf("[ERROR] mkdir %s: %v", destDir, err))
 			v.bumpProgress()
 			continue
@@ -1317,7 +1281,7 @@ func (v *ImportView) processBatch(ctx context.Context, outboxDir string, entries
 			// matches hardlinks and symlinked dirs; skipping those just leaves
 			// the source in place, which is always safe.
 			if srcInfo, err := os.Stat(src); err == nil && os.SameFile(srcInfo, destInfo) {
-				atomic.AddInt64(&v.statSkipped, 1)
+				v.statSkipped.Add(1)
 				v.appendLog(fmt.Sprintf("[SKIP] %s is already filed in %s", baseName, dateFolder))
 				v.bumpProgress()
 				continue
@@ -1325,10 +1289,10 @@ func (v *ImportView) processBatch(ctx context.Context, outboxDir string, entries
 			same, _ := fsutil.SameContent(src, dest)
 			if same {
 				if err := os.Remove(src); err != nil {
-					atomic.AddInt64(&v.statErrors, 1)
+					v.statErrors.Add(1)
 					v.appendLog("[ERROR] Could not remove duplicate " + baseName + ": " + err.Error())
 				} else {
-					atomic.AddInt64(&v.statSkipped, 1)
+					v.statSkipped.Add(1)
 					v.appendLog(fmt.Sprintf("[SKIP] %s already in %s (identical)", baseName, dateFolder))
 				}
 				v.bumpProgress()
@@ -1337,7 +1301,7 @@ func (v *ImportView) processBatch(ctx context.Context, outboxDir string, entries
 		}
 		dest, copied, moveErr := fsutil.MoveUniqueDeferred(ctx, src, destDir, baseName)
 		if moveErr != nil {
-			atomic.AddInt64(&v.statErrors, 1)
+			v.statErrors.Add(1)
 			v.appendLog("[ERROR] Could not move " + baseName + ": " + moveErr.Error())
 		} else if copied {
 			// Cross-device: the bytes are in destDir but its entry isn't
@@ -1354,12 +1318,11 @@ func (v *ImportView) processBatch(ctx context.Context, outboxDir string, entries
 				flush()
 			}
 		} else {
-			atomic.AddInt64(&v.statMoved, 1)
+			v.statMoved.Add(1)
 			v.appendLog(fmt.Sprintf("[OK] Moved %s -> %s", baseName, filepath.Join(dateFolder, filepath.Base(dest))))
 		}
 		v.bumpProgress()
 	}
-	flush()
 }
 
 func (v *ImportView) extractZipToInbox(ctx context.Context, zipPath, inboxDir string) []string {
