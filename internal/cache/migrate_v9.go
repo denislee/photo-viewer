@@ -77,6 +77,15 @@ func migrateV9(db *sql.DB, userVersion int) error {
 			PRIMARY KEY (face_id, tag_id)
 		) WITHOUT ROWID;
 		CREATE INDEX IF NOT EXISTS idx_face_tag_links_tag ON face_tag_links(tag_id);
+		-- Durable: the centroid of every named cluster, saved by Clear() so a
+		-- group the user named (without confirming faces) gets its name back
+		-- when Regroup runs over the re-detected faces. Consumed by that
+		-- Regroup (ReplaceClusters).
+		CREATE TABLE IF NOT EXISTS person_anchors (
+			id        INTEGER PRIMARY KEY AUTOINCREMENT,
+			person_id INTEGER NOT NULL,
+			centroid  BLOB NOT NULL
+		);
 	`); err != nil {
 		return err
 	}

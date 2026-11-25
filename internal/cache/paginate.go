@@ -15,11 +15,15 @@ import (
 // ordered by path, which lets pagination and neighbor lookup share one code
 // path instead of duplicating four queries.
 type View struct {
-	Kind    string // "all" | "favorites" | "year" | "dir"
-	Dir     string // absolute path; only for Kind == "dir"
-	Year    int    // only for Kind == "year"
-	Filter  string // "All" | "Photos" | "Videos"
-	ShowRAW bool   // when false, RAW entries are excluded
+	Kind string // "all" | "favorites" | "year" | "dir" | "person" | "group"
+	Dir  string // absolute path; only for Kind == "dir"
+	Year int    // only for Kind == "year"
+	// PersonID selects the photos containing that person (Kind "person");
+	// ClusterID the photos of an unnamed group's faces (Kind "group").
+	PersonID  int64
+	ClusterID int64
+	Filter    string // "All" | "Photos" | "Videos"
+	ShowRAW   bool   // when false, RAW entries are excluded
 }
 
 // whereClause renders the SQL WHERE fragment (without the leading "WHERE")
@@ -31,6 +35,13 @@ func (v View) whereClause() (string, []any) {
 	switch v.Kind {
 	case "favorites":
 		return "favorite = 1" + typeWhere, typeArgs
+	case "person":
+		// Served by idx_faces_person (person_id, path).
+		return "path IN (SELECT path FROM faces WHERE person_id = ?)" + typeWhere,
+			append([]any{v.PersonID}, typeArgs...)
+	case "group":
+		return "path IN (SELECT path FROM faces WHERE cluster_id = ? AND assign = 'cluster' AND person_id IS NULL)" + typeWhere,
+			append([]any{v.ClusterID}, typeArgs...)
 	case "year":
 		args := []any{v.Year}
 		args = append(args, typeArgs...)

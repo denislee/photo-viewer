@@ -165,6 +165,10 @@ type Controller struct {
 	// (I-19 item 6). Without it, os.Exit could run after the trash renames
 	// but before RemoveEntries, leaving ghost rows until a Rebuild.
 	deletions sync.WaitGroup
+
+	// faces is the face-recognition state (pipeline, detection pass, people
+	// undo stack); see controller_faces.go.
+	faces faceState
 }
 
 func NewController(root string, idx *cache.Index, store *cache.ThumbStore, cacheDir string) *Controller {
@@ -273,7 +277,7 @@ func (c *Controller) cancelScanLocked() {
 // and the sidebar tree both re-anchor on path; the Favorites and Trash views
 // skip the scan. Safe to call from any goroutine.
 func (c *Controller) SelectDir(path string) {
-	if path == FavoritesView || path == TrashView {
+	if path == FavoritesView || path == TrashView || isPeopleDir(path) {
 		c.mu.Lock()
 		c.cancelScanLocked()
 		c.currentDir = path
@@ -290,7 +294,14 @@ func (c *Controller) SelectDir(path string) {
 	c.mu.Unlock()
 
 	c.scheduleRefresh(path)
-	go c.scanInto(ctx, path)
+	go func() {
+		c.scanInto(ctx, path)
+		// Newly indexed photos get their faces detected; the pass skips
+		// everything already fresh, so this is cheap on a re-scan.
+		if ctx.Err() == nil && c.facesRunning() {
+			c.DetectFaces()
+		}
+	}()
 }
 
 // SetFilter switches the active media filter ("All", "Photos", "Videos") and
@@ -533,6 +544,14 @@ func (c *Controller) refreshFromIndex(dir string, recount bool) {
 	case dir == TrashView:
 		entries = cache.ListTrash(c.trashDir)
 		needGoFilter = true
+	case dir == PeopleView:
+		// The overview draws avatars, not entries.
+	case strings.HasPrefix(dir, PersonViewPrefix):
+		id, _ := parseSentinelID(dir, PersonViewPrefix)
+		entries = c.index.ListPage(cache.View{Kind: "person", PersonID: id, Filter: filter, ShowRAW: showRAW}, 0, 0)
+	case strings.HasPrefix(dir, GroupViewPrefix):
+		id, _ := parseSentinelID(dir, GroupViewPrefix)
+		entries = c.index.ListPage(cache.View{Kind: "group", ClusterID: id, Filter: filter, ShowRAW: showRAW}, 0, 0)
 	case strings.HasPrefix(dir, YearViewPrefix):
 		// U-08: resolve the year-preview union in a single covering-index query
 		// scoped to treeDir instead of one prefix-LIKE ListDir per date dir. The
@@ -569,7 +588,7 @@ func (c *Controller) refreshFromIndex(dir string, recount bool) {
 	sortEntries(filtered, sortMode)
 
 	// Avoid running listSubdirs (filesystem I/O) under the mutex.
-	wantSubdirs := treeDir == dir && dir != FavoritesView && dir != TrashView
+	wantSubdirs := treeDir == dir && dir != FavoritesView && dir != TrashView && !isPeopleDir(dir)
 	var subs []string
 	if wantSubdirs {
 		subs = listSubdirs(dir)
@@ -646,6 +665,7 @@ func (c *Controller) refreshFromIndex(dir string, recount bool) {
 		}
 	}
 	counts[FavoritesView] = c.index.CountFavorites(filter, showRAW)
+	counts[PeopleView] = c.index.CountPeople()
 	if c.trashDir != "" {
 		// Cached mirror — no per-refresh os.ReadDir + stat over the trash
 		// directory. The delete / restore / empty paths keep this in sync.

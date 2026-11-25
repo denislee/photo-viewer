@@ -51,7 +51,7 @@ func TestCollectRestoresBatchesAllResults(t *testing.T) {
 	trashPaths, origPaths := seedTrashFixture(t, root, trashDir, n)
 
 	// store nil: RestoreFromTrash skips the thumb rename when no store is wired.
-	results, restored := collectRestores(trashPaths, nil)
+	results, restored, _ := collectRestores(trashPaths, nil)
 
 	if restored != n {
 		t.Fatalf("restored = %d, want %d", restored, n)

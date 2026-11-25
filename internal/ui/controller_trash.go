@@ -89,9 +89,19 @@ func (c *Controller) DrainDeletions(timeout time.Duration) bool {
 // aborting the batch. Never mutates widget state directly — the single recount
 // request at the end repaints via the Controller's refresh path.
 func (c *Controller) restoreBatch(paths []string) {
-	results, restored := collectRestores(paths, c.store)
+	results, restored, renamed := collectRestores(paths, c.store)
+	for orig, dst := range renamed {
+		if err := c.index.MoveTags(orig, dst); err != nil {
+			log.Printf("trash: move face tags %s: %v", orig, err)
+		}
+	}
 	if len(results) > 0 {
 		c.index.ReconcileBatchChanged(results)
+		// The restored files lost their face rows on delete; their durable
+		// tags re-attach when the pass re-detects them.
+		if c.facesRunning() {
+			c.DetectFaces()
+		}
 	}
 	if restored > 0 {
 		c.bumpTrashCount(-restored)
@@ -106,15 +116,25 @@ func (c *Controller) restoreBatch(paths []string) {
 // caller issues the single batched writes. restored counts every successful
 // RestoreFromTrash (what the trash count must drop by); it can exceed
 // len(results) if a restored file vanished before its post-restore Stat.
-func collectRestores(paths []string, store *cache.ThumbStore) (results []scan.Result, restored int) {
+//
+// renamed maps original path → restored path for files that came back under
+// a new name ("x (restored 1).jpg"), so their face tags can be re-keyed.
+func collectRestores(paths []string, store *cache.ThumbStore) (results []scan.Result, restored int, renamed map[string]string) {
 	results = make([]scan.Result, 0, len(paths))
 	for _, p := range paths {
+		orig, _ := cache.TrashOriginalPath(p)
 		dst, err := cache.RestoreFromTrash(p, store)
 		if err != nil {
 			log.Printf("trash: restore failed for %s: %v", p, err)
 			continue
 		}
 		restored++
+		if orig != "" && orig != dst {
+			if renamed == nil {
+				renamed = map[string]string{}
+			}
+			renamed[orig] = dst
+		}
 		info, sErr := os.Stat(dst)
 		if sErr != nil {
 			continue
@@ -126,7 +146,7 @@ func collectRestores(paths []string, store *cache.ThumbStore) (results []scan.Re
 			ModTime: info.ModTime(),
 		})
 	}
-	return results, restored
+	return results, restored, renamed
 }
 
 // patchLocalDeletion is the in-memory mirror of "these paths went away" —

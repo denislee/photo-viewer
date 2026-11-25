@@ -1038,6 +1038,10 @@ func (i *Index) Clear() error {
 	}
 	defer tx.Rollback()
 	for _, stmt := range []string{
+		// Keep the names of named groups across the wipe (see person_anchors).
+		// Anchors from an earlier Clear that no Regroup consumed yet are kept
+		// alongside.
+		"INSERT INTO person_anchors (person_id, centroid) SELECT person_id, centroid FROM face_clusters WHERE person_id IS NOT NULL",
 		"DELETE FROM entries",
 		"DELETE FROM faces",
 		"DELETE FROM face_clusters",

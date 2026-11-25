@@ -30,6 +30,8 @@ func (c *Controller) Rebuild() error {
 	c.scanCancel = cancel
 	idx := c.index
 	c.mu.Unlock()
+	// A detection pass writing face rows would race the wipe below.
+	c.cancelFacePass()
 
 	// Reset the index in place instead of deleting and reopening the db.
 	// Keeping the same *cache.Index handle means the duplicates view, fuzzy
@@ -87,6 +89,9 @@ func (c *Controller) Rebuild() error {
 		if err := c.index.Vacuum(); err != nil {
 			log.Printf("rebuild: vacuum: %v", err)
 		}
+		// Faces: re-detect (the durable tags re-attach as rows are written),
+		// regroup so names re-link, then sweep tags of vanished files.
+		c.afterRebuildFaces(ctx)
 	}()
 	return nil
 }

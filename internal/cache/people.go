@@ -949,3 +949,29 @@ func parseNBox(s string) ([4]float64, bool) {
 	}
 	return b, HasNBox(b)
 }
+
+// ForgetFaces wipes the machine face layer (faces, clusters, links, and the
+// per-file detection freshness) and, when alsoPeople, the durable people and
+// tags too. Settings → "Forget all face data".
+func (i *Index) ForgetFaces(alsoPeople bool) error {
+	tx, err := i.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	stmts := []string{
+		"DELETE FROM face_tag_links",
+		"DELETE FROM faces",
+		"DELETE FROM face_clusters",
+		"UPDATE entries SET face_thumb_mtime = NULL WHERE face_thumb_mtime IS NOT NULL",
+	}
+	if alsoPeople {
+		stmts = append(stmts, "DELETE FROM face_tags", "DELETE FROM people")
+	}
+	for _, q := range stmts {
+		if _, err := tx.Exec(q); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
+}

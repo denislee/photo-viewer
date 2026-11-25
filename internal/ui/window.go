@@ -121,12 +121,16 @@ func Run(w *app.Window, ctrl *Controller) error {
 	// background goroutines read c.invalidate while SetInvalidate was still
 	// racing to publish it (and it still surfaces in the process bar).
 	go ctrl.SelectDir(ctrl.LibraryRoot())
+	// Face recognition: probe the helper off the UI goroutine (1–15 s) and,
+	// when it works and the setting is on, start detecting.
+	ctrl.StartFaces()
 
 	var ops op.Ops
 	for {
 		ev := w.Event()
 		switch e := ev.(type) {
 		case app.DestroyEvent:
+			ctrl.StopFaces()
 			if !ctrl.DrainDeletions(3 * time.Second) {
 				log.Printf("delete: exiting with deletions still in flight")
 			}

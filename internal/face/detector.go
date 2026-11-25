@@ -176,6 +176,21 @@ func refreshProbe() Status {
 	return s
 }
 
+// CachedStatus returns the memoised probe result without running a probe;
+// ok is false before the first probe.
+func CachedStatus() (Status, bool) {
+	probeMu.Lock()
+	defer probeMu.Unlock()
+	if probeCached == nil {
+		return Status{}, false
+	}
+	return *probeCached, true
+}
+
+// RefreshStatus re-runs the probe and updates the memo (Settings → Recheck
+// before any pipeline exists).
+func RefreshStatus() Status { return refreshProbe() }
+
 // Available is a thin wrapper for hot paths that just need a yes/no. It reads
 // the cached probe result, so only the first call pays the Python fork cost.
 func Available() bool { return cachedProbe().Working }

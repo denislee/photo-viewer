@@ -16,6 +16,32 @@ type RegroupFace struct {
 	OldCluster int64   // cluster before the regroup, 0 if none
 }
 
+// Anchor is a saved named-cluster centroid (see person_anchors).
+type Anchor struct {
+	PersonID int64
+	Centroid []float32
+}
+
+// Anchors returns the saved named-cluster centroids.
+func (i *Index) Anchors() ([]Anchor, error) {
+	rows, err := i.db.Query("SELECT person_id, centroid FROM person_anchors WHERE person_id IN (SELECT id FROM people) ORDER BY id")
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []Anchor
+	for rows.Next() {
+		var a Anchor
+		var blob []byte
+		if err := rows.Scan(&a.PersonID, &blob); err != nil {
+			return nil, err
+		}
+		a.Centroid = DecodeEmbedding(blob)
+		out = append(out, a)
+	}
+	return out, rows.Err()
+}
+
 // RegroupCluster is one cluster the regroup pass produced.
 type RegroupCluster struct {
 	Centroid []float32
@@ -98,7 +124,7 @@ func (i *Index) LoadForRegroup() ([]RegroupFace, map[int64]int64, error) {
 // ReplaceClusters swaps the whole cluster layer for the regroup result in one
 // transaction: every cluster is recreated, every face re-pointed (faces in no
 // cluster are left unclustered) and every identity re-derived. Tags are not
-// touched.
+// touched; the saved person anchors are consumed.
 func (i *Index) ReplaceClusters(clusters []RegroupCluster) error {
 	tx, err := i.db.Begin()
 	if err != nil {
@@ -146,6 +172,9 @@ func (i *Index) ReplaceClusters(clusters []RegroupCluster) error {
 		}
 	}
 	if _, err := tx.Exec(rederiveSQL); err != nil {
+		return err
+	}
+	if _, err := tx.Exec("DELETE FROM person_anchors"); err != nil {
 		return err
 	}
 	return tx.Commit()

@@ -29,6 +29,11 @@ type RegroupOptions struct {
 	// Progress, when set, is called with (done, total) every few hundred
 	// faces and once at the end.
 	Progress func(done, total int)
+
+	// anchors are the named-cluster centroids Clear saved; a cluster that
+	// gets no name from confirmed faces or old clusters takes the person of
+	// the nearest anchor within the threshold.
+	anchors []cache.Anchor
 }
 
 // Regroup runs the regroup pass over idx and replaces its clusters. Callers
@@ -36,6 +41,10 @@ type RegroupOptions struct {
 // cluster cache is serialised with it.
 func Regroup(ctx context.Context, idx *cache.Index, opt RegroupOptions) error {
 	faces, oldPersons, err := idx.LoadForRegroup()
+	if err != nil {
+		return err
+	}
+	opt.anchors, err = idx.Anchors()
 	if err != nil {
 		return err
 	}
@@ -137,6 +146,9 @@ func regroupCore(ctx context.Context, faces []cache.RegroupFace, oldPersons map[
 			rc.PersonID = c.PersonID.Int64
 		default:
 			rc.PersonID = relinkPerson(faces, members[s], oldPersons)
+			if rc.PersonID == 0 {
+				rc.PersonID = anchorPerson(c.Centroid, faces, members[s], opt)
+			}
 		}
 		out = append(out, rc)
 	}
@@ -188,6 +200,30 @@ func argmax(m map[int64]int) int64 {
 	for k, n := range m {
 		if n > bestN || (n == bestN && k < best) {
 			best, bestN = k, n
+		}
+	}
+	return best
+}
+
+// anchorPerson returns the person of the nearest saved anchor within the
+// threshold, unless a member rejected that person.
+func anchorPerson(centroid []float32, faces []cache.RegroupFace, members []int, opt RegroupOptions) int64 {
+	maxSq := opt.MaxSq
+	if maxSq <= 0 {
+		maxSq = MaxClusterSqDistance
+	}
+	best, bestD := int64(0), maxSq
+	for _, a := range opt.anchors {
+		if d := SquaredEuclidean(centroid, a.Centroid); d < bestD {
+			best, bestD = a.PersonID, d
+		}
+	}
+	if best == 0 {
+		return 0
+	}
+	for _, k := range members {
+		if rejected(cache.TagHint{Rejected: faces[k].Rejected}, best) {
+			return 0
 		}
 	}
 	return best

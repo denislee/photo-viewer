@@ -49,6 +49,13 @@ type Config struct {
 	// hosts on the network can reach it. The default (false) binds to
 	// 127.0.0.1 only.
 	WebServerBindAll bool `json:"web_server_bind_all"`
+
+	// FacesDisabled turns face recognition off. Stored inverted so the
+	// default (absent key) is on, as the plan asks when the helper exists.
+	FacesDisabled bool `json:"faces_disabled"`
+	// FaceStrictness is the grouping preset: "strict" (0.50), "normal"
+	// (0.60, default) or "loose" (0.65) Euclidean. Changing it regroups.
+	FaceStrictness string `json:"face_strictness"`
 }
 
 var (
