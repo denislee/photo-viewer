@@ -3,7 +3,9 @@ package face
 import (
 	"context"
 	"errors"
+	"image"
 	"log"
+	"os"
 	"runtime"
 	"sync"
 	"sync/atomic"
@@ -457,6 +459,8 @@ func (p *Pipeline) assignAndPersist(j Job, dets []Detection) (changed bool) {
 			ThumbMtime: j.ThumbMod,
 			BBox:       d.BBox,
 			Embedding:  d.Embedding,
+			NBox:       normBox(d, j.ThumbPath),
+			Quality:    d.Quality,
 		}
 		idx := NearestCluster(d.Embedding, p.cachedClusters)
 		if idx >= 0 {
@@ -522,4 +526,20 @@ func (p *Pipeline) InvalidateClusters() {
 	p.freshnessMu.Lock()
 	p.freshness = nil
 	p.freshnessMu.Unlock()
+}
+
+// normBox normalises a detection's bbox by the size of the image it was
+// found on: the helper's reported size, else the JPEG header of the
+// rendition (one cheap DecodeConfig), else unknown.
+func normBox(d Detection, renditionPath string) [4]float64 {
+	w, h := d.ImgW, d.ImgH
+	if (w <= 0 || h <= 0) && renditionPath != "" {
+		if f, err := os.Open(renditionPath); err == nil {
+			if cfg, _, err := image.DecodeConfig(f); err == nil {
+				w, h = cfg.Width, cfg.Height
+			}
+			f.Close()
+		}
+	}
+	return cache.NormBox(d.BBox, w, h)
 }

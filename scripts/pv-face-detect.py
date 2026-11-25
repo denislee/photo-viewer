@@ -6,7 +6,8 @@
 #
 # Server mode protocol (one JSON object per line, both directions):
 #   request:  {"path": "/abs/path/to/image.jpg"}
-#   response: {"detections": [{"bbox":[x,y,w,h],"embedding":[128 floats]}, ...]}
+#   response: {"detections": [{"bbox":[x,y,w,h],"embedding":[128 floats],
+#                              "quality":0..1}, ...], "size":[img_w,img_h]}
 #       or:   {"error": "human-readable message"}
 # Exit 0 on stdin EOF.
 #
@@ -167,19 +168,55 @@ except SystemExit as e:
     sys.exit(2)
 
 
+def _face_quality(img, left: int, top: int, width: int, height: int) -> float:
+    """Detector-side quality score in 0..1: face size times sharpness.
+
+    size:  0 at a 12 px face, 1 at 60 px and up (HOG's embeddings are noisy
+           on tiny crops, which is the main source of wrong groups).
+    sharp: variance of a 4-neighbour Laplacian over the grey face crop,
+           mapped so ~150 (a crisp face) is 1; motion blur and heavy JPEG
+           smoothing push it toward 0.
+    The score is size * (0.5 + 0.5 * sharp), so a big blurry face still
+    outranks a tiny sharp one. Pure numpy so it can be unit-tested without
+    face_recognition.
+    """
+    import numpy as np  # type: ignore
+
+    side = min(width, height)
+    size = min(max((side - 12) / 48.0, 0.0), 1.0)
+    h, w = img.shape[0], img.shape[1]
+    x0, y0 = max(left, 0), max(top, 0)
+    x1, y1 = min(left + width, w), min(top + height, h)
+    if x1 - x0 < 3 or y1 - y0 < 3:
+        return 0.0
+    crop = np.asarray(img[y0:y1, x0:x1], dtype=np.float64)
+    grey = crop.mean(axis=2) if crop.ndim == 3 else crop
+    lap = (
+        4 * grey[1:-1, 1:-1]
+        - grey[:-2, 1:-1]
+        - grey[2:, 1:-1]
+        - grey[1:-1, :-2]
+        - grey[1:-1, 2:]
+    )
+    sharp = min(float(lap.var()) / 150.0, 1.0)
+    return round(size * (0.5 + 0.5 * sharp), 4)
+
+
 def _detect_one(path: str):
     img = face_recognition.load_image_file(path)
     locs = face_recognition.face_locations(img, model="hog")
     encs = face_recognition.face_encodings(img, locs) if locs else []
     out = []
     for (top, right, bottom, left), enc in zip(locs, encs):
+        w, h = int(right - left), int(bottom - top)
         out.append(
             {
-                "bbox": [int(left), int(top), int(right - left), int(bottom - top)],
+                "bbox": [int(left), int(top), w, h],
                 "embedding": [float(x) for x in enc],
+                "quality": _face_quality(img, int(left), int(top), w, h),
             }
         )
-    return out
+    return out, [int(img.shape[1]), int(img.shape[0])]
 
 
 def _serve() -> int:
@@ -198,8 +235,8 @@ def _serve() -> int:
             sys.stdout.flush()
             continue
         try:
-            dets = _detect_one(path)
-            sys.stdout.write(json.dumps({"detections": dets}) + "\n")
+            dets, size = _detect_one(path)
+            sys.stdout.write(json.dumps({"detections": dets, "size": size}) + "\n")
         except Exception as e:  # noqa: BLE001
             sys.stdout.write(json.dumps({"error": f"{type(e).__name__}: {e}"}) + "\n")
         sys.stdout.flush()
@@ -232,7 +269,7 @@ def main() -> int:
         return 0
     path = sys.argv[1]
     try:
-        out = _detect_one(path)
+        out, _ = _detect_one(path)
     except Exception as e:  # noqa: BLE001 - report any decode failure
         sys.stderr.write(f"load {path}: {e}\n")
         return 1

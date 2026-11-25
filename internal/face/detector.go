@@ -51,6 +51,14 @@ func resolveBinary() (string, error) {
 type Detection struct {
 	BBox      [4]int    `json:"bbox"`
 	Embedding []float32 `json:"embedding"`
+	// Quality is the helper's 0..1 face size × sharpness score (0 when an
+	// older helper did not report one).
+	Quality float64 `json:"quality"`
+	// ImgW/ImgH are the pixel size of the image the face was found on, from
+	// the response's "size" (0 when an older helper did not report it). They
+	// turn BBox into the normalised box stored on the face row.
+	ImgW int `json:"-"`
+	ImgH int `json:"-"`
 }
 
 // Status reports the helper's reachability for the UI. Three states:
@@ -277,6 +285,7 @@ func (d *daemon) Detect(ctx context.Context, imagePath string) ([]Detection, err
 		}
 		var resp struct {
 			Detections []Detection `json:"detections"`
+			Size       [2]int      `json:"size"`
 			Error      string      `json:"error"`
 		}
 		if err := json.Unmarshal(r.line, &resp); err != nil {
@@ -286,6 +295,9 @@ func (d *daemon) Detect(ctx context.Context, imagePath string) ([]Detection, err
 		if resp.Error != "" {
 			// Daemon is healthy; it just couldn't handle this one image.
 			return nil, &perImageError{msg: resp.Error}
+		}
+		for k := range resp.Detections {
+			resp.Detections[k].ImgW, resp.Detections[k].ImgH = resp.Size[0], resp.Size[1]
 		}
 		return resp.Detections, nil
 	}

@@ -177,6 +177,42 @@ def test_per_probe_timeout_skips_wedged_to_working():
     assert elapsed < 5.0, elapsed
 
 
+def _load_quality_fn():
+    """Pull _face_quality out of the script without importing it (importing
+    would run the pipx re-exec and the face_recognition import)."""
+    import ast
+
+    with open(SCRIPT) as fh:
+        tree = ast.parse(fh.read())
+    fn = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "_face_quality")
+    ns = {}
+    exec(compile(ast.Module(body=[fn], type_ignores=[]), SCRIPT, "exec"), ns)
+    return ns["_face_quality"]
+
+
+def test_face_quality_size_and_sharpness():
+    try:
+        import numpy as np  # type: ignore
+    except ImportError:
+        print("SKIP test_face_quality_size_and_sharpness: numpy not installed")
+        return
+    q = _load_quality_fn()
+    rng = np.random.default_rng(1)
+    sharp = rng.integers(0, 255, size=(200, 200, 3)).astype(np.uint8)
+    flat = np.full((200, 200, 3), 128, dtype=np.uint8)
+    big_sharp = q(sharp, 10, 10, 80, 80)
+    big_flat = q(flat, 10, 10, 80, 80)
+    tiny_sharp = q(sharp, 10, 10, 10, 10)
+    assert 0.99 <= big_sharp <= 1.0, big_sharp
+    assert abs(big_flat - 0.5) < 1e-6, big_flat  # full size, zero sharpness
+    assert tiny_sharp == 0.0, tiny_sharp  # under 12 px scores 0
+    ramp = np.tile(np.arange(200, dtype=np.uint8)[None, :, None], (200, 1, 3))
+    assert q(ramp, 10, 10, 80, 80) < big_sharp  # smooth (blurry) face scores lower
+    mid = q(sharp, 10, 10, 36, 36)
+    assert tiny_sharp < mid < big_sharp, mid  # grows with face size
+    assert q(sharp, 500, 500, 40, 40) == 0.0  # entirely outside the image
+
+
 def _main():
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     failures = 0
