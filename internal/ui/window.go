@@ -15,6 +15,8 @@ import (
 	"gioui.org/op/clip"
 	"gioui.org/op/paint"
 	"gioui.org/unit"
+
+	"github.com/dns/photo-viewer/internal/cache"
 )
 
 // sidebarSplitter owns the drag state for the resizable divider between the
@@ -91,18 +93,9 @@ func Run(w *app.Window, ctrl *Controller) error {
 	webView := NewWebServerView(ctrl.NewWebServer(), w.Invalidate)
 	search := NewFuzzySearchView(ctrl.Index())
 	search.SetInvalidate(func() { w.Invalidate() })
-	search.OnPick = func(path string, isDir bool) {
-		_, prev, _, _ := ctrl.Snapshot()
-		grid.RememberFor(prev)
-		target := path
-		if !isDir {
-			target = filepath.Dir(path)
-		}
-		grid.RestoreFor(target)
-		ctrl.SelectDir(target)
-		search.Close()
-		w.Invalidate()
-	}
+
+	wireSidebar(sidebar, search, grid, viewer, ctrl, w)
+
 	// focusSearch is set by the Ctrl+K handler so the next layout pass can
 	// route keyboard focus to the editor (must run inside a frame).
 	focusSearch := false
@@ -112,81 +105,7 @@ func Run(w *app.Window, ctrl *Controller) error {
 	// the sidebar, and Enter/'l' on a sidebar row hands it back to the grid.
 	sidebarFocus := false
 
-	sidebar.OnPick = func(p string) {
-		_, prev, _, _ := ctrl.Snapshot()
-		grid.RememberFor(prev)
-		grid.RestoreFor(p)
-		ctrl.SelectDir(p)
-	}
-	sidebar.OnPreview = func(p string) {
-		_, prev, _, _ := ctrl.Snapshot()
-		grid.RememberFor(prev)
-		grid.RestoreFor(p)
-		ctrl.PreviewDir(p)
-	}
-	sidebar.OnPreviewYear = func(year string, dirs []string) {
-		_, prev, _, _ := ctrl.Snapshot()
-		grid.RememberFor(prev)
-		grid.RestoreFor(YearViewPrefix + year)
-		ctrl.PreviewYear(year)
-	}
-	grid.OnOpen = func(idx int) {
-		_, _, entries, _ := ctrl.Snapshot()
-		viewer.Show(entries, idx)
-		w.Invalidate()
-	}
-	toolbar.OnImport = func() {
-		imports.Show()
-		w.Invalidate()
-	}
-	toolbar.OnDuplicates = func() {
-		dups.Show()
-		w.Invalidate()
-	}
-	toolbar.OnOrganize = func() {
-		organize.Show(ctrl.Index())
-		w.Invalidate()
-	}
-	toolbar.OnExportFavorites = func() {
-		go exportFavoritesViaPicker(ctrl, w.Invalidate)
-	}
-	toolbar.OnSettings = func() {
-		settings.Show()
-		w.Invalidate()
-	}
-	toolbar.OnRebuild = func() {
-		go func() {
-			if err := ctrl.Rebuild(); err != nil {
-				ctrl.surfaceError("rebuild index", err)
-			}
-		}()
-	}
-	toolbar.OnWarmUp = func() {
-		ctrl.WarmUp()
-	}
-	toolbar.OnWebServer = func() {
-		webView.Show()
-		w.Invalidate()
-	}
-	toolbar.OnFilter = func(f string) {
-		ctrl.SetFilter(f)
-	}
-	toolbar.OnShowRAW = func(v bool) {
-		ctrl.SetShowRAW(v)
-	}
-	toolbar.OnGroupByYear = func(v bool) {
-		UpdateConfig(func(c *Config) { c.GroupByYear = v })
-		w.Invalidate()
-	}
-	toolbar.OnSortByLength = func(v bool) {
-		mode := SortByName
-		if v {
-			mode = SortByDuration
-		}
-		UpdateConfig(func(c *Config) { c.SortMode = mode })
-		ctrl.SetSort(mode)
-		w.Invalidate()
-	}
+	wireToolbar(toolbar, ctrl, imports, dups, organize, settings, webView, w)
 
 	views := &appViews{
 		toolbar: toolbar, sidebar: sidebar, grid: grid, viewer: viewer,
@@ -251,9 +170,127 @@ func Run(w *app.Window, ctrl *Controller) error {
 	}
 }
 
+// wireSidebar wires the sidebar, search palette and grid callbacks. The three
+// pane switches all snapshot the current dir first so each pane can remember
+// its own scroll position before the switch, which is why they need both the
+// grid and the controller. The closures capture the views built by Run.
+func wireSidebar(sidebar *Sidebar, search *FuzzySearchView, grid *Grid, viewer *Viewer, ctrl *Controller, w *app.Window) {
+	search.OnPick = func(path string, isDir bool) {
+		_, prev, _, _ := ctrl.Snapshot()
+		grid.RememberFor(prev)
+		target := path
+		if !isDir {
+			target = filepath.Dir(path)
+		}
+		grid.RestoreFor(target)
+		ctrl.SelectDir(target)
+		search.Close()
+		w.Invalidate()
+	}
+
+	sidebar.OnPick = func(p string) {
+		_, prev, _, _ := ctrl.Snapshot()
+		grid.RememberFor(prev)
+		grid.RestoreFor(p)
+		ctrl.SelectDir(p)
+	}
+	sidebar.OnPreview = func(p string) {
+		_, prev, _, _ := ctrl.Snapshot()
+		grid.RememberFor(prev)
+		grid.RestoreFor(p)
+		ctrl.PreviewDir(p)
+	}
+	sidebar.OnPreviewYear = func(year string, dirs []string) {
+		_, prev, _, _ := ctrl.Snapshot()
+		grid.RememberFor(prev)
+		grid.RestoreFor(YearViewPrefix + year)
+		ctrl.PreviewYear(year)
+	}
+	grid.OnOpen = func(idx int) {
+		_, _, entries, _ := ctrl.Snapshot()
+		viewer.Show(entries, idx)
+		w.Invalidate()
+	}
+}
+
+// wireToolbar wires every toolbar button to the view or controller action it
+// opens. The background actions (rebuild, favorites export) run on their own
+// goroutine so a slow disk never blocks the event loop; the config-backed
+// toggles persist through UpdateConfig.
+func wireToolbar(toolbar *Toolbar, ctrl *Controller, imports *ImportView, dups *DuplicatesView, organize *OrganizeView, settings *SettingsView, webView *WebServerView, w *app.Window) {
+	toolbar.OnImport = func() {
+		imports.Show()
+		w.Invalidate()
+	}
+	toolbar.OnDuplicates = func() {
+		dups.Show()
+		w.Invalidate()
+	}
+	toolbar.OnOrganize = func() {
+		organize.Show(ctrl.Index())
+		w.Invalidate()
+	}
+	toolbar.OnExportFavorites = func() {
+		go exportFavoritesViaPicker(ctrl, w.Invalidate)
+	}
+	toolbar.OnSettings = func() {
+		settings.Show()
+		w.Invalidate()
+	}
+	toolbar.OnRebuild = func() {
+		go func() {
+			if err := ctrl.Rebuild(); err != nil {
+				ctrl.surfaceError("rebuild index", err)
+			}
+		}()
+	}
+	toolbar.OnWarmUp = func() {
+		ctrl.WarmUp()
+	}
+	toolbar.OnWebServer = func() {
+		webView.Show()
+		w.Invalidate()
+	}
+	toolbar.OnFilter = func(f string) {
+		ctrl.SetFilter(f)
+	}
+	toolbar.OnShowRAW = func(v bool) {
+		ctrl.SetShowRAW(v)
+	}
+	toolbar.OnGroupByYear = func(v bool) {
+		UpdateConfig(func(c *Config) { c.GroupByYear = v })
+		w.Invalidate()
+	}
+	toolbar.OnSortByLength = func(v bool) {
+		mode := SortByName
+		if v {
+			mode = SortByDuration
+		}
+		UpdateConfig(func(c *Config) { c.SortMode = mode })
+		ctrl.SetSort(mode)
+		w.Invalidate()
+	}
+}
+
+// rootFrame carries what drawRoot measures once per frame — the controller
+// snapshot and the window/bar geometry — into the body and overlay passes.
+// Bundling it keeps both helpers down to a handful of parameters instead of a
+// dozen scalars (same intent as appViews, G4-09). The snapshot is taken once
+// in drawRoot so both passes see the same library state.
+type rootFrame struct {
+	treeDir    string
+	currentDir string
+	entries    []cache.Entry
+	subdirs    []string
+
+	totalW   int
+	totalH   int
+	sbH      int // shortcut bar height, 0 when hints are disabled
+	pbH      int // process bar height, 0 when no process is running
+	procSnap []ProcessSnapshot
+}
+
 func drawRoot(gtx layout.Context, th *Theme, ctrl *Controller, views *appViews, sidebarFocus bool, w *app.Window) {
-	tb, sb, g, v := views.toolbar, views.sidebar, views.grid, views.viewer
-	processBar, splitter := views.processBar, views.splitter
 	rect := image.Rectangle{Max: gtx.Constraints.Max}
 	defer clip.Rect(rect).Push(gtx.Ops).Pop()
 	paint.ColorOp{Color: th.Background}.Add(gtx.Ops)
@@ -272,7 +309,7 @@ func drawRoot(gtx layout.Context, th *Theme, ctrl *Controller, views *appViews, 
 	// Process bar — sits just above the shortcut bar and only consumes
 	// space when at least one background process is running.
 	procSnap := ctrl.processes.Snapshot()
-	pbH := gtx.Dp(unit.Dp(processBar.HeightDp(procSnap)))
+	pbH := gtx.Dp(unit.Dp(views.processBar.HeightDp(procSnap)))
 
 	// Bottom shortcut bar — drawn over the viewer and all modals when the
 	// user has opted in via Settings. Hidden by default.
@@ -283,9 +320,76 @@ func drawRoot(gtx layout.Context, th *Theme, ctrl *Controller, views *appViews, 
 		gtx2 := gtx
 		gtx2.Constraints = layout.Exact(image.Pt(totalW, sbH))
 		stack := op.Offset(image.Pt(0, totalH-sbH)).Push(gtx.Ops)
-		drawShortcutBar(gtx2, th, v.Open, sidebarFocus, ctrl.SelectionMode())
+		drawShortcutBar(gtx2, th, views.viewer.Open, sidebarFocus, ctrl.SelectionMode())
 		stack.Pop()
 	}
+
+	f := rootFrame{
+		treeDir: treeDir, currentDir: currentDir,
+		entries: entries, subdirs: subdirs,
+		totalW: totalW, totalH: totalH,
+		sbH: sbH, pbH: pbH,
+		procSnap: procSnap,
+	}
+
+	// The overlays cover the whole window, so when one of them takes the frame
+	// the body must not be drawn at all (see layoutOverlays).
+	if layoutOverlays(gtx, th, ctrl, views, f, drawShortcut) {
+		return
+	}
+	layoutBody(gtx, th, ctrl, views, w, f, drawShortcut)
+}
+
+// layoutOverlays draws the full-window overlays — the top modal (search
+// palette, SD-card prompt, duplicates, import, organize, settings, web server)
+// and the viewer — and reports whether one of them took the frame, in which
+// case the body must be skipped. The shortcut bar is drawn on top of them so
+// its esc/close hints stay visible.
+func layoutOverlays(gtx layout.Context, th *Theme, ctrl *Controller, views *appViews, f rootFrame, drawShortcut func()) bool {
+	v := views.viewer
+
+	// Modal overlays cover the window. Drawn before the shortcut bar so it
+	// stays visible at the bottom for esc/close hints. Only the top modal
+	// (see newModals for the order) is drawn.
+	if m := views.topModal(); m != nil {
+		// A modal over a playing video must not leave it redrawing at the
+		// video frame rate underneath (G5-04).
+		if v.Open {
+			v.SetVideoVisible(false)
+		}
+		gtx2 := gtx
+		gtx2.Constraints = layout.Exact(image.Pt(f.totalW, f.totalH-f.sbH))
+		m.layout(gtx2, th)
+		drawShortcut()
+		return true
+	}
+
+	// When the viewer is open it covers the window. Skip drawing the
+	// background UI so its clickables don't steal keyboard focus from the
+	// root key handler.
+	if v.Open {
+		gtx2 := gtx
+		gtx2.Constraints = layout.Exact(image.Pt(f.totalW, f.totalH-f.sbH))
+		v.InTrash = f.currentDir == TrashView
+		v.Layout(gtx2, th, ctrl.Thumbs())
+		drawShortcut()
+		return true
+	}
+
+	return false
+}
+
+// layoutBody draws the main screen: the toolbar, the resizable sidebar with
+// its splitter, the grid, and the process and shortcut bars, plus the two
+// overlays anchored to that content (the delete confirmation and the toolbar
+// tooltip).
+func layoutBody(gtx layout.Context, th *Theme, ctrl *Controller, views *appViews, w *app.Window, f rootFrame, drawShortcut func()) {
+	tb, sb, g, v := views.toolbar, views.sidebar, views.grid, views.viewer
+	processBar, splitter := views.processBar, views.splitter
+	treeDir, currentDir, entries, subdirs := f.treeDir, f.currentDir, f.entries, f.subdirs
+	totalW, totalH, sbH, pbH := f.totalW, f.totalH, f.sbH, f.pbH
+	procSnap := f.procSnap
+
 	drawProcBar := func() {
 		if pbH == 0 {
 			// Layout never runs for an empty bar, so release the finished
@@ -298,34 +402,6 @@ func drawRoot(gtx layout.Context, th *Theme, ctrl *Controller, views *appViews, 
 		stack := op.Offset(image.Pt(0, totalH-sbH-pbH)).Push(gtx.Ops)
 		processBar.Layout(gtx2, th, procSnap)
 		stack.Pop()
-	}
-
-	// Modal overlays cover the window. Drawn before the shortcut bar so it
-	// stays visible at the bottom for esc/close hints. Only the top modal
-	// (see newModals for the order) is drawn.
-	if m := views.topModal(); m != nil {
-		// A modal over a playing video must not leave it redrawing at the
-		// video frame rate underneath (G5-04).
-		if v.Open {
-			v.SetVideoVisible(false)
-		}
-		gtx2 := gtx
-		gtx2.Constraints = layout.Exact(image.Pt(totalW, totalH-sbH))
-		m.layout(gtx2, th)
-		drawShortcut()
-		return
-	}
-
-	// When the viewer is open it covers the window. Skip drawing the
-	// background UI so its clickables don't steal keyboard focus from the
-	// root key handler.
-	if v.Open {
-		gtx2 := gtx
-		gtx2.Constraints = layout.Exact(image.Pt(totalW, totalH-sbH))
-		v.InTrash = currentDir == TrashView
-		v.Layout(gtx2, th, ctrl.Thumbs())
-		drawShortcut()
-		return
 	}
 
 	tbH := gtx.Dp(unit.Dp(toolbarHeightDp))
