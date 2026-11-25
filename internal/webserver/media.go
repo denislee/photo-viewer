@@ -10,24 +10,34 @@ import (
 	"github.com/dns/photo-viewer/internal/cache"
 )
 
+// entryParam resolves the {id} path value to an index (or trash) entry,
+// answering 404 itself when the id is malformed or unknown.
+func (s *Server) entryParam(w http.ResponseWriter, r *http.Request) (cache.Entry, bool) {
+	id := r.PathValue("id")
+	if !validID(id) {
+		http.NotFound(w, r)
+		return cache.Entry{}, false
+	}
+	e, ok := s.lookupEntry(id)
+	if !ok {
+		http.NotFound(w, r)
+		return cache.Entry{}, false
+	}
+	return e, true
+}
+
 // handleThumb serves the cached thumbnail JPEG for /thumb/<id>.
 // Generates on demand via ThumbStore.Path so unseen thumbs are created
 // the same way the GUI would.
 func (s *Server) handleThumb(w http.ResponseWriter, r *http.Request) {
-	id := strings.TrimPrefix(r.URL.Path, "/thumb/")
-	if !validID(id) {
-		http.NotFound(w, r)
-		return
-	}
 	// Resolve the entry before the conditional check so the ETag can fold in
 	// the source mtime — cheap now that GetEntryByThumbID is index-backed
 	// (I-08). The old ETag was the bare thumb id (== sha1 of the path), so it
 	// never changed when a file was edited in place and remote browsers 304'd
 	// on the stale thumb forever. Keying on mtime as well means an edit yields
 	// a fresh ETag and the next revalidation fetches the regenerated thumb.
-	e, ok := s.lookupEntry(id)
+	e, ok := s.entryParam(w, r)
 	if !ok {
-		http.NotFound(w, r)
 		return
 	}
 	etag := mtimeETag(e)
@@ -45,14 +55,8 @@ func (s *Server) handleThumb(w http.ResponseWriter, r *http.Request) {
 // handleMedia serves the original media file for /media/<id>. Uses
 // http.ServeFile so range requests are honored (important for video).
 func (s *Server) handleMedia(w http.ResponseWriter, r *http.Request) {
-	id := strings.TrimPrefix(r.URL.Path, "/media/")
-	if !validID(id) {
-		http.NotFound(w, r)
-		return
-	}
-	e, ok := s.lookupEntry(id)
+	e, ok := s.entryParam(w, r)
 	if !ok {
-		http.NotFound(w, r)
 		return
 	}
 	if ct := mimeFor(e.Path); ct != "" {
@@ -158,14 +162,8 @@ func etagMatches(ifNoneMatch, etag string) bool {
 // exactly like handleThumb, so editing the file in place invalidates any
 // cached response.
 func (s *Server) handleDisplay(w http.ResponseWriter, r *http.Request) {
-	id := strings.TrimPrefix(r.URL.Path, "/display/")
-	if !validID(id) {
-		http.NotFound(w, r)
-		return
-	}
-	e, ok := s.lookupEntry(id)
+	e, ok := s.entryParam(w, r)
 	if !ok {
-		http.NotFound(w, r)
 		return
 	}
 	etag := mtimeETag(e)

@@ -212,11 +212,6 @@ func buildCtxQuery(from, year, dir, filter string, showRAW bool) string {
 // kind they render, so one body serves all three.
 func (s *Server) galleryOf(kind string) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		// "/" is the mux catch-all; anything else under it is not the index.
-		if kind == "all" && r.URL.Path != "/" {
-			http.NotFound(w, r)
-			return
-		}
 		filter, showRAW := parseToggles(r.URL.Query())
 		s.renderGalleryPage(w, r, s.newViewInfo(kind, 0, "", filter, showRAW))
 	}

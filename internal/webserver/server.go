@@ -147,6 +147,41 @@ func (s *Server) Addr() string {
 	return s.addr
 }
 
+// handler builds the server's full handler chain: the routes, gzip on the
+// text routes, basic auth when password is set, and secureHeaders outermost.
+// Start serves it; tests use it so they exercise the same chain as production.
+func (s *Server) handler(password string) http.Handler {
+	mux := http.NewServeMux()
+	// gz wraps text routes (HTML pages + JSON APIs) with gzip. The binary
+	// routes (/thumb, /media, /hls segments) are left on the raw
+	// ResponseWriter: their payloads are already compressed, and http.ServeFile
+	// there relies on range requests and the io.ReaderFrom sendfile fast path
+	// that a wrapping writer would defeat.
+	gz := func(h http.HandlerFunc) http.HandlerFunc { return gzipMiddleware(h).ServeHTTP }
+	mux.HandleFunc("GET /{$}", gz(s.galleryOf("all")))
+	mux.HandleFunc("GET /favorites", gz(s.galleryOf("favorites")))
+	mux.HandleFunc("GET /trash", gz(s.galleryOf("trash")))
+	mux.HandleFunc("GET /year/", gz(s.handleYear))
+	mux.HandleFunc("GET /dir", gz(s.handleDir))
+	mux.HandleFunc("GET /view/{id}", gz(s.handleView))
+	mux.HandleFunc("GET /thumb/{id}", s.handleThumb)
+	mux.HandleFunc("GET /media/{id}", s.handleMedia)
+	mux.HandleFunc("GET /display/{id}", s.handleDisplay)
+	mux.HandleFunc("GET /hls/{id}/{file}", s.handleHLS)
+	mux.HandleFunc("GET /api/page", gz(s.handleAPIPage))
+	mux.HandleFunc("POST /api/favorite", gz(s.handleAPIFavorite))
+	mux.HandleFunc("GET /api/info", gz(s.handleAPIInfo))
+
+	var handler http.Handler = mux
+	if password != "" {
+		handler = basicAuth(handler, password)
+	}
+	// Outermost wrapper so hardening headers (W-11) land on every response,
+	// including the 401/429 that basicAuth returns before the mux is reached.
+	handler = secureHeaders(handler)
+	return handler
+}
+
 // Start binds host:port and serves the index. When password is non-empty the
 // routes are wrapped with HTTP Basic auth (username "viewer"). Returns an
 // error if the listener can't be opened or the server is already running.
@@ -162,37 +197,8 @@ func (s *Server) Start(host string, port int, password string) error {
 		s.mu.Unlock()
 		return err
 	}
-	mux := http.NewServeMux()
-	// gz wraps text routes (HTML pages + JSON APIs) with gzip. The binary
-	// routes (/thumb, /media, /hls segments) are left on the raw
-	// ResponseWriter: their payloads are already compressed, and http.ServeFile
-	// there relies on range requests and the io.ReaderFrom sendfile fast path
-	// that a wrapping writer would defeat.
-	gz := func(h http.HandlerFunc) http.HandlerFunc { return gzipMiddleware(h).ServeHTTP }
-	mux.HandleFunc("/", gz(s.galleryOf("all")))
-	mux.HandleFunc("/favorites", gz(s.galleryOf("favorites")))
-	mux.HandleFunc("/trash", gz(s.galleryOf("trash")))
-	mux.HandleFunc("/year/", gz(s.handleYear))
-	mux.HandleFunc("/dir", gz(s.handleDir))
-	mux.HandleFunc("/view/", gz(s.handleView))
-	mux.HandleFunc("/thumb/", s.handleThumb)
-	mux.HandleFunc("/media/", s.handleMedia)
-	mux.HandleFunc("/display/", s.handleDisplay)
-	mux.HandleFunc("/hls/", s.handleHLS)
-	mux.HandleFunc("/api/page", gz(s.handleAPIPage))
-	mux.HandleFunc("/api/favorite", gz(s.handleAPIFavorite))
-	mux.HandleFunc("/api/info", gz(s.handleAPIInfo))
-
-	var handler http.Handler = mux
-	if password != "" {
-		handler = basicAuth(handler, password)
-	}
-	// Outermost wrapper so hardening headers (W-11) land on every response,
-	// including the 401/429 that basicAuth returns before the mux is reached.
-	handler = secureHeaders(handler)
-
 	srv := &http.Server{
-		Handler:      handler,
+		Handler:      s.handler(password),
 		ReadTimeout:  30 * time.Second,
 		WriteTimeout: 0, // streaming large videos can exceed any fixed budget
 		IdleTimeout:  120 * time.Second,

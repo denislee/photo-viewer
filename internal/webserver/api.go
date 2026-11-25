@@ -113,11 +113,6 @@ const favoriteMaxBody = 4 << 10
 // handleAPIFavorite toggles or sets the favorite flag for a given thumb id.
 // Returns the new state so the client can update the UI deterministically.
 func (s *Server) handleAPIFavorite(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		w.Header().Set("Allow", "POST")
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
 	if ct := r.Header.Get("Content-Type"); !strings.HasPrefix(ct, "application/json") {
 		http.Error(w, "unsupported media type", http.StatusUnsupportedMediaType)
 		return

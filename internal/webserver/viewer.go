@@ -5,7 +5,6 @@ import (
 	"html"
 	"net/http"
 	"path/filepath"
-	"strings"
 
 	"github.com/dns/photo-viewer/internal/cache"
 	"github.com/dns/photo-viewer/internal/scan"
@@ -15,14 +14,8 @@ import (
 // and prev/next links into the surrounding list. The `from` query carries
 // the list context — without it, the viewer renders without nav arrows.
 func (s *Server) handleView(w http.ResponseWriter, r *http.Request) {
-	id := strings.TrimPrefix(r.URL.Path, "/view/")
-	if !validID(id) {
-		http.NotFound(w, r)
-		return
-	}
-	cur, ok := s.lookupEntry(id)
+	cur, ok := s.entryParam(w, r)
 	if !ok {
-		http.NotFound(w, r)
 		return
 	}
 

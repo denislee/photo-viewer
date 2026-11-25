@@ -65,16 +65,7 @@ func fixture(t *testing.T, n int) (*Server, *httptest.Server, func()) {
 	idx.ReconcileBatch(results)
 
 	s := New(idx, store, display, libRoot, filepath.Join(libRoot, ".photo-viewer-trash"))
-	mux := http.NewServeMux()
-	mux.HandleFunc("/", s.galleryOf("all"))
-	mux.HandleFunc("/favorites", s.galleryOf("favorites"))
-	mux.HandleFunc("/year/", s.handleYear)
-	mux.HandleFunc("/dir", s.handleDir)
-	mux.HandleFunc("/view/", s.handleView)
-	mux.HandleFunc("/thumb/", s.handleThumb)
-	mux.HandleFunc("/display/", s.handleDisplay)
-	mux.HandleFunc("/api/page", s.handleAPIPage)
-	ts := httptest.NewServer(mux)
+	ts := httptest.NewServer(s.handler(""))
 
 	return s, ts, func() {
 		ts.Close()
@@ -399,8 +390,8 @@ func TestAPIPageEmptyDirPathRejected(t *testing.T) {
 	}
 }
 
-// apiFixture creates a minimal test server with only /api/favorite registered
-// — enough for CSRF boundary tests that need no actual index data.
+// apiFixture creates a test server over an empty index — enough for CSRF
+// boundary tests that need no actual index data.
 func apiFixture(t *testing.T) (*httptest.Server, func()) {
 	t.Helper()
 	tmp, err := os.MkdirTemp("", "pv-api-")
@@ -416,9 +407,7 @@ func apiFixture(t *testing.T) (*httptest.Server, func()) {
 		t.Fatal(err)
 	}
 	s := New(idx, store, nil, tmp, filepath.Join(tmp, ".photo-viewer-trash"))
-	mux := http.NewServeMux()
-	mux.HandleFunc("/api/favorite", s.handleAPIFavorite)
-	ts := httptest.NewServer(mux)
+	ts := httptest.NewServer(s.handler(""))
 	return ts, func() {
 		ts.Close()
 		idx.Close()
@@ -510,9 +499,7 @@ func TestAPIFavoriteAcceptsSameOrigin(t *testing.T) {
 	id := cache.ThumbIDFor(mediaPath)
 
 	s := New(idx, store, nil, tmp, filepath.Join(tmp, ".photo-viewer-trash"))
-	mux := http.NewServeMux()
-	mux.HandleFunc("/api/favorite", s.handleAPIFavorite)
-	ts := httptest.NewServer(mux)
+	ts := httptest.NewServer(s.handler(""))
 	defer ts.Close()
 
 	body := strings.NewReader(`{"id":"` + id + `","on":true}`)
@@ -597,9 +584,7 @@ func TestGalleryPageScansSubdirsOnce(t *testing.T) {
 	idx.ReconcileBatch(results)
 
 	s := New(idx, store, nil, libRoot, filepath.Join(libRoot, ".photo-viewer-trash"))
-	mux := http.NewServeMux()
-	mux.HandleFunc("/dir", s.handleDir)
-	ts := httptest.NewServer(mux)
+	ts := httptest.NewServer(s.handler(""))
 	defer ts.Close()
 
 	// Count listSubdirs calls for the open directory only. The separate scan of
@@ -781,9 +766,7 @@ func trashFixture(t *testing.T, n int) (*httptest.Server, func()) {
 	idx.ReconcileBatch(results)
 
 	s := New(idx, store, nil, libRoot, filepath.Join(libRoot, ".photo-viewer-trash"))
-	mux := http.NewServeMux()
-	mux.HandleFunc("/trash", s.galleryOf("trash"))
-	ts := httptest.NewServer(mux)
+	ts := httptest.NewServer(s.handler(""))
 	return ts, func() {
 		ts.Close()
 		idx.Close()
@@ -909,9 +892,7 @@ func TestContentDispositionEscapesQuote(t *testing.T) {
 	}})
 
 	s := New(idx, store, nil, tmp, filepath.Join(tmp, ".photo-viewer-trash"))
-	mux := http.NewServeMux()
-	mux.HandleFunc("/media/", s.handleMedia)
-	ts := httptest.NewServer(mux)
+	ts := httptest.NewServer(s.handler(""))
 	defer ts.Close()
 
 	id := cache.ThumbIDFor(fpath)
@@ -990,11 +971,9 @@ func TestSecureHeaders(t *testing.T) {
 	s, _, cleanup := fixture(t, 1)
 	defer cleanup()
 
-	mux := http.NewServeMux()
-	mux.HandleFunc("/", s.galleryOf("all"))
-	mux.HandleFunc("/thumb/", s.handleThumb)
-	mux.HandleFunc("/api/page", s.handleAPIPage)
-	ts := httptest.NewServer(secureHeaders(mux))
+	// s.handler already applies secureHeaders outermost, exactly as in
+	// production.
+	ts := httptest.NewServer(s.handler(""))
 	defer ts.Close()
 
 	// HTML page carries nosniff + CSP + Referrer-Policy.
@@ -1059,9 +1038,9 @@ func TestAuthThrottle(t *testing.T) {
 	s, _, cleanup := fixture(t, 1)
 	defer cleanup()
 
-	mux := http.NewServeMux()
-	mux.HandleFunc("/", s.galleryOf("all"))
-	ts := httptest.NewServer(secureHeaders(basicAuth(mux, "secret")))
+	// s.handler("secret") applies basicAuth + secureHeaders exactly as in
+	// production.
+	ts := httptest.NewServer(s.handler("secret"))
 	defer ts.Close()
 
 	do := func(pass string) int {
@@ -1134,9 +1113,7 @@ func TestVideoViewerPosterAndTranscodeFallback(t *testing.T) {
 	})
 
 	s := New(idx, store, nil, tmp, filepath.Join(tmp, ".photo-viewer-trash"))
-	mux := http.NewServeMux()
-	mux.HandleFunc("/view/", s.handleView)
-	ts := httptest.NewServer(mux)
+	ts := httptest.NewServer(s.handler(""))
 	defer ts.Close()
 
 	get := func(id string) string {
@@ -1209,9 +1186,9 @@ func makeDisplayJPEG(t *testing.T, w, h int) []byte {
 }
 
 // displayFixture wires an index + real on-disk files + a display store behind
-// just the /display route. Unlike fixture(), the media files actually exist on
-// disk so /display can serve/render them. It seeds two entries sharing one set
-// of JPEG bytes: small.jpg (a natively-renderable original, under the
+// the production handler chain. Unlike fixture(), the media files actually
+// exist on disk so /display can serve/render them. It seeds two entries sharing
+// one set of JPEG bytes: small.jpg (a natively-renderable original, under the
 // pass-through threshold) and photo.dng (typed RAW; the JPEG magic makes
 // LoadRAWPreview return the bytes whole, so the rendition needs no exiftool).
 func displayFixture(t *testing.T) (ts *httptest.Server, ids map[string]string, jpegBytes []byte, mtime time.Time, cleanup func()) {
@@ -1267,9 +1244,7 @@ func displayFixture(t *testing.T) (ts *httptest.Server, ids map[string]string, j
 	idx.ReconcileBatch(results)
 
 	s := New(idx, store, display, libRoot, filepath.Join(libRoot, ".photo-viewer-trash"))
-	mux := http.NewServeMux()
-	mux.HandleFunc("/display/", s.handleDisplay)
-	ts = httptest.NewServer(mux)
+	ts = httptest.NewServer(s.handler(""))
 	return ts, ids, jpegBytes, mtime, func() {
 		ts.Close()
 		idx.Close()
@@ -1432,12 +1407,7 @@ func TestNoAbsolutePathsExposed(t *testing.T) {
 	idx.ReconcileBatch(results)
 
 	s := New(idx, store, nil, libRoot, filepath.Join(libRoot, ".photo-viewer-trash"))
-	mux := http.NewServeMux()
-	mux.HandleFunc("/", s.galleryOf("all"))
-	mux.HandleFunc("/dir", s.handleDir)
-	mux.HandleFunc("/view/", s.handleView)
-	mux.HandleFunc("/api/info", s.handleAPIInfo)
-	ts := httptest.NewServer(mux)
+	ts := httptest.NewServer(s.handler(""))
 	defer ts.Close()
 
 	get := func(path string) (int, string) {
@@ -1543,7 +1513,7 @@ func TestTrashUsesResolvedDirOnReadOnlyRoot(t *testing.T) {
 	s := New(idx, store, nil, libRoot, td)
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodGet, "/trash", nil)
-	s.galleryOf("trash")(rec, req)
+	s.handler("").ServeHTTP(rec, req)
 
 	if rec.Code != http.StatusOK {
 		t.Fatalf("GET /trash = %d, want 200", rec.Code)

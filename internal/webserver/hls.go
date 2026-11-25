@@ -106,17 +106,15 @@ func hlsSegCount(dur float64) int {
 // (segments). Both resolve <id> to a video entry via the shared lookup so
 // trash items work the same as indexed ones.
 func (s *Server) handleHLS(w http.ResponseWriter, r *http.Request) {
-	rest := strings.TrimPrefix(r.URL.Path, "/hls/")
-	id, file, ok := strings.Cut(rest, "/")
-	if !ok || !validID(id) {
+	e, ok := s.entryParam(w, r)
+	if !ok {
+		return
+	}
+	if e.Type != scan.TypeVideo {
 		http.NotFound(w, r)
 		return
 	}
-	e, ok := s.lookupEntry(id)
-	if !ok || e.Type != scan.TypeVideo {
-		http.NotFound(w, r)
-		return
-	}
+	file := r.PathValue("file")
 
 	switch {
 	case file == "index.m3u8":

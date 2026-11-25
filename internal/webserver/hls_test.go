@@ -72,9 +72,7 @@ func hlsFixture(t *testing.T, videoName string, seconds int) (string, *httptest.
 	}})
 
 	s := New(idx, store, nil, libRoot, filepath.Join(libRoot, ".photo-viewer-trash"))
-	mux := http.NewServeMux()
-	mux.HandleFunc("/hls/", s.handleHLS)
-	ts := httptest.NewServer(mux)
+	ts := httptest.NewServer(s.handler(""))
 
 	id := cache.ThumbIDFor(vid)
 	cleanup := func() {
@@ -212,7 +210,7 @@ func TestHLSPlaylistUsesIndexDuration(t *testing.T) {
 	// isn't even required for this path).
 	s, id, cleanup := indexedVideoServer(t, 14000)
 	defer cleanup()
-	ts := httptest.NewServer(http.HandlerFunc(s.handleHLS))
+	ts := httptest.NewServer(s.handler(""))
 	defer ts.Close()
 
 	resp, err := http.Get(ts.URL + "/hls/" + id + "/index.m3u8")
@@ -248,7 +246,7 @@ func TestHLSPlaylistETag(t *testing.T) {
 			req.Header.Set("If-None-Match", ifNoneMatch)
 		}
 		rec := httptest.NewRecorder()
-		s.handleHLS(rec, req)
+		s.handler("").ServeHTTP(rec, req)
 		return rec
 	}
 
@@ -304,7 +302,7 @@ func TestHLSSegmentRejectsOutOfRange(t *testing.T) {
 	// must 404 rather than spawn an ffmpeg seek past the end and cache junk.
 	s, id, cleanup := indexedVideoServer(t, 8000)
 	defer cleanup()
-	ts := httptest.NewServer(http.HandlerFunc(s.handleHLS))
+	ts := httptest.NewServer(s.handler(""))
 	defer ts.Close()
 
 	resp, err := http.Get(ts.URL + "/hls/" + id + "/seg5.ts")
@@ -325,7 +323,7 @@ func TestHLSSegmentRejectsOutOfRange(t *testing.T) {
 func TestHLSSegmentBoundsUnknownDuration(t *testing.T) {
 	s, id, cleanup := indexedVideoServer(t, 0) // duration-less on purpose
 	defer cleanup()
-	ts := httptest.NewServer(http.HandlerFunc(s.handleHLS))
+	ts := httptest.NewServer(s.handler(""))
 	defer ts.Close()
 
 	var probes int
@@ -562,7 +560,7 @@ func TestHLSTrashPlaylistAndSegmentsProbeOnce(t *testing.T) {
 	get := func(name string) *httptest.ResponseRecorder {
 		t.Helper()
 		rec := httptest.NewRecorder()
-		s.handleHLS(rec, httptest.NewRequest(http.MethodGet, "/hls/"+id+"/"+name, nil))
+		s.handler("").ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/hls/"+id+"/"+name, nil))
 		return rec
 	}
 

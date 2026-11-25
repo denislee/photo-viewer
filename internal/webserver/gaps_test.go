@@ -254,7 +254,7 @@ func TestHLSPhotoIDNotFound(t *testing.T) {
 
 	for _, name := range []string{"index.m3u8", "seg0.ts"} {
 		rec := httptest.NewRecorder()
-		s.handleHLS(rec, httptest.NewRequest(http.MethodGet, "/hls/"+id+"/"+name, nil))
+		s.handler("").ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/hls/"+id+"/"+name, nil))
 		if rec.Code != http.StatusNotFound {
 			t.Errorf("GET /hls/%s/%s = %d, want 404 (photo, not video)", id, name, rec.Code)
 		}
@@ -272,7 +272,7 @@ func TestAPIInfoStatusAndShape(t *testing.T) {
 	}
 	defer func() { mediaInfoFn = orig }()
 
-	// fixture registers no /api/info route, so the handler is driven directly.
+	// fixture serves the full production handler chain, including /api/info.
 	s, _, cleanup := fixture(t, 1)
 	defer cleanup()
 
@@ -293,7 +293,7 @@ func TestAPIInfoStatusAndShape(t *testing.T) {
 
 	get := func(query string) *httptest.ResponseRecorder {
 		rec := httptest.NewRecorder()
-		s.handleAPIInfo(rec, httptest.NewRequest(http.MethodGet, "/api/info"+query, nil))
+		s.handler("").ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/api/info"+query, nil))
 		return rec
 	}
 
