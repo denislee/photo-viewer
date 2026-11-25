@@ -70,3 +70,135 @@ func UpdatedCentroid(centroid, v []float32, count int) []float32 {
 	}
 	return out
 }
+
+// People-aware assignment (plan §3.5, items 1–3).
+
+// MinClusterQuality is the helper quality score below which a face is stored
+// but not clustered: tiny or blurry crops give noisy embeddings, and one
+// noisy early face is enough to drag a running-mean centroid toward someone
+// else ("chaining"). A zero quality means "not reported" (older helper) and
+// is clustered as before. Deliberately low until the W1 eval set says more.
+const MinClusterQuality = 0.05
+
+// ExemplarMargin is how much closer (squared distance) a face must be to
+// person P's nearest confirmed face than to any other person's before the
+// exemplar step sends it to P.
+const ExemplarMargin = 0.04
+
+// Exemplar is a confirmed face of a person, used as an anchor.
+type Exemplar = cache.Exemplar
+
+// Decision is where one detection goes.
+type Decision struct {
+	// Cluster is the index into the clusters slice to join, or -1.
+	Cluster int
+	// New is true when a new cluster should be created (Cluster == -1).
+	// Cluster == -1 && !New means "store unclustered".
+	New bool
+	// Person names the new cluster (New only), 0 for unnamed.
+	Person int64
+}
+
+// Assigner holds the knobs and anchors for one assignment pass.
+type Assigner struct {
+	// MaxSq is the squared same-person threshold (strictness); 0 means
+	// MaxClusterSqDistance.
+	MaxSq     float64
+	Exemplars []Exemplar
+}
+
+func (a *Assigner) maxSq() float64 {
+	if a == nil || a.MaxSq <= 0 {
+		return MaxClusterSqDistance
+	}
+	return a.MaxSq
+}
+
+// Decide places one detection with embedding v and helper quality q, given
+// what the user's tags already say about it (hint) and the current clusters.
+// Rules, in order:
+//
+//  1. ignored, or quality under MinClusterQuality → stored unclustered;
+//  2. confirmed as P → P's nearest cluster, whatever the distance (or a new
+//     cluster named P);
+//  3. nearest confirmed exemplar is P within the threshold and beats every
+//     other person by ExemplarMargin → P's nearest cluster (or a new one);
+//  4. nearest centroid within the threshold, skipping clusters of people the
+//     face rejected;
+//  5. otherwise a new unnamed cluster.
+func (a *Assigner) Decide(v []float32, q float64, hint cache.TagHint, clusters []cache.Cluster) Decision {
+	if len(v) == 0 || hint.Ignored || (q > 0 && q < MinClusterQuality) {
+		return Decision{Cluster: -1}
+	}
+	toPerson := func(p int64) Decision {
+		best, bestD := -1, math.Inf(1)
+		for k := range clusters {
+			if clusters[k].PersonID.Valid && clusters[k].PersonID.Int64 == p {
+				if d := SquaredEuclidean(v, clusters[k].Centroid); d < bestD {
+					best, bestD = k, d
+				}
+			}
+		}
+		if best >= 0 {
+			return Decision{Cluster: best}
+		}
+		return Decision{Cluster: -1, New: true, Person: p}
+	}
+	if hint.Confirmed > 0 {
+		return toPerson(hint.Confirmed)
+	}
+	maxSq := a.maxSq()
+	if a != nil && len(a.Exemplars) > 0 {
+		nearest := map[int64]float64{}
+		for _, e := range a.Exemplars {
+			d := SquaredEuclidean(v, e.Embedding)
+			if cur, ok := nearest[e.PersonID]; !ok || d < cur {
+				nearest[e.PersonID] = d
+			}
+		}
+		bestP, bestD, otherD := int64(0), math.Inf(1), math.Inf(1)
+		for p, d := range nearest {
+			if rejected(hint, p) {
+				continue
+			}
+			switch {
+			case d < bestD || (d == bestD && p < bestP):
+				otherD = math.Min(otherD, bestD)
+				bestP, bestD = p, d
+			case d < otherD:
+				otherD = d
+			}
+		}
+		// A rejected person still counts as "another person" for the margin.
+		for p, d := range nearest {
+			if p != bestP && rejected(hint, p) {
+				otherD = math.Min(otherD, d)
+			}
+		}
+		if bestP > 0 && bestD < maxSq && bestD+ExemplarMargin <= otherD {
+			return toPerson(bestP)
+		}
+	}
+	best, bestD := -1, maxSq
+	for k := range clusters {
+		if clusters[k].PersonID.Valid && rejected(hint, clusters[k].PersonID.Int64) {
+			continue
+		}
+		if d := SquaredEuclidean(v, clusters[k].Centroid); d < bestD {
+			best, bestD = k, d
+		}
+	}
+	if best >= 0 {
+		return Decision{Cluster: best}
+	}
+	return Decision{Cluster: -1, New: true}
+}
+
+func rejected(h cache.TagHint, p int64) bool {
+	for _, r := range h.Rejected {
+		if r == p {
+			return true
+		}
+	}
+	return false
+}

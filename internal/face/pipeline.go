@@ -75,6 +75,11 @@ type Pipeline struct {
 	clusterMu      sync.Mutex
 	cachedClusters []cache.Cluster
 	clusterCacheOK bool
+	// exemplars (confirmed faces) are loaded with the cluster cache and
+	// dropped with it, so a Mutate that confirms a face is seen next assign.
+	exemplars []cache.Exemplar
+	// maxSq is the strictness threshold (squared); guarded by clusterMu.
+	maxSq float64
 
 	// freshnessMu guards freshness, an in-memory mirror of the latest
 	// thumb_mtime stored per-path in entries.face_thumb_mtime (F5-01).
@@ -423,8 +428,10 @@ func (p *Pipeline) assignAndPersist(j Job, dets []Detection) (changed bool) {
 
 	if !p.clusterCacheOK {
 		p.cachedClusters = p.idx.AllClusters()
+		p.exemplars, _ = p.idx.Exemplars()
 		p.clusterCacheOK = true
 	}
+	assigner := &Assigner{MaxSq: p.maxSq, Exemplars: p.exemplars}
 
 	// A re-detection replaces the path's previous faces, and WriteFacesForPath
 	// takes those out of their clusters' stored centroids. Mirror that here so
@@ -450,7 +457,21 @@ func (p *Pipeline) assignAndPersist(j Job, dets []Detection) (changed bool) {
 	// for ops[i]. Used to fix up new-cluster IDs after the DB commit.
 	cacheSlots := make([]int, 0, len(dets))
 
-	for _, d := range dets {
+	// What the user's durable tags already say about these detections
+	// (confirmed / ignored / rejected), so assignment honours them now rather
+	// than only after the write re-attaches the tags.
+	boxes := make([][4]float64, len(dets))
+	embs := make([][]float32, len(dets))
+	for k, d := range dets {
+		boxes[k] = normBox(d, j.ThumbPath)
+		embs[k] = d.Embedding
+	}
+	hints, err := p.idx.PreMatchTags(j.Entry.Path, boxes, embs)
+	if err != nil {
+		log.Printf("face: tags for %s: %v", j.Entry.Path, err)
+	}
+
+	for k, d := range dets {
 		if len(d.Embedding) == 0 {
 			continue
 		}
@@ -459,11 +480,11 @@ func (p *Pipeline) assignAndPersist(j Job, dets []Detection) (changed bool) {
 			ThumbMtime: j.ThumbMod,
 			BBox:       d.BBox,
 			Embedding:  d.Embedding,
-			NBox:       normBox(d, j.ThumbPath),
+			NBox:       boxes[k],
 			Quality:    d.Quality,
 		}
-		idx := NearestCluster(d.Embedding, p.cachedClusters)
-		if idx >= 0 {
+		dec := assigner.Decide(d.Embedding, d.Quality, hints[k], p.cachedClusters)
+		if idx := dec.Cluster; idx >= 0 {
 			c := p.cachedClusters[idx]
 			newCentroid := UpdatedCentroid(c.Centroid, d.Embedding, c.Count)
 			ops = append(ops, cache.FaceOp{
@@ -474,17 +495,23 @@ func (p *Pipeline) assignAndPersist(j Job, dets []Detection) (changed bool) {
 			p.cachedClusters[idx].Centroid = newCentroid
 			p.cachedClusters[idx].Count = c.Count + 1
 			cacheSlots = append(cacheSlots, idx)
-		} else {
+		} else if dec.New {
 			emb := append([]float32(nil), d.Embedding...)
 			ops = append(ops, cache.FaceOp{
 				Face:               f,
 				NewClusterCentroid: emb,
+				NewClusterPersonID: dec.Person,
 			})
-			p.cachedClusters = append(p.cachedClusters, cache.Cluster{
-				Centroid: emb,
-				Count:    1,
-			})
+			c := cache.Cluster{Centroid: emb, Count: 1}
+			if dec.Person > 0 {
+				c.PersonID.Int64, c.PersonID.Valid = dec.Person, true
+			}
+			p.cachedClusters = append(p.cachedClusters, c)
 			cacheSlots = append(cacheSlots, len(p.cachedClusters)-1)
+		} else {
+			// Stored, not clustered (ignored or low quality).
+			ops = append(ops, cache.FaceOp{Face: f})
+			cacheSlots = append(cacheSlots, -1)
 		}
 	}
 
@@ -501,12 +528,20 @@ func (p *Pipeline) assignAndPersist(j Job, dets []Detection) (changed bool) {
 	p.markFresh(j.Entry.Path, j.ThumbMod)
 
 	for i, op := range ops {
-		if op.ExistingClusterID == 0 {
+		if op.ExistingClusterID == 0 && cacheSlots[i] >= 0 {
 			p.cachedClusters[cacheSlots[i]].ID = results[i].ClusterID
 			changed = true
 		}
 	}
 	return changed
+}
+
+// SetMaxSqDistance sets the strictness threshold (squared Euclidean) used by
+// later assignments; <= 0 restores MaxClusterSqDistance.
+func (p *Pipeline) SetMaxSqDistance(v float64) {
+	p.clusterMu.Lock()
+	p.maxSq = v
+	p.clusterMu.Unlock()
 }
 
 // InvalidateClusters drops the in-memory cluster cache. UI paths that mutate

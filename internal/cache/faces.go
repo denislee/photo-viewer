@@ -91,11 +91,18 @@ func (i *Index) LoadFaceFreshness() map[string]int64 {
 //     centroid with UpdatedCentroid.
 //   - ExistingClusterID == 0 → create a new cluster seeded by
 //     NewClusterCentroid, with sample_face_id pointing at the new face.
+//
+// With neither set (ExistingClusterID == 0 and NewClusterCentroid empty) the
+// face is stored unclustered: low-quality and ignored faces are kept (so the
+// viewer can show them and tags can attach) but never pull a centroid.
 type FaceOp struct {
 	Face               Face
 	ExistingClusterID  int64
 	UpdatedCentroid    []float32
 	NewClusterCentroid []float32
+	// NewClusterPersonID names the new cluster at creation (a face that a
+	// confirmed tag or a person exemplar sent to a person with no cluster).
+	NewClusterPersonID int64
 }
 
 // FaceOpResult parallels the input slice from WriteFacesForPath.
@@ -219,6 +226,10 @@ func (i *Index) WriteFacesForPath(path string, thumbMtime int64, ops []FaceOp) (
 		if err != nil {
 			return nil, err
 		}
+		if len(op.NewClusterCentroid) == 0 {
+			results[k] = FaceOpResult{FaceID: faceID} // stored unclustered
+			continue
+		}
 
 		cres, err := newCluster.Exec(EncodeEmbedding(op.NewClusterCentroid), faceID)
 		if err != nil {
@@ -227,6 +238,11 @@ func (i *Index) WriteFacesForPath(path string, thumbMtime int64, ops []FaceOp) (
 		clusterID, err := cres.LastInsertId()
 		if err != nil {
 			return nil, err
+		}
+		if op.NewClusterPersonID > 0 {
+			if _, err := tx.Exec("UPDATE face_clusters SET person_id = ? WHERE id = ?", op.NewClusterPersonID, clusterID); err != nil {
+				return nil, err
+			}
 		}
 		if _, err := setCluster.Exec(clusterID, faceID); err != nil {
 			return nil, err
