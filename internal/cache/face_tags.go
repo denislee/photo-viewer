@@ -19,10 +19,9 @@ const (
 )
 
 type linkFace struct {
-	id   int64
-	box  [4]float64
-	emb  []float32
-	used bool
+	id  int64
+	box [4]float64
+	emb []float32
 }
 
 // linkTagsTx rebuilds face_tag_links for path's faces and re-derives them.
@@ -50,6 +49,10 @@ func linkTagsTx(tx *sql.Tx, path string) error {
 		t.emb = DecodeEmbedding(blob)
 		tags = append(tags, t)
 	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return err
+	}
 	if err := rows.Close(); err != nil {
 		return err
 	}
@@ -73,6 +76,10 @@ func linkTagsTx(tx *sql.Tx, path string) error {
 			}
 			f.emb = DecodeEmbedding(blob)
 			faces = append(faces, f)
+		}
+		if err := rows.Err(); err != nil {
+			rows.Close()
+			return err
 		}
 		if err := rows.Close(); err != nil {
 			return err

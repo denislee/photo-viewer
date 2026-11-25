@@ -44,7 +44,7 @@ func (s *Server) renderPeoplePage(w http.ResponseWriter, r *http.Request, vi vie
 	}
 
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	w.Write(pageHeaderBytes)
+	_, _ = w.Write(pageHeaderBytes)
 	fmt.Fprint(w, `<input type="checkbox" id="navtoggle" class="navtoggle" hidden>`)
 	fmt.Fprint(w, `<div class="layout">`)
 	// The sidebar's trash row is the only count it can't derive itself; pass the

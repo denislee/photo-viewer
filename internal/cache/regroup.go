@@ -73,6 +73,10 @@ func (i *Index) LoadForRegroup() ([]RegroupFace, map[int64]int64, error) {
 		pos[f.ID] = len(out)
 		out = append(out, f)
 	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return nil, nil, err
+	}
 	if err := rows.Close(); err != nil {
 		return nil, nil, err
 	}
@@ -101,6 +105,10 @@ func (i *Index) LoadForRegroup() ([]RegroupFace, map[int64]int64, error) {
 		case VerdictRejected:
 			out[k].Rejected = append(out[k].Rejected, pid.Int64)
 		}
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return nil, nil, err
 	}
 	if err := rows.Close(); err != nil {
 		return nil, nil, err

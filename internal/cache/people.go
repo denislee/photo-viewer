@@ -522,6 +522,10 @@ func (i *Index) ListPeople() ([]Person, error) {
 		out = append(out, p)
 		covers = append(covers, c)
 	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return nil, err
+	}
 	if err := rows.Close(); err != nil {
 		return nil, err
 	}
@@ -554,8 +558,9 @@ func (i *Index) coverFace(personID int64, path, bbox sql.NullString) Face {
 					best, bestIoU = f, s
 				}
 			}
+			iterErr := rows.Err()
 			rows.Close()
-			if best.ID != 0 {
+			if iterErr == nil && best.ID != 0 {
 				return best
 			}
 		}
@@ -597,6 +602,10 @@ func (i *Index) ListGroups(minFaces int) ([]Group, error) {
 		}
 		out = append(out, g)
 		samples = append(samples, sample)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return nil, err
 	}
 	if err := rows.Close(); err != nil {
 		return nil, err
@@ -715,6 +724,9 @@ func (i *Index) PeopleInPhoto(path string) []Person {
 		if rows.Scan(&p.ID, &p.Name) == nil {
 			out = append(out, p)
 		}
+	}
+	if rows.Err() != nil {
+		return nil
 	}
 	return out
 }
