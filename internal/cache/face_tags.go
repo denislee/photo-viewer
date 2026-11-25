@@ -291,3 +291,30 @@ func updatedCentroid(centroid, v []float32, count int) []float32 {
 	}
 	return out
 }
+
+// FaceHint returns what the linked tags say about one stored face.
+func (i *Index) FaceHint(faceID int64) (TagHint, error) {
+	var h TagHint
+	rows, err := i.db.Query(`SELECT t.verdict, t.person_id FROM face_tag_links l JOIN face_tags t ON t.id = l.tag_id
+		WHERE l.face_id = ? ORDER BY t.updated_at, t.id`, faceID)
+	if err != nil {
+		return h, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var verdict string
+		var pid sql.NullInt64
+		if err := rows.Scan(&verdict, &pid); err != nil {
+			return h, err
+		}
+		switch Verdict(verdict) {
+		case VerdictConfirmed:
+			h.Confirmed, h.Ignored = pid.Int64, false
+		case VerdictIgnored:
+			h.Confirmed, h.Ignored = 0, true
+		case VerdictRejected:
+			h.Rejected = append(h.Rejected, pid.Int64)
+		}
+	}
+	return h, rows.Err()
+}

@@ -20,6 +20,18 @@ type Undo struct {
 
 	clusters map[int64]sql.NullInt64 // face_clusters.person_id before
 	all      bool                    // op touched rows beyond tagPaths/clusters
+
+	moves []faceMove // cluster moves made after the tag write (face.Retag)
+}
+
+type faceMove struct{ face, from int64 }
+
+// AddMove records that face was moved out of cluster from (0 = it was
+// unclustered) after this op, so ApplyUndo moves it back.
+func (u *Undo) AddMove(face, from int64) {
+	if u != nil {
+		u.moves = append(u.moves, faceMove{face, from})
+	}
 }
 
 type personRow struct {
@@ -215,6 +227,21 @@ func (i *Index) ApplyUndo(u *Undo) error {
 	if u == nil {
 		return nil
 	}
+	// Moves first, newest first, so the faces are back in their clusters
+	// before identities are re-derived below. A cluster that no longer exists
+	// (emptied and dropped) is recreated as a singleton.
+	for k := len(u.moves) - 1; k >= 0; k-- {
+		m := u.moves[k]
+		to := m.from
+		if to == 0 {
+			to = -1
+		} else if !i.clusterExists(to) {
+			to = 0
+		}
+		if _, err := i.ReassignFace(m.face, to, 0); err != nil && err != sql.ErrNoRows {
+			return err
+		}
+	}
 	tx, err := i.db.Begin()
 	if err != nil {
 		return err
@@ -288,4 +315,9 @@ func itoa(v int64) string {
 		b[i] = '-'
 	}
 	return string(b[i:])
+}
+
+func (i *Index) clusterExists(id int64) bool {
+	var one int
+	return i.db.QueryRow("SELECT 1 FROM face_clusters WHERE id = ?", id).Scan(&one) == nil
 }
