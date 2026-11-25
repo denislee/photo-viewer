@@ -468,6 +468,11 @@ func (i *Index) RemoveEntry(path string) error {
 	if err := subtractFacesTx(tx, path); err != nil {
 		return err
 	}
+	// face_tags are kept on purpose: a delete goes to the trash, and a restore
+	// must bring the names back. SweepOrphanTags reaps them later.
+	if _, err := tx.Exec("DELETE FROM face_tag_links WHERE face_id IN (SELECT id FROM faces WHERE path = ?)", path); err != nil {
+		return err
+	}
 	if _, err := tx.Exec("DELETE FROM faces WHERE path = ?", path); err != nil {
 		return err
 	}
@@ -501,8 +506,14 @@ func (i *Index) RemoveEntries(paths []string) error {
 	if err := subtractFacesTx(tx, paths...); err != nil {
 		return err
 	}
+	delLinks, err := tx.Prepare("DELETE FROM face_tag_links WHERE face_id IN (SELECT id FROM faces WHERE path = ?)")
+	if err != nil {
+		return err
+	}
+	defer delLinks.Close()
 	for _, p := range paths {
 		_, _ = delEntry.Exec(p)
+		_, _ = delLinks.Exec(p)
 		_, _ = delFaces.Exec(p)
 	}
 	return tx.Commit()

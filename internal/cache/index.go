@@ -1013,11 +1013,15 @@ func (i *Index) MovePath(oldPath, newPath string) error {
 	if _, err := tx.Exec("UPDATE faces SET path = ? WHERE path = ?", newPath, oldPath); err != nil {
 		return err
 	}
+	// The durable tags follow the file too, so names survive an organize move.
+	if _, err := tx.Exec("UPDATE face_tags SET path = ? WHERE path = ?", newPath, oldPath); err != nil {
+		return err
+	}
 	return tx.Commit()
 }
 
 // Clear empties the index in place — every entry, face, and face cluster is
-// deleted in a single transaction while the database file and connection stay
+// deleted in a single transaction (the people and face_tags tables survive) while the database file and connection stay
 // open. This is the "Rebuild index" primitive.
 //
 // Resetting the live handle (rather than deleting the db file and reopening a
@@ -1037,6 +1041,10 @@ func (i *Index) Clear() error {
 		"DELETE FROM entries",
 		"DELETE FROM faces",
 		"DELETE FROM face_clusters",
+		"DELETE FROM face_tag_links",
+		// people and face_tags are the durable user layer and are deliberately
+		// NOT cleared: re-detection after the rescan re-attaches the tags
+		// (linkTagsTx) and Regroup re-links names to the new clusters.
 	} {
 		if _, err := tx.Exec(stmt); err != nil {
 			return err

@@ -66,6 +66,17 @@ func migrateV9(db *sql.DB, userVersion int) error {
 	if _, err := db.Exec(`
 		CREATE INDEX IF NOT EXISTS idx_faces_person ON faces(person_id, path);
 		CREATE INDEX IF NOT EXISTS idx_face_clusters_person ON face_clusters(person_id);
+		-- Machine layer: which face row each durable tag is currently attached
+		-- to. Rebuilt by applyTagsTx whenever a path's faces are rewritten and
+		-- cleared with the other machine tables, so it never outlives the face
+		-- ids it names. A face can carry several tags (one confirmed/ignored
+		-- decision plus any number of rejections).
+		CREATE TABLE IF NOT EXISTS face_tag_links (
+			face_id INTEGER NOT NULL,
+			tag_id  INTEGER NOT NULL,
+			PRIMARY KEY (face_id, tag_id)
+		) WITHOUT ROWID;
+		CREATE INDEX IF NOT EXISTS idx_face_tag_links_tag ON face_tag_links(tag_id);
 	`); err != nil {
 		return err
 	}

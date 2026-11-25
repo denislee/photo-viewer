@@ -16,12 +16,22 @@ type Face struct {
 	BBox       [4]int // x, y, w, h in thumbnail pixel space
 	Embedding  []float32
 	ClusterID  sql.NullInt64
+	// NBox is BBox normalised to 0..1 of the rendition it was detected on
+	// (NoNBox when unknown: rows written before schema v9).
+	NBox [4]float64
+	// Quality is the detector-side score (face size × sharpness, 0..1);
+	// faces under MinClusterQuality are stored but not clustered.
+	Quality float64
+	// PersonID / Assign are the face's effective identity (see people.go).
+	PersonID sql.NullInt64
+	Assign   string
 }
 
 // Cluster is a group of faces that share an identity.
 type Cluster struct {
 	ID           int64
 	Label        sql.NullString
+	PersonID     sql.NullInt64
 	Centroid     []float32
 	SampleFaceID sql.NullInt64
 	Count        int
@@ -119,7 +129,8 @@ func (i *Index) WriteFacesForPath(path string, thumbMtime int64, ops []FaceOp) (
 		return nil, err
 	}
 	insStmt, err := i.stmt(&i.faceInsStmt,
-		`INSERT INTO faces (path, thumb_mtime, bbox_x, bbox_y, bbox_w, bbox_h, embedding, cluster_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`)
+		`INSERT INTO faces (path, thumb_mtime, bbox_x, bbox_y, bbox_w, bbox_h, embedding, cluster_id, nx, ny, nw, nh, quality)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
 	if err != nil {
 		return nil, err
 	}
@@ -151,6 +162,11 @@ func (i *Index) WriteFacesForPath(path string, thumbMtime int64, ops []FaceOp) (
 	if err := subtractFacesTx(tx, path); err != nil {
 		return nil, err
 	}
+	// The old rows' tag links go with them; linkTagsTx re-attaches the
+	// durable tags to the new rows below (plan §3.4).
+	if _, err := tx.Exec("DELETE FROM face_tag_links WHERE face_id IN (SELECT id FROM faces WHERE path = ?)", path); err != nil {
+		return nil, err
+	}
 	del := tx.Stmt(delStmt)
 	defer del.Close()
 	if _, err := del.Exec(path); err != nil {
@@ -179,9 +195,9 @@ func (i *Index) WriteFacesForPath(path string, thumbMtime int64, ops []FaceOp) (
 			if _, err := updCluster.Exec(EncodeEmbedding(op.UpdatedCentroid), clusterID); err != nil {
 				return nil, err
 			}
-			res, err := ins.Exec(
+			res, err := ins.Exec(append([]any{
 				f.Path, thumbMtime, f.BBox[0], f.BBox[1], f.BBox[2], f.BBox[3], EncodeEmbedding(f.Embedding), clusterID,
-			)
+			}, faceExtraArgs(f)...)...)
 			if err != nil {
 				return nil, err
 			}
@@ -193,9 +209,9 @@ func (i *Index) WriteFacesForPath(path string, thumbMtime int64, ops []FaceOp) (
 			continue
 		}
 
-		res, err := ins.Exec(
+		res, err := ins.Exec(append([]any{
 			f.Path, thumbMtime, f.BBox[0], f.BBox[1], f.BBox[2], f.BBox[3], EncodeEmbedding(f.Embedding), nil,
-		)
+		}, faceExtraArgs(f)...)...)
 		if err != nil {
 			return nil, err
 		}
@@ -218,6 +234,11 @@ func (i *Index) WriteFacesForPath(path string, thumbMtime int64, ops []FaceOp) (
 		results[k] = FaceOpResult{FaceID: faceID, ClusterID: clusterID}
 	}
 
+	// Re-attach the path's durable tags to the new rows and re-derive their
+	// identity — this is what keeps names and fixes across re-detection.
+	if err := linkTagsTx(tx, path); err != nil {
+		return nil, err
+	}
 	if _, err := tx.Exec("UPDATE entries SET face_thumb_mtime = ? WHERE path = ?", thumbMtime, path); err != nil {
 		return nil, err
 	}
@@ -225,6 +246,19 @@ func (i *Index) WriteFacesForPath(path string, thumbMtime int64, ops []FaceOp) (
 		return nil, err
 	}
 	return results, nil
+}
+
+// faceExtraArgs are the v9 columns of a face insert: nx, ny, nw, nh, quality.
+// An unknown normalised box or a zero quality is stored as NULL.
+func faceExtraArgs(f Face) []any {
+	out := []any{nil, nil, nil, nil, nil}
+	if HasNBox(f.NBox) {
+		out[0], out[1], out[2], out[3] = f.NBox[0], f.NBox[1], f.NBox[2], f.NBox[3]
+	}
+	if f.Quality > 0 {
+		out[4] = f.Quality
+	}
+	return out
 }
 
 // MoveFaces relocates any face rows from oldPath to newPath after a media file
@@ -247,6 +281,9 @@ func (i *Index) MoveFaces(oldPath, newPath string) error {
 	if _, err := tx.Exec("UPDATE faces SET path = ? WHERE path = ?", newPath, oldPath); err != nil {
 		return err
 	}
+	if _, err := tx.Exec("UPDATE face_tags SET path = ? WHERE path = ?", newPath, oldPath); err != nil {
+		return err
+	}
 	if _, err := tx.Exec(`UPDATE entries SET face_thumb_mtime = COALESCE(
 			(SELECT MAX(thumb_mtime) FROM faces WHERE path = ?), face_thumb_mtime)
 		WHERE path = ?`, newPath, newPath); err != nil {
@@ -262,7 +299,7 @@ func (i *Index) MoveFaces(oldPath, newPath string) error {
 // stays O(faces) instead of O(clusters × faces).
 func (i *Index) AllClusters() []Cluster {
 	rows, err := i.db.Query(`
-		SELECT c.id, c.label, c.centroid, c.sample_face_id,
+		SELECT c.id, c.label, c.person_id, c.centroid, c.sample_face_id,
 			COALESCE(f.cnt, 0) AS cnt
 		FROM face_clusters c
 		LEFT JOIN (
@@ -280,7 +317,7 @@ func (i *Index) AllClusters() []Cluster {
 	for rows.Next() {
 		var c Cluster
 		var blob []byte
-		if err := rows.Scan(&c.ID, &c.Label, &blob, &c.SampleFaceID, &c.Count); err == nil {
+		if err := rows.Scan(&c.ID, &c.Label, &c.PersonID, &blob, &c.SampleFaceID, &c.Count); err == nil {
 			c.Centroid = DecodeEmbedding(blob)
 			out = append(out, c)
 		}

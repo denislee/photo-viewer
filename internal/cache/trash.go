@@ -308,3 +308,29 @@ func dirSize(root string) int64 {
 	})
 	return total
 }
+
+// TrashOriginalPath returns the original location recorded in trashPath's
+// sidecar metadata.
+func TrashOriginalPath(trashPath string) (string, error) {
+	data, err := os.ReadFile(trashPath + trashMetaSuffix)
+	if err != nil {
+		return "", err
+	}
+	var meta trashMeta
+	if err := json.Unmarshal(data, &meta); err != nil {
+		return "", err
+	}
+	return meta.OriginalPath, nil
+}
+
+// TrashOriginalPaths returns the original paths of every item in trashDir
+// (SweepOrphanTags keeps the face tags of these).
+func TrashOriginalPaths(trashDir string) map[string]bool {
+	out := map[string]bool{}
+	for _, e := range ListTrash(trashDir) {
+		if p, err := TrashOriginalPath(e.Path); err == nil && p != "" {
+			out[p] = true
+		}
+	}
+	return out
+}
