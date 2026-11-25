@@ -9,6 +9,8 @@ import (
 	"sort"
 	"strings"
 	"testing"
+
+	"github.com/dns/photo-viewer/internal/scan"
 )
 
 // renderSubdirsGroupedRef is the pre-W4-09 implementation kept verbatim as an
@@ -26,7 +28,7 @@ func (s *Server) renderSubdirsGroupedRef(w http.ResponseWriter, subdirs []string
 	buckets := map[string]*bucket{}
 	var nonDate []string
 	for _, d := range subdirs {
-		m := dateFolderRe.FindStringSubmatch(filepath.Base(d))
+		m := scan.DateFolderRe.FindStringSubmatch(filepath.Base(d))
 		if m == nil {
 			nonDate = append(nonDate, d)
 			continue

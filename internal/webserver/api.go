@@ -22,6 +22,7 @@ import (
 	_ "golang.org/x/image/webp"
 
 	"github.com/dns/photo-viewer/internal/cache"
+	"github.com/dns/photo-viewer/internal/format"
 	"github.com/dns/photo-viewer/internal/scan"
 )
 
@@ -168,7 +169,7 @@ func (s *Server) handleAPIFavorite(w http.ResponseWriter, r *http.Request) {
 	}
 	// The caches now serve stale values while revalidating (W5-01), so drop them
 	// explicitly: the favorite counts this toggle just changed must not lag.
-	s.sidebar.clear()
+	// Years don't depend on favorites, so only the view counts are cleared.
 	s.viewCounts.clear()
 	resp := struct {
 		ID       string `json:"id"`
@@ -227,8 +228,8 @@ func (s *Server) handleAPIInfo(w http.ResponseWriter, r *http.Request) {
 		ID:           e.ThumbID,
 		Name:         filepath.Base(e.Path),
 		Path:         s.relPath(e.Path),
-		Type:         titleCase(e.Type.String()),
-		Size:         formatBytes(e.Size),
+		Type:         e.Type.Title(),
+		Size:         format.Bytes(e.Size),
 		Created:      fmtTimeOr(mi.Created),
 		Modified:     e.ModTime.Local().Format("2006-01-02 15:04:05"),
 		Dimensions:   cached.dims,
@@ -281,31 +282,4 @@ func decodeDimensions(e cache.Entry) string {
 		return "—"
 	}
 	return fmt.Sprintf("%d × %d", cfg.Width, cfg.Height)
-}
-
-// titleCase upper-cases the first byte of s. Trivial helper that mirrors
-// ui.titleCaseGio so the type column in the info panel matches the GUI.
-func titleCase(s string) string {
-	if s == "" {
-		return s
-	}
-	b := []byte(s)
-	if b[0] >= 'a' && b[0] <= 'z' {
-		b[0] -= 'a' - 'A'
-	}
-	return string(b)
-}
-
-// formatBytes is a compact human size formatter used by the info panel.
-func formatBytes(n int64) string {
-	const unit = 1024
-	if n < unit {
-		return fmt.Sprintf("%d B", n)
-	}
-	div, exp := int64(unit), 0
-	for x := n / unit; x >= unit; x /= unit {
-		div *= unit
-		exp++
-	}
-	return fmt.Sprintf("%.1f %cB", float64(n)/float64(div), "KMGTPE"[exp])
 }

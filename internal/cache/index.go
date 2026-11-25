@@ -105,7 +105,7 @@ type Index struct {
 	db *sql.DB
 
 	// generation is bumped by Clear so that caches keyed on the index contents
-	// (e.g. the webserver's rootSidebarAgg cache) can detect a rebuild and
+	// (e.g. the webserver's ttlCache users) can detect a rebuild and
 	// drop stale entries immediately rather than waiting for their TTL.
 	generation atomic.Uint64
 

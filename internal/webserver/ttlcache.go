@@ -7,7 +7,7 @@ import (
 
 // ttlCache memoizes compute(key) for ttl, invalidating an entry early when the
 // caller's generation (Index.Generation() for index-derived values) moves on.
-// It backs the trash listing, sidebar aggregate, per-view counts, child counts
+// It backs the trash listing, subdir listings, year totals, per-view counts, child counts
 // and HLS duration memo (W4-02).
 //
 // The lock is only held to read or write the map, never across compute, so a

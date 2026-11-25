@@ -21,6 +21,7 @@ import (
 	"gioui.org/widget/material"
 
 	"github.com/dns/photo-viewer/internal/cache"
+	"github.com/dns/photo-viewer/internal/format"
 )
 
 // DuplicatesView is the modal "find duplicates" overlay. Open is true while
@@ -719,7 +720,7 @@ func (d *DuplicatesView) layoutGroupRow(gtx layout.Context, th *Theme, g cache.D
 					}
 					return layout.Flex{Axis: layout.Vertical}.Layout(gtx,
 						layout.Rigid(func(gtx layout.Context) layout.Dimensions {
-							lbl := material.Label(th.Theme, unit.Sp(13), fmt.Sprintf("%d copies — %s each", len(g.Entries), formatBytesGio(size)))
+							lbl := material.Label(th.Theme, unit.Sp(13), fmt.Sprintf("%d copies — %s each", len(g.Entries), format.Bytes(size)))
 							lbl.Color = th.Foreground
 							lbl.MaxLines = 1
 							lbl.Font.Weight = 600
@@ -773,7 +774,7 @@ func (d *DuplicatesView) layoutDetail(gtx layout.Context, th *Theme, groups []ca
 	thumbPx := gtx.Dp(unit.Dp(180))
 	rows := make([]layout.FlexChild, 0, len(g.Entries)+6)
 
-	header := fmt.Sprintf("%d copies — %s each", len(g.Entries), formatBytesGio(g.Entries[0].Size))
+	header := fmt.Sprintf("%d copies — %s each", len(g.Entries), format.Bytes(g.Entries[0].Size))
 	rows = append(rows, layout.Rigid(func(gtx layout.Context) layout.Dimensions {
 		lbl := material.Label(th.Theme, unit.Sp(14), header)
 		lbl.Color = th.Foreground
@@ -930,20 +931,4 @@ func shortPath(p string) string {
 		cut++
 	}
 	return "…" + p[cut:]
-}
-
-// formatBytesGio is the shared byte-size formatter for the UI overlays
-// (duplicates, viewer, settings). Units are binary (1024-based), so the
-// suffix is the accurate "KiB"/"MiB"/… rather than the decimal "KB"/"MB".
-func formatBytesGio(b int64) string {
-	const u = 1024
-	if b < u {
-		return fmt.Sprintf("%d B", b)
-	}
-	div, exp := int64(u), 0
-	for n := b / u; n >= u; n /= u {
-		div *= u
-		exp++
-	}
-	return fmt.Sprintf("%.1f %ciB", float64(b)/float64(div), "KMGTPE"[exp])
 }

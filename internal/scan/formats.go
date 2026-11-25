@@ -2,8 +2,13 @@ package scan
 
 import (
 	"path/filepath"
+	"regexp"
 	"strings"
 )
+
+// DateFolderRe matches the YYYY-MM-DD folder names import and Organize file
+// into; group 1 is the year. Shared by the GUI and web sidebars.
+var DateFolderRe = regexp.MustCompile(`^(\d{4})-\d{2}-\d{2}$`)
 
 type MediaType int
 
@@ -27,6 +32,20 @@ func (t MediaType) String() string {
 		return "video"
 	}
 	return "unknown"
+}
+
+// Title returns String with its first letter upper-cased, for display in the
+// GUI and web UI info panels ("Photo", "Raw", "Heic", "Video", "Unknown").
+func (t MediaType) Title() string {
+	s := t.String()
+	if s == "" {
+		return s
+	}
+	b := []byte(s)
+	if b[0] >= 'a' && b[0] <= 'z' {
+		b[0] -= 'a' - 'A'
+	}
+	return string(b)
 }
 
 var extensions = map[string]MediaType{

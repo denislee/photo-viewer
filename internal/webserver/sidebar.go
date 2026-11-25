@@ -6,17 +6,12 @@ import (
 	"html"
 	"net/http"
 	"path/filepath"
-	"regexp"
 	"slices"
 	"strconv"
 
 	"github.com/dns/photo-viewer/internal/cache"
+	"github.com/dns/photo-viewer/internal/scan"
 )
-
-// dateFolderRe matches subdir basenames the import flow produces: YYYY-MM-DD.
-// Mirrors internal/ui.dateFolderRe so the web sidebar's year grouping bins
-// directories the same way the native sidebar does.
-var dateFolderRe = regexp.MustCompile(`^(\d{4})-\d{2}-\d{2}$`)
 
 // sidebarKey identifies a cached sidebar aggregate: the two toolbar toggles
 // that change every count in it.
@@ -43,7 +38,7 @@ type sidebarAgg struct {
 // toolbar state so toggling a category doesn't reset the view options.
 func (s *Server) renderSidebar(w http.ResponseWriter, vi viewInfo, dirChildren []string, dirChildCounts map[string]int, trashCount int) {
 	v := vi.v
-	agg := s.rootSidebarAgg(v.Filter, v.ShowRAW)
+	agg := s.sidebarAggregate(v.Filter, v.ShowRAW)
 	fmt.Fprint(w, `<nav class="sidebar"><div class="sec">Library</div>`)
 
 	sidebarRow(w, vi.link("/"), "All media", "", agg.allCount, vi.kind == "all")
@@ -93,25 +88,22 @@ func (s *Server) cachedCountView(v cache.View) int {
 	})
 }
 
-// rootSidebarAgg returns the cached library-root sidebar aggregate for the
-// given filter/raw toggles, recomputing it when the entry is missing or the
-// index was cleared (generation mismatch). An entry older than
-// shortCacheTTL is served stale while one background refresh recomputes it
-// (stale-while-revalidate). The recompute runs outside the cache lock, so
-// concurrent renders of other toggles don't queue behind it, and the
-// All/Favorites totals share the view-count cache with the gallery header
-// (W3-01).
-func (s *Server) rootSidebarAgg(filter string, showRAW bool) *sidebarAgg {
-	key := sidebarKey{filter: filter, showRAW: showRAW}
-	return s.sidebar.get(key, s.index.Generation(), func() *sidebarAgg {
-		return &sidebarAgg{
-			allCount: s.cachedCountView(cache.View{Kind: "all", Filter: filter, ShowRAW: showRAW}),
-			favCount: s.cachedCountView(cache.View{Kind: "favorites", Filter: filter, ShowRAW: showRAW}),
-			subdirs:  s.cachedSubdirs(s.libraryRoot),
-			counts:   s.cachedChildCounts(s.libraryRoot, filter, showRAW),
-			years:    s.index.Years(filter, showRAW),
-		}
-	})
+// sidebarAggregate builds the library-root sidebar aggregate for the given
+// filter/raw toggles from the per-input caches. Each input has its own cache,
+// so there is no outer cache masking the subdir mtime check or lagging counts
+// by two refresh cycles (W6-01). The All/Favorites totals share the view-count
+// cache with the gallery header (W3-01), the root child counts come from the
+// child-count cache, and the year totals have their own generation-keyed cache.
+func (s *Server) sidebarAggregate(filter string, showRAW bool) sidebarAgg {
+	return sidebarAgg{
+		allCount: s.cachedCountView(cache.View{Kind: "all", Filter: filter, ShowRAW: showRAW}),
+		favCount: s.cachedCountView(cache.View{Kind: "favorites", Filter: filter, ShowRAW: showRAW}),
+		subdirs:  s.cachedSubdirs(s.libraryRoot),
+		counts:   s.cachedChildCounts(s.libraryRoot, filter, showRAW),
+		years: s.years.get(sidebarKey{filter: filter, showRAW: showRAW}, s.index.Generation(), func() []cache.YearStat {
+			return s.index.Years(filter, showRAW)
+		}),
+	}
 }
 
 // renderSubdirsGrouped renders the given child directories, using the supplied
@@ -138,7 +130,7 @@ func (s *Server) renderSubdirsGrouped(w http.ResponseWriter, subdirs []string, c
 	var nonDate []string
 	for _, d := range subdirs {
 		base := filepath.Base(d)
-		if !dateFolderRe.MatchString(base) {
+		if !scan.DateFolderRe.MatchString(base) {
 			nonDate = append(nonDate, d)
 			continue
 		}

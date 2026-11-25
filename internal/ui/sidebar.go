@@ -3,7 +3,6 @@ package ui
 import (
 	"image"
 	"path/filepath"
-	"regexp"
 	"slices"
 	"sort"
 	"strconv"
@@ -17,11 +16,9 @@ import (
 	"gioui.org/unit"
 	"gioui.org/widget"
 	"gioui.org/widget/material"
-)
 
-// dateFolderRe matches subdir basenames the import flow produces: YYYY-MM-DD.
-// Used by year-grouping to decide which subdirs to bucket under a year header.
-var dateFolderRe = regexp.MustCompile(`^(\d{4})-\d{2}-\d{2}$`)
+	"github.com/dns/photo-viewer/internal/scan"
+)
 
 // Sidebar is a flat list of the library root + the current directory's parent
 // + immediate child directories. With year-grouping on, YYYY-MM-DD child
@@ -307,7 +304,7 @@ func (s *Sidebar) buildRows(root, treeDir string, subdirs []string, counts map[s
 	var nonDate []string
 	for _, d := range subdirs {
 		base := filepath.Base(d)
-		m := dateFolderRe.FindStringSubmatch(base)
+		m := scan.DateFolderRe.FindStringSubmatch(base)
 		if m == nil {
 			nonDate = append(nonDate, d)
 			continue

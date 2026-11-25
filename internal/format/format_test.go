@@ -1,12 +1,12 @@
-package ui
+package format
 
 import "testing"
 
-// TestFormatBytesGio locks the U-16 byte-formatter consolidation: the single
-// shared formatter emits raw bytes below 1 KiB and binary (1024-based) units
-// with the accurate "iB" suffix above it — the same verdicts the old
+// TestBytes locks the byte-formatter consolidation: the single shared
+// formatter emits raw bytes below 1 KiB and binary (1024-based) units with the
+// accurate "iB" suffix above it — the same verdicts the old ui
 // humanBytes/formatBytesGio pair produced, now unified on "KiB".
-func TestFormatBytesGio(t *testing.T) {
+func TestBytes(t *testing.T) {
 	cases := []struct {
 		in   int64
 		want string
@@ -22,8 +22,8 @@ func TestFormatBytesGio(t *testing.T) {
 		{1024 * 1024 * 1024 * 1024, "1.0 TiB"},
 	}
 	for _, c := range cases {
-		if got := formatBytesGio(c.in); got != c.want {
-			t.Errorf("formatBytesGio(%d) = %q, want %q", c.in, got, c.want)
+		if got := Bytes(c.in); got != c.want {
+			t.Errorf("Bytes(%d) = %q, want %q", c.in, got, c.want)
 		}
 	}
 }

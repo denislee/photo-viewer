@@ -9,7 +9,6 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
-	"time"
 
 	"github.com/dns/photo-viewer/internal/cache"
 	"github.com/dns/photo-viewer/internal/scan"
@@ -516,26 +515,13 @@ func listSubdirs(dir string) []string {
 	return out
 }
 
-// subdirCacheCap bounds the subdir listing cache before a miss resets it.
-// Entries are invalidated by the directory's mtime, but a server that browses
-// many directories would still accumulate one entry per directory ever opened;
-// the cap keeps that map off the unbounded-growth path at the cost of dropping
-// every listing (they are cheap to recompute) once the cap is crossed.
-const subdirCacheCap = 256
-
-// subdirCacheEntry is one cached child-directory listing plus the parent
-// directory's mtime when the listing was read. The mtime moves whenever a
-// child is created, removed or renamed, so comparing it is enough to notice a
-// listing went stale — no TTL or inotify watcher needed.
-type subdirCacheEntry struct {
-	mtime time.Time
-	subs  []string
-}
-
-// cachedSubdirs returns dir's immediate child directories, reusing the listing
-// cached for that directory while its mtime is unchanged. An empty listing is
-// cached like any other; a directory that can't be stat'ed is not cached, so
-// its real state surfaces on every call.
+// cachedSubdirs returns dir's immediate child directories, cached in
+// s.subdirs with the directory's mtime as the generation so a created or
+// removed child drops the listing at once; the short TTL is the backstop for
+// filesystems whose 2 s mtime resolution (FAT32) hides a same-tick change
+// (W6-B5). An empty listing is cached like any other, a directory that can't
+// be stat'ed is not cached so its real state surfaces on every call, and
+// ttlCache collapses concurrent cold listings of the same directory.
 func (s *Server) cachedSubdirs(dir string) []string {
 	if dir == "" {
 		return nil
@@ -544,26 +530,9 @@ func (s *Server) cachedSubdirs(dir string) []string {
 	if err != nil {
 		return listSubdirs(dir)
 	}
-	mtime := st.ModTime()
-
-	s.subdirMu.Lock()
-	if e, ok := s.subdirCache[dir]; ok && e.mtime.Equal(mtime) {
-		s.subdirMu.Unlock()
-		return e.subs
-	}
-	s.subdirMu.Unlock()
-
-	// Read outside the lock: os.ReadDir can block on a slow or remote volume
-	// and must not serialise every other gallery render.
-	subs := listSubdirs(dir)
-
-	s.subdirMu.Lock()
-	if s.subdirCache == nil || len(s.subdirCache) >= subdirCacheCap {
-		s.subdirCache = make(map[string]subdirCacheEntry)
-	}
-	s.subdirCache[dir] = subdirCacheEntry{mtime: mtime, subs: subs}
-	s.subdirMu.Unlock()
-	return subs
+	return s.subdirs.get(dir, uint64(st.ModTime().UnixNano()), func() []string {
+		return listSubdirs(dir)
+	})
 }
 
 // childCountKey identifies a cached CountChildDirsFiltered result: the parent

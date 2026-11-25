@@ -33,6 +33,7 @@ import (
 	_ "golang.org/x/image/webp"
 
 	"github.com/dns/photo-viewer/internal/cache"
+	"github.com/dns/photo-viewer/internal/format"
 	"github.com/dns/photo-viewer/internal/fsutil"
 	"github.com/dns/photo-viewer/internal/imgorient"
 	"github.com/dns/photo-viewer/internal/scan"
@@ -926,8 +927,8 @@ func buildInfoRows(e cache.Entry, info cachedInfo, dims string) []infoRow {
 	rows := []infoRow{
 		{value: filepath.Base(e.Path)},
 		{"Path", e.Path},
-		{"Type", titleCaseGio(e.Type.String())},
-		{"Size", formatBytesGio(e.Size)},
+		{"Type", e.Type.Title()},
+		{"Size", format.Bytes(e.Size)},
 		{"Created", info.Created},
 		{"Modified", e.ModTime.Local().Format("2006-01-02 15:04:05")},
 		{"Dimensions", dims},
@@ -1070,17 +1071,6 @@ func (v *Viewer) mediaInfoFor(e cache.Entry) cachedInfo {
 // next to its push site.
 func opOffset(gtx layout.Context, pt image.Point) op.TransformStack {
 	return op.Offset(pt).Push(gtx.Ops)
-}
-
-func titleCaseGio(s string) string {
-	if s == "" {
-		return s
-	}
-	b := []byte(s)
-	if b[0] >= 'a' && b[0] <= 'z' {
-		b[0] -= 'a' - 'A'
-	}
-	return string(b)
 }
 
 // imageFor returns the image to paint for photo/HEIC/RAW entries: the decoded

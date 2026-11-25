@@ -350,13 +350,13 @@ func TestTTLCacheSWRBackgroundPanicRecovered(t *testing.T) {
 	}
 }
 
-// TestCachedCountViewSharesSidebarCounts verifies rootSidebarAgg's All total
+// TestCachedCountViewSharesSidebarCounts verifies sidebarAggregate's All total
 // goes through the shared view-count cache (W3-01).
 func TestCachedCountViewSharesSidebarCounts(t *testing.T) {
 	s, _, cleanup := fixture(t, 5)
 	defer cleanup()
 
-	s.rootSidebarAgg("All", true)
+	s.sidebarAggregate("All", true)
 
 	key := cache.View{Kind: "all", Filter: "All", ShowRAW: true}
 	s.viewCounts.mu.Lock()

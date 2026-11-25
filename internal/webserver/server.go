@@ -63,22 +63,22 @@ type Server struct {
 	// trash caches the trash listing (entries + id index) so /trash,
 	// /thumb/<trash id>, and /media/<trash id> don't stat the dir per request.
 	trash ttlCache[struct{}, trashSnapshot]
-	// sidebar caches the root sidebar aggregate per filter/raw toggles.
-	sidebar ttlCache[sidebarKey, *sidebarAgg]
 	// viewCounts caches CountView per View for the gallery header and sidebar.
 	viewCounts ttlCache[cache.View, int]
 	// childCounts caches CountChildDirsFiltered per (dir, filter, raw) so the
 	// gallery's "In <dir>" section, its chip strip and the root sidebar don't
 	// rescan the subtree on every page render.
 	childCounts ttlCache[childCountKey, map[string]int]
+	// years caches the sidebar's per-year totals per filter/raw toggles, keyed
+	// on the index generation so a rebuild invalidates it at once (W6-01).
+	years ttlCache[sidebarKey, []cache.YearStat]
 
-	// subdirCache memoises a directory's immediate child directories, keyed by
-	// the directory path and validated against its mtime: a dir's mtime moves
-	// whenever a child is created, removed or renamed, so a stale listing is
-	// dropped without any TTL. subdirMu guards the map only, never the
-	// os.ReadDir.
-	subdirMu    sync.Mutex
-	subdirCache map[string]subdirCacheEntry
+	// subdirs memoises a directory's immediate child directories, keyed by the
+	// directory path with the generation set to its mtime in UnixNano: a dir's
+	// mtime moves whenever a child is created, removed or renamed, so a stale
+	// listing is dropped at once. The short TTL is the backstop for filesystems
+	// whose 2 s mtime resolution (FAT32) hides a same-tick change (W6-B5).
+	subdirs ttlCache[string, []string]
 	// hlsDurations memoises probed HLS source durations per file version, so a
 	// trashed or probe-failed entry doesn't fork ffprobe on every playlist and
 	// segment request (W4-06). See hlsDuration.
@@ -121,11 +121,12 @@ func New(index *cache.Index, store, display *cache.ThumbStore, libraryRoot, tras
 	return &Server{
 		index: index, store: store, display: display, libraryRoot: libraryRoot, trashDir: trashDir,
 		trash:      ttlCache[struct{}, trashSnapshot]{ttl: shortCacheTTL},
-		sidebar:    ttlCache[sidebarKey, *sidebarAgg]{ttl: shortCacheTTL, swr: true},
 		viewCounts: ttlCache[cache.View, int]{ttl: shortCacheTTL, sweepAt: cacheSweepCap, swr: true},
 		childCounts: ttlCache[childCountKey, map[string]int]{
 			ttl: shortCacheTTL, sweepAt: cacheSweepCap, swr: true,
 		},
+		years:   ttlCache[sidebarKey, []cache.YearStat]{ttl: shortCacheTTL, swr: true},
+		subdirs: ttlCache[string, []string]{ttl: shortCacheTTL, sweepAt: cacheSweepCap},
 		hlsDurations: ttlCache[fileVersion, float64]{
 			ttl: hlsDurationTTL, sweepAt: hlsDurationCacheCap,
 		},

@@ -12,6 +12,7 @@ import (
 	"gioui.org/widget/material"
 
 	"github.com/dns/photo-viewer/internal/export"
+	"github.com/dns/photo-viewer/internal/format"
 )
 
 // SettingsView is a minimal settings overlay for the Gio build. It exposes
@@ -126,7 +127,7 @@ func (v *SettingsView) trashStatus() string {
 	if count == 0 {
 		return "Trash is empty"
 	}
-	return fmt.Sprintf("Trash: %d item(s), %s", count, formatBytesGio(bytes))
+	return fmt.Sprintf("Trash: %d item(s), %s", count, format.Bytes(bytes))
 }
 
 // Close hides the modal.
@@ -243,7 +244,7 @@ func (v *SettingsView) Layout(gtx layout.Context, th *Theme) layout.Dimensions {
 			} else if count == 0 {
 				v.trashMsg = "Trash is empty"
 			} else {
-				v.trashMsg = fmt.Sprintf("Wiped %d item(s), freed %s", count, formatBytesGio(bytes))
+				v.trashMsg = fmt.Sprintf("Wiped %d item(s), freed %s", count, format.Bytes(bytes))
 			}
 			v.mu.Unlock()
 			if v.invalidate != nil {
