@@ -11,8 +11,9 @@ import (
 )
 
 // CopyTo copies src to exactly dst, crash-safely: the bytes go to a temp file
-// next to dst (createTemp), are fsynced, get src's permission bits and mtime,
-// and are then renamed into place with RenameNoReplace, so an existing dst is
+// next to dst (createTemp, created with src's permission bits so the umask
+// still applies — never more permissive than a new file), are fsynced, get
+// src's mtime, and are then renamed into place with RenameNoReplace, so an existing dst is
 // never replaced (the error then satisfies errors.Is(err, fs.ErrExist)).
 // Cancelling ctx aborts the copy. The temp is removed on every error path.
 func CopyTo(ctx context.Context, src, dst string) error {
@@ -26,12 +27,12 @@ func CopyTo(ctx context.Context, src, dst string) error {
 		return err
 	}
 
-	tmp, err := createTemp(filepath.Dir(dst), filepath.Base(dst))
+	tmp, err := createTemp(filepath.Dir(dst), filepath.Base(dst), info.Mode().Perm())
 	if err != nil {
 		return err
 	}
 	tmpName := tmp.Name()
-	if err := fillTemp(ctx, tmp, in, info.Mode().Perm()); err != nil {
+	if err := fillTemp(ctx, tmp, in); err != nil {
 		os.Remove(tmpName)
 		return err
 	}

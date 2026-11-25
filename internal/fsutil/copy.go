@@ -76,7 +76,7 @@ func CopyUnique(ctx context.Context, src, dir, base string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	return writeUnique(ctx, dir, base, in, info.ModTime(), 0)
+	return writeUnique(ctx, dir, base, in, info.ModTime())
 }
 
 // WriteUnique streams r into dir as base, or base_N when that name is taken,
@@ -90,19 +90,18 @@ func CopyUnique(ctx context.Context, src, dir, base string) (string, error) {
 // rename is also what lets a caller delete the source afterwards: its bytes
 // are no longer only in the page cache.
 func WriteUnique(ctx context.Context, dir, base string, r io.Reader) (string, error) {
-	return writeUnique(ctx, dir, base, r, time.Time{}, 0)
+	return writeUnique(ctx, dir, base, r, time.Time{})
 }
 
-// writeUnique streams r into a temp file in dir, applies the given mtime and
-// perm (0 = leave the umask to decide), and claims the final name. It returns
-// the path the file now lives at.
-func writeUnique(ctx context.Context, dir, base string, r io.Reader, mtime time.Time, perm fs.FileMode) (string, error) {
-	tmp, err := createTemp(dir, base)
+// writeUnique streams r into a temp file in dir, applies mtime (when set), and
+// claims the final name. It returns the path the file now lives at.
+func writeUnique(ctx context.Context, dir, base string, r io.Reader, mtime time.Time) (string, error) {
+	tmp, err := createTemp(dir, base, 0o666)
 	if err != nil {
 		return "", err
 	}
 	tmpName := tmp.Name()
-	if err := fillTemp(ctx, tmp, r, perm); err != nil {
+	if err := fillTemp(ctx, tmp, r); err != nil {
 		os.Remove(tmpName)
 		return "", err
 	}
@@ -120,10 +119,9 @@ func writeUnique(ctx context.Context, dir, base string, r io.Reader, mtime time.
 }
 
 // fillTemp copies r into the already-created temp file tmp and makes the bytes
-// durable: it fsyncs them, chmods the file to perm when perm != 0 (a failure
-// fails the write like any copy error), and closes it. It never removes the
+// durable: it fsyncs them and closes the file. It never removes the
 // temp; every caller drops it on error so a partial file is never published.
-func fillTemp(ctx context.Context, tmp *os.File, r io.Reader, perm fs.FileMode) error {
+func fillTemp(ctx context.Context, tmp *os.File, r io.Reader) error {
 	var err error
 	// An *os.File source goes through copyFileCtx so the kernel copy fast path
 	// survives a cancellable ctx; any other reader (a zip entry, a network
@@ -137,11 +135,6 @@ func fillTemp(ctx context.Context, tmp *os.File, r io.Reader, perm fs.FileMode) 
 		// A failed Sync is exactly the "bytes still only in the page cache"
 		// case, so it fails the write like any copy error.
 		err = tmp.Sync()
-	}
-	if err == nil && perm != 0 {
-		// An explicit perm keeps the source's exact permission bits (CopyTo);
-		// 0 leaves the umask to decide, as createTemp's mode intended.
-		err = tmp.Chmod(perm)
 	}
 	if cerr := tmp.Close(); err == nil {
 		err = cerr
@@ -175,16 +168,17 @@ func copyFileCtx(ctx context.Context, dst *os.File, src *os.File) error {
 
 // createTemp exclusively creates base.tmp in dir (base.1.tmp, … if another
 // writer or a crash left one behind). O_EXCL keeps two concurrent writers of
-// the same name from interleaving into one temp; mode 0666 lets the umask
-// decide the final permissions, as for any newly created file (os.CreateTemp
-// would leave every moved file 0600).
-func createTemp(dir, base string) (*os.File, error) {
+// the same name from interleaving into one temp. perm is passed to the
+// create, so the umask still applies: 0o666 gives the usual new-file
+// permissions (os.CreateTemp would leave every moved file 0600), and CopyTo
+// passes the source's bits, never more permissive than the umask allows.
+func createTemp(dir, base string, perm fs.FileMode) (*os.File, error) {
 	for n := 0; ; n++ {
 		name := filepath.Join(dir, base+".tmp")
 		if n > 0 {
 			name = filepath.Join(dir, fmt.Sprintf("%s.%d.tmp", base, n))
 		}
-		f, err := os.OpenFile(name, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o666)
+		f, err := os.OpenFile(name, os.O_WRONLY|os.O_CREATE|os.O_EXCL, perm)
 		if !errors.Is(err, fs.ErrExist) || n >= MaxCollisionSuffix {
 			return f, err
 		}

@@ -6,6 +6,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -141,4 +142,31 @@ func TestWriteFileAtomicReplaces(t *testing.T) {
 		t.Errorf("mode = %o, want 644", perm)
 	}
 	noTemps(t, filepath.Dir(p))
+}
+
+// TestCopyToRespectsUmask: the source's permission bits go through the create,
+// so the umask still strips them — a world-writable (or FAT32 0777) source
+// never yields a copy more permissive than a newly created file.
+func TestCopyToRespectsUmask(t *testing.T) {
+	old := syscall.Umask(0o022)
+	defer syscall.Umask(old)
+	dir := t.TempDir()
+	src := filepath.Join(dir, "src.jpg")
+	if err := os.WriteFile(src, []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(src, 0o777); err != nil {
+		t.Fatal(err)
+	}
+	dst := filepath.Join(dir, "dst.jpg")
+	if err := CopyTo(context.Background(), src, dst); err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Stat(dst)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := info.Mode().Perm(); got != 0o755 {
+		t.Errorf("dst mode = %o, want 755 (0777 source under umask 022)", got)
+	}
 }
