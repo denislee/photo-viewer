@@ -409,7 +409,7 @@ func TestDecodeOriginalFitsWindow(t *testing.T) {
 	if d.sz.Y <= d.sz.X {
 		t.Fatalf("decoded %v is not portrait (orientation lost)", d.sz)
 	}
-	r := recentImage{sz: d.sz, native: d.native, full: d.full}
+	r := recentImage{decodedImage: d}
 	if r.needsUpgrade(target) {
 		t.Fatal("needsUpgrade for the target it was decoded for")
 	}

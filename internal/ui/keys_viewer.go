@@ -6,6 +6,7 @@ import (
 
 	"github.com/dns/photo-viewer/internal/cache"
 	"github.com/dns/photo-viewer/internal/scan"
+	"github.com/dns/photo-viewer/internal/video"
 )
 
 func handleViewerKey(ke key.Event, viewer *Viewer, grid *Grid, ctrl *Controller, w *app.Window) {
@@ -13,19 +14,7 @@ func handleViewerKey(ke key.Event, viewer *Viewer, grid *Grid, ctrl *Controller,
 	// are meaningful — every other key is a no-op so a stray hjkl can't
 	// silently advance past a confirmation the user hasn't dismissed.
 	if viewer.Confirming {
-		switch ke.Name {
-		case key.NameReturn:
-			viewer.ConfirmDelete(ctrl.DeletePath)
-			w.Invalidate()
-		case key.NameEscape:
-			viewer.CancelDelete()
-			w.Invalidate()
-		case "[":
-			if ke.Modifiers.Contain(key.ModCtrl) {
-				viewer.CancelDelete()
-				w.Invalidate()
-			}
-		}
+		handleConfirmKey(ke, func() { viewer.ConfirmDelete(ctrl.DeletePath) }, viewer.CancelDelete, w)
 		return
 	}
 
@@ -56,23 +45,14 @@ func handleViewerKey(ke key.Event, viewer *Viewer, grid *Grid, ctrl *Controller,
 			syncGrid()
 			viewer.Close()
 			w.Invalidate()
-		} else if isViewerVideo(viewer) {
-			if p := viewer.player.Load(); p != nil {
-				p.SeekRelative(-5)
-				w.Invalidate()
-			}
+		} else {
+			withPlayer(viewer, w, func(p *video.Player) { p.SeekRelative(-5) })
 		}
-	case key.NameLeftArrow, "H":
+	case key.NameLeftArrow, "H", key.NameUpArrow, "K":
 		viewer.Prev()
 		w.Invalidate()
-	case key.NameRightArrow, "L":
+	case key.NameRightArrow, "L", key.NameDownArrow, "J":
 		viewer.Next()
-		w.Invalidate()
-	case key.NameDownArrow, "J":
-		viewer.Next()
-		w.Invalidate()
-	case key.NameUpArrow, "K":
-		viewer.Prev()
 		w.Invalidate()
 	case "D":
 		viewer.RequestDelete()
@@ -96,26 +76,11 @@ func handleViewerKey(ke key.Event, viewer *Viewer, grid *Grid, ctrl *Controller,
 		// Pause/resume the embedded player when on a video. Space on
 		// anything else is a no-op so it doesn't accidentally pause a
 		// player that isn't loaded.
-		if isViewerVideo(viewer) {
-			if p := viewer.player.Load(); p != nil {
-				p.TogglePause()
-				w.Invalidate()
-			}
-		}
+		withPlayer(viewer, w, func(p *video.Player) { p.TogglePause() })
 	case "M":
-		if isViewerVideo(viewer) {
-			if p := viewer.player.Load(); p != nil {
-				p.ToggleMute()
-				w.Invalidate()
-			}
-		}
+		withPlayer(viewer, w, func(p *video.Player) { p.ToggleMute() })
 	case "]":
-		if isViewerVideo(viewer) {
-			if p := viewer.player.Load(); p != nil {
-				p.SeekRelative(5)
-				w.Invalidate()
-			}
-		}
+		withPlayer(viewer, w, func(p *video.Player) { p.SeekRelative(5) })
 	}
 }
 
@@ -143,4 +108,17 @@ func isViewerVideo(viewer *Viewer) bool {
 		return false
 	}
 	return viewer.entries[viewer.Index].Type == scan.TypeVideo
+}
+
+// withPlayer runs fn on the viewer's player when the current entry is a video
+// and the player is ready, then invalidates the window; it is a no-op
+// otherwise, so the video-control keys can't touch a player that isn't loaded.
+func withPlayer(viewer *Viewer, w *app.Window, fn func(p *video.Player)) {
+	if !isViewerVideo(viewer) {
+		return
+	}
+	if p := viewer.player.Load(); p != nil {
+		fn(p)
+		w.Invalidate()
+	}
 }

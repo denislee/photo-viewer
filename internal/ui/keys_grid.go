@@ -17,44 +17,16 @@ func handleGridKey(ke key.Event, grid *Grid, sidebarFocus *bool, viewer *Viewer,
 	// While the delete-confirmation modal is up, only Enter / Esc / Ctrl+[
 	// are meaningful — all other grid navigation is suppressed so a stray
 	// j/k can't move the selection out from under the prompt.
-	if grid.Confirming {
-		switch ke.Name {
-		case key.NameReturn:
-			grid.ConfirmDelete(ctrl.DeletePath)
-			w.Invalidate()
-		case key.NameEscape:
-			grid.CancelDelete()
-			w.Invalidate()
-		case "[":
-			if ke.Modifiers.Contain(key.ModCtrl) {
-				grid.CancelDelete()
-				w.Invalidate()
-			}
-		}
+	if grid.Confirming() {
+		handleConfirmKey(ke, func() { grid.ConfirmDelete(ctrl.DeletePath) }, grid.CancelDelete, w)
 		return
 	}
 	moved := false
-	// 'gg' / 'G' vim-style jumps. Track the first 'g' on the grid; any other
-	// keystroke clears the pending state so a stale 'g' doesn't fire later.
-	if ke.Name == "G" {
-		if ke.Modifiers.Contain(key.ModShift) {
-			if grid.JumpBottom(total) {
-				w.Invalidate()
-			}
-			grid.GPending = false
-			return
-		}
-		if grid.GPending {
-			if grid.JumpTop(total) {
-				w.Invalidate()
-			}
-			grid.GPending = false
-			return
-		}
-		grid.GPending = true
+	// 'gg' / 'G' vim-style jumps and Ctrl+F / Ctrl+B paging share their state
+	// machine with the sidebar.
+	if handlePagerKey(ke, gridPager{g: grid, total: total, w: w}) {
 		return
 	}
-	grid.GPending = false
 	// Ctrl-modified shortcuts come through with the same Name as the unmodified
 	// key; route them by checking Modifiers first.
 	if ke.Modifiers.Contain(key.ModCtrl) {
@@ -69,16 +41,6 @@ func handleGridKey(ke key.Event, grid *Grid, sidebarFocus *bool, viewer *Viewer,
 				w.Invalidate()
 			}
 			return
-		case "F":
-			if grid.PageMove(+1, total) {
-				w.Invalidate()
-			}
-			return
-		case "B":
-			if grid.PageMove(-1, total) {
-				w.Invalidate()
-			}
-			return
 		}
 	}
 	switch ke.Name {
@@ -88,10 +50,7 @@ func handleGridKey(ke key.Event, grid *Grid, sidebarFocus *bool, viewer *Viewer,
 		} else {
 			ctrl.SetSelectionMode(true)
 			if total > 0 {
-				idx := grid.SelectedIndex(total)
-				if idx >= 0 && idx < total {
-					ctrl.ToggleSelection(entries[idx].Path)
-				}
+				ctrl.ToggleSelection(entries[grid.SelectedIndex(total)].Path)
 			}
 		}
 		w.Invalidate()
@@ -159,10 +118,8 @@ func handleGridKey(ke key.Event, grid *Grid, sidebarFocus *bool, viewer *Viewer,
 	case "F":
 		if total > 0 {
 			idx := grid.SelectedIndex(total)
-			if idx >= 0 && idx < total {
-				ctrl.ToggleFavorite(entries[idx].Path, entries[idx].Favorite)
-				w.Invalidate()
-			}
+			ctrl.ToggleFavorite(entries[idx].Path, entries[idx].Favorite)
+			w.Invalidate()
 		}
 	case "D":
 		if total > 0 {
@@ -176,10 +133,7 @@ func handleGridKey(ke key.Event, grid *Grid, sidebarFocus *bool, viewer *Viewer,
 				selected = ctrl.SelectedEntries(entries)
 			}
 			if len(selected) == 0 {
-				idx := grid.SelectedIndex(total)
-				if idx >= 0 && idx < total {
-					selected = append(selected, entries[idx])
-				}
+				selected = append(selected, entries[grid.SelectedIndex(total)])
 			}
 
 			if len(selected) > 0 {
@@ -195,10 +149,7 @@ func handleGridKey(ke key.Event, grid *Grid, sidebarFocus *bool, viewer *Viewer,
 	}
 	if moved {
 		if ctrl.SelectionMode() {
-			idx := grid.SelectedIndex(total)
-			if idx >= 0 && idx < total {
-				ctrl.Select(entries[idx].Path)
-			}
+			ctrl.Select(entries[grid.SelectedIndex(total)].Path)
 		}
 		w.Invalidate()
 	}

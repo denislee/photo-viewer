@@ -11,8 +11,6 @@ import (
 	"gioui.org/op"
 	"gioui.org/op/clip"
 	"gioui.org/op/paint"
-
-	"github.com/dns/photo-viewer/internal/scan"
 )
 
 // viewerMaxZoom bounds the zoom factor, relative to the image fitted to the
@@ -64,11 +62,7 @@ func (v *Viewer) zoomable() bool {
 	if !v.Open || v.Confirming || v.Index < 0 || v.Index >= len(v.entries) {
 		return false
 	}
-	switch v.entries[v.Index].Type {
-	case scan.TypePhoto, scan.TypeRAW, scan.TypeHEIC:
-		return true
-	}
-	return false
+	return decodable(v.entries[v.Index].Type)
 }
 
 // Pinch applies one touchpad pinch step and reports whether the view changed.

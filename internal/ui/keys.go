@@ -166,44 +166,121 @@ func handleKeys(gtx layout.Context, ctrl *Controller, views *appViews, sidebarFo
 	}
 }
 
-func handleSidebarKey(ke key.Event, sidebar *Sidebar, sidebarFocus *bool, w *app.Window) {
-	moved := false
+// pager is the shared keyboard-navigation surface of the grid and the sidebar.
+// handlePagerKey drives the vim-style gg/G jumps and the Ctrl+F/Ctrl+B page
+// moves through it, so both key handlers run the same state machine.
+type pager interface {
+	// GPending reports whether a lone 'g' is waiting for its second.
+	GPending() bool
+	// SetGPending records or clears the pending 'g'.
+	SetGPending(pending bool)
+	// JumpTop and JumpBottom move the selection to the first/last row,
+	// reporting whether it moved.
+	JumpTop() bool
+	JumpBottom() bool
+	// PageMove moves the selection by one viewport-worth of rows.
+	PageMove(dir int) bool
+	// Changed is called after the selection moved, so the pager can preview
+	// the new row and wake the frame loop.
+	Changed()
+}
+
+// gridPager adapts Grid to pager for handleGridKey; total is the entry count
+// its jumps and page moves clamp to.
+type gridPager struct {
+	g     *Grid
+	total int
+	w     *app.Window
+}
+
+func (p gridPager) GPending() bool           { return p.g.GPending }
+func (p gridPager) SetGPending(pending bool) { p.g.GPending = pending }
+func (p gridPager) JumpTop() bool            { return p.g.JumpTop(p.total) }
+func (p gridPager) JumpBottom() bool         { return p.g.JumpBottom(p.total) }
+func (p gridPager) PageMove(dir int) bool    { return p.g.PageMove(dir, p.total) }
+func (p gridPager) Changed()                 { p.w.Invalidate() }
+
+// sidebarPager adapts Sidebar to pager for handleSidebarKey.
+type sidebarPager struct {
+	s *Sidebar
+	w *app.Window
+}
+
+func (p sidebarPager) GPending() bool           { return p.s.GPending }
+func (p sidebarPager) SetGPending(pending bool) { p.s.GPending = pending }
+func (p sidebarPager) JumpTop() bool            { return p.s.JumpTop() }
+func (p sidebarPager) JumpBottom() bool         { return p.s.JumpBottom() }
+func (p sidebarPager) PageMove(dir int) bool    { return p.s.PageMove(dir) }
+func (p sidebarPager) Changed() {
+	p.s.Preview()
+	p.w.Invalidate()
+}
+
+// handlePagerKey runs the gg/G and Ctrl+F/Ctrl+B state machine shared by the
+// grid and sidebar handlers, and reports whether it consumed the keystroke.
+// Any other key clears a pending 'g' so a stale one can't fire later.
+func handlePagerKey(ke key.Event, p pager) bool {
 	if ke.Name == "G" {
 		if ke.Modifiers.Contain(key.ModShift) {
-			if sidebar.JumpBottom() {
-				sidebar.Preview()
-				w.Invalidate()
+			if p.JumpBottom() {
+				p.Changed()
 			}
-			sidebar.GPending = false
-			return
+			p.SetGPending(false)
+			return true
 		}
-		if sidebar.GPending {
-			if sidebar.JumpTop() {
-				sidebar.Preview()
-				w.Invalidate()
+		if p.GPending() {
+			if p.JumpTop() {
+				p.Changed()
 			}
-			sidebar.GPending = false
-			return
+			p.SetGPending(false)
+			return true
 		}
-		sidebar.GPending = true
-		return
+		p.SetGPending(true)
+		return true
 	}
-	sidebar.GPending = false
+	p.SetGPending(false)
 	if ke.Modifiers.Contain(key.ModCtrl) {
 		switch ke.Name {
 		case "F":
-			if sidebar.PageMove(+1) {
-				sidebar.Preview()
-				w.Invalidate()
+			if p.PageMove(+1) {
+				p.Changed()
 			}
-			return
+			return true
 		case "B":
-			if sidebar.PageMove(-1) {
-				sidebar.Preview()
-				w.Invalidate()
+			if p.PageMove(-1) {
+				p.Changed()
 			}
-			return
+			return true
 		}
+	}
+	return false
+}
+
+// handleConfirmKey routes one key event while a delete-confirmation modal is
+// up over the viewer or the grid: Enter confirms, Esc and Ctrl+[ cancel.
+// Every other key is swallowed so a stray hjkl can't advance past the prompt.
+func handleConfirmKey(ke key.Event, confirm, cancel func(), w *app.Window) {
+	switch ke.Name {
+	case key.NameReturn:
+		confirm()
+		w.Invalidate()
+	case key.NameEscape:
+		cancel()
+		w.Invalidate()
+	case "[":
+		if ke.Modifiers.Contain(key.ModCtrl) {
+			cancel()
+			w.Invalidate()
+		}
+	}
+}
+
+func handleSidebarKey(ke key.Event, sidebar *Sidebar, sidebarFocus *bool, w *app.Window) {
+	moved := false
+	// 'gg' / 'G' vim-style jumps and Ctrl+F / Ctrl+B paging share their state
+	// machine with the grid.
+	if handlePagerKey(ke, sidebarPager{s: sidebar, w: w}) {
+		return
 	}
 	switch ke.Name {
 	case "J", key.NameDownArrow:

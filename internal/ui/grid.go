@@ -52,10 +52,9 @@ type Grid struct {
 	// handler clears it on any other key.
 	GPending bool
 
-	// Confirming is true while the delete-confirmation modal is up over the
-	// grid. ConfirmPath is the absolute path captured when the modal opened
+	// ConfirmPath, non-empty while the delete-confirmation modal is up over
+	// the grid (see Confirming), is the absolute path captured when the modal opened
 	// so it remains stable across refreshes that may reorder entries.
-	Confirming  bool
 	ConfirmPath string
 
 	// lastSelByDir remembers the selected index for each directory the user
@@ -87,19 +86,21 @@ const (
 	gridPrefetchBackRows = 1
 )
 
+// Confirming reports whether the delete-confirmation modal is up over the
+// grid (G6-10: it used to be a bool kept in sync with ConfirmPath).
+func (g *Grid) Confirming() bool { return g.ConfirmPath != "" }
+
 // RequestDelete opens the delete-confirmation modal for the entry at idx.
 // No-op when the index is out of range.
 func (g *Grid) RequestDelete(entries []cache.Entry, idx int) {
 	if idx < 0 || idx >= len(entries) {
 		return
 	}
-	g.Confirming = true
 	g.ConfirmPath = entries[idx].Path
 }
 
 // CancelDelete dismisses the confirmation modal without deleting anything.
 func (g *Grid) CancelDelete() {
-	g.Confirming = false
 	g.ConfirmPath = ""
 }
 
@@ -107,7 +108,6 @@ func (g *Grid) CancelDelete() {
 // selection is left clamped by the next Layout pass via SelectedIndex.
 func (g *Grid) ConfirmDelete(deleter func(path string)) {
 	path := g.ConfirmPath
-	g.Confirming = false
 	g.ConfirmPath = ""
 	if path == "" {
 		return

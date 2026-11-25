@@ -401,7 +401,7 @@ func drawRoot(gtx layout.Context, th *Theme, ctrl *Controller, views *appViews, 
 
 	// Delete-confirmation overlay covers the entire window above the
 	// shortcut bar so it's prominent regardless of grid scroll position.
-	if g.Confirming {
+	if g.Confirming() {
 		gtx2 := gtx
 		gtx2.Constraints = layout.Exact(image.Pt(totalW, totalH-sbH))
 		drawDeleteConfirm(gtx2, th, filepath.Base(g.ConfirmPath), image.Rectangle{Max: gtx2.Constraints.Max}, currentDir == TrashView)

@@ -204,23 +204,21 @@ const viewerMetaCap = 1024
 // reserved for a future zoom mode.
 const viewerMaxPreviewSide = 4096
 
-// recentImage is one decoded image in the recent cache.
+// recentImage is one decoded image in the recent cache: the source it was
+// decoded from plus the decode itself.
 type recentImage struct {
 	path string
 	mod  time.Time // source mtime when decoded; a mismatch is a miss
-	op   paint.ImageOp
-	sz   image.Point // decoded (upright) size
-	// native is the upright size of the best source available, or zero when
-	// unknown (a display-store rendition). full means sz already is the
-	// source's full resolution, so a larger window can't gain anything.
-	native image.Point
-	full   bool
+	decodedImage
 }
 
 // decodedImage is what decodeOriginal returns.
 type decodedImage struct {
-	op     paint.ImageOp
-	sz     image.Point
+	op paint.ImageOp
+	sz image.Point // decoded (upright) size
+	// native is the upright size of the best source available, or zero when
+	// unknown (a display-store rendition). full means sz already is the
+	// source's full resolution, so a larger window can't gain anything.
 	native image.Point
 	full   bool
 }
@@ -310,9 +308,18 @@ func (v *Viewer) targetSize() image.Point {
 // viewer is closed, so warm-up decodes before the first open fit the window.
 func (v *Viewer) NoteWindowSize(gtx layout.Context, size image.Point) {
 	if v.ShowInfo {
-		size.X -= min(gtx.Dp(unit.Dp(300)), size.X/2)
+		size.X -= infoPanelWidth(gtx, image.Rectangle{Max: size})
 	}
 	v.setTarget(size)
+}
+
+// infoPanelDp is the info sidebar's preferred width.
+const infoPanelDp = 300
+
+// infoPanelWidth returns the info sidebar's width inside area: infoPanelDp,
+// capped at half the area's width so the image keeps at least half the window.
+func infoPanelWidth(gtx layout.Context, area image.Rectangle) int {
+	return min(gtx.Dp(unit.Dp(infoPanelDp)), area.Dx()/2)
 }
 
 // navigated records a navigation for the key-repeat debounce.
@@ -473,7 +480,7 @@ func (v *Viewer) cachePut(e cache.Entry, d decodedImage) {
 		}
 	}
 	v.cacheDropLocked(e.Path)
-	r := recentImage{path: e.Path, mod: e.ModTime, op: d.op, sz: d.sz, native: d.native, full: d.full}
+	r := recentImage{path: e.Path, mod: e.ModTime, decodedImage: d}
 	v.recent = slices.Insert(v.recent, 0, r)
 	if len(v.recent) > viewerRecentCap {
 		v.recent = v.recent[:viewerRecentCap]
@@ -726,27 +733,19 @@ func (v *Viewer) Layout(gtx layout.Context, th *Theme, tc *thumbCache) layout.Di
 	imgArea := rect
 	infoW := 0
 	if v.ShowInfo {
-		infoW = gtx.Dp(unit.Dp(300))
-		infoW = min(infoW, size.X/2)
+		infoW = infoPanelWidth(gtx, rect)
 		imgArea = image.Rectangle{Max: image.Pt(size.X-infoW, size.Y)}
 	}
 
 	if e.Type == scan.TypeVideo {
 		// Drawing the video makes it visible again after a modal hid it (G5-04).
 		v.SetVideoVisible(true)
-		if op, size, ok := v.playVideo(e, imgArea.Dx(), imgArea.Dy()); ok {
-			if size == imgArea.Size() {
-				// mpv already letterboxed to (Dx, Dy), so we paint at
-				// imgArea.Min with the rect's native size.
-				off := opOffset(gtx, imgArea.Min)
-				op.Add(gtx.Ops)
-				paint.PaintOp{}.Add(gtx.Ops)
-				off.Pop()
-			} else {
-				// A native-size render (V5-02): mpv letterboxed inside
-				// size, whose aspect is the clip's, so fit that to the area.
-				drawFitted(gtx, op, size, imgArea)
-			}
+		if vop, vsz, ok := v.playVideo(e, imgArea.Dx(), imgArea.Dy()); ok {
+			// mpv renders at the area's size when the clip is at least as
+			// large (a 1:1 paint), or letterboxes a native-size render inside
+			// its own aspect (V5-02); either way drawFitted scales it to the
+			// area, the former at scale 1.
+			drawFitted(gtx, vop, vsz, imgArea)
 		} else if imgOp, imgSz, fb := tc.Get(e); fb {
 			// While mpv is still warming up or libmpv is unavailable,
 			// show the cached thumbnail so the screen isn't blank.
@@ -829,7 +828,7 @@ func drawDeleteConfirm(gtx layout.Context, th *Theme, filename string, rect imag
 		Max: image.Pt(rect.Min.X+(rect.Dx()-boxW)/2+boxW, rect.Min.Y+(rect.Dy()-boxH)/2+boxH),
 	}
 	paint.FillShape(gtx.Ops, color.NRGBA{R: 0x1c, G: 0x1f, B: 0x26, A: 0xff}, clip.UniformRRect(boxRect, gtx.Dp(unit.Dp(8))).Op(gtx.Ops))
-	drawBorder(gtx, boxRect, 1, color.NRGBA{R: 0xc0, G: 0x40, B: 0x40, A: 0xff})
+	drawBorder(gtx, boxRect, 1, th.Destructive)
 
 	off := op.Offset(image.Pt(boxRect.Min.X+pad, boxRect.Min.Y+pad)).Push(gtx.Ops)
 	contentCall.Add(gtx.Ops)
@@ -853,7 +852,7 @@ func (v *Viewer) layoutInfoPanel(gtx layout.Context, th *Theme, e cache.Entry, r
 	innerGtx.Constraints.Min = image.Pt(0, 0)
 	clipArea := clip.Rect(rect).Push(gtx.Ops)
 	defer clipArea.Pop()
-	off := opOffset(gtx, image.Pt(rect.Min.X+pad, rect.Min.Y+pad))
+	off := op.Offset(image.Pt(rect.Min.X+pad, rect.Min.Y+pad)).Push(gtx.Ops)
 	defer off.Pop()
 
 	// The strings only change with the entry or its async metadata, so they
@@ -886,7 +885,7 @@ func (v *Viewer) layoutInfoPanel(gtx layout.Context, th *Theme, e cache.Entry, r
 	rowGap := gtx.Dp(unit.Dp(8))
 	for _, r := range v.infoRows[1:] {
 		lbl := material.Label(th.Theme, unit.Sp(11), r.label)
-		lbl.Color = infoLabelColor
+		lbl.Color = th.Muted
 		lbl.Font.Weight = 700
 		put(lbl)
 		val := material.Label(th.Theme, unit.Sp(12), r.value)
@@ -896,9 +895,6 @@ func (v *Viewer) layoutInfoPanel(gtx layout.Context, th *Theme, e cache.Entry, r
 		y += rowGap
 	}
 }
-
-// infoLabelColor is the info panel's row-label colour.
-var infoLabelColor = color.NRGBA{R: 0x90, G: 0x95, B: 0xa0, A: 0xff}
 
 // infoRow is one label/value line of the info panel.
 type infoRow struct{ label, value string }
@@ -1007,10 +1003,24 @@ func fetchMediaInfo(path string) cachedInfo {
 	}
 }
 
-// opOffset is a thin wrapper around op.Offset so defer Pop() reads cleanly
-// next to its push site.
-func opOffset(gtx layout.Context, pt image.Point) op.TransformStack {
-	return op.Offset(pt).Push(gtx.Ops)
+// settleDelay returns how long a decode started now should wait for a burst of
+// key-repeat navigation to settle.
+func (v *Viewer) settleDelay() time.Duration {
+	if v.rapidNav {
+		return viewerSettleDelay
+	}
+	return 0
+}
+
+// decodable reports whether entries of type t go through the viewer's image
+// decode path — as opposed to video, which mpv plays, or formats with no
+// preview support.
+func decodable(t scan.MediaType) bool {
+	switch t {
+	case scan.TypePhoto, scan.TypeRAW, scan.TypeHEIC:
+		return true
+	}
+	return false
 }
 
 // imageFor returns the image to paint for photo/HEIC/RAW entries: the decoded
@@ -1019,8 +1029,7 @@ func opOffset(gtx layout.Context, pt image.Point) op.TransformStack {
 // past what the cached decode can show sharply (V2). Videos and decode
 // failures fall back to the thumbnail. UI goroutine only.
 func (v *Viewer) imageFor(e cache.Entry, tc *thumbCache, target image.Point) (paint.ImageOp, image.Point, bool) {
-	switch e.Type {
-	case scan.TypePhoto, scan.TypeRAW, scan.TypeHEIC:
+	if decodable(e.Type) {
 		v.init()
 		if r, ok := v.cacheGet(e); ok {
 			if r.needsUpgrade(target) && (v.loadingPath != e.Path || v.loadingTarget != target) {
@@ -1029,11 +1038,7 @@ func (v *Viewer) imageFor(e cache.Entry, tc *thumbCache, target image.Point) (pa
 			return r.op, r.sz, true
 		}
 		if v.loadingPath != e.Path {
-			var delay time.Duration
-			if v.rapidNav {
-				delay = viewerSettleDelay
-			}
-			v.kickDecode(e, target, delay)
+			v.kickDecode(e, target, v.settleDelay())
 		}
 	}
 	// Fall back to the cached thumbnail (always JPEG).
@@ -1172,22 +1177,17 @@ func (v *Viewer) prefetchAt(idx int) {
 		return
 	}
 	e := v.entries[idx]
-	switch e.Type {
-	case scan.TypePhoto, scan.TypeRAW, scan.TypeHEIC:
-	case scan.TypeVideo:
+	if e.Type == scan.TypeVideo {
 		v.prefetchVideo(e, idx)
 		return
-	default:
+	}
+	if !decodable(e.Type) {
 		return
 	}
 	if v.loadingPath == e.Path || v.cacheHasEntry(e) {
 		return
 	}
-	var delay time.Duration
-	if v.rapidNav {
-		delay = viewerSettleDelay
-	}
-	v.startPrefetch(e, idx, delay, v.decodeWork(e))
+	v.startPrefetch(e, idx, v.settleDelay(), v.decodeWork(e))
 }
 
 // Warm decodes e ahead of time while the grid has it selected, so Enter opens
@@ -1204,9 +1204,7 @@ func (v *Viewer) Warm(e cache.Entry) {
 		v.warmJob.cancel()
 	}
 	v.warmJob = nil
-	switch e.Type {
-	case scan.TypePhoto, scan.TypeRAW, scan.TypeHEIC:
-	default:
+	if !decodable(e.Type) {
 		return
 	}
 	if v.cacheHasEntry(e) {
