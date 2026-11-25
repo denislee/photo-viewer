@@ -101,3 +101,13 @@ func TestAsyncMemoNewestFirst(t *testing.T) {
 		t.Errorf("compute order = %v, want [busy new old]", order)
 	}
 }
+
+// set stores a ready value for path; tests seed the memo with it.
+func (a *asyncMemo[T]) set(path string, v T) {
+	a.mu.Lock()
+	if a.m == nil {
+		a.m = make(map[string]memoSlot[T])
+	}
+	a.m[path] = memoSlot[T]{v: v, ready: true}
+	a.mu.Unlock()
+}

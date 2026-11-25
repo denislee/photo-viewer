@@ -52,16 +52,6 @@ func (a *asyncMemo[T]) get(path string, pending T, compute func(string) T, inval
 	return pending
 }
 
-// set stores a ready value for path (tests seed the memo with it).
-func (a *asyncMemo[T]) set(path string, v T) {
-	a.mu.Lock()
-	if a.m == nil {
-		a.m = make(map[string]memoSlot[T])
-	}
-	a.m[path] = memoSlot[T]{v: v, ready: true}
-	a.mu.Unlock()
-}
-
 // work drains the queue newest-first, then exits; the next get restarts it.
 func (a *asyncMemo[T]) work(compute func(string) T, invalidate func()) {
 	for {

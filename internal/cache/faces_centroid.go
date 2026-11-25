@@ -74,6 +74,10 @@ func subtractFacesTx(tx *sql.Tx, paths ...string) error {
 			m.emb = DecodeEmbedding(emb)
 			members = append(members, m)
 		}
+		if err := rows.Err(); err != nil {
+			rows.Close()
+			return err
+		}
 		if err := rows.Close(); err != nil {
 			return err
 		}
