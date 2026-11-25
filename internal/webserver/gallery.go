@@ -373,7 +373,7 @@ func (s *Server) renderGalleryPage(w http.ResponseWriter, r *http.Request, vi vi
 	}
 
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	w.Write(pageHeaderBytes)
+	_, _ = w.Write(pageHeaderBytes)
 	fmt.Fprint(w, `<input type="checkbox" id="navtoggle" class="navtoggle" hidden>`)
 	fmt.Fprint(w, `<div class="layout">`)
 	s.renderSidebar(w, vi, dirChildren, dirChildCounts, trashCount)
@@ -400,7 +400,7 @@ func (s *Server) renderGalleryPage(w http.ResponseWriter, r *http.Request, vi vi
 			html.EscapeString(appendQuery(vi.backHref, "p="+strconv.Itoa(page+1))))
 	}
 	fmt.Fprint(w, `</main></div>`)
-	w.Write(gridScriptBytes)
+	_, _ = w.Write(gridScriptBytes)
 	fmt.Fprint(w, `</body></html>`)
 }
 

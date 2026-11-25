@@ -73,7 +73,7 @@ func (s *Server) renderViewer(w http.ResponseWriter,
 	vi viewInfo, pos, total int,
 ) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	w.Write(pageHeaderBytes)
+	_, _ = w.Write(pageHeaderBytes)
 
 	prevHref := ""
 	if prev != nil {

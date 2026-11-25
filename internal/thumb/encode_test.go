@@ -19,7 +19,7 @@ func TestEncodeJPEGDecodes(t *testing.T) {
 		for x := range w {
 			c := color.RGBA{R: uint8(x * 2), G: uint8(y * 3), B: uint8(x + y), A: 0xff}
 			rgba.SetRGBA(x, y, c)
-			nrgba.SetNRGBA(x, y, color.NRGBA{R: c.R, G: c.G, B: c.B, A: c.A})
+			nrgba.SetNRGBA(x, y, color.NRGBA(c))
 		}
 	}
 	for _, tc := range []struct {

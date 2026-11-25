@@ -1008,7 +1008,7 @@ func (p *Player) Close() {
 	// without mu. Taking and immediately releasing the write side is enough:
 	// closed is already true, so no new command can start.
 	p.cmdMu.Lock()
-	p.cmdMu.Unlock()
+	p.cmdMu.Unlock() //nolint:staticcheck // SA2001: intentional barrier, see comment above
 	if ctx != nil {
 		if gl != nil {
 			C.free_render_ctx_gl(gl, ctx)
