@@ -167,12 +167,23 @@ func WalkWith(ctx context.Context, root string, opts WalkOptions) <-chan Result 
 }
 
 // walkMedia walks root and calls fn for every media file, applying the
-// filters shared by WalkWith and Count: hidden directories (names starting
-// with '.', so the .photo-viewer-cache dir is never picked up) and hidden
-// files are skipped, as is anything DetectType doesn't recognise.
-// Filesystem errors go to onErr (if non-nil) and the walk carries on into
-// sibling paths. A non-nil error from fn stops the walk.
+// filters shared by WalkWith and Count: walkVisible's hidden directory/file
+// rules, plus anything DetectType doesn't recognise.
 func walkMedia(ctx context.Context, root string, onErr func(path string, err error), fn func(path string, t MediaType, d fs.DirEntry) error) error {
+	return walkVisible(ctx, root, onErr, func(path string, d fs.DirEntry) error {
+		t := DetectType(path)
+		if t == TypeUnknown {
+			return nil
+		}
+		return fn(path, t, d)
+	})
+}
+
+// walkVisible walks root calling fn for every regular file that is not hidden
+// and not inside a hidden directory (root itself may be hidden). Walk errors go
+// to onErr (when non-nil) and are skipped. Returns ctx.Err() once ctx is
+// cancelled.
+func walkVisible(ctx context.Context, root string, onErr func(path string, err error), fn func(path string, d fs.DirEntry) error) error {
 	return filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
 			if onErr != nil {
@@ -198,11 +209,7 @@ func walkMedia(ctx context.Context, root string, onErr func(path string, err err
 		if strings.HasPrefix(name, ".") {
 			return nil
 		}
-		t := DetectType(path)
-		if t == TypeUnknown {
-			return nil
-		}
-		return fn(path, t, d)
+		return fn(path, d)
 	})
 }
 

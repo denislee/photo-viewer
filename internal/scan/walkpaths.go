@@ -3,8 +3,6 @@ package scan
 import (
 	"context"
 	"io/fs"
-	"path/filepath"
-	"strings"
 )
 
 // WalkMediaPaths calls fn for every media file under root, with the same rules
@@ -29,22 +27,5 @@ func WalkMediaPaths(ctx context.Context, root string, fn func(path string, t Med
 // early; any other non-nil error aborts the walk and is returned. Walk errors
 // are ignored. Returns ctx.Err() if ctx is cancelled.
 func WalkVisibleFiles(ctx context.Context, root string, fn func(path string) error) error {
-	return filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
-		if err != nil {
-			return nil
-		}
-		if ctx.Err() != nil {
-			return ctx.Err()
-		}
-		if d.IsDir() {
-			if path != root && strings.HasPrefix(d.Name(), ".") {
-				return fs.SkipDir
-			}
-			return nil
-		}
-		if strings.HasPrefix(d.Name(), ".") {
-			return nil
-		}
-		return fn(path)
-	})
+	return walkVisible(ctx, root, nil, func(p string, _ fs.DirEntry) error { return fn(p) })
 }

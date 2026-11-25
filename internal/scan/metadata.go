@@ -108,49 +108,7 @@ func GetMediaInfo(path string) MediaInfo {
 	// re-reading the file would only repeat the miss (every video, most PNGs)
 	// and, on TIFF-family RAWs, cost a whole-file ReadAll (S4-04).
 	if exifErr != nil {
-		if f, err := openExifFile(path); err == nil {
-			if x, err := exif.Decode(f); err == nil {
-				if !dateFound {
-					if tm, err := x.DateTime(); err == nil {
-						info.Created = tm
-						dateFound = true
-					}
-				}
-				if info.Camera == "" {
-					if cam, err := x.Get(exif.Model); err == nil {
-						info.Camera = strings.Trim(cam.String(), "\"")
-					}
-				}
-				// Basic manual extraction for settings if exiftool missed them.
-				if info.Aperture == "" {
-					if fnum, err := x.Get(exif.FNumber); err == nil {
-						if rat := safeRat(fnum); rat != nil {
-							f, _ := rat.Float64()
-							info.Aperture = fmt.Sprintf("f/%.1f", f)
-						}
-					}
-				}
-				if info.ShutterSpeed == "" {
-					if exp, err := x.Get(exif.ExposureTime); err == nil {
-						info.ShutterSpeed = strings.Trim(exp.String(), "\"") + "s"
-					}
-				}
-				if info.ISO == "" {
-					if iso, err := x.Get(exif.ISOSpeedRatings); err == nil {
-						info.ISO = strings.Trim(iso.String(), "\"")
-					}
-				}
-				if info.FocalLength == "" {
-					if fl, err := x.Get(exif.FocalLength); err == nil {
-						if rat := safeRat(fl); rat != nil {
-							f, _ := rat.Float64()
-							info.FocalLength = fmt.Sprintf("%.1f mm", f)
-						}
-					}
-				}
-			}
-			f.Close()
-		}
+		info, dateFound = goexifInfo(path)
 	}
 
 	// Fallback 2: File modification time if no date found yet.
@@ -163,6 +121,48 @@ func GetMediaInfo(path string) MediaInfo {
 	}
 
 	return info
+}
+
+// goexifInfo reads path with goexif, the fallback GetMediaInfo uses when
+// exiftool itself failed. Nothing has been filled in at that point, so every
+// tag is read unconditionally.
+func goexifInfo(path string) (info MediaInfo, dateFound bool) {
+	f, err := openExifFile(path)
+	if err != nil {
+		return info, false
+	}
+	defer f.Close()
+	x, err := exif.Decode(f)
+	if err != nil {
+		return info, false
+	}
+	if tm, err := x.DateTime(); err == nil {
+		info.Created = tm
+		dateFound = true
+	}
+	if cam, err := x.Get(exif.Model); err == nil {
+		info.Camera = strings.Trim(cam.String(), "\"")
+	}
+	// Basic manual extraction for settings if exiftool missed them.
+	if fnum, err := x.Get(exif.FNumber); err == nil {
+		if rat := safeRat(fnum); rat != nil {
+			v, _ := rat.Float64()
+			info.Aperture = fmt.Sprintf("f/%.1f", v)
+		}
+	}
+	if exp, err := x.Get(exif.ExposureTime); err == nil {
+		info.ShutterSpeed = strings.Trim(exp.String(), "\"") + "s"
+	}
+	if iso, err := x.Get(exif.ISOSpeedRatings); err == nil {
+		info.ISO = strings.Trim(iso.String(), "\"")
+	}
+	if fl, err := x.Get(exif.FocalLength); err == nil {
+		if rat := safeRat(fl); rat != nil {
+			v, _ := rat.Float64()
+			info.FocalLength = fmt.Sprintf("%.1f mm", v)
+		}
+	}
+	return info, dateFound
 }
 
 // exifJSONString returns rec[key] as a plain string whether exiftool encoded it

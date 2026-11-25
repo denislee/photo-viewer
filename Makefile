@@ -1,4 +1,4 @@
-.PHONY: all build install uninstall test race test-video lint vuln check clean run fmt fmt-check vet
+.PHONY: all build install uninstall test race test-video test-py lint vuln check clean run fmt fmt-check vet
 
 # Binaries
 APP_BIN=photo-viewer
@@ -75,6 +75,13 @@ test-video:
 	PV_CROP_VIDEO="$$clip" go test -race -count=1 -run 'TestClose' -v ./internal/video/ && \
 	PV_CROP_VIDEO="$$clip" go test -race -count=1 -run 'TestPlayVideoPaintSizeMatchesFrame' -v ./internal/ui/
 
+# The Python helper's tests drive pipx venv selection, which they can only
+# exercise when face_recognition is NOT importable in the runner, so they run
+# in a throwaway venv without system site-packages.
+test-py:
+	@d=$$(mktemp -d) && trap 'rm -rf "$$d"' EXIT && \
+	python3 -m venv --without-pip "$$d" && "$$d/bin/python" scripts/test_pv_face_detect.py
+
 lint:
 	$(GOLANGCI_LINT) run ./...
 
@@ -82,7 +89,7 @@ vuln:
 	$(GOVULNCHECK) ./...
 
 # Everything to run before pushing.
-check: fmt-check vet lint race test-video vuln
+check: fmt-check vet lint race test-video test-py vuln
 
 clean:
 	go clean

@@ -286,15 +286,14 @@ func (c *Controller) isInTrash(path string) bool {
 }
 
 // TrashStats reports the number of items and total bytes currently in the
-// trash. The count comes from an in-memory mirror that the delete /
-// restore / empty paths keep in sync, so refreshFromIndex doesn't have to
-// re-walk the trash dir on every delete. Bytes is still read from disk —
-// it's only consumed by the settings modal, where one stat walk per open
-// is fine. Seeds the count on first call.
+// trash. Both come from a single walk of the trash dir, which is fine because
+// the settings modal opens rarely. The in-memory mirror still serves
+// refreshFromIndex, which must not re-walk the trash dir on every delete.
 func (c *Controller) TrashStats() (count int, bytes int64) {
-	count = c.cachedTrashCount()
 	if c.trashDir != "" {
-		_, bytes = cache.TrashStats(c.trashDir)
+		count, bytes = cache.TrashStats(c.trashDir)
+	} else {
+		count = c.cachedTrashCount()
 	}
 	return count, bytes
 }

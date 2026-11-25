@@ -273,9 +273,9 @@ func (v *SettingsView) Layout(gtx layout.Context, th *Theme) layout.Dimensions {
 				return lbl.Layout(gtx)
 			}),
 			layout.Rigid(layout.Spacer{Height: unit.Dp(14)}.Layout),
-			layout.Rigid(v.editorRow(th, "Inbox directory", &v.inboxEditor, "/path/to/inbox", &v.inboxBrowseBtn)),
+			layout.Rigid(labeledEditor(th, "Inbox directory", &v.inboxEditor, "/path/to/inbox", &v.inboxBrowseBtn)),
 			layout.Rigid(layout.Spacer{Height: unit.Dp(10)}.Layout),
-			layout.Rigid(v.editorRow(th, "Outbox directory", &v.outboxEditor, "/path/to/outbox", &v.outboxBrowseBtn)),
+			layout.Rigid(labeledEditor(th, "Outbox directory", &v.outboxEditor, "/path/to/outbox", &v.outboxBrowseBtn)),
 			layout.Rigid(layout.Spacer{Height: unit.Dp(16)}.Layout),
 			layout.Rigid(func(gtx layout.Context) layout.Dimensions {
 				cb := material.CheckBox(th.Theme, &v.sdAutoDetect,
@@ -474,8 +474,26 @@ func (v *SettingsView) setExportMsg(s string) {
 	}
 }
 
-func (v *SettingsView) editorRow(th *Theme, label string, ed *widget.Editor, hint string, browse *widget.Clickable) layout.Widget {
+// labeledEditor is the bold label + single-line editor box used by Settings and
+// the web-server panel. browse, when non-nil, adds a "Browse..." button to the
+// right of the editor.
+func labeledEditor(th *Theme, label string, ed *widget.Editor, hint string, browse *widget.Clickable) layout.Widget {
 	return func(gtx layout.Context) layout.Dimensions {
+		row := []layout.FlexChild{
+			layout.Flexed(1, func(gtx layout.Context) layout.Dimensions {
+				ed.SingleLine = true
+				editor := material.Editor(th.Theme, ed, hint)
+				editor.Color = th.Foreground
+				editor.HintColor = th.Muted
+				return drawEditorBox(gtx, th.CellBG, layout.UniformInset(unit.Dp(8)), editor.Layout)
+			}),
+		}
+		if browse != nil {
+			row = append(row,
+				layout.Rigid(layout.Spacer{Width: unit.Dp(6)}.Layout),
+				layout.Rigid(material.Button(th.Theme, browse, "Browse...").Layout),
+			)
+		}
 		return layout.Flex{Axis: layout.Vertical}.Layout(gtx,
 			layout.Rigid(func(gtx layout.Context) layout.Dimensions {
 				lbl := material.Label(th.Theme, unit.Sp(12), label)
@@ -485,17 +503,7 @@ func (v *SettingsView) editorRow(th *Theme, label string, ed *widget.Editor, hin
 			}),
 			layout.Rigid(layout.Spacer{Height: unit.Dp(4)}.Layout),
 			layout.Rigid(func(gtx layout.Context) layout.Dimensions {
-				return layout.Flex{Axis: layout.Horizontal, Alignment: layout.Middle}.Layout(gtx,
-					layout.Flexed(1, func(gtx layout.Context) layout.Dimensions {
-						ed.SingleLine = true
-						editor := material.Editor(th.Theme, ed, hint)
-						editor.Color = th.Foreground
-						editor.HintColor = th.Muted
-						return drawEditorBox(gtx, th.CellBG, layout.UniformInset(unit.Dp(8)), editor.Layout)
-					}),
-					layout.Rigid(layout.Spacer{Width: unit.Dp(6)}.Layout),
-					layout.Rigid(material.Button(th.Theme, browse, "Browse...").Layout),
-				)
+				return layout.Flex{Axis: layout.Horizontal, Alignment: layout.Middle}.Layout(gtx, row...)
 			}),
 		)
 	}

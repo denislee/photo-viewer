@@ -128,9 +128,9 @@ func (v *WebServerView) Layout(gtx layout.Context, th *Theme) layout.Dimensions 
 				return lbl.Layout(gtx)
 			}),
 			layout.Rigid(layout.Spacer{Height: unit.Dp(14)}.Layout),
-			layout.Rigid(v.fieldRow(th, "Port", &v.portEditor, "8080")),
+			layout.Rigid(labeledEditor(th, "Port", &v.portEditor, "8080", nil)),
 			layout.Rigid(layout.Spacer{Height: unit.Dp(10)}.Layout),
-			layout.Rigid(v.fieldRow(th, "Password (optional)", &v.passwordEditor, "leave blank for no auth")),
+			layout.Rigid(labeledEditor(th, "Password (optional)", &v.passwordEditor, "leave blank for no auth", nil)),
 			layout.Rigid(layout.Spacer{Height: unit.Dp(10)}.Layout),
 			layout.Rigid(func(gtx layout.Context) layout.Dimensions {
 				cb := material.CheckBox(th.Theme, &v.bindAll,
@@ -168,28 +168,6 @@ func (v *WebServerView) actionButton(th *Theme, running, stopping bool) layout.W
 		return material.Button(th.Theme, &v.stopBtn, "Stop server").Layout
 	}
 	return material.Button(th.Theme, &v.startBtn, "Start server").Layout
-}
-
-// fieldRow renders a single labeled editor with the same look as Settings.
-func (v *WebServerView) fieldRow(th *Theme, label string, ed *widget.Editor, hint string) layout.Widget {
-	return func(gtx layout.Context) layout.Dimensions {
-		return layout.Flex{Axis: layout.Vertical}.Layout(gtx,
-			layout.Rigid(func(gtx layout.Context) layout.Dimensions {
-				lbl := material.Label(th.Theme, unit.Sp(12), label)
-				lbl.Color = th.Foreground
-				lbl.Font.Weight = 700
-				return lbl.Layout(gtx)
-			}),
-			layout.Rigid(layout.Spacer{Height: unit.Dp(4)}.Layout),
-			layout.Rigid(func(gtx layout.Context) layout.Dimensions {
-				ed.SingleLine = true
-				editor := material.Editor(th.Theme, ed, hint)
-				editor.Color = th.Foreground
-				editor.HintColor = th.Muted
-				return drawEditorBox(gtx, th.CellBG, layout.UniformInset(unit.Dp(8)), editor.Layout)
-			}),
-		)
-	}
 }
 
 func (v *WebServerView) handleStart() {

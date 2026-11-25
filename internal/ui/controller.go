@@ -10,7 +10,6 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
-	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -711,23 +710,23 @@ func sortEntries(entries []cache.Entry, mode string) {
 	if normalizeSort(mode) != SortByDuration {
 		return
 	}
-	// Path is a unique tie-breaker (it's the index primary key), so the
-	// comparator is a total order and stability is irrelevant — sort.Slice
-	// is faster and allocation-free.
-	sort.Slice(entries, func(i, j int) bool {
-		di, dj := entries[i].DurationMs, entries[j].DurationMs
-		if di != dj {
-			// Non-video / unknown duration (0 or the -1 probe-failure
-			// sentinel) → end of list.
-			if di <= 0 {
-				return false
-			}
-			if dj <= 0 {
-				return true
-			}
-			return di > dj
+	// Path is a unique tie-breaker (the index primary key), so the order is
+	// total.
+	slices.SortFunc(entries, func(a, b cache.Entry) int {
+		da, db := a.DurationMs, b.DurationMs
+		switch {
+		// Non-video / unknown duration (0 or the -1 probe-failure
+		// sentinel) → end of list.
+		case da > 0 && db <= 0:
+			return -1
+		case da <= 0 && db > 0:
+			return 1
+		case da > db:
+			return -1
+		case da < db:
+			return 1
 		}
-		return entries[i].Path < entries[j].Path
+		return strings.Compare(a.Path, b.Path)
 	})
 }
 

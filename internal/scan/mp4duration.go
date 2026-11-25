@@ -2,6 +2,7 @@ package scan
 
 import (
 	"encoding/binary"
+	"iter"
 	"math"
 	"os"
 	"path/filepath"
@@ -78,11 +79,7 @@ func mp4DurationMs(path string) (int64, bool) {
 		duration  uint64
 		haveMvhd  bool
 	)
-	for off, boxes := moov.payloadOff, 0; off < moov.end; boxes++ {
-		if boxes >= maxBoxes {
-			return 0, false
-		}
-		b, ok := readBoxHeader(f, off, moov.end)
+	for b, ok := range boxes(f, moov.payloadOff, moov.end) {
 		if !ok {
 			return 0, false
 		}
@@ -96,7 +93,6 @@ func mp4DurationMs(path string) (int64, bool) {
 			}
 			timescale, duration, haveMvhd = ts, d, true
 		}
-		off = b.end
 	}
 	if !haveMvhd {
 		return 0, false
@@ -104,20 +100,37 @@ func mp4DurationMs(path string) (int64, bool) {
 	return durationMs(duration, timescale)
 }
 
+// boxes yields the sibling boxes in [start, end) in order. A malformed header,
+// or more than maxBoxes siblings, yields one final (mp4Box{}, false) and stops.
+func boxes(f *os.File, start, end int64) iter.Seq2[mp4Box, bool] {
+	return func(yield func(mp4Box, bool) bool) {
+		for off, n := start, 0; off < end; n++ {
+			if n >= maxBoxes {
+				yield(mp4Box{}, false)
+				return
+			}
+			b, ok := readBoxHeader(f, off, end)
+			if !ok {
+				yield(mp4Box{}, false)
+				return
+			}
+			if !yield(b, true) {
+				return
+			}
+			off = b.end
+		}
+	}
+}
+
 // findBox returns the first box of type typ among the siblings in [start, end).
 func findBox(f *os.File, start, end int64, typ string) (mp4Box, bool) {
-	for off, boxes := start, 0; off < end; boxes++ {
-		if boxes >= maxBoxes {
-			return mp4Box{}, false
-		}
-		b, ok := readBoxHeader(f, off, end)
+	for b, ok := range boxes(f, start, end) {
 		if !ok {
 			return mp4Box{}, false
 		}
 		if b.typ == typ {
 			return b, true
 		}
-		off = b.end
 	}
 	return mp4Box{}, false
 }
