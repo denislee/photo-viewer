@@ -39,6 +39,9 @@ type viewerZoom struct {
 	hovering bool
 	dragging bool
 	dragLast f32.Point
+	// drawn is where the last drawZoomed put the image on screen; the face
+	// boxes are mapped into it.
+	drawn f32Rect
 }
 
 func (z *viewerZoom) factor() float32 {
@@ -204,6 +207,7 @@ func (v *Viewer) drawZoomed(gtx layout.Context, img paint.ImageOp, imgSz image.P
 	drawn := layout.FPt(imgSz).Mul(s)
 	c := layout.FPt(area.Min.Add(area.Max)).Mul(0.5)
 	origin := c.Sub(drawn.Mul(0.5)).Add(v.zoom.pan)
+	v.zoom.drawn = f32Rect{min: origin, max: origin.Add(drawn)}
 
 	defer clip.Rect(area).Push(gtx.Ops).Pop()
 	defer op.Affine(f32.AffineId().Scale(f32.Point{}, f32.Pt(s, s)).Offset(origin)).Push(gtx.Ops).Pop()

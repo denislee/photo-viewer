@@ -123,6 +123,11 @@ func Run(w *app.Window, ctrl *Controller) error {
 		}
 	})
 	review.SetInvalidate(w.Invalidate)
+	viewer.SetFaces(newViewerFaces(ctrl, func(id int64) {
+		viewer.Close()
+		ctrl.SelectDir(PersonDir(id))
+		w.Invalidate()
+	}))
 	openReview := func(t ReviewTarget) {
 		review.Show(t)
 		w.Invalidate()
@@ -386,6 +391,10 @@ func layoutOverlays(gtx layout.Context, th *Theme, ctrl *Controller, views *appV
 		}
 		gtx2 := gtx
 		gtx2.Constraints = layout.Exact(image.Pt(f.totalW, f.totalH-f.sbH))
+		if m.name == "viewerPicker" {
+			// The tag picker floats over the photo it is tagging.
+			v.Layout(gtx2, th, ctrl.Thumbs())
+		}
 		m.layout(gtx2, th)
 		drawShortcut()
 		return true

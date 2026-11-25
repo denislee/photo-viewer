@@ -127,6 +127,15 @@ func newModals(v *appViews, libraryRoot func() string) []modal {
 			textInput: true,
 		},
 		{
+			// The viewer's face-tag picker; layoutOverlays draws the viewer
+			// under it.
+			name:      "viewerPicker",
+			open:      func() bool { return v.viewer != nil && v.viewer.Open && v.viewer.FacePickerOpen() },
+			layout:    func(gtx layout.Context, th *Theme) { v.viewer.LayoutFacePicker(gtx, th) },
+			keys:      func(ke key.Event) bool { return v.viewer.FacePickerKey(ke) },
+			textInput: true,
+		},
+		{
 			name:        "review",
 			open:        func() bool { return v.review != nil && v.review.Open },
 			layout:      func(gtx layout.Context, th *Theme) { v.review.Layout(gtx, th) },

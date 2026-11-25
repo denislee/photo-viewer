@@ -28,6 +28,13 @@ func handleViewerKey(ke key.Event, viewer *Viewer, grid *Grid, ctrl *Controller,
 		}
 	}
 
+	// Face boxes / tagging (p, t, and Y/N/X/Enter/Esc on a selected box).
+	if viewer.Index >= 0 && viewer.Index < len(viewer.entries) &&
+		viewer.faces.handleKey(ke, viewer.entries[viewer.Index].Path) {
+		w.Invalidate()
+		return
+	}
+
 	// Esc first backs out of a zoom, then closes the viewer.
 	if ke.Name == key.NameEscape && viewer.Zoomed() {
 		viewer.ResetZoom()

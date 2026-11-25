@@ -25,6 +25,8 @@ var (
 		"[/]: seek 5s",
 		"m: mute",
 		"o: open externally",
+		"p: face boxes",
+		"t: next face (enter name · y/n/x)",
 		"esc/q/ctrl+[: close",
 	}, "   ·   ")
 	shortcutTextSidebar = strings.Join([]string{

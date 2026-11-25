@@ -20,6 +20,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"gioui.org/io/key"
 	"gioui.org/layout"
 	"gioui.org/op"
 	"gioui.org/op/clip"
@@ -45,6 +46,9 @@ import (
 // is true when the viewer should claim the screen. ShowInfo toggles the
 // metadata side panel (bound to 'i').
 type Viewer struct {
+	// faces is the face-box / tagging layer (viewer_faces.go); nil until
+	// SetFaces wires it.
+	faces    *viewerFaces
 	Open     bool
 	Index    int
 	ShowInfo bool
@@ -758,6 +762,7 @@ func (v *Viewer) Layout(gtx layout.Context, th *Theme, tc *thumbCache) layout.Di
 		imgOp, imgSz, ok := v.imageFor(e, tc, v.zoomTarget(v.targetSize()))
 		if ok {
 			v.drawZoomed(gtx, imgOp, imgSz, imgArea)
+			v.faces.draw(gtx, th, e.Path, v.zoom.drawn, imgArea)
 		}
 	}
 
@@ -894,6 +899,37 @@ func (v *Viewer) layoutInfoPanel(gtx layout.Context, th *Theme, e cache.Entry, r
 		put(val)
 		y += rowGap
 	}
+	// People in the photo, each name opening that person's view.
+	if v.faces != nil && y < innerH {
+		st := op.Offset(image.Pt(0, y)).Push(gtx.Ops)
+		g := innerGtx
+		g.Constraints.Max.Y = innerH - y
+		v.faces.layoutPeopleLinks(g, th, e.Path, innerW)
+		st.Pop()
+	}
+}
+
+// SetFaces wires the face layer (boxes, tagging, People line).
+func (v *Viewer) SetFaces(f *viewerFaces) { v.faces = f }
+
+// FacePickerOpen reports whether the face-tag picker is showing.
+func (v *Viewer) FacePickerOpen() bool { return v.faces != nil && v.faces.picker.Open }
+
+// LayoutFacePicker draws the face-tag picker over the viewer.
+func (v *Viewer) LayoutFacePicker(gtx layout.Context, th *Theme) {
+	if v.faces == nil {
+		return
+	}
+	people := v.faces.pickerPeople()
+	v.faces.picker.Layout(gtx, th, people, "Who is this?")
+}
+
+// FacePickerKey routes keys to the open face-tag picker.
+func (v *Viewer) FacePickerKey(ke key.Event) bool {
+	if v.faces == nil {
+		return false
+	}
+	return v.faces.picker.Key(ke, v.faces.pickerPeople())
 }
 
 // infoRow is one label/value line of the info panel.

@@ -13,6 +13,7 @@ func testAppViews() *appViews {
 		settings: &SettingsView{}, search: &FuzzySearchView{},
 		sdPrompt: &SDPromptView{}, webView: &WebServerView{},
 		header: &PersonHeader{}, review: &ReviewView{},
+		viewer: &Viewer{Open: true, faces: &viewerFaces{}},
 	}
 	v.modals = newModals(v, func() string { return "/lib" })
 	return v
@@ -23,8 +24,8 @@ func testAppViews() *appViews {
 // drawRoot and handleKeys used.
 func TestTopModalPriority(t *testing.T) {
 	v := testAppViews()
-	order := []string{"search", "personPicker", "review", "duplicates", "imports", "organize", "settings", "sdPrompt", "webServer"}
-	flags := []*bool{&v.search.Open, &v.header.picker.Open, &v.review.Open, &v.dups.Open, &v.imports.Open, &v.organize.Open,
+	order := []string{"search", "personPicker", "viewerPicker", "review", "duplicates", "imports", "organize", "settings", "sdPrompt", "webServer"}
+	flags := []*bool{&v.search.Open, &v.header.picker.Open, &v.viewer.faces.picker.Open, &v.review.Open, &v.dups.Open, &v.imports.Open, &v.organize.Open,
 		&v.settings.Open, &v.sdPrompt.Open, &v.webView.Open}
 	if len(v.modals) != len(order) {
 		t.Fatalf("%d modals, want %d", len(v.modals), len(order))
