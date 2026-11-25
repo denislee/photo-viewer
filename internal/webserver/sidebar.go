@@ -43,6 +43,10 @@ func (s *Server) renderSidebar(w http.ResponseWriter, vi viewInfo, dirChildren [
 
 	sidebarRow(w, vi.link("/"), "All media", "", agg.allCount, vi.kind == "all")
 	sidebarRow(w, vi.link("/favorites"), "Favorites", "★", agg.favCount, vi.kind == "favorites")
+	// People is READ-ONLY in the web UI; CountPeople is one indexed count, so it
+	// needs no cache of its own (unlike the view totals above).
+	sidebarRow(w, vi.link("/people"), "People", "👤", s.index.CountPeople(),
+		vi.kind == "people" || vi.kind == "person")
 
 	if trashCount > 0 || vi.kind == "trash" {
 		sidebarRow(w, "/trash", "Trash", "🗑", trashCount, vi.kind == "trash")

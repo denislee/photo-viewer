@@ -213,7 +213,11 @@ func (c *Controller) NewWebServer() *webserver.Server {
 	// always-writable root the primary thumb store already resolved, so this
 	// only fails in pathological cases; a nil store degrades /display to
 	// serving originals (fine for JPEG/PNG, no RAW/HEIC rendition).
-	return webserver.New(c.index, c.store, c.DisplayStore(), c.libraryRoot, c.trashDir)
+	srv := webserver.New(c.index, c.store, c.DisplayStore(), c.libraryRoot, c.trashDir)
+	// Face-crop avatars (/face) cache under the same writable root, alongside
+	// thumbs/ and the display tier.
+	srv.SetFaceCacheDir(c.cacheDir)
+	return srv
 }
 
 // DisplayStore returns the shared <cacheDir>/display rendition store, creating

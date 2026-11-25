@@ -114,6 +114,7 @@ func (s *Server) renderViewer(w http.ResponseWriter,
 			starCls, cur.ThumbID, star)
 	}
 	fmt.Fprintf(w, `<button type="button" class="vinfo" id="infoBtn" data-id="%s" title="Info (i)">i</button>`, cur.ThumbID)
+	fmt.Fprintf(w, `<button type="button" class="vinfo" id="faceBtn" data-id="%s" title="Faces (p)">Faces</button>`, cur.ThumbID)
 	fmt.Fprint(w, `</header>`)
 
 	fmt.Fprint(w, `<div class="vstage">`)

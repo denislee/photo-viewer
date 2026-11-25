@@ -174,25 +174,37 @@ func (s *Server) handleAPIFavorite(w http.ResponseWriter, r *http.Request) {
 	_ = json.NewEncoder(w).Encode(resp)
 }
 
+// faceJSON is one detected face in /api/info's "faces" array. Box is the
+// normalised (0..1) rect the detector recorded for the rendition it ran on, so
+// the viewer can overlay it on the displayed image without knowing any pixel
+// size. Person is 0 when the face has no identity yet.
+type faceJSON struct {
+	Box       [4]float64 `json:"box"`
+	Name      string     `json:"name"`
+	Person    int64      `json:"person"`
+	Confirmed bool       `json:"confirmed"`
+}
+
 // infoJSON is the wire shape returned by /api/info. Lazily fetched per
 // /view/<id> request so opening the viewer doesn't pay the exiftool cost
 // up front.
 type infoJSON struct {
-	ID           string `json:"id"`
-	Name         string `json:"name"`
-	Path         string `json:"path"`
-	Type         string `json:"type"`
-	Size         string `json:"size"`
-	Created      string `json:"created"`
-	Modified     string `json:"modified"`
-	Dimensions   string `json:"dimensions"`
-	Camera       string `json:"camera"`
-	Lens         string `json:"lens"`
-	Aperture     string `json:"aperture"`
-	ShutterSpeed string `json:"shutter_speed"`
-	ISO          string `json:"iso"`
-	FocalLength  string `json:"focal_length"`
-	Favorite     bool   `json:"favorite"`
+	ID           string     `json:"id"`
+	Name         string     `json:"name"`
+	Path         string     `json:"path"`
+	Type         string     `json:"type"`
+	Size         string     `json:"size"`
+	Created      string     `json:"created"`
+	Modified     string     `json:"modified"`
+	Dimensions   string     `json:"dimensions"`
+	Camera       string     `json:"camera"`
+	Lens         string     `json:"lens"`
+	Aperture     string     `json:"aperture"`
+	ShutterSpeed string     `json:"shutter_speed"`
+	ISO          string     `json:"iso"`
+	FocalLength  string     `json:"focal_length"`
+	Favorite     bool       `json:"favorite"`
+	Faces        []faceJSON `json:"faces"`
 }
 
 // handleAPIInfo returns extended metadata for one entry. The viewer's info
@@ -236,9 +248,41 @@ func (s *Server) handleAPIInfo(w http.ResponseWriter, r *http.Request) {
 		FocalLength:  cmp.Or(mi.FocalLength, "—"),
 		Favorite:     e.Favorite,
 	}
+	// Faces are computed outside the metadata cache on every request: a rename
+	// or a confirm happens in the GUI at any moment, and infoVal is keyed by
+	// file version (which no face write moves), so caching them there would
+	// serve a stale name until the file itself changed.
+	info.Faces = s.photoFaces(e.Path)
 
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	_ = json.NewEncoder(w).Encode(info)
+}
+
+// photoFaces returns the faces of path for /api/info, left to right.
+// Ignored faces (assign "ignored") and rows without a normalised box (written
+// before schema v9) are left out: there is nothing to draw for them.
+func (s *Server) photoFaces(path string) []faceJSON {
+	out := []faceJSON{}
+	faces, err := s.index.FacesInPhoto(path)
+	if err != nil {
+		return out
+	}
+	for _, f := range faces {
+		if !cache.HasNBox(f.NBox) || f.Assign == cache.AssignIgnored {
+			continue
+		}
+		var pid int64
+		if f.PersonID.Valid {
+			pid = f.PersonID.Int64
+		}
+		out = append(out, faceJSON{
+			Box:       f.NBox,
+			Name:      f.PersonName,
+			Person:    pid,
+			Confirmed: f.Assign == cache.AssignUser,
+		})
+	}
+	return out
 }
 
 // fmtTimeOr formats a capture timestamp for the info panel, or "—" when the

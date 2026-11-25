@@ -72,10 +72,18 @@
   .vbar .vfav, .vbar .vinfo { background: #1c1c1c; color: #ddd; border: 1px solid #2a2a2a;
             border-radius: 6px; padding: 4px 10px; font-size: 14px; cursor: pointer; }
   .vbar .vfav.on { color: #e0b03c; border-color: #4a3a18; }
+  .vbar .vinfo.on { background: #2a3a52; border-color: #3a5a82; color: #fff; }
   .vbar .vinfo:hover, .vbar .vfav:hover { background: #243046; }
   .vstage { position: relative; flex: 1; display: flex; align-items: center; justify-content: center;
             min-height: 0; }
   .vmedia { max-width: 100%; max-height: 100%; object-fit: contain; display: block; }
+  /* Face boxes: positioned over the rendered image from /api/info's normalised
+     rects, so they scale with it; pointer-events pass through to the arrows. */
+  .facebox { position: absolute; border: 2px solid #4a90e2; border-radius: 3px;
+             box-shadow: 0 0 0 1px rgba(0,0,0,0.55); pointer-events: none; }
+  .facelabel { position: absolute; left: -2px; bottom: 100%; padding: 2px 6px;
+               background: rgba(12,16,22,0.85); color: #fff; font-size: 11px;
+               border-radius: 3px 3px 0 0; white-space: nowrap; }
   .varrow { position: absolute; top: 0; bottom: 0; width: 25%; display: flex; align-items: center;
             color: #fff; font-size: 56px; text-decoration: none; user-select: none;
             opacity: 0.35; transition: opacity 0.15s; }

@@ -7,8 +7,9 @@
 //
 // Layout: server.go (Server, lifecycle, routes), middleware.go (security
 // headers, Basic auth + throttle, gzip), gallery.go / sidebar.go (HTML
-// gallery pages), viewer.go (/view), api.go (/api/*), media.go (/thumb,
-// /media, /display), hls.go (/hls), and assets/ (page CSS/JS, embedded).
+// gallery pages), people.go (/people, /person, /face), viewer.go (/view),
+// api.go (/api/*), media.go (/thumb, /media, /display), hls.go (/hls), and
+// assets/ (page CSS/JS, embedded).
 package webserver
 
 import (
@@ -59,6 +60,10 @@ type Server struct {
 	display     *cache.ThumbStore // larger renditions for /display; may be nil
 	libraryRoot string
 	trashDir    string // resolved by the caller (cache.TrashDir); "" when no trash
+
+	// faceCacheDir is where /face caches the cropped face avatars. "" disables
+	// the route (every request 404s). Set with SetFaceCacheDir before Start.
+	faceCacheDir string
 
 	// trash caches the trash listing (entries + id index) so /trash,
 	// /thumb/<trash id>, and /media/<trash id> don't stat the dir per request.
@@ -133,6 +138,11 @@ func New(index *cache.Index, store, display *cache.ThumbStore, libraryRoot, tras
 	}
 }
 
+// SetFaceCacheDir sets the directory /face writes its cached face-crop JPEGs
+// into — normally the same <cacheDir> that hosts thumbs/. It must be called
+// before Start; an empty dir leaves /face answering 404 (no crop cache to use).
+func (s *Server) SetFaceCacheDir(dir string) { s.faceCacheDir = dir }
+
 // Running reports whether the server has an active listener.
 func (s *Server) Running() bool {
 	s.mu.Lock()
@@ -161,10 +171,13 @@ func (s *Server) handler(password string) http.Handler {
 	mux.HandleFunc("GET /{$}", gz(s.galleryOf("all")))
 	mux.HandleFunc("GET /favorites", gz(s.galleryOf("favorites")))
 	mux.HandleFunc("GET /trash", gz(s.galleryOf("trash")))
+	mux.HandleFunc("GET /people", gz(s.handlePeople))
+	mux.HandleFunc("GET /person/{id}", gz(s.handlePerson))
 	mux.HandleFunc("GET /year/", gz(s.handleYear))
 	mux.HandleFunc("GET /dir", gz(s.handleDir))
 	mux.HandleFunc("GET /view/{id}", gz(s.handleView))
 	mux.HandleFunc("GET /thumb/{id}", s.handleThumb)
+	mux.HandleFunc("GET /face/{id}", s.handleFace)
 	mux.HandleFunc("GET /media/{id}", s.handleMedia)
 	mux.HandleFunc("GET /display/{id}", s.handleDisplay)
 	mux.HandleFunc("GET /hls/{id}/{file}", s.handleHLS)

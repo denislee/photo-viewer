@@ -144,6 +144,15 @@ func (s *Server) newViewInfo(kind string, year int, dirAbs, filter string, showR
 		vi.title = "Trash"
 		vi.base = "/trash"
 		vi.ctxQuery = buildCtxQuery("trash", "", "", filter, showRAW)
+	case "people":
+		vi.title = "People"
+		vi.base = "/people"
+		vi.ctxQuery = buildCtxQuery("people", "", "", filter, showRAW)
+	case "person":
+		// The person id, the name-derived title and the pid-bearing context
+		// query are filled in by personViewInfo: newViewInfo's parameters carry
+		// no id. The base path stays empty here so that helper owns it.
+		vi.v.Kind = "person"
 	case "year":
 		vi.v.Year = year
 		ys := strconv.Itoa(year)
@@ -187,6 +196,18 @@ func (s *Server) viewFromQuery(q url.Values) (viewInfo, bool) {
 			return viewInfo{}, false
 		}
 		return s.newViewInfo("dir", 0, abs, filter, showRAW), true
+	case "person":
+		pid, err := strconv.ParseInt(q.Get("pid"), 10, 64)
+		if err != nil || pid <= 0 {
+			return viewInfo{}, false
+		}
+		vi := s.personViewInfo(pid, filter, showRAW)
+		if vi.title == "" {
+			// The person was deleted (or never existed): drop the context rather
+			// than forward a view that would filter to nothing.
+			return viewInfo{}, false
+		}
+		return vi, true
 	}
 	return viewInfo{}, false
 }
