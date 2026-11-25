@@ -12,6 +12,9 @@ import (
 	"sync/atomic"
 	"time"
 
+	"gioui.org/layout"
+	"gioui.org/op"
+
 	"github.com/dns/photo-viewer/internal/cache"
 	"github.com/dns/photo-viewer/internal/face"
 )
@@ -794,4 +797,22 @@ func (c *Controller) IgnoreGroup(clusterID int64) {
 			c.SelectDir(PeopleView)
 		}
 	})
+}
+
+// PeopleLoading reports whether a People snapshot reload is in flight.
+func (c *Controller) PeopleLoading() bool {
+	c.faces.mu.Lock()
+	defer c.faces.mu.Unlock()
+	return c.faces.snap.loading
+}
+
+// pollWhileLoading asks Gio for another frame shortly while an async load
+// is in flight. The loaders also call Invalidate when they finish, but a
+// load that completes inside the very frame that started it (a small
+// library answers in microseconds) has its Invalidate absorbed by that
+// frame, leaving the view on "Loading…" until something else redraws.
+func pollWhileLoading(gtx layout.Context, loading bool) {
+	if loading {
+		gtx.Execute(op.InvalidateCmd{At: gtx.Now.Add(30 * time.Millisecond)})
+	}
 }

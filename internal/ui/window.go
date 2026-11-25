@@ -152,6 +152,7 @@ func Run(w *app.Window, ctrl *Controller) error {
 	// Face recognition: probe the helper off the UI goroutine (1–15 s) and,
 	// when it works and the setting is on, start detecting.
 	ctrl.StartFaces()
+	debugStartView(ctrl, views, w)
 
 	var ops op.Ops
 	for {

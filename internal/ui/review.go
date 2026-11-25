@@ -449,7 +449,7 @@ func (r *ReviewView) helpLine() string {
 	t := r.targetCopy()
 	switch {
 	case t.ClusterID > 0:
-		return "y confirm · n remove from group · m move to… · i not a face · v mark · o open photo · ctrl+z undo · esc close"
+		return "n remove from group · m move to… (name it) · i not a face · v mark · o open photo · ctrl+z undo · esc close"
 	case t.Suggest:
 		return "y yes · n no · s skip · Y all yes · N all no · esc close"
 	}
@@ -488,6 +488,7 @@ func (r *ReviewView) Layout(gtx layout.Context, th *Theme) layout.Dimensions {
 	r.mu.Lock()
 	loaded, loading := r.loaded, r.loading
 	r.mu.Unlock()
+	pollWhileLoading(gtx, loading)
 	if !sameFaceSlice(loaded, r.faces) {
 		r.syncFaces(loaded)
 	}

@@ -151,10 +151,23 @@ func drawAvatar(gtx layout.Context, th *Theme, ac *avatarCache, f cache.Face, si
 	if op, sz, ok := ac.Get(f); ok {
 		drawFitted(gtx, op, sz, sq)
 	} else {
+		pollWhileLoading(gtx, ac.pendingOrQueued(f.ID))
 		// "?" placeholder disc tint.
 		paint.ColorOp{Color: color.NRGBA{R: 0x3a, G: 0x3a, B: 0x44, A: 0xff}}.Add(gtx.Ops)
 		paint.PaintOp{}.Add(gtx.Ops)
 	}
 	st.Pop()
 	return layout.Dimensions{Size: sq.Max}
+}
+
+// pendingOrQueued reports whether face id's avatar is still being loaded
+// (not cached, not failed), so the caller keeps asking for frames.
+func (a *avatarCache) pendingOrQueued(id int64) bool {
+	if a == nil || id == 0 {
+		return false
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	_, cached := a.items[id]
+	return !cached && !a.failed[id]
 }

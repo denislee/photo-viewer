@@ -342,6 +342,7 @@ func (p *PeoplePane) Layout(gtx layout.Context, th *Theme) layout.Dimensions {
 
 	if p.ctrl != nil {
 		p.snap, p.loaded = p.ctrl.People()
+		pollWhileLoading(gtx, p.ctrl.PeopleLoading())
 	}
 	cards := p.cards()
 	p.clampSelection()

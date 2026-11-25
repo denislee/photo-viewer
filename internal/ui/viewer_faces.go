@@ -113,6 +113,9 @@ func (vf *viewerFaces) draw(gtx layout.Context, th *Theme, path string, img f32R
 		return
 	}
 	faces := vf.forPath(path)
+	vf.mu.Lock()
+	pollWhileLoading(gtx, vf.loading)
+	vf.mu.Unlock()
 	if len(vf.clicks) < len(faces) {
 		vf.clicks = make([]widget.Clickable, len(faces))
 	}
@@ -248,6 +251,9 @@ func (vf *viewerFaces) handleKey(ke key.Event, path string) bool {
 // the height used.
 func (vf *viewerFaces) layoutPeopleLinks(gtx layout.Context, th *Theme, path string, w int) int {
 	ppl := vf.peopleIn(path)
+	vf.mu.Lock()
+	pollWhileLoading(gtx, vf.loading)
+	vf.mu.Unlock()
 	if len(ppl) == 0 {
 		return 0
 	}
