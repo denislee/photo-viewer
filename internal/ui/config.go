@@ -146,7 +146,9 @@ var (
 
 	// writeConfigFile is the disk write, indirected so tests can stall it or
 	// make it fail.
-	writeConfigFile = writeFileAtomic
+	writeConfigFile = func(p string, data []byte) error {
+		return fsutil.WriteFileAtomic(p, data, 0o644)
+	}
 )
 
 // configWriter is the single background config writer. A kick that arrives
@@ -197,38 +199,4 @@ func FlushConfig(timeout time.Duration) error {
 	case <-time.After(timeout):
 		return errors.New("config: flush timed out")
 	}
-}
-
-// writeFileAtomic replaces p with data crash-safely: write a temp file in the
-// same directory, fsync it, rename it over p, then fsync the directory. A
-// crash mid-write leaves the previous file intact instead of a truncated one
-// that LoadConfig would silently discard along with every setting.
-func writeFileAtomic(p string, data []byte) error {
-	dir := filepath.Dir(p)
-	if err := os.MkdirAll(dir, 0o755); err != nil {
-		return err
-	}
-	f, err := os.CreateTemp(dir, filepath.Base(p)+".*.tmp")
-	if err != nil {
-		return err
-	}
-	tmp := f.Name()
-	_, err = f.Write(data)
-	if err == nil {
-		err = f.Chmod(0o644)
-	}
-	if err == nil {
-		err = f.Sync()
-	}
-	if cerr := f.Close(); err == nil {
-		err = cerr
-	}
-	if err == nil {
-		err = os.Rename(tmp, p)
-	}
-	if err != nil {
-		_ = os.Remove(tmp)
-		return err
-	}
-	return fsutil.SyncDir(dir)
 }

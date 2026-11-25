@@ -4,14 +4,11 @@ package export
 
 import (
 	"context"
-	"errors"
 	"fmt"
-	"io"
 	"os"
 	"path/filepath"
 	"runtime"
 	"strings"
-	"syscall"
 
 	"github.com/dns/photo-viewer/internal/cache"
 	"github.com/dns/photo-viewer/internal/fsutil"
@@ -145,53 +142,45 @@ func Favorites(ctx context.Context, idx *cache.Index, opts Options, progress Pro
 		}
 	}
 
-	// flush reports every complete item from the head of the FIFO, stopping at
-	// the first still-running parallel job so reporting never reorders.
-	flush := func() {
-		for len(pending) > 0 {
-			head := pending[0]
-			if head.ch != nil {
-				select {
-				case out := <-head.ch:
-					report(head, out)
-					pending = pending[1:]
-					continue
-				default:
-					return
-				}
-			}
-			report(head, head.out)
-			pending = pending[1:]
+	// advance reports the item at the head of the FIFO when its outcome is
+	// known, so reporting never reorders: a settled item reports at once, and a
+	// parallel job is polled non-blockingly when !block or waited for when
+	// block. It returns whether it reported one — false when pending is empty
+	// or, with !block, the head job is still running.
+	advance := func(block bool) bool {
+		if len(pending) == 0 {
+			return false
 		}
-	}
-
-	// blockOnHead waits for the FIFO head (whether already known or a running
-	// job) and reports it.
-	blockOnHead := func() {
 		head := pending[0]
 		out := head.out
 		if head.ch != nil {
-			out = <-head.ch
+			if block {
+				out = <-head.ch
+			} else {
+				select {
+				case out = <-head.ch:
+				default:
+					return false
+				}
+			}
 		}
 		report(head, out)
 		pending = pending[1:]
+		return true
 	}
 
-	// enqueue appends one planned item in step order, reports everything that is
-	// already complete, and — when the FIFO grows past 2*n — waits for its head
-	// so at most 2*n items are ever outstanding.
+	// enqueue appends one planned item in step order and reports everything that
+	// is already complete. Once the FIFO grows past 2*n it blocks on its head
+	// before going on, so at most 2*n items are ever outstanding.
 	enqueue := func(it *pendingItem) {
 		pending = append(pending, it)
-		flush()
-		for len(pending) > 2*n {
-			blockOnHead()
+		for advance(len(pending) > 2*n) {
 		}
 	}
 
 	// drain waits for every outstanding item and reports it in step order.
 	drain := func() {
-		for len(pending) > 0 {
-			blockOnHead()
+		for advance(true) {
 		}
 	}
 
@@ -271,14 +260,9 @@ func Favorites(ctx context.Context, idx *cache.Index, opts Options, progress Pro
 			it := &pendingItem{step: step, src: src, dest: dest, ch: make(chan pendingOutcome, 1)}
 			go func(it *pendingItem, typ scan.MediaType, src, dest, action string) {
 				sem <- struct{}{}
-				handled, err := recompressFile(ctx, typ, src, dest, opts.MaxLongEdge, jpegQ, crf)
-				if !handled {
-					// RAW (or required tool missing) — fall back to plain copy.
-					err = copyFile(src, dest)
-					action = "COPY"
-				}
+				act, err := recompressOrCopy(ctx, typ, src, dest, opts.MaxLongEdge, jpegQ, crf, action)
 				<-sem
-				it.ch <- pendingOutcome{action: action, err: err}
+				it.ch <- pendingOutcome{action: act, err: err}
 			}(it, e.Type, src, dest, action)
 			enqueue(it)
 			continue
@@ -287,18 +271,11 @@ func Favorites(ctx context.Context, idx *cache.Index, opts Options, progress Pro
 		var opErr error
 		switch {
 		case opts.Move:
-			opErr = moveFile(src, dest)
+			opErr = fsutil.MoveTo(ctx, src, dest)
 		case willRecompress:
-			handled, err := recompressFile(ctx, e.Type, src, dest, opts.MaxLongEdge, jpegQ, crf)
-			if !handled {
-				// RAW (or required tool missing) — fall back to plain copy.
-				opErr = copyFile(src, dest)
-				action = "COPY"
-			} else {
-				opErr = err
-			}
+			action, opErr = recompressOrCopy(ctx, e.Type, src, dest, opts.MaxLongEdge, jpegQ, crf, action)
 		default:
-			opErr = copyFile(src, dest)
+			opErr = fsutil.CopyTo(ctx, src, dest)
 		}
 		enqueue(&pendingItem{
 			step: step,
@@ -356,88 +333,16 @@ func avoidCollision(p string, taken func(string) bool) (string, error) {
 	return fsutil.FreeName(func(n int) string { return fsutil.SuffixName(dir, base, n) }, taken)
 }
 
-// copyFile copies src to dst crash-safely: it streams into a sibling dst+".tmp",
-// fsyncs it to stable storage, and only then renames it into place. The fsync
-// is the linchpin of -move safety: moveFile unlinks the source right after
-// copyFile returns, and on a USB drive (the typical -move target) the copied
-// bytes can still be entirely in the destination's page cache at that point — a
-// yanked drive or power loss would then destroy the sole surviving copy of the
-// favorite. On any error the temp is removed so a truncated file never lands at
-// dst. Source mode and mtime are preserved on the copy.
-func copyFile(src, dst string) error {
-	in, err := os.Open(src)
-	if err != nil {
-		return err
+// recompressOrCopy re-encodes src into dest at the given limits, falling back
+// to a plain copy when recompression didn't handle the type (RAW) or a required
+// tool is missing. It returns the action to report: the given action when
+// recompression ran (success or hard failure), or "COPY" for the fallback —
+// used by both the pooled and the inline recompress paths (S6-19).
+func recompressOrCopy(ctx context.Context, t scan.MediaType, src, dest string, maxEdge, jpegQ, crf int, action string) (string, error) {
+	handled, err := recompressFile(ctx, t, src, dest, maxEdge, jpegQ, crf)
+	if !handled {
+		// RAW (or required tool missing) — fall back to plain copy.
+		return "COPY", fsutil.CopyTo(ctx, src, dest)
 	}
-	defer in.Close()
-
-	info, err := in.Stat()
-	if err != nil {
-		return err
-	}
-
-	tmp := dst + ".tmp"
-	out, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, info.Mode())
-	if err != nil {
-		return err
-	}
-	// Plain io.Copy: dst's .tmp is a real *os.File, so io.Copy still takes the
-	// kernel copy_file_range/sendfile fast path. (An earlier version pooled a
-	// 64 KiB buffer for io.CopyBuffer, but *os.File implements io.ReaderFrom so
-	// the buffer was ignored — a no-op that's been reverted.)
-	if _, err := io.Copy(out, in); err != nil {
-		out.Close()
-		os.Remove(tmp) // best-effort: never leave a partial temp behind
-		return err
-	}
-	// A failed Sync is exactly the "bytes still only in the page cache" case, so
-	// treat it as a copy failure: drop the temp and report the error so no
-	// caller (moveFile) deletes the source believing the copy is durable.
-	if err := out.Sync(); err != nil {
-		out.Close()
-		os.Remove(tmp)
-		return err
-	}
-	if err := out.Close(); err != nil {
-		os.Remove(tmp)
-		return err
-	}
-	_ = os.Chtimes(tmp, info.ModTime(), info.ModTime())
-	// Rename is atomic within a filesystem: dst is either absent or the fully
-	// written, fsynced file — never a half-copy.
-	return os.Rename(tmp, dst)
-}
-
-// moveFile renames src to dst; only when that fails with EXDEV (the paths are
-// on different filesystems — the usual case when -move targets a USB drive on a
-// separate mount) does it fall back to a crash-safe copy + remove. Every other
-// rename error (permission denied, read-only dst, …) is surfaced as a failure
-// rather than silently masked as a "successful move" that switched to
-// copy+delete — the old unconditional fallback hid real errors that way.
-func moveFile(src, dst string) error {
-	err := os.Rename(src, dst)
-	if err == nil {
-		return nil
-	}
-	if !errors.Is(err, syscall.EXDEV) {
-		return err
-	}
-	// Cross-filesystem: copy durably, then unlink the source. copyFile fsyncs
-	// the file data before its rename; here we additionally fsync the
-	// destination directory so the rename's directory entry is itself durable
-	// before we drop the source. Otherwise a power loss could lose the entry
-	// even though the file's data was synced — again leaving zero copies.
-	if err := copyFile(src, dst); err != nil {
-		return err
-	}
-	if err := fsutil.SyncDir(filepath.Dir(dst)); err != nil {
-		return err
-	}
-	// Count the move as a success only after the source unlink succeeds; a
-	// leftover source with the copy already in place is surfaced so the operator
-	// can reconcile it rather than believing the move fully completed.
-	if err := os.Remove(src); err != nil {
-		return fmt.Errorf("copied to %s but could not remove source %s: %w", dst, src, err)
-	}
-	return nil
+	return action, err
 }

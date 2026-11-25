@@ -8,6 +8,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/dns/photo-viewer/internal/fsutil"
 )
 
 // resetConfigForTest points the config file at a fresh temp dir, clears the
@@ -27,7 +29,9 @@ func resetConfigForTest(t *testing.T) string {
 
 	t.Cleanup(func() {
 		cfgWriteMu.Lock()
-		writeConfigFile = writeFileAtomic
+		writeConfigFile = func(p string, d []byte) error {
+			return fsutil.WriteFileAtomic(p, d, 0o644)
+		}
 		cfgWriteMu.Unlock()
 		_ = FlushConfig(5 * time.Second)
 	})
@@ -105,7 +109,7 @@ func TestUpdateConfigNonBlockingWithStalledWriter(t *testing.T) {
 	release := make(chan struct{})
 	setConfigWriter(func(p string, d []byte) error {
 		<-release
-		return writeFileAtomic(p, d)
+		return fsutil.WriteFileAtomic(p, d, 0o644)
 	})
 
 	start := time.Now()
@@ -173,7 +177,9 @@ func TestPersistConfigFailureKeepsOldFile(t *testing.T) {
 		t.Errorf("file InboxDir after failed save = %q, want /old", got)
 	}
 
-	setConfigWriter(writeFileAtomic)
+	setConfigWriter(func(p string, d []byte) error {
+		return fsutil.WriteFileAtomic(p, d, 0o644)
+	})
 	if err := FlushConfig(5 * time.Second); err != nil {
 		t.Fatalf("FlushConfig after restoring writer: %v", err)
 	}
@@ -189,11 +195,11 @@ func TestWriteFileAtomicReplacesAndLeavesNoTemp(t *testing.T) {
 	dir := t.TempDir()
 	p := filepath.Join(dir, "sub", "config.json")
 
-	if err := writeFileAtomic(p, []byte("one")); err != nil {
-		t.Fatalf("writeFileAtomic(one): %v", err)
+	if err := fsutil.WriteFileAtomic(p, []byte("one"), 0o644); err != nil {
+		t.Fatalf("WriteFileAtomic(one): %v", err)
 	}
-	if err := writeFileAtomic(p, []byte("two")); err != nil {
-		t.Fatalf("writeFileAtomic(two): %v", err)
+	if err := fsutil.WriteFileAtomic(p, []byte("two"), 0o644); err != nil {
+		t.Fatalf("WriteFileAtomic(two): %v", err)
 	}
 
 	data, err := os.ReadFile(p)
@@ -232,8 +238,8 @@ func TestWriteFileAtomicRenameFailureCleansTemp(t *testing.T) {
 		t.Fatalf("mkdir target: %v", err)
 	}
 
-	if err := writeFileAtomic(p, []byte("x")); err == nil {
-		t.Fatal("writeFileAtomic over a non-empty directory returned nil, want error")
+	if err := fsutil.WriteFileAtomic(p, []byte("x"), 0o644); err == nil {
+		t.Fatal("WriteFileAtomic over a non-empty directory returned nil, want error")
 	}
 
 	info, err := os.Stat(p)

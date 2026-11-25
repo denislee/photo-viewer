@@ -62,7 +62,10 @@ func MoveUniqueDeferred(ctx context.Context, src, dir, base string) (dst string,
 // copy. src is never modified.
 //
 // The copy keeps src's mtime, so an imported file still sorts (and dates, via
-// GetOldestMediaDate's mtime branch) by capture time instead of copy time.
+// GetOldestMediaDate's mtime branch) by capture time instead of copy time. Its
+// permissions are left to the umask on purpose (S3-01 declined): a FAT32 SD
+// card reports every file as 0755/0777, and copying that would mark imported
+// photos executable.
 func CopyUnique(ctx context.Context, src, dir, base string) (string, error) {
 	in, err := os.Open(src)
 	if err != nil {
@@ -73,7 +76,7 @@ func CopyUnique(ctx context.Context, src, dir, base string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	return writeUnique(ctx, dir, base, in, info.ModTime())
+	return writeUnique(ctx, dir, base, in, info.ModTime(), 0)
 }
 
 // WriteUnique streams r into dir as base, or base_N when that name is taken,
@@ -87,15 +90,41 @@ func CopyUnique(ctx context.Context, src, dir, base string) (string, error) {
 // rename is also what lets a caller delete the source afterwards: its bytes
 // are no longer only in the page cache.
 func WriteUnique(ctx context.Context, dir, base string, r io.Reader) (string, error) {
-	return writeUnique(ctx, dir, base, r, time.Time{})
+	return writeUnique(ctx, dir, base, r, time.Time{}, 0)
 }
 
-func writeUnique(ctx context.Context, dir, base string, r io.Reader, mtime time.Time) (string, error) {
+// writeUnique streams r into a temp file in dir, applies the given mtime and
+// perm (0 = leave the umask to decide), and claims the final name. It returns
+// the path the file now lives at.
+func writeUnique(ctx context.Context, dir, base string, r io.Reader, mtime time.Time, perm fs.FileMode) (string, error) {
 	tmp, err := createTemp(dir, base)
 	if err != nil {
 		return "", err
 	}
 	tmpName := tmp.Name()
+	if err := fillTemp(ctx, tmp, r, perm); err != nil {
+		os.Remove(tmpName)
+		return "", err
+	}
+	// Best-effort, matching CopyTo: a failed stamp doesn't invalidate a good
+	// copy.
+	if !mtime.IsZero() {
+		_ = os.Chtimes(tmpName, mtime, mtime)
+	}
+	dst, err := RenameUnique(tmpName, func(n int) string { return SuffixName(dir, base, n) })
+	if err != nil {
+		os.Remove(tmpName)
+		return "", err
+	}
+	return dst, nil
+}
+
+// fillTemp copies r into the already-created temp file tmp and makes the bytes
+// durable: it fsyncs them, chmods the file to perm when perm != 0 (a failure
+// fails the write like any copy error), and closes it. It never removes the
+// temp; every caller drops it on error so a partial file is never published.
+func fillTemp(ctx context.Context, tmp *os.File, r io.Reader, perm fs.FileMode) error {
+	var err error
 	// An *os.File source goes through copyFileCtx so the kernel copy fast path
 	// survives a cancellable ctx; any other reader (a zip entry, a network
 	// body) is wrapped so cancellation stops it at the next read.
@@ -109,24 +138,15 @@ func writeUnique(ctx context.Context, dir, base string, r io.Reader, mtime time.
 		// case, so it fails the write like any copy error.
 		err = tmp.Sync()
 	}
+	if err == nil && perm != 0 {
+		// An explicit perm keeps the source's exact permission bits (CopyTo);
+		// 0 leaves the umask to decide, as createTemp's mode intended.
+		err = tmp.Chmod(perm)
+	}
 	if cerr := tmp.Close(); err == nil {
 		err = cerr
 	}
-	if err != nil {
-		os.Remove(tmpName)
-		return "", err
-	}
-	// Best-effort, matching export.copyFile: a failed stamp doesn't invalidate
-	// a good copy.
-	if !mtime.IsZero() {
-		_ = os.Chtimes(tmpName, mtime, mtime)
-	}
-	dst, err := RenameUnique(tmpName, func(n int) string { return SuffixName(dir, base, n) })
-	if err != nil {
-		os.Remove(tmpName)
-		return "", err
-	}
-	return dst, nil
+	return err
 }
 
 // copyChunk is the cancellation granularity of a file-to-file copy: each chunk

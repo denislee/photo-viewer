@@ -38,7 +38,8 @@ func mustRead(t *testing.T, p string) string {
 
 // TestCopyFileDurableAndAtomic covers the happy path of the crash-safe copy:
 // the destination gets the exact source bytes, no ".tmp" is left behind, and
-// the source is untouched (copyFile never removes it — moveFile does).
+// the source is untouched (fsutil.CopyTo never removes it — fsutil.MoveTo
+// does).
 func TestCopyFileDurableAndAtomic(t *testing.T) {
 	dir := t.TempDir()
 	src := filepath.Join(dir, "photo.jpg")
@@ -48,8 +49,8 @@ func TestCopyFileDurableAndAtomic(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if err := copyFile(src, dst); err != nil {
-		t.Fatalf("copyFile: %v", err)
+	if err := fsutil.CopyTo(context.Background(), src, dst); err != nil {
+		t.Fatalf("CopyTo: %v", err)
 	}
 	if b := mustRead(t, dst); b != "PIXELS" {
 		t.Fatalf("copied bytes = %q, want PIXELS", b)
@@ -73,8 +74,8 @@ func TestMoveFileSameFilesystem(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if err := moveFile(src, dst); err != nil {
-		t.Fatalf("moveFile: %v", err)
+	if err := fsutil.MoveTo(context.Background(), src, dst); err != nil {
+		t.Fatalf("MoveTo: %v", err)
 	}
 	if b := mustRead(t, dst); b != "BYTES" {
 		t.Fatalf("moved bytes = %q", b)
@@ -178,8 +179,8 @@ func TestDryRunPlanMatchesRealCopy(t *testing.T) {
 	if planned != real {
 		t.Fatalf("dry-run planned %s but real run resolved %s", planned, real)
 	}
-	if err := copyFile(src, real); err != nil {
-		t.Fatalf("copyFile: %v", err)
+	if err := fsutil.CopyTo(context.Background(), src, real); err != nil {
+		t.Fatalf("CopyTo: %v", err)
 	}
 	if want := filepath.Join(dir, "a_1.jpg"); real != want {
 		t.Fatalf("destination = %s, want %s", real, want)

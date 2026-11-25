@@ -160,7 +160,7 @@ func imageBytesViaFfmpeg(ctx context.Context, data []byte, dst string, size int)
 	return runFfmpegThumb(ctx, dst, size, bytes.NewReader(data), "-f", "image2pipe", "-i", "pipe:0")
 }
 
-// rgbaPool recycles the destination RGBA used by writeThumb. The thumbnail
+// rgbaPool recycles the destination RGBA used by FitEncode. The thumbnail
 // size is fixed at the package level (cache.ThumbSize) so essentially every
 // buffer is reusable as-is; the slice length is reset before scaling and
 // the original capacity preserved when returning to the pool.
@@ -168,14 +168,16 @@ var rgbaPool = sync.Pool{
 	New: func() any { return &image.RGBA{} },
 }
 
-// writeThumb resamples src to fit within size×size, bakes in the given EXIF
-// orientation, and writes a JPEG to dst. orientation must be one of [1, 8]
-// (1 = already upright / identity); callers that decoded through a tool which
-// already auto-rotates (ffmpeg, heif-convert) pass 1.
-func writeThumb(src image.Image, dst string, size, orientation int) error {
+// FitEncode resamples src to fit within maxEdge×maxEdge, bakes in the given
+// EXIF orientation, and writes a JPEG at the requested quality to w. It is
+// shared by thumbnails (writeThumb) and export recompression, so both paths
+// produce identically scaled and oriented pixels (X6-05). orientation must be
+// one of [1, 8] (1 = already upright / identity); callers that decoded through
+// a tool which already auto-rotates (ffmpeg, heif-convert) pass 1.
+func FitEncode(w io.Writer, src image.Image, maxEdge, orientation, quality int) error {
 	b := src.Bounds()
-	w, h := b.Dx(), b.Dy()
-	tw, th := imgfit.Within(w, h, size)
+	w0, h0 := b.Dx(), b.Dy()
+	tw, th := imgfit.Within(w0, h0, maxEdge)
 	thumb := rgbaPool.Get().(*image.RGBA)
 	defer rgbaPool.Put(thumb)
 
@@ -200,14 +202,24 @@ func writeThumb(src image.Image, dst string, size, orientation int) error {
 	// with scaling, so remapping the small thumbnail costs (src/dst)² less than
 	// orienting the full-resolution source. imgfit.Within was fed the stored dims,
 	// so for the transpose orientations (5–8) the output's axes swap here —
-	// both edges stay ≤ size, so it still fits. orientation==1 returns thumb
+	// both edges stay ≤ maxEdge, so it still fits. orientation==1 returns thumb
 	// untouched (the common case), so the pooled buffer is reused as-is.
 	oriented := imgorient.Apply(thumb, orientation)
 
+	// The pooled buffer is only returned to the pool by the deferred Put once
+	// the encode has finished, so it never escapes this call.
+	return EncodeJPEG(w, oriented, quality)
+}
+
+// writeThumb resamples src to fit within size×size, bakes in the given EXIF
+// orientation, and writes a JPEG to dst. orientation must be one of [1, 8]
+// (1 = already upright / identity); callers that decoded through a tool which
+// already auto-rotates (ffmpeg, heif-convert) pass 1.
+func writeThumb(src image.Image, dst string, size, orientation int) error {
 	out, err := os.Create(dst)
 	if err != nil {
 		return err
 	}
 	defer out.Close()
-	return EncodeJPEG(out, oriented, 82)
+	return FitEncode(out, src, size, orientation, 82)
 }

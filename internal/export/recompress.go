@@ -5,14 +5,12 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"image"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
 
-	"github.com/dns/photo-viewer/internal/imgfit"
 	"github.com/dns/photo-viewer/internal/imgorient"
 	"github.com/dns/photo-viewer/internal/scan"
 	"github.com/dns/photo-viewer/internal/thumb"
@@ -80,8 +78,9 @@ func recompressFile(ctx context.Context, t scan.MediaType, src, dst string, maxE
 // quality. JPEGs decode through libjpeg-turbo with DCT scaling
 // (thumb.DecodeFit), so a large photo is decoded only as large as the output
 // needs; ctx cancels the read and the decode. The output is encoded through
-// thumb.EncodeJPEG, which uses libjpeg-turbo when it is linked (T5-03) and
-// image/jpeg otherwise.
+// thumb.FitEncode (the same fit + CatmullRom scale + orientation path the
+// thumbnailer uses), which encodes with libjpeg-turbo when it is linked
+// (T5-03) and image/jpeg otherwise.
 func recompressImage(ctx context.Context, src, dst string, maxEdge, quality int) error {
 	// Capture the source mtime before decoding so we can stamp it onto the
 	// finalized output (see the Chtimes after rename below).
@@ -113,51 +112,39 @@ func recompressImage(ctx context.Context, src, dst string, maxEdge, quality int)
 	// imgfit.Within is fed the stored dims; for the transpose orientations (5–8) the
 	// output's axes swap, both staying ≤ maxEdge.
 	orient := imgorient.ReadOrientationFrom(bytes.NewReader(data))
-	b := img.Bounds()
-	tw, th := imgfit.Within(b.Dx(), b.Dy(), maxEdge)
-	scaled := image.NewRGBA(image.Rect(0, 0, tw, th))
-	// CatmullRom (a 4×4 cubic kernel), not ApproxBiLinear: a kept-forever export
-	// of a 24 MP source down to a 2048 px edge is exactly the large-downscale
-	// regime where bilinear aliases badly — the same reason the 256 px thumb path
-	// uses it (thumb/image.go). Exports aren't latency-critical (video is
-	// ffmpeg-bound anyway), so the extra CPU is fine. thumb.ScaleCatmullRom also
-	// pools the scaler's float64 scratch across same-size exports (T5-04).
-	thumb.ScaleCatmullRom(scaled, scaled.Rect, img, b)
-	dstImg := imgorient.Apply(scaled, orient)
 	if err := ctx.Err(); err != nil {
 		return err
 	}
 
+	// thumb.FitEncode owns the fit/scale/orient/encode sequence shared with the
+	// thumbnail path: CatmullRom (a 4×4 cubic kernel), not ApproxBiLinear — a
+	// kept-forever export of a 24 MP source down to a 2048 px edge is exactly the
+	// large-downscale regime where bilinear aliases badly, the same reason the
+	// 256 px thumb path uses it. Exports aren't latency-critical (video is
+	// ffmpeg-bound anyway), so the extra CPU is fine.
 	tmp := dst + ".tmp"
 	out, err := os.Create(tmp)
 	if err != nil {
 		return err
 	}
-	if err := thumb.EncodeJPEG(out, dstImg, quality); err != nil {
-		out.Close()
+	err = thumb.FitEncode(out, img, maxEdge, orient, quality)
+	if cerr := out.Close(); err == nil {
+		err = cerr
+	}
+	if err != nil {
 		os.Remove(tmp)
 		return err
 	}
-	// fsync before the rename so the encoded JPEG is on stable storage, not just
-	// in the page cache, before it becomes visible at dst. A failed Sync is the
-	// "not yet durable" case, so treat it as an encode failure and drop the temp.
-	if err := out.Sync(); err != nil {
-		out.Close()
-		os.Remove(tmp)
-		return err
-	}
-	if err := out.Close(); err != nil {
-		os.Remove(tmp)
-		return err
-	}
-	if err := os.Rename(tmp, dst); err != nil {
+	// publishTemp fsyncs the encoded JPEG so it is on stable storage, not just
+	// in the page cache, before the rename makes it visible at dst.
+	if err := publishTemp(tmp, dst); err != nil {
 		return err
 	}
 	// Preserve the source's mtime so a recompressed export sorts by capture time
 	// (source mtime), not encode time, in any date-ordered browser — mirroring
-	// copyFile's mode+mtime preservation in favorites.go. Best-effort, matching
-	// copyFile's ignored Chtimes error: a failed stamp doesn't invalidate an
-	// otherwise-good export.
+	// fsutil.CopyTo's mode+mtime preservation. Best-effort, matching
+	// fsutil.CopyTo's ignored Chtimes error: a failed stamp doesn't invalidate
+	// an otherwise-good export.
 	_ = os.Chtimes(dst, info.ModTime(), info.ModTime())
 	return nil
 }
@@ -187,7 +174,8 @@ func recompressHEIC(ctx context.Context, src, dst string, maxEdge, quality int) 
 	if haveFfmpeg() {
 		ffErr = recompressHEICViaFfmpeg(ctx, src, dst, maxEdge, quality)
 		if ffErr == nil {
-			// Preserve the source mtime (S-09). Best-effort, matching copyFile.
+			// Preserve the source mtime (S-09). Best-effort, matching
+			// fsutil.CopyTo.
 			_ = os.Chtimes(dst, info.ModTime(), info.ModTime())
 			return nil
 		}
@@ -217,7 +205,8 @@ func recompressHEIC(ctx context.Context, src, dst string, maxEdge, quality int) 
 		return err
 	}
 	// Override the intermediate-temp mtime recompressImage stamped with the
-	// original HEIC's mtime. Best-effort, matching copyFile's ignored error.
+	// original HEIC's mtime. Best-effort, matching fsutil.CopyTo's ignored
+	// error.
 	_ = os.Chtimes(dst, info.ModTime(), info.ModTime())
 	return nil
 }
@@ -366,7 +355,8 @@ func recompressVideo(ctx context.Context, src, dst string, maxEdge, crf int) err
 		return err
 	}
 	// Preserve the source's mtime so the transcoded clip sorts by capture time,
-	// not encode time. Best-effort, matching copyFile's ignored Chtimes error.
+	// not encode time. Best-effort, matching fsutil.CopyTo's ignored Chtimes
+	// error.
 	_ = os.Chtimes(dst, info.ModTime(), info.ModTime())
 	return nil
 }
