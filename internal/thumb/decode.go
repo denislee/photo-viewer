@@ -54,6 +54,23 @@ func DecodeFit(ctx context.Context, data []byte, size int) (image.Image, error) 
 	return img, err
 }
 
+// readAllSized reads the rest of f into one buffer, prefixed by prefix, sizing
+// the buffer up front from f's Stat so a known-length file is read in one pass.
+func readAllSized(ctx context.Context, f *os.File, prefix []byte) ([]byte, error) {
+	var buf bytes.Buffer
+	if info, err := f.Stat(); err == nil {
+		// +MinRead: ReadFrom grows the buffer by MinRead once it is exactly
+		// full, before it sees EOF; without the slack that reallocation
+		// doubles the buffer and copies the whole file (T5-02).
+		buf.Grow(int(info.Size()) + bytes.MinRead)
+	}
+	buf.Write(prefix)
+	if _, err := buf.ReadFrom(fsutil.NewContextReader(ctx, f)); err != nil {
+		return nil, err
+	}
+	return buf.Bytes(), nil
+}
+
 // readJPEG returns src's contents when it starts with a JPEG SOI marker, and
 // (nil, nil) for any other format so the caller can take its usual path.
 func readJPEG(ctx context.Context, src string) ([]byte, error) {
@@ -66,18 +83,7 @@ func readJPEG(ctx context.Context, src string) ([]byte, error) {
 	if _, err := io.ReadFull(f, head[:]); err != nil || !jpegturbo.IsJPEG(head[:]) {
 		return nil, nil
 	}
-	var buf bytes.Buffer
-	if info, err := f.Stat(); err == nil {
-		// +MinRead: ReadFrom grows the buffer by MinRead once it is exactly
-		// full, before it sees EOF; without the slack that reallocation
-		// doubles the buffer and copies the whole file (T5-02).
-		buf.Grow(int(info.Size()) + bytes.MinRead)
-	}
-	buf.Write(head[:])
-	if _, err := buf.ReadFrom(fsutil.NewContextReader(ctx, f)); err != nil {
-		return nil, err
-	}
-	return buf.Bytes(), nil
+	return readAllSized(ctx, f, head[:])
 }
 
 // ReadFile reads path fully, aborting with ctx.Err() once ctx is cancelled.
@@ -87,15 +93,5 @@ func ReadFile(ctx context.Context, path string) ([]byte, error) {
 		return nil, err
 	}
 	defer f.Close()
-	var buf bytes.Buffer
-	if info, err := f.Stat(); err == nil {
-		// +MinRead: ReadFrom grows the buffer by MinRead once it is exactly
-		// full, before it sees EOF; without the slack that reallocation
-		// doubles the buffer and copies the whole file (T5-02).
-		buf.Grow(int(info.Size()) + bytes.MinRead)
-	}
-	if _, err := buf.ReadFrom(fsutil.NewContextReader(ctx, f)); err != nil {
-		return nil, err
-	}
-	return buf.Bytes(), nil
+	return readAllSized(ctx, f, nil)
 }

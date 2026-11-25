@@ -8,7 +8,6 @@ import (
 	"image"
 	_ "image/jpeg"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -16,6 +15,7 @@ import (
 	"github.com/dns/photo-viewer/internal/imgorient"
 	"github.com/dns/photo-viewer/internal/jpegturbo"
 	"github.com/dns/photo-viewer/internal/scan"
+	"github.com/dns/photo-viewer/internal/tools"
 )
 
 // RAW extracts an embedded JPEG preview from a camera RAW file and resamples
@@ -23,32 +23,24 @@ import (
 func RAW(ctx context.Context, src, dst string, size int) error {
 	data, orientation, previewErr := loadRAWPreview(ctx, src)
 	if previewErr == nil && len(data) > 0 {
-		// libjpeg-turbo in process: DCT-scaled decode of the preview with no
-		// fork, and the RAW's own orientation tag applied (the ffmpeg path
-		// below can only honour a tag inside the preview itself).
-		if jpegturbo.Available() && jpegturbo.IsJPEG(data) {
-			if img, err := DecodeFit(ctx, data, size); err == nil {
-				return writeThumb(img, dst, size, orientation)
+		turbo := jpegturbo.Available() && jpegturbo.IsJPEG(data)
+		// Without libjpeg-turbo's DCT scaling, a full-resolution embedded
+		// preview (often 10–45 MP) that is not a turbo-decodable JPEG is
+		// cheaper to scale through ffmpeg than to expand into a huge RGBA in
+		// Go: the same >=imageFfmpegThreshold watershed the plain-image path
+		// uses. On ffmpeg failure fall through to DecodeFit.
+		if !turbo && len(data) >= imageFfmpegThreshold && haveFfmpeg() {
+			if err := imageBytesViaFfmpeg(ctx, data, dst, size); err == nil {
+				return nil
 			}
 		}
-		// A full-resolution embedded preview (often 10–45 MP) is far cheaper to
-		// DCT-scale through ffmpeg than to expand into a huge RGBA in Go — the
-		// same >=imageFfmpegThreshold watershed the plain-image path uses. On
-		// ffmpeg failure we fall through to the Go decoder below.
-		if len(data) >= imageFfmpegThreshold {
-			if haveFfmpeg() {
-				if err := imageBytesViaFfmpeg(ctx, data, dst, size); err == nil {
-					return nil
-				}
-			}
-		}
-		if img, _, err := image.Decode(bytes.NewReader(data)); err == nil {
-			// The Go decoder ignores EXIF orientation; the preview is stored in
-			// sensor orientation, so pass the RAW's Orientation tag to writeThumb,
-			// which bakes it in after the downscale (S-04). (The ffmpeg fast path
-			// above relies on ffmpeg's autorotate instead — a large preview that
-			// lacks its own tag is no worse than the pre-I-12 behaviour, which
-			// never rotated at all.)
+		if img, err := DecodeFit(ctx, data, size); err == nil {
+			// DecodeFit/image.Decode ignore EXIF orientation; the preview is
+			// stored in sensor orientation, so pass the RAW's Orientation tag to
+			// writeThumb, which bakes it in after the downscale (S-04). (The
+			// ffmpeg fast path above relies on ffmpeg's autorotate instead — a
+			// large preview that lacks its own tag is no worse than the pre-I-12
+			// behaviour, which never rotated at all.)
 			return writeThumb(img, dst, size, orientation)
 		}
 	}
@@ -127,14 +119,11 @@ func decodeRAWViaFfmpeg(ctx context.Context, src string, fit func(w, h int) (int
 	if !haveFfmpeg() {
 		return nil, errFfmpegNotInstalled
 	}
-	cmd := exec.CommandContext(ctx, "ffmpeg", "-loglevel", "error", "-threads", "1", "-i", src, "-frames:v", "1", "-f", "image2pipe", "-vcodec", "mjpeg", "-")
-	var out, stderr bytes.Buffer
-	cmd.Stdout = &out
-	cmd.Stderr = &stderr
-	if err := cmd.Run(); err != nil {
-		return nil, ffmpegError(err, &stderr)
+	out, err := tools.Run(ctx, nil, "ffmpeg", "-loglevel", "error", "-threads", "1", "-i", src, "-frames:v", "1", "-f", "image2pipe", "-vcodec", "mjpeg", "-")
+	if err != nil {
+		return nil, err
 	}
-	img, _, err := DecodeFitFunc(ctx, out.Bytes(), fit)
+	img, _, err := DecodeFitFunc(ctx, out, fit)
 	return img, err
 }
 
@@ -145,20 +134,12 @@ func decodeRAWViaFfmpeg(ctx context.Context, src string, fit func(w, h int) (int
 // such tag) it falls back to imgorient.ReadOrientation, and it is only computed
 // on a path that actually returns preview bytes.
 func loadRAWPreview(ctx context.Context, src string) (data []byte, orientation int, err error) {
-	f, err := os.Open(src)
+	// If it's already a JPEG, return it whole.
+	data, err = readJPEG(ctx, src)
 	if err != nil {
 		return nil, 0, err
 	}
-	var head [4]byte
-	n, _ := f.Read(head[:])
-	f.Close()
-
-	// If it's already a JPEG, return it whole.
-	if n >= 3 && head[0] == 0xff && head[1] == 0xd8 && head[2] == 0xff {
-		data, err := os.ReadFile(src)
-		if err != nil {
-			return nil, 0, err
-		}
+	if data != nil {
 		return data, imgorient.ReadOrientation(src), nil
 	}
 
@@ -283,12 +264,5 @@ func extractEmbedded(ctx context.Context, src, tag string) ([]byte, error) {
 // writes the tag's bytes to stdout. It is the fallback for when the temp dir
 // the daemon's -W output needs can't be created.
 func extractEmbeddedOneShot(ctx context.Context, src, tag string) ([]byte, error) {
-	cmd := exec.CommandContext(ctx, "exiftool", "-b", tag, src)
-	var buf, stderr bytes.Buffer
-	cmd.Stdout = &buf
-	cmd.Stderr = &stderr
-	if err := cmd.Run(); err != nil {
-		return nil, scan.ExiftoolError(err, &stderr)
-	}
-	return buf.Bytes(), nil
+	return tools.Run(ctx, nil, "exiftool", "-b", tag, src)
 }

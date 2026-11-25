@@ -247,8 +247,8 @@ func SetMediaDate(path string, t time.Time) error {
 		"-TrackModifyDate="+stamp,
 		path)
 	if err != nil {
-		// RunExiftool already reports why: a one-shot failure carries exiftool's
-		// first stderr line inside the error (ExiftoolError), and a missing tool
+		// RunExiftool already reports why: a one-shot failure folds exiftool's
+		// first stderr line into the error (tools.Run), and a missing tool
 		// arrives as "exiftool not installed". The returned stdout is empty on
 		// error, so it must not be folded into the message.
 		return err

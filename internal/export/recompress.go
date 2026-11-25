@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -197,9 +196,8 @@ func recompressHEIC(ctx context.Context, src, dst string, maxEdge, quality int) 
 	tmpFull.Close()
 	defer os.Remove(tmpFull.Name())
 
-	cmd := exec.CommandContext(ctx, "heif-convert", "-q", "95", src, tmpFull.Name())
-	if out, err := cmd.CombinedOutput(); err != nil {
-		return fmt.Errorf("heif-convert: %v: %s", err, strings.TrimSpace(string(out)))
+	if _, err := tools.Run(ctx, nil, "heif-convert", "-q", "95", src, tmpFull.Name()); err != nil {
+		return err
 	}
 	if err := recompressImage(ctx, tmpFull.Name(), dst, maxEdge, quality); err != nil {
 		return err
@@ -228,7 +226,7 @@ func recompressHEICViaFfmpeg(ctx context.Context, src, dst string, maxEdge, qual
 	if err != nil {
 		// Only a rejected stream-group specifier (no grid, or an older ffmpeg)
 		// is worth a -vf retry; a corrupt file or missing decoder fails both.
-		if ctx.Err() != nil || !strings.Contains(err.Error(), "pecifier") {
+		if ctx.Err() != nil || !thumb.IsStreamSpecifierError(err) {
 			return err
 		}
 		// No grid stream group (or an older ffmpeg): retry once with -vf.
@@ -257,10 +255,9 @@ func runHEICRecompress(ctx context.Context, src, tmp string, filterArgs []string
 		"-f", "image2",
 		tmp,
 	)
-	cmd := exec.CommandContext(ctx, "ffmpeg", args...)
-	if out, err := cmd.CombinedOutput(); err != nil {
+	if _, err := tools.Run(ctx, nil, "ffmpeg", args...); err != nil {
 		os.Remove(tmp)
-		return fmt.Errorf("ffmpeg: %v: %s", err, strings.TrimSpace(string(out)))
+		return err
 	}
 	return nil
 }
@@ -346,10 +343,9 @@ func recompressVideo(ctx context.Context, src, dst string, maxEdge, crf int) err
 		"-movflags", "+faststart",
 		tmp,
 	}
-	cmd := exec.CommandContext(ctx, "ffmpeg", args...)
-	if out, err := cmd.CombinedOutput(); err != nil {
+	if _, err := tools.Run(ctx, nil, "ffmpeg", args...); err != nil {
 		os.Remove(tmp)
-		return fmt.Errorf("ffmpeg: %v: %s", err, strings.TrimSpace(string(out)))
+		return err
 	}
 	if err := publishTemp(tmp, dst); err != nil {
 		return err

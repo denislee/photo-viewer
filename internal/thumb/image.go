@@ -10,8 +10,6 @@ import (
 	_ "image/png"
 	"io"
 	"os"
-	"os/exec"
-	"strings"
 	"sync"
 
 	_ "golang.org/x/image/bmp"
@@ -89,15 +87,6 @@ func ffmpegScaleFilter(size int) string {
 	return fmt.Sprintf("scale='if(gt(iw,ih),%d,-2)':'if(gt(iw,ih),-2,%d)'", size, size)
 }
 
-// ffmpegError folds ffmpeg's stderr (captured via -loglevel error) into the
-// returned error so a failure reports *why* instead of a bare "exit status 1".
-func ffmpegError(err error, stderr *bytes.Buffer) error {
-	if msg := strings.TrimSpace(stderr.String()); msg != "" {
-		return fmt.Errorf("ffmpeg: %s", msg)
-	}
-	return err
-}
-
 // ffmpegThumbArgsFilter builds the argument list of a single-frame thumbnail
 // run: inArgs (input options ending in -i <input>), then one frame through
 // filterArgs written as a JPEG to dst. The filter is the caller's because tiled
@@ -127,15 +116,9 @@ func runFfmpegThumb(ctx context.Context, dst string, size int, stdin io.Reader, 
 // runFfmpegThumbFilter is runFfmpegThumb with the output-filter arguments
 // supplied by the caller (see ffmpegThumbArgsFilter).
 func runFfmpegThumbFilter(ctx context.Context, dst string, filterArgs []string, stdin io.Reader, inArgs ...string) error {
-	cmd := exec.CommandContext(ctx, "ffmpeg", ffmpegThumbArgsFilter(dst, filterArgs, inArgs...)...)
-	if stdin != nil {
-		cmd.Stdin = stdin
-	}
-	var stderr bytes.Buffer
-	cmd.Stderr = &stderr
-	if err := cmd.Run(); err != nil {
+	if _, err := tools.Run(ctx, stdin, "ffmpeg", ffmpegThumbArgsFilter(dst, filterArgs, inArgs...)...); err != nil {
 		os.Remove(dst)
-		return ffmpegError(err, &stderr)
+		return err
 	}
 	_, err := os.Stat(dst)
 	return err

@@ -2,9 +2,8 @@ package scan
 
 import (
 	"bufio"
-	"bytes"
+	"context"
 	"errors"
-	"fmt"
 	"io"
 	"os/exec"
 	"runtime"
@@ -295,25 +294,5 @@ func runExiftoolOneShot(args ...string) ([]byte, error) {
 	if !haveExiftool() {
 		return nil, errors.New("exiftool not installed")
 	}
-	cmd := exec.Command("exiftool", args...)
-	var out, stderr bytes.Buffer
-	cmd.Stdout = &out
-	cmd.Stderr = &stderr
-	if err := cmd.Run(); err != nil {
-		return nil, ExiftoolError(err, &stderr)
-	}
-	return out.Bytes(), nil
-}
-
-// ExiftoolError folds the first line of exiftool's stderr into the returned
-// error so a one-shot failure reports *why* instead of a bare "exit status 1".
-// Only the first line is kept — a failing exiftool often emits several warning
-// lines (unknown makernotes, minor tag complaints) that would otherwise spam
-// logs. Shared with internal/thumb; mirrors ffmpegError there.
-func ExiftoolError(err error, stderr *bytes.Buffer) error {
-	if msg := strings.TrimSpace(stderr.String()); msg != "" {
-		first, _, _ := strings.Cut(msg, "\n")
-		return fmt.Errorf("exiftool: %s: %w", first, err)
-	}
-	return err
+	return tools.Run(context.Background(), nil, "exiftool", args...)
 }

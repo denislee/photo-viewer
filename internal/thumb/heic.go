@@ -1,16 +1,16 @@
 package thumb
 
 import (
-	"bytes"
 	"context"
 	"errors"
 	"fmt"
 	_ "image/jpeg"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync/atomic"
+
+	"github.com/dns/photo-viewer/internal/tools"
 )
 
 // ffmpegNoHEIC latches true the first time ffmpeg fails to open a HEIC that the
@@ -90,16 +90,26 @@ func heicViaFfmpeg(ctx context.Context, src, dst string, size int) error {
 	// non-grid file, or an ffmpeg without stream groups). Any other failure —
 	// a corrupt file, no HEVC decoder — would fail -vf too, so it costs one
 	// fork, not two (T4-03).
-	if !isStreamSpecifierError(err) {
+	if !IsStreamSpecifierError(err) {
 		return err
 	}
 	return imageViaFfmpeg(ctx, src, dst, size)
 }
 
-// isStreamSpecifierError reports whether an ffmpeg error says the `[0:g:0]`
-// stream specifier matched nothing or was not understood.
-func isStreamSpecifierError(err error) bool {
-	return err != nil && strings.Contains(err.Error(), "pecifier")
+// IsStreamSpecifierError reports whether an ffmpeg error says the `[0:g:0]`
+// stream-group specifier matched nothing or was not understood; shared with
+// export (X6-04). A *tools.Error carries the tool's stderr, so the check reads
+// that; failing that, the error text itself keeps test fakes that return plain
+// errors working.
+func IsStreamSpecifierError(err error) bool {
+	if err == nil {
+		return false
+	}
+	var te *tools.Error
+	if errors.As(err, &te) {
+		return strings.Contains(te.Stderr, "pecifier")
+	}
+	return strings.Contains(err.Error(), "pecifier")
 }
 
 // HEICToJPEG decodes a HEIC/HEIF file to a full-resolution JPEG written under
@@ -112,10 +122,7 @@ func HEICToJPEG(ctx context.Context, src, tmpDir string, skipFfmpeg bool) (strin
 	var heifErr error
 	if haveHeifConvert() {
 		intermediate := filepath.Join(tmpDir, "out.jpg")
-		var stderr bytes.Buffer
-		cmd := exec.CommandContext(ctx, "heif-convert", "-q", "90", "--quiet", src, intermediate)
-		cmd.Stderr = &stderr
-		errRun := cmd.Run()
+		_, errRun := tools.Run(ctx, nil, "heif-convert", "-q", "90", "--quiet", src, intermediate)
 		// For multi-image HEIC (Apple live photos, HDR pairs, image stacks)
 		// heif-convert writes out-1.jpg, out-2.jpg, ... and never creates the
 		// requested name. Pick whichever JPEG it actually produced; ignore
@@ -125,7 +132,7 @@ func HEICToJPEG(ctx context.Context, src, tmpDir string, skipFfmpeg bool) (strin
 			return jpg, nil
 		}
 		if errRun != nil {
-			heifErr = fmt.Errorf("heif-convert: %s", stderrOr(&stderr, errRun))
+			heifErr = errRun
 		} else {
 			heifErr = errors.New("heif-convert produced no jpeg output")
 		}
@@ -138,30 +145,21 @@ func HEICToJPEG(ctx context.Context, src, tmpDir string, skipFfmpeg bool) (strin
 	// hides why ffmpeg failed (S6-04).
 	if !skipFfmpeg && !ffmpegNoHEIC.Load() && haveFfmpeg() {
 		out := filepath.Join(tmpDir, "ff-out.jpg")
-		var stderr bytes.Buffer
 		// -threads 1 (before -i) caps the HEVC-intra decoder — a single-frame
 		// HEIC decode needs no parallel threads, and this path runs under the
 		// store's oversized extSem (C-06).
-		cmd := exec.CommandContext(ctx, "ffmpeg", "-y", "-loglevel", "error",
+		_, err := tools.Run(ctx, nil, "ffmpeg", "-y", "-loglevel", "error",
 			"-threads", "1", "-i", src, "-frames:v", "1", "-update", "1", out)
-		cmd.Stderr = &stderr
-		err := cmd.Run()
 		if err == nil {
-			if _, err = os.Stat(out); err == nil {
+			_, statErr := os.Stat(out)
+			if statErr == nil {
 				return out, nil
 			}
+			err = fmt.Errorf("ffmpeg: %w", statErr)
 		}
-		return "", errors.Join(heifErr, fmt.Errorf("ffmpeg: %s", stderrOr(&stderr, err)))
+		return "", errors.Join(heifErr, err)
 	}
 	return "", heifErr
-}
-
-// stderrOr returns a tool's trimmed stderr, or err's text when it wrote none.
-func stderrOr(stderr *bytes.Buffer, err error) string {
-	if msg := strings.TrimSpace(stderr.String()); msg != "" {
-		return msg
-	}
-	return err.Error()
 }
 
 func pickHeifOutput(dir, preferred string) (string, error) {
