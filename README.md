@@ -18,6 +18,11 @@ with a SQLite index, inline video playback through libmpv, and an optional web g
   - **Organize**: sorts files into dated folders.
   - **Duplicates**: finds duplicate files by content hash.
   - **Export favorites**: can re-compress the exported copies.
+- **People**: faces are detected in the background (with the optional `pv-face-detect`
+  helper, all on this computer) and grouped by likeness. Name a group to name every face in
+  it, open a person to see all their photos in the normal grid, and fix mistakes in
+  **Review faces** (wrong faces sort first; `y`/`n`/`m`/`i`, all undoable with `ctrl z`).
+  Names and fixes survive re-detection, moves, delete/restore and "Rebuild index".
 - **Web server** (toolbar → Web server): serves the indexed library to a browser, with
   thumbnails, a viewer, favorites, and video, using HLS for iOS/Safari. It binds to
   `127.0.0.1:8080` by default. Settings can change the port or bind to all interfaces, and an
@@ -61,7 +66,7 @@ placeholder icon instead of a thumbnail).
 | `zenity` | Directory pickers and warning dialogs |
 | `udisksctl`, `lsblk` | SD-card detection and mounting for import |
 | `mpv`, `xdg-open` | "Open externally" (`o`) |
-| `pv-face-detect` + Python [`face_recognition`](https://github.com/ageitgey/face_recognition) | Face detection during `pv-scan` (see below) |
+| `pv-face-detect` + Python [`face_recognition`](https://github.com/ageitgey/face_recognition) | Face detection for People (GUI and `pv-scan`); `pipx install face_recognition` |
 
 ## Build & run
 
@@ -86,8 +91,9 @@ If `-root` is omitted, the current working directory is used.
 GUI preferences live in `$XDG_CONFIG_HOME/photo-viewer/config.json`
 (`~/.config/photo-viewer/config.json` by default). Change them from Settings (`,`). They include
 `inbox_dir` / `outbox_dir` for Import, `import_delete_source`, `sd_card_auto_detect`,
-`group_by_year` (sidebar), `sort_mode`, `show_shortcut_hints`, `web_server_port`, and
-`web_server_bind_all`. Import refuses an Inbox/Outbox pair where one is inside the other.
+`group_by_year` (sidebar), `sort_mode`, `show_shortcut_hints`, `web_server_port`,
+`web_server_bind_all`, `faces_disabled` and `face_strictness` (`strict`/`normal`/`loose`;
+changing it regroups every face). Import refuses an Inbox/Outbox pair where one is inside the other.
 
 Video playback renders through a headless OpenGL context and decodes on the GPU via VAAPI
 (Intel needs `intel-media-driver`, AMD `libva-mesa-driver`). Without VAAPI it decodes in
@@ -104,7 +110,9 @@ ones:
 | --- | --- |
 | Grid | `h/j/k/l` navigate · `enter` open · `f` favorite · `d` delete · `v` selection mode · `o` open externally · `ctrl k` search · `ctrl +/-` zoom · `ctrl f/b` page · `ctrl i` import · `ctrl d` duplicates · `ctrl e` export favorites · `,` settings · `q` quit |
 | Selection | `h/j/k/l` select · `enter` open · `e` export selected · `o` open externally · `v` leave |
-| Viewer | `h/l` or `←/→` prev/next · `f` favorite · `d` delete · `space` play/pause · `[`/`]` seek 5 s · `m` mute · `o` open externally · `esc`/`q` close |
+| Viewer | `h/l` or `←/→` prev/next · `f` favorite · `d` delete · `space` play/pause · `[`/`]` seek 5 s · `m` mute · `o` open externally · `p` face boxes · `t` next face, then `enter` name it · `y` confirm · `n` not this person · `x` not a face · `esc`/`q` close |
+| People | `h/j/k/l` move · `enter` open · `r` regroup · `ctrl z` undo; in a person's grid `r` renames and `ctrl z` undoes |
+| Review faces | `h/j/k/l` move · `y`/`enter` confirm · `n`/`x` not this person · `m` move to… · `i` not a face · `c` set cover · `v` mark · `o` open photo · `ctrl z` undo · `esc` close; suggestions: `y`/`n`/`s` skip, `Y`/`N` all |
 | Sidebar | `j/k` select folder · `enter` open · `l`/`→` focus grid · `ctrl f/b` page |
 
 ## Data on disk
@@ -114,12 +122,13 @@ Where the data goes depends on how the app is started.
 **With `--root <dir>`**, everything lives inside the library so it travels with it:
 
 ```
-<root>/.photo-viewer.db                 # SQLite index (entries, favorites, hashes, faces)
+<root>/.photo-viewer.db                 # SQLite index (entries, favorites, hashes, faces, people)
 <root>/.photo-viewer-trash/             # soft-deleted files, restorable
 <root>/.photo-viewer-cache/
 ├── thumbs/ab/abc123…ef.jpg             # 256 px grid thumbnails, name = SHA-1(absolute path)
 ├── thumbs-512/ab/abc123…ef.jpg         # 512 px thumbnails, made on demand for large grid cells
-└── display/ab/abc123…ef.jpg            # ≤2048 px renditions: web viewer, and HEIC/RAW in the viewer
+├── display/ab/abc123…ef.jpg            # ≤2048 px renditions: web viewer, and HEIC/RAW in the viewer
+└── faces/00/00000000000000ab.jpg       # face-crop avatars, name = face row id
 ```
 
 **Without `--root`** (the library is the working directory), the index and cache go in this

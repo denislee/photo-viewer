@@ -344,11 +344,10 @@ func (i *Index) AllClusters() []Cluster {
 	return out
 }
 
-// The four cluster read/write APIs below (RenameCluster, PathsInCluster,
-// SampleFace, MergeClusters) back the not-yet-built People sidebar. No caller
-// exists yet, but the face detection + clustering pipeline is actively
-// maintained and these are its intended read surface, so they are retained
-// deliberately rather than deleted (see C-04).
+// The cluster APIs below (RenameCluster, PathsInCluster, SampleFace,
+// MergeClusters) predate the People feature, which uses people.go instead;
+// they are retained for tests and tooling (see C-04). RenameCluster writes
+// the deprecated face_clusters.label — names live in people since v9.
 
 // RenameCluster updates the user-visible label for a cluster.
 func (i *Index) RenameCluster(clusterID int64, label string) error {

@@ -42,9 +42,8 @@ type Job struct {
 	ThumbMod  int64 // mtime of the thumbnail used for invalidation
 }
 
-// OnClusterChange is called after a face creates a new cluster. No current
-// caller passes one; the hook exists for a UI that needs to refresh a People
-// list.
+// OnClusterChange is called after a face creates a new cluster. The GUI
+// passes a debounced refresh of its People views.
 type OnClusterChange func()
 
 // Pipeline owns a worker pool that detects faces and writes them into the
@@ -111,10 +110,6 @@ func (p *Pipeline) Enabled() bool {
 // status. Caller is responsible for calling Start afterwards if the state
 // flipped from off → on; this function never starts or stops workers on
 // its own, to avoid surprising the caller.
-//
-// No production caller yet (only tests): kept deliberately as part of the
-// read/maintenance surface for the future People sidebar. See CLAUDE.md,
-// architecture layer 4. Do not delete it as dead code.
 func (p *Pipeline) Recheck() Status {
 	// refreshProbe (not cachedProbe) so a newly-installed or newly-broken helper
 	// is actually re-probed and the memoised result is refreshed for the next
@@ -186,10 +181,6 @@ func (p *Pipeline) Stop() {
 // Submit enqueues an entry for face detection. Non-photo types and entries
 // that already have fresh face rows are skipped cheaply. Never blocks: if the
 // queue is full the job is dropped (better than holding up the scan flush).
-//
-// No production caller yet (only tests): kept deliberately as part of the
-// read/maintenance surface for the future People sidebar. See CLAUDE.md,
-// architecture layer 4. Do not delete it as dead code.
 func (p *Pipeline) Submit(j Job) {
 	jobs, ok := p.acceptJob(j)
 	if !ok {
@@ -547,10 +538,6 @@ func (p *Pipeline) SetMaxSqDistance(v float64) {
 // InvalidateClusters drops the in-memory cluster cache. UI paths that mutate
 // clusters out-of-band (merge, wipe) must call this so the next assign reloads
 // from the index. Rename leaves centroid+count unchanged and does not need it.
-//
-// No production caller yet (only tests): kept deliberately as part of the
-// read/maintenance surface for the future People sidebar. See CLAUDE.md,
-// architecture layer 4. Do not delete it as dead code.
 func (p *Pipeline) InvalidateClusters() {
 	p.clusterMu.Lock()
 	p.cachedClusters = nil
