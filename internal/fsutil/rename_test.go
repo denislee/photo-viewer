@@ -36,7 +36,7 @@ func gone(t *testing.T, p string) {
 // both files intact — to replace an existing one.
 func TestRenameNoReplace(t *testing.T) {
 	impls := map[string]func(src, dst string) error{
-		"RenameNoReplace":     RenameNoReplace,
+		"renameExclusive":     renameExclusive,
 		"linkOrCheckedRename": linkOrCheckedRename,
 	}
 	for name, rename := range impls {

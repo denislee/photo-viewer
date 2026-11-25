@@ -19,7 +19,7 @@ import (
 // of spinning forever.
 const MaxCollisionSuffix = 10000
 
-// RenameNoReplace renames src to dst but never replaces an existing dst: if
+// renameExclusive renames src to dst but never replaces an existing dst: if
 // dst exists it fails with an error satisfying errors.Is(err, fs.ErrExist) and
 // leaves both files untouched. A plain os.Rename silently clobbers dst, so a
 // stat-then-rename leaves a window in which a file created at dst is lost.
@@ -29,7 +29,7 @@ const MaxCollisionSuffix = 10000
 // src, and only on filesystems with neither (e.g. some FUSE mounts) falls back
 // to an Lstat check before os.Rename. Like os.Rename, a cross-filesystem move
 // fails with an error satisfying errors.Is(err, syscall.EXDEV).
-func RenameNoReplace(src, dst string) error {
+func renameExclusive(src, dst string) error {
 	err := renameNoReplace(src, dst)
 	if !errors.Is(err, errNoReplaceUnsupported) {
 		return err
@@ -41,7 +41,7 @@ func RenameNoReplace(src, dst string) error {
 // available for this platform, kernel, or filesystem.
 var errNoReplaceUnsupported = errors.New("rename without replace unsupported")
 
-// linkOrCheckedRename is RenameNoReplace's portable fallback.
+// linkOrCheckedRename is renameExclusive's portable fallback.
 func linkOrCheckedRename(src, dst string) error {
 	err := os.Link(src, dst)
 	switch {
@@ -84,7 +84,7 @@ func SuffixName(dir, base string, n int) string {
 func RenameUnique(src string, candidate func(n int) string) (string, error) {
 	for n := 0; n <= MaxCollisionSuffix; n++ {
 		dst := candidate(n)
-		err := RenameNoReplace(src, dst)
+		err := renameExclusive(src, dst)
 		if err == nil {
 			return dst, nil
 		}

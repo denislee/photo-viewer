@@ -47,58 +47,48 @@ var scalingFactors = sync.OnceValue(func() [][2]int {
 	return out
 })
 
-// handles keeps idle TurboJPEG decompressor handles for reuse. Creating one is
-// cheap but not free (it allocates libjpeg's state), and every thumbnail worker
-// decodes in a loop. A bounded channel rather than a sync.Pool, because a pool
-// may drop items at GC without running tj3Destroy, which would leak C memory.
-var handles = make(chan C.tjhandle, 64)
+// tjPool keeps idle TurboJPEG handles of one kind for reuse: a bounded channel,
+// refilled by put and drained by get, creating a handle with init on a miss and
+// destroying one that doesn't fit.
+type tjPool struct {
+	idle chan C.tjhandle
+	init func() C.tjhandle
+}
 
-func getHandle() (C.tjhandle, error) {
+// get returns an idle handle from the pool, creating one with init on a miss.
+func (p *tjPool) get() (C.tjhandle, error) {
 	select {
-	case h := <-handles:
+	case h := <-p.idle:
 		return h, nil
 	default:
 	}
-	h := C.pv_tj_init_decompress()
+	h := p.init()
 	if h == nil {
 		return nil, errors.New("jpegturbo: tj3Init failed")
 	}
 	return h, nil
 }
 
-func putHandle(h C.tjhandle) {
+// put returns h to the pool, destroying it when the pool is full.
+func (p *tjPool) put(h C.tjhandle) {
 	select {
-	case handles <- h:
+	case p.idle <- h:
 	default:
 		C.tj3Destroy(h)
 	}
 }
 
-// chandles keeps idle TurboJPEG compressor handles for reuse, mirroring
-// handles for decompressors. Small pool: encoding runs inline on the thumbnail
-// and export paths rather than under a large worker fan-out.
-var chandles = make(chan C.tjhandle, 16)
+// decompressors keeps idle TurboJPEG decompressor handles for reuse. Creating
+// one is cheap but not free (it allocates libjpeg's state), and every thumbnail
+// worker decodes in a loop, so the pool holds 64. A bounded channel rather than
+// a sync.Pool, because a pool may drop items at GC without running tj3Destroy,
+// which would leak C memory.
+var decompressors = &tjPool{idle: make(chan C.tjhandle, 64), init: func() C.tjhandle { return C.pv_tj_init_decompress() }}
 
-func getCHandle() (C.tjhandle, error) {
-	select {
-	case h := <-chandles:
-		return h, nil
-	default:
-	}
-	h := C.pv_tj_init_compress()
-	if h == nil {
-		return nil, errors.New("jpegturbo: tj3Init failed")
-	}
-	return h, nil
-}
-
-func putCHandle(h C.tjhandle) {
-	select {
-	case chandles <- h:
-	default:
-		C.tj3Destroy(h)
-	}
-}
+// compressors keeps idle TurboJPEG compressor handles for reuse, mirroring
+// decompressors. Small pool (16): encoding runs inline on the thumbnail and
+// export paths rather than under a large worker fan-out.
+var compressors = &tjPool{idle: make(chan C.tjhandle, 16), init: func() C.tjhandle { return C.pv_tj_init_compress() }}
 
 func tjError(h C.tjhandle, what string) error {
 	return fmt.Errorf("jpegturbo: %s: %s", what, C.GoString(C.tj3GetErrorStr(h)))
@@ -125,11 +115,11 @@ func decodeFit(data []byte, fit func(w, h int) (minW, minH int)) (*image.RGBA, C
 	if !IsJPEG(data) {
 		return nil, cfg, errors.New("jpegturbo: not a JPEG")
 	}
-	h, err := getHandle()
+	h, err := decompressors.get()
 	if err != nil {
 		return nil, cfg, err
 	}
-	defer putHandle(h)
+	defer decompressors.put(h)
 
 	w, ht, err := header(h, data)
 	if err != nil {
@@ -176,11 +166,11 @@ func encodeRGBA(img *image.RGBA, quality int) ([]byte, error) {
 		return nil, errors.New("jpegturbo: empty image")
 	}
 	q := max(min(quality, 100), 1)
-	h, err := getCHandle()
+	h, err := compressors.get()
 	if err != nil {
 		return nil, err
 	}
-	defer putCHandle(h)
+	defer compressors.put(h)
 
 	if C.tj3Set(h, C.TJPARAM_QUALITY, C.int(q)) != 0 {
 		return nil, tjError(h, "quality")

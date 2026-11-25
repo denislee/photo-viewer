@@ -91,7 +91,7 @@ func (c *Controller) DrainDeletions(timeout time.Duration) bool {
 func (c *Controller) restoreBatch(paths []string) {
 	results, restored := collectRestores(paths, c.store)
 	if len(results) > 0 {
-		c.index.ReconcileBatch(results)
+		c.index.ReconcileBatchChanged(results)
 	}
 	if restored > 0 {
 		c.bumpTrashCount(-restored)
@@ -174,13 +174,11 @@ func (c *Controller) patchLocalDeletion(paths []string, intoTrash bool) (allLoca
 		}
 		c.entries = kept
 	}
-	if c.dirCounts != nil {
-		// Clone-swap rather than mutate in place: the sidebar reads the map
-		// returned by DirCountsWithVersion() lock-free every frame, so
-		// decrementing the published map here would race that reader (fatal
-		// error: concurrent map read and map write). Patch a copy and swap the
-		// pointer under mu.
-		next := maps.Clone(c.dirCounts)
+	// Clone-swap rather than mutate in place: the sidebar reads the map
+	// returned by DirCountsWithVersion() lock-free every frame, so
+	// decrementing the published map here would race that reader (fatal
+	// error: concurrent map read and map write).
+	c.swapCountsLocked(func(next map[string]int) {
 		// Walk each *actually-removed* path up its ancestor chain and
 		// decrement the matching dirCounts keys. Iterating present (not
 		// deleted) is what makes the decrement idempotent. This is
@@ -208,9 +206,7 @@ func (c *Controller) patchLocalDeletion(paths []string, intoTrash bool) (allLoca
 			next[FavoritesView] -= favCount
 			next[FavoritesView] = max(next[FavoritesView], 0)
 		}
-		c.dirCounts = next
-		c.dirCountsVer++
-	}
+	})
 	allLocal = len(present) == len(paths)
 	c.mu.Unlock()
 
@@ -328,6 +324,21 @@ func (c *Controller) cachedTrashCount() int {
 	return n
 }
 
+// swapCountsLocked clone-swaps the published dirCounts: fn mutates a copy,
+// which then replaces the map and bumps dirCountsVer. The sidebar reads the
+// published map lock-free every frame, so it must never be written in place
+// (fatal concurrent map read/write). No-op when no counts are published yet.
+// The caller must hold c.mu.
+func (c *Controller) swapCountsLocked(fn func(next map[string]int)) {
+	if c.dirCounts == nil {
+		return
+	}
+	next := maps.Clone(c.dirCounts)
+	fn(next)
+	c.dirCounts = next
+	c.dirCountsVer++
+}
+
 // bumpTrashCount adjusts the cached trash count by delta. Seeds the count
 // from disk if it hasn't been loaded yet so the delta lands on a real value.
 func (c *Controller) bumpTrashCount(delta int) {
@@ -335,30 +346,20 @@ func (c *Controller) bumpTrashCount(delta int) {
 	c.mu.Lock()
 	c.trashCount += delta
 	c.trashCount = max(c.trashCount, 0)
-	if c.dirCounts != nil {
-		// Clone-swap: the published map is read lock-free by the sidebar
-		// every frame, so writing TrashView in place would race that reader.
-		next := maps.Clone(c.dirCounts)
+	c.swapCountsLocked(func(next map[string]int) {
 		next[TrashView] = c.trashCount
-		c.dirCounts = next
-		c.dirCountsVer++
-	}
+	})
 	c.mu.Unlock()
 }
 
-// resetTrashCount sets the cached count to 0 (used by EmptyTrash).
-func (c *Controller) resetTrashCount() {
+// setTrashCount sets the cached count to n (used by EmptyTrash with 0).
+func (c *Controller) setTrashCount(n int) {
 	c.mu.Lock()
-	c.trashCount = 0
+	c.trashCount = n
 	c.trashCountValid = true
-	if c.dirCounts != nil {
-		// Clone-swap rather than mutate the published map in place — the
-		// sidebar reads it lock-free. See bumpTrashCount.
-		next := maps.Clone(c.dirCounts)
-		next[TrashView] = 0
-		c.dirCounts = next
-		c.dirCountsVer++
-	}
+	c.swapCountsLocked(func(next map[string]int) {
+		next[TrashView] = n
+	})
 	c.mu.Unlock()
 }
 
@@ -384,7 +385,7 @@ func (c *Controller) EmptyTrash(done func(count int, bytes int64, err error)) {
 			}
 		}
 		count, bytes, err := cache.EmptyTrash(dir)
-		c.resetTrashCount()
+		c.setTrashCount(0)
 		// The trash view (if currently shown) needs a refresh so the now-
 		// empty list reflects on screen, and the sidebar's counts changed.
 		c.scheduleRefreshRecount(c.activeDir())

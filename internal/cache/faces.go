@@ -100,6 +100,7 @@ type FaceOpResult struct {
 // thumbMtime, the mtime of the thumbnail detection ran on, is recorded on the
 // entries row in the same transaction, so an image with no faces (nil ops) is
 // remembered as processed too and not re-detected next run (F5-01).
+// Every face row is stamped with thumbMtime; Face.ThumbMtime is not read here.
 // Callers (the face pipeline) are expected to have already chosen
 // existing-cluster vs. new-cluster against an in-memory cache.
 //
@@ -179,7 +180,7 @@ func (i *Index) WriteFacesForPath(path string, thumbMtime int64, ops []FaceOp) (
 				return nil, err
 			}
 			res, err := ins.Exec(
-				f.Path, f.ThumbMtime, f.BBox[0], f.BBox[1], f.BBox[2], f.BBox[3], EncodeEmbedding(f.Embedding), clusterID,
+				f.Path, thumbMtime, f.BBox[0], f.BBox[1], f.BBox[2], f.BBox[3], EncodeEmbedding(f.Embedding), clusterID,
 			)
 			if err != nil {
 				return nil, err
@@ -193,7 +194,7 @@ func (i *Index) WriteFacesForPath(path string, thumbMtime int64, ops []FaceOp) (
 		}
 
 		res, err := ins.Exec(
-			f.Path, f.ThumbMtime, f.BBox[0], f.BBox[1], f.BBox[2], f.BBox[3], EncodeEmbedding(f.Embedding), nil,
+			f.Path, thumbMtime, f.BBox[0], f.BBox[1], f.BBox[2], f.BBox[3], EncodeEmbedding(f.Embedding), nil,
 		)
 		if err != nil {
 			return nil, err

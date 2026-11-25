@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"log"
-	"maps"
 	"path/filepath"
 	"time"
 
@@ -173,9 +172,9 @@ func (c *Controller) FlushFavorites(timeout time.Duration) {
 // cached FavoritesView count by ±1 without a full refresh. Mirrors
 // patchLocalDeletion's clone-swap discipline: c.entries gets a fresh backing
 // array (Snapshot hands the slice header out and other goroutines may still be
-// reading the old one) and dirCounts is clone-swapped (the sidebar reads the
-// published map lock-free every frame, so mutating it in place would race that
-// reader). Wakes the UI.
+// reading the old one) and dirCounts is clone-swapped via swapCountsLocked
+// (the sidebar reads the published map lock-free every frame, so mutating it in
+// place would race that reader). Wakes the UI.
 func (c *Controller) patchFavorite(path string, newVal bool) {
 	c.mu.Lock()
 	// Flip Favorite on the matching displayed entry so its star repaints
@@ -193,19 +192,15 @@ func (c *Controller) patchFavorite(path string, newVal bool) {
 		}
 	}
 	// The DB flip changed the favorites total by exactly ±1; mirror that delta
-	// into the sidebar's cached count. Clone-swap rather than mutate in place —
-	// see the c.entries note above and bumpTrashCount.
-	if c.dirCounts != nil {
-		next := maps.Clone(c.dirCounts)
+	// into the sidebar's cached count.
+	c.swapCountsLocked(func(next map[string]int) {
 		if newVal {
 			next[FavoritesView]++
 		} else {
 			next[FavoritesView]--
 			next[FavoritesView] = max(next[FavoritesView], 0)
 		}
-		c.dirCounts = next
-		c.dirCountsVer++
-	}
+	})
 	c.mu.Unlock()
 	if c.invalidate != nil {
 		c.invalidate()

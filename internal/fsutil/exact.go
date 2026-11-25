@@ -13,7 +13,7 @@ import (
 // CopyTo copies src to exactly dst, crash-safely: the bytes go to a temp file
 // next to dst (createTemp, created with src's permission bits so the umask
 // still applies — never more permissive than a new file), are fsynced, get
-// src's mtime, and are then renamed into place with RenameNoReplace, so an existing dst is
+// src's mtime, and are then renamed into place with renameExclusive, so an existing dst is
 // never replaced (the error then satisfies errors.Is(err, fs.ErrExist)).
 // Cancelling ctx aborts the copy. The temp is removed on every error path.
 func CopyTo(ctx context.Context, src, dst string) error {
@@ -39,7 +39,7 @@ func CopyTo(ctx context.Context, src, dst string) error {
 	// Best-effort, matching CopyUnique: a failed stamp doesn't invalidate a
 	// good copy.
 	_ = os.Chtimes(tmpName, info.ModTime(), info.ModTime())
-	if err := RenameNoReplace(tmpName, dst); err != nil {
+	if err := renameExclusive(tmpName, dst); err != nil {
 		os.Remove(tmpName)
 		return err
 	}
@@ -52,7 +52,7 @@ func CopyTo(ctx context.Context, src, dst string) error {
 // to CopyTo, fsync dst's directory (SyncDir) so the new entry is durable, and
 // only then remove src. Every other rename error is returned as is.
 func MoveTo(ctx context.Context, src, dst string) error {
-	err := RenameNoReplace(src, dst)
+	err := renameExclusive(src, dst)
 	if err == nil {
 		return nil
 	}

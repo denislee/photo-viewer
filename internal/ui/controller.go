@@ -410,7 +410,7 @@ func (c *Controller) ApplyMove(oldPath, newPath string) error {
 	// No row for oldPath (never indexed, or already dropped): index newPath
 	// from a fresh stat instead.
 	if info, err := os.Stat(newPath); err == nil {
-		c.index.ReconcileBatch([]scan.Result{{
+		c.index.ReconcileBatchChanged([]scan.Result{{
 			Path:    newPath,
 			Type:    scan.DetectType(newPath),
 			Size:    info.Size(),
