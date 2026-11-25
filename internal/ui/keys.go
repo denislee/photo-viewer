@@ -77,6 +77,18 @@ var (
 		key.Filter{Name: "=", Required: key.ModCtrl},
 		key.Filter{Name: "-", Required: key.ModCtrl},
 		key.Filter{Name: ","},
+		// People: review verdicts, rename, undo, viewer face boxes/tags.
+		key.Filter{Name: "C"},
+		key.Filter{Name: "N"},
+		key.Filter{Name: "N", Required: key.ModShift},
+		key.Filter{Name: "P"},
+		key.Filter{Name: "R"},
+		key.Filter{Name: "S"},
+		key.Filter{Name: "T"},
+		key.Filter{Name: "X"},
+		key.Filter{Name: "Y"},
+		key.Filter{Name: "Y", Required: key.ModShift},
+		key.Filter{Name: "Z", Required: key.ModCtrl},
 	)
 )
 
@@ -87,10 +99,14 @@ func keyFiltersFor(views *appViews) []event.Filter {
 	top := views.topModal()
 	switch {
 	case top == nil:
+		// The person header's name editor needs printable keys too.
+		if views.header != nil && views.header.Editing() {
+			return textInputKeyFilters
+		}
 		return fullKeyFilters
 	case top.name == "search":
 		return baseKeyFilters
-	case top.textInput:
+	case top.wantsText():
 		return textInputKeyFilters
 	}
 	return fullKeyFilters
@@ -154,8 +170,18 @@ func handleKeys(gtx layout.Context, ctrl *Controller, views *appViews, sidebarFo
 			handleViewerKey(ke, viewer, grid, ctrl, w)
 			continue
 		}
+		if views.header != nil && views.header.Editing() {
+			if views.header.Key(ke) {
+				w.Invalidate()
+			}
+			continue
+		}
 		if *sidebarFocus {
 			handleSidebarKey(ke, sidebar, sidebarFocus, w)
+			continue
+		}
+		if handlePeopleKey(ke, ctrl, views, sidebarFocus) {
+			w.Invalidate()
 			continue
 		}
 		// Snapshot per event (it is just a locked read of the slice header):

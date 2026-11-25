@@ -252,6 +252,7 @@ func (s *Sidebar) buildRows(root, treeDir string, subdirs []string, counts map[s
 
 	rows = []sidebarRow{
 		{label: "Favorites", path: FavoritesView, kind: rowPath},
+		{label: "People", path: PeopleView, kind: rowPath},
 		{label: "Trash", path: TrashView, kind: rowPath},
 		{label: filepath.Base(root), path: root, kind: rowPath},
 	}
@@ -262,8 +263,11 @@ func (s *Sidebar) buildRows(root, treeDir string, subdirs []string, counts map[s
 		if n, ok := counts[FavoritesView]; ok {
 			rows[0].countLabel = strconv.Itoa(n)
 		}
-		if n, ok := counts[TrashView]; ok {
+		if n, ok := counts[PeopleView]; ok {
 			rows[1].countLabel = strconv.Itoa(n)
+		}
+		if n, ok := counts[TrashView]; ok {
+			rows[2].countLabel = strconv.Itoa(n)
 		}
 	}
 	if treeDir != root {

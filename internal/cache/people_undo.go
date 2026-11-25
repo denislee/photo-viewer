@@ -321,3 +321,42 @@ func (i *Index) clusterExists(id int64) bool {
 	var one int
 	return i.db.QueryRow("SELECT 1 FROM face_clusters WHERE id = ?", id).Scan(&one) == nil
 }
+
+// NewUndo returns an empty undo record (for ops that only move faces).
+func NewUndo(label string) *Undo { return &Undo{Label: label} }
+
+// AddCreated records a person the op created (deleted on undo).
+func (u *Undo) AddCreated(personID int64) {
+	if u != nil {
+		u.created = append(u.created, personID)
+	}
+}
+
+// Merge folds another undo record into u (u's label wins).
+func (u *Undo) Merge(o *Undo) {
+	if u == nil || o == nil {
+		return
+	}
+	u.people = append(u.people, o.people...)
+	u.created = append(u.created, o.created...)
+	seen := map[string]bool{}
+	for _, p := range u.tagPaths {
+		seen[p] = true
+	}
+	for _, p := range o.tagPaths {
+		if !seen[p] {
+			u.tagPaths = append(u.tagPaths, p)
+		}
+	}
+	u.tags = append(u.tags, o.tags...)
+	if len(o.clusters) > 0 && u.clusters == nil {
+		u.clusters = map[int64]sql.NullInt64{}
+	}
+	for id, p := range o.clusters {
+		if _, ok := u.clusters[id]; !ok {
+			u.clusters[id] = p
+		}
+	}
+	u.all = u.all || o.all
+	u.moves = append(u.moves, o.moves...)
+}

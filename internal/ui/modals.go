@@ -21,6 +21,9 @@ type appViews struct {
 	webView    *WebServerView
 	processBar *ProcessBar
 	splitter   *sidebarSplitter
+	people     *PeoplePane
+	header     *PersonHeader
+	review     *ReviewView
 
 	// modals is the full-window overlays in priority order; see newModals.
 	modals []modal
@@ -41,6 +44,17 @@ type modal struct {
 	layout    func(gtx layout.Context, th *Theme)
 	keys      func(ke key.Event) bool
 	textInput bool
+	// textInputFn, when set, decides textInput per frame (a modal whose
+	// editor only shows some of the time, e.g. the review's person picker).
+	textInputFn func() bool
+}
+
+// wantsText reports whether printable keys must reach the modal's editor.
+func (m *modal) wantsText() bool {
+	if m.textInputFn != nil {
+		return m.textInputFn()
+	}
+	return m.textInput
 }
 
 // isCtrlBracket reports Ctrl+[, the vim-style Esc.
@@ -103,6 +117,21 @@ func newModals(v *appViews, libraryRoot func() string) []modal {
 				}
 				return false
 			},
+		},
+		{
+			// The header's "Merge into…" person picker (text input).
+			name:      "personPicker",
+			open:      func() bool { return v.header != nil && v.header.PickerOpen() },
+			layout:    func(gtx layout.Context, th *Theme) { v.header.LayoutPicker(gtx, th) },
+			keys:      v.header.Key,
+			textInput: true,
+		},
+		{
+			name:        "review",
+			open:        func() bool { return v.review != nil && v.review.Open },
+			layout:      func(gtx layout.Context, th *Theme) { v.review.Layout(gtx, th) },
+			keys:        v.review.Key,
+			textInputFn: func() bool { return v.review.TextInput() },
 		},
 		{
 			name:   "duplicates",

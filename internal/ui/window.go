@@ -107,11 +107,34 @@ func Run(w *app.Window, ctrl *Controller) error {
 
 	wireToolbar(toolbar, ctrl, imports, dups, organize, settings, webView, w)
 
+	// People: the review overlay, the overview pane and the person/group
+	// header strip. "Open photo" from the review opens the viewer on the
+	// grid's entries when the photo is among them, else on just that photo.
+	review := NewReviewView(ctrl, func(path string) {
+		_, _, entries, _ := ctrl.Snapshot()
+		for i, e := range entries {
+			if e.Path == path {
+				viewer.Show(entries, i)
+				return
+			}
+		}
+		if e, ok := ctrl.Index().GetEntry(path); ok {
+			viewer.Show([]cache.Entry{e}, 0)
+		}
+	})
+	review.SetInvalidate(w.Invalidate)
+	openReview := func(t ReviewTarget) {
+		review.Show(t)
+		w.Invalidate()
+	}
+
 	views := &appViews{
 		toolbar: toolbar, sidebar: sidebar, grid: grid, viewer: viewer,
 		dups: dups, imports: imports, organize: organize, settings: settings,
 		search: search, sdPrompt: sdPrompt, webView: webView,
 		processBar: processBar, splitter: &sidebarSplitter{},
+		people: NewPeoplePane(ctrl, openReview), header: NewPersonHeader(ctrl, openReview),
+		review: review,
 	}
 	views.modals = newModals(views, ctrl.LibraryRoot)
 
@@ -422,6 +445,8 @@ func layoutBody(gtx layout.Context, th *Theme, ctrl *Controller, views *appViews
 			dispDir = "Trash"
 		case strings.HasPrefix(dispDir, YearViewPrefix):
 			dispDir = "Year " + strings.TrimPrefix(dispDir, YearViewPrefix)
+		case isPeopleDir(dispDir):
+			dispDir = ctrl.PersonSentinelName(dispDir)
 		}
 		tb.Layout(gtx2, th, dispDir, len(entries))
 	}
@@ -464,8 +489,26 @@ func layoutBody(gtx layout.Context, th *Theme, ctrl *Controller, views *appViews
 		layoutSplitter(gtx, th, splitter, splitW, bodyH, leftW, totalW, minW, maxW, w)
 		stack.Pop()
 	}
-	// Grid
-	{
+	// Grid — or, for People, the overview pane; a person/group grid gets
+	// its header strip on top.
+	switch hh := gtx.Dp(unit.Dp(views.header.HeightDp(currentDir))); {
+	case currentDir == PeopleView:
+		gtx2 := gtx
+		gtx2.Constraints = layout.Exact(image.Pt(rightW, bodyH))
+		stack := op.Offset(image.Pt(leftW+splitW, bodyY)).Push(gtx.Ops)
+		views.people.Layout(gtx2, th)
+		stack.Pop()
+	case hh > 0 && hh < bodyH:
+		gtx2 := gtx
+		gtx2.Constraints = layout.Exact(image.Pt(rightW, hh))
+		stack := op.Offset(image.Pt(leftW+splitW, bodyY)).Push(gtx.Ops)
+		views.header.Layout(gtx2, th, currentDir, len(entries))
+		stack.Pop()
+		gtx2.Constraints = layout.Exact(image.Pt(rightW, bodyH-hh))
+		stack = op.Offset(image.Pt(leftW+splitW, bodyY+hh)).Push(gtx.Ops)
+		g.Layout(gtx2, th, entries, ctrl)
+		stack.Pop()
+	default:
 		gtx2 := gtx
 		gtx2.Constraints = layout.Exact(image.Pt(rightW, bodyH))
 		stack := op.Offset(image.Pt(leftW+splitW, bodyY)).Push(gtx.Ops)
@@ -488,6 +531,9 @@ func layoutBody(gtx layout.Context, th *Theme, ctrl *Controller, views *appViews
 	}
 
 	drawProcBar()
+	if msg, ok := ctrl.Toast(); ok {
+		drawToast(gtx, th, msg, image.Rect(leftW+splitW, bodyY, totalW, bodyY+bodyH))
+	}
 	drawShortcut()
 
 	// Tooltip overlay for the toolbar — drawn last so it floats above the

@@ -57,6 +57,17 @@ func TestKeyFilterSets(t *testing.T) {
 		key.Filter{Name: "=", Required: key.ModCtrl},
 		key.Filter{Name: "-", Required: key.ModCtrl},
 		key.Filter{Name: ","},
+		key.Filter{Name: "C"},
+		key.Filter{Name: "N"},
+		key.Filter{Name: "N", Required: key.ModShift},
+		key.Filter{Name: "P"},
+		key.Filter{Name: "R"},
+		key.Filter{Name: "S"},
+		key.Filter{Name: "T"},
+		key.Filter{Name: "X"},
+		key.Filter{Name: "Y"},
+		key.Filter{Name: "Y", Required: key.ModShift},
+		key.Filter{Name: "Z", Required: key.ModCtrl},
 	)
 
 	if !reflect.DeepEqual(baseKeyFilters, wantBase) {

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"log"
 	"os"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -96,6 +97,10 @@ type faceState struct {
 
 	// ver bumps on every change to people/groups so views reload lazily.
 	ver atomic.Uint64
+
+	snap       peopleSnapCache // guarded by mu
+	avatarOnce sync.Once
+	avatars    *avatarCache
 }
 
 // FacesEnabled reports the settings toggle (on by default).
@@ -541,4 +546,252 @@ func (c *Controller) facesRunning() bool {
 	c.faces.mu.Lock()
 	defer c.faces.mu.Unlock()
 	return c.faces.pipe != nil && c.faces.stop != nil
+}
+
+// PeopleSnapshot is everything the People overview draws, loaded off the UI
+// goroutine whenever PeopleVersion changes.
+type PeopleSnapshot struct {
+	Ver         uint64
+	People      []cache.Person // visible, by photo count
+	Hidden      []cache.Person
+	Groups      []cache.Group // unnamed, >= minGroupFaces faces
+	SmallGroups []cache.Group // unnamed, fewer faces (folded by default)
+	Suggestions []PersonSuggestion
+}
+
+// PersonSuggestion is "N photos might be <Person>".
+type PersonSuggestion struct {
+	Person cache.Person
+	Faces  []cache.FaceInfo
+}
+
+// minGroupFaces is the size under which unnamed groups are folded behind
+// "Show small groups".
+const minGroupFaces = 3
+
+// peopleSnap caches the last loaded snapshot; guarded by faces.mu.
+type peopleSnapCache struct {
+	snap    PeopleSnapshot
+	loaded  bool
+	loading bool
+}
+
+// People returns the latest snapshot and whether one was loaded yet. A
+// stale snapshot triggers a background reload; the caller redraws on the
+// invalidate it fires.
+func (c *Controller) People() (PeopleSnapshot, bool) {
+	ver := c.faces.ver.Load()
+	c.faces.mu.Lock()
+	sc := &c.faces.snap
+	snap, loaded := sc.snap, sc.loaded
+	if (!loaded || snap.Ver != ver) && !sc.loading {
+		sc.loading = true
+		go c.loadPeople(ver)
+	}
+	c.faces.mu.Unlock()
+	return snap, loaded
+}
+
+func (c *Controller) loadPeople(ver uint64) {
+	s := PeopleSnapshot{Ver: ver}
+	people, err := c.index.ListPeople()
+	if err != nil {
+		log.Printf("people: list: %v", err)
+	}
+	byID := map[int64]cache.Person{}
+	for _, p := range people {
+		byID[p.ID] = p
+		if p.Hidden {
+			s.Hidden = append(s.Hidden, p)
+		} else {
+			s.People = append(s.People, p)
+		}
+	}
+	groups, err := c.index.ListGroups(1)
+	if err != nil {
+		log.Printf("people: groups: %v", err)
+	}
+	for _, g := range groups {
+		if g.Faces >= minGroupFaces {
+			s.Groups = append(s.Groups, g)
+		} else {
+			s.SmallGroups = append(s.SmallGroups, g)
+		}
+	}
+	if sug, err := c.index.Suggestions(); err == nil {
+		for pid, fs := range sug {
+			if p, ok := byID[pid]; ok && !p.Hidden && len(fs) > 0 {
+				s.Suggestions = append(s.Suggestions, PersonSuggestion{Person: p, Faces: fs})
+			}
+		}
+		slices.SortFunc(s.Suggestions, func(a, b PersonSuggestion) int { return len(b.Faces) - len(a.Faces) })
+	}
+	c.faces.mu.Lock()
+	c.faces.snap = peopleSnapCache{snap: s, loaded: true}
+	c.faces.mu.Unlock()
+	if c.invalidate != nil {
+		c.invalidate()
+	}
+}
+
+// Avatars returns the shared face-avatar cache.
+func (c *Controller) Avatars() *avatarCache {
+	c.faces.avatarOnce.Do(func() {
+		c.faces.avatars = newAvatarCache(c.index, c.store, c.cacheDir, func() {
+			if c.invalidate != nil {
+				c.invalidate()
+			}
+		})
+	})
+	return c.faces.avatars
+}
+
+// FaceDetecting reports whether a detection pass is running.
+func (c *Controller) FaceDetecting() bool {
+	c.faces.mu.Lock()
+	defer c.faces.mu.Unlock()
+	return c.faces.pass != nil
+}
+
+// PersonSentinelName returns the toolbar title of a people sentinel.
+func (c *Controller) PersonSentinelName(dir string) string {
+	if dir == PeopleView {
+		return "People"
+	}
+	if id, ok := parseSentinelID(dir, PersonViewPrefix); ok {
+		if n, ok := c.index.PersonName(id); ok {
+			return n
+		}
+		return "Person"
+	}
+	if _, ok := parseSentinelID(dir, GroupViewPrefix); ok {
+		return "Unnamed group"
+	}
+	return dir
+}
+
+// SetCover makes faceID the avatar of personID.
+func (c *Controller) SetCover(personID, faceID int64) {
+	c.PeopleOp(func(idx *cache.Index) (*cache.Undo, string, error) {
+		u, err := idx.SetCover(personID, faceID)
+		return u, "Cover updated", err
+	}, nil)
+}
+
+// ConfirmAsName confirms faces as the person called name, creating the
+// person when the name is new ("Move to… → + New person").
+func (c *Controller) ConfirmAsName(faceIDs []int64, name string) {
+	c.PeopleOp(func(idx *cache.Index) (*cache.Undo, string, error) {
+		pid, ok := idx.PersonByName(name)
+		var created *cache.Undo
+		if !ok {
+			id, err := idx.CreatePerson(name)
+			if err != nil {
+				return nil, "", err
+			}
+			pid = id
+			created = cache.NewUndo("")
+			created.AddCreated(pid)
+		}
+		u, err := face.Retag(idx, c.faceMaxSq(), faceIDs, cache.VerdictConfirmed, pid)
+		if u != nil && created != nil {
+			u.Merge(created)
+		}
+		n, _ := idx.PersonName(pid)
+		return u, "Moved " + faceCountLabel(len(faceIDs)) + " to " + n, err
+	}, nil)
+}
+
+// SplitFaces takes faces out of an unnamed group into singleton groups
+// ("not this group" — there is no person to reject).
+func (c *Controller) SplitFaces(faceIDs []int64) {
+	c.PeopleOp(func(idx *cache.Index) (*cache.Undo, string, error) {
+		u := cache.NewUndo("Remove from group")
+		for _, id := range faceIDs {
+			f, ok := idx.Face(id)
+			if !ok {
+				continue
+			}
+			if _, err := idx.ReassignFace(id, 0, 0); err != nil {
+				return u, "", err
+			}
+			u.AddMove(id, f.ClusterID.Int64)
+		}
+		return u, "Removed " + faceCountLabel(len(faceIDs)) + " from the group", nil
+	}, nil)
+}
+
+// RenamePerson renames; a name held by someone else calls onExists (from
+// the op goroutine) so the UI can offer a merge.
+func (c *Controller) RenamePerson(id int64, name string, onExists func(otherID int64, otherName string)) {
+	c.PeopleOp(func(idx *cache.Index) (*cache.Undo, string, error) {
+		u, err := idx.RenamePerson(id, name)
+		return u, "Renamed to " + name, err
+	}, func(err error) {
+		var ex *cache.ErrNameExists
+		if errors.As(err, &ex) && onExists != nil {
+			onExists(ex.ID, ex.Name)
+		}
+	})
+}
+
+// MergePeople folds src into dst; the person view follows to dst.
+func (c *Controller) MergePeople(src, dst int64) {
+	c.PeopleOp(func(idx *cache.Index) (*cache.Undo, string, error) {
+		n, _ := idx.PersonName(dst)
+		u, err := idx.MergePeople(src, dst)
+		return u, "Merged into " + n, err
+	}, func(err error) {
+		if err == nil && c.activeDir() == PersonDir(src) {
+			c.SelectDir(PersonDir(dst))
+		}
+	})
+}
+
+// HidePerson toggles "don't show in People".
+func (c *Controller) HidePerson(id int64, hidden bool) {
+	msg := "Hidden from People"
+	if !hidden {
+		msg = "Shown in People"
+	}
+	c.PeopleOp(func(idx *cache.Index) (*cache.Undo, string, error) {
+		u, err := idx.HidePerson(id, hidden)
+		return u, msg, err
+	}, nil)
+}
+
+// NameGroup names an unnamed group (an existing name merges into that
+// person) and switches the grid to the person.
+func (c *Controller) NameGroup(clusterID int64, name string) {
+	var pid int64
+	c.PeopleOp(func(idx *cache.Index) (*cache.Undo, string, error) {
+		id, u, err := idx.NamePersonFromCluster(clusterID, name)
+		pid = id
+		return u, "Named " + name, err
+	}, func(err error) {
+		if err == nil && pid > 0 && c.activeDir() == GroupDir(clusterID) {
+			c.SelectDir(PersonDir(pid))
+		}
+	})
+}
+
+// IgnoreGroup marks every face of an unnamed group as ignored ("not a
+// person I care about").
+func (c *Controller) IgnoreGroup(clusterID int64) {
+	c.PeopleOp(func(idx *cache.Index) (*cache.Undo, string, error) {
+		fs, err := idx.FacesOfCluster(clusterID, cache.OrderPath)
+		if err != nil {
+			return nil, "", err
+		}
+		ids := make([]int64, len(fs))
+		for k, f := range fs {
+			ids[k] = f.ID
+		}
+		u, err := face.Retag(idx, c.faceMaxSq(), ids, cache.VerdictIgnored, 0)
+		return u, "Ignored " + faceCountLabel(len(ids)), err
+	}, func(err error) {
+		if err == nil && c.activeDir() == GroupDir(clusterID) {
+			c.SelectDir(PeopleView)
+		}
+	})
 }

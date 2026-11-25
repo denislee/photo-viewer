@@ -12,7 +12,7 @@ func subdirPaths(rows []sidebarRow) []string {
 	var out []string
 	for _, r := range rows {
 		switch r.path {
-		case FavoritesView, TrashView:
+		case FavoritesView, PeopleView, TrashView:
 			continue
 		}
 		out = append(out, r.path)
