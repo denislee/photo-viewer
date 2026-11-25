@@ -503,6 +503,59 @@ func New(invalidate func()) (*Player, error) {
 		C.pv_gl_destroy(gl)
 		return nil, errors.New("mpv_create failed")
 	}
+	// Options must be set before mpv_initialize.
+	if err := buildOptions(h, gl); err != nil {
+		C.mpv_terminate_destroy(h)
+		C.pv_gl_destroy(gl)
+		return nil, err
+	}
+
+	if rc := C.mpv_initialize(h); rc < 0 {
+		C.mpv_terminate_destroy(h)
+		C.pv_gl_destroy(gl)
+		return nil, fmt.Errorf("mpv_initialize: %s", C.GoString(C.mpv_error_string(rc)))
+	}
+
+	// Surface mpv's own warnings/errors to stderr (see drainEvents). When an
+	// internal libmpv/ffmpeg/hwdec assertion aborts the process, the message
+	// it logs first lands in the log immediately above the Go crash dump,
+	// which is the only breadcrumb a C-side abort() leaves behind.
+	lvl := C.CString("warn")
+	C.mpv_request_log_messages(h, lvl)
+	C.free(unsafe.Pointer(lvl))
+
+	p := &Player{h: h, invalidate: invalidate, drainDone: make(chan struct{})}
+	p.handle = cgo.NewHandle(p)
+	user := C.uintptr_t(p.handle)
+
+	// The render context's creation may fall back from GL to software, which
+	// also rewrites the GL-only options above to their SW-safe values, so read
+	// the GL context back from p afterwards.
+	if err := p.newRenderCtx(gl); err != nil {
+		return nil, err
+	}
+	gl = p.gl
+	// Before the callbacks are registered: goMpvRenderUpdate reads p.async
+	// from mpv's threads.
+	if gl != nil && asyncWanted() {
+		p.async = newAsyncRender()
+		go p.renderLoop(p.async)
+		log.Printf("video: rendering on a dedicated GL thread (PV_VIDEO_ASYNC)")
+	}
+	C.set_render_update_cb(p.ctx, user)
+	C.set_wakeup_cb(h, user)
+
+	// Drain events in the background so mpv's queue doesn't fill up.
+	go p.drainEvents()
+
+	return p, nil
+}
+
+// buildOptions sets the mpv options that must be applied before
+// mpv_initialize. gl is the headless GL context, nil when only the software
+// path is available; it decides the hwdec and rotation options. The caller
+// owns the cleanup of h and gl when it returns an error.
+func buildOptions(h *C.mpv_handle, gl *C.pv_gl) error {
 	// rotate is the video-rotate option: on the software path rotation is
 	// zeroed and baked in with a filter instead (see below); mpv's GL
 	// renderer rotates correctly by itself.
@@ -511,9 +564,9 @@ func New(invalidate func()) (*Player, error) {
 		rotate = "0"
 	}
 
-	// Options must be set before mpv_initialize. We disable on-screen text
-	// (the host UI provides its own controls), enable looping for the
-	// photo-viewer use case, and ask for hardware decoding when available.
+	// We disable on-screen text (the host UI provides its own controls),
+	// enable looping for the photo-viewer use case, and ask for hardware
+	// decoding when available.
 	setOpt := func(name, value string) error {
 		cn := C.CString(name)
 		cv := C.CString(value)
@@ -597,33 +650,22 @@ func New(invalidate func()) (*Player, error) {
 		{"hr-seek-framedrop", "yes"},
 	} {
 		if err := setOpt(kv[0], kv[1]); err != nil {
-			C.mpv_terminate_destroy(h)
-			C.pv_gl_destroy(gl)
-			return nil, err
+			return err
 		}
 	}
+	return nil
+}
 
-	if rc := C.mpv_initialize(h); rc < 0 {
-		C.mpv_terminate_destroy(h)
-		C.pv_gl_destroy(gl)
-		return nil, fmt.Errorf("mpv_initialize: %s", C.GoString(C.mpv_error_string(rc)))
-	}
-
-	// Surface mpv's own warnings/errors to stderr (see drainEvents). When an
-	// internal libmpv/ffmpeg/hwdec assertion aborts the process, the message
-	// it logs first lands in the log immediately above the Go crash dump,
-	// which is the only breadcrumb a C-side abort() leaves behind.
-	lvl := C.CString("warn")
-	C.mpv_request_log_messages(h, lvl)
-	C.free(unsafe.Pointer(lvl))
-
-	p := &Player{h: h, invalidate: invalidate, drainDone: make(chan struct{})}
-	p.handle = cgo.NewHandle(p)
-	user := C.uintptr_t(p.handle)
-
+// newRenderCtx creates the mpv render context and stores it on p, together with
+// the GL context actually backing it (nil on the software path). It tries the
+// OpenGL path first when gl is non-nil, and on failure destroys that GL context,
+// rewrites the GL-only options to their SW-safe values and falls back to the
+// software renderer. On a software-path failure it tears down the mpv handle
+// and the cgo handle before returning the error.
+func (p *Player) newRenderCtx(gl *C.pv_gl) error {
 	var ctx *C.mpv_render_context
 	if gl != nil {
-		if rc := C.create_render_ctx_gl(h, gl, &ctx); rc < 0 {
+		if rc := C.create_render_ctx_gl(p.h, gl, &ctx); rc < 0 {
 			log.Printf("video: mpv OpenGL render context: %s; using software rendering",
 				C.GoString(C.mpv_error_string(rc)))
 			C.pv_gl_destroy(gl)
@@ -633,35 +675,22 @@ func New(invalidate func()) (*Player, error) {
 			// SW-safe values before any file is loaded.
 			for _, kv := range [][2]string{{"hwdec", hwdecMode(false)}, {"video-rotate", "no"}} {
 				cn, cv := C.CString(kv[0]), C.CString(kv[1])
-				C.mpv_set_property_string(h, cn, cv)
+				C.mpv_set_property_string(p.h, cn, cv)
 				C.free(unsafe.Pointer(cn))
 				C.free(unsafe.Pointer(cv))
 			}
 		}
 	}
 	if gl == nil {
-		if rc := C.create_render_ctx_sw(h, &ctx); rc < 0 {
+		if rc := C.create_render_ctx_sw(p.h, &ctx); rc < 0 {
 			p.handle.Delete()
-			C.mpv_terminate_destroy(h)
-			return nil, fmt.Errorf("mpv_render_context_create: %s", C.GoString(C.mpv_error_string(rc)))
+			C.mpv_terminate_destroy(p.h)
+			return fmt.Errorf("mpv_render_context_create: %s", C.GoString(C.mpv_error_string(rc)))
 		}
 	}
 	p.ctx = ctx
 	p.gl = gl
-	// Before the callbacks are registered: goMpvRenderUpdate reads p.async
-	// from mpv's threads.
-	if gl != nil && asyncWanted() {
-		p.async = newAsyncRender()
-		go p.renderLoop(p.async)
-		log.Printf("video: rendering on a dedicated GL thread (PV_VIDEO_ASYNC)")
-	}
-	C.set_render_update_cb(ctx, user)
-	C.set_wakeup_cb(h, user)
-
-	// Drain events in the background so mpv's queue doesn't fill up.
-	go p.drainEvents()
-
-	return p, nil
+	return nil
 }
 
 // Load starts playback of path. Any previously-playing file is replaced.
