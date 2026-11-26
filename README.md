@@ -66,7 +66,7 @@ placeholder icon instead of a thumbnail).
 | `zenity` | Directory pickers and warning dialogs |
 | `udisksctl`, `lsblk` | SD-card detection and mounting for import |
 | `mpv`, `xdg-open` | "Open externally" (`o`) |
-| `pv-face-detect` + Python [`face_recognition`](https://github.com/ageitgey/face_recognition) | Face detection for People (GUI and `pv-scan`); `pipx install face_recognition` |
+| `pv-face-detect` + Python [`face_recognition`](https://github.com/ageitgey/face_recognition) | Face detection for People (GUI only); `pipx install face_recognition` |
 
 ## Build & run
 
@@ -81,10 +81,10 @@ If `-root` is omitted, the current working directory is used.
 
 | Command | What it does |
 | --- | --- |
-| `pv-scan -root DIR [-no-faces] [-v]` | Headless scan: builds or updates the index and thumbnails (and faces, when `pv-face-detect` is available) without a display. Ctrl-C stops cleanly. |
+| `pv-scan -root DIR [-v]` | Headless scan: builds or updates the index and thumbnails without a display. Face detection is GUI-only. Ctrl-C stops cleanly. |
 | `pv-organize -src DIR -dst DIR [-dry-run]` | Moves media into `DST/YYYY/MM/DD/` by capture date (exiftool). Never overwrites: name collisions get `_1`, `_2`, …. |
 | `pv-export-favorites -root DIR -dst DIR [-flatten] [-move] [-dry-run] [-max-long-edge N] [-jpeg-quality Q] [-video-crf C]` | Copies (or moves) every favorite out of the library. With `-max-long-edge`, images and videos are re-compressed; RAW files are always copied as-is. |
-| `pv-face-detect` | Python helper (`scripts/pv-face-detect.py`, installed by `make build`) that `pv-scan` runs as a long-lived `--server` process. `pv-face-detect --check` smoke-tests the install. It finds `face_recognition` in the current Python or in a pipx venv. |
+| `pv-face-detect` | Python helper (`scripts/pv-face-detect.py`, installed by `make build`) that the GUI runs as a long-lived `--server` process. `pv-face-detect --check` smoke-tests the install. It finds `face_recognition` in the current Python or in a pipx venv. |
 
 ## Configuration
 

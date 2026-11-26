@@ -10,7 +10,7 @@ import (
 
 // TestZeroFaceImageNotRedetectedByNextPipeline is the F5-01 end-to-end check
 // across a process boundary: an image that yielded zero detections must still
-// be remembered as scanned, so the next pv-scan run (a brand-new Pipeline,
+// be remembered as scanned, so the next GUI session (a brand-new Pipeline,
 // whose freshness mirror starts empty and is loaded from the index) skips it
 // instead of re-running detection forever. A newer thumbnail (different mtime)
 // must still be re-detected.

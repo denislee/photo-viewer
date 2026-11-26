@@ -219,7 +219,7 @@ func Load(dbPath string) (*Index, error) {
 	// face_thumb_mtime (v8, F5-01) records the thumbnail mtime the face
 	// pipeline last ran detection against, including runs that found no faces.
 	// Freshness used to be derived from face rows alone, so every face-free
-	// photo (most of a library) was re-detected on every pv-scan run. NULL means
+	// photo (most of a library) was re-detected on every detection pass. NULL means
 	// "never scanned for faces". Living on the entries row, it follows MovePath
 	// and is dropped by RemoveEntry/Clear with the row itself.
 	if err := addColumn(db, "ALTER TABLE entries ADD COLUMN face_thumb_mtime INTEGER"); err != nil {

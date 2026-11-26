@@ -454,8 +454,7 @@ func (i *Index) FindDuplicates() []DuplicateGroup {
 // enough to fix the clustering: each removed face is also taken out of its
 // cluster's running-mean centroid (subtractFacesTx), otherwise the centroid
 // keeps weighting toward files that no longer exist (I-04 6c). A running face
-// pipeline's in-memory cluster cache is not told; only pv-scan runs one, and
-// it never deletes.
+// pipeline's (the GUI's) in-memory cluster cache is not told.
 func (i *Index) RemoveEntry(path string) error {
 	tx, err := i.db.Begin()
 	if err != nil {

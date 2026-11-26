@@ -49,7 +49,7 @@ func (p *Pipeline) Retag(faceIDs []int64, verdict cache.Verdict, personID int64)
 	return undo, err
 }
 
-// Retag is Pipeline.Retag for callers without a pipeline (pv-scan, tests).
+// Retag is Pipeline.Retag for callers without a pipeline (tests).
 // maxSq is the strictness threshold (0 = default).
 func Retag(idx *cache.Index, maxSq float64, faceIDs []int64, verdict cache.Verdict, personID int64) (*cache.Undo, error) {
 	undo, err := idx.TagFaces(faceIDs, verdict, personID)

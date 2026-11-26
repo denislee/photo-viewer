@@ -149,7 +149,7 @@ func (p *Pipeline) Start(parent context.Context) {
 }
 
 // Stop asks the workers to drain what's already queued and exit, then waits for
-// them. Use this for graceful drain at end of run (e.g. pv-scan completion).
+// them. Use this for graceful drain at end of run (e.g. the GUI shutting down).
 // Safe to call multiple times.
 //
 // Shutdown is signalled by closing the private quit channel, NOT the jobs
@@ -193,7 +193,7 @@ func (p *Pipeline) Submit(j Job) {
 	}
 }
 
-// SubmitBlocking is the variant headless callers (pv-scan) use: it blocks
+// SubmitBlocking is the variant the GUI detection pass uses: it blocks
 // until the job is accepted by a worker. Returns false if the pipeline is
 // stopped or the entry isn't a face candidate, so callers can stop early.
 func (p *Pipeline) SubmitBlocking(ctx context.Context, j Job) bool {
