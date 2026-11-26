@@ -40,6 +40,10 @@ type SettingsView struct {
 	// Face recognition section (settings_faces.go).
 	facesOn         widget.Bool
 	facesRecheck    widget.Clickable
+	facesDetectBtn  widget.Clickable
+	facesRegroupBtn widget.Clickable
+	facesPauseBtn   widget.Clickable
+	facesStopBtn    widget.Clickable
 	strictness      widget.Enum
 	forgetBtn       widget.Clickable
 	forgetKeepBtn   widget.Clickable

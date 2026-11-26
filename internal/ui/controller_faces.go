@@ -84,11 +84,17 @@ var newFacePipeline = func(idx *cache.Index, onChange face.OnClusterChange) *fac
 type faceState struct {
 	ops sync.Mutex
 
-	mu       sync.Mutex
-	pipe     *face.Pipeline
-	status   face.Status
-	probed   bool
-	probing  bool
+	mu      sync.Mutex
+	pipe    *face.Pipeline
+	status  face.Status
+	probed  bool
+	probing bool
+	// checking is true while a Settings → Recheck probe (1–15 s) is in
+	// flight, so the row can say so and extra clicks don't stack probes.
+	checking  bool
+	checkedAt time.Time // when the last Recheck finished
+	// lastPass summarises the last finished detection pass for Settings.
+	lastPass string
 	ctx      context.Context // parent of the workers; cancelled by StopFaces
 	stop     context.CancelFunc
 	pass     context.CancelFunc // in-flight detection pass
@@ -191,13 +197,22 @@ func (c *Controller) StartFaces() {
 	}()
 }
 
-// RecheckFaces re-probes the helper (Settings → Recheck) and starts the
-// pipeline if it just became available.
+// RecheckFaces re-probes the helper (Settings → Recheck), reports the result
+// as a toast and starts the pipeline if it just became available; when it is
+// already running, StartFaces runs a fresh detection pass so photos added
+// since the last one are picked up. A click while a probe is in flight is
+// ignored.
 func (c *Controller) RecheckFaces() {
-	go func() {
-		c.faces.mu.Lock()
-		p := c.faces.pipe
+	c.faces.mu.Lock()
+	if c.faces.checking {
 		c.faces.mu.Unlock()
+		return
+	}
+	c.faces.checking = true
+	p := c.faces.pipe
+	c.faces.mu.Unlock()
+	c.bumpPeople()
+	go func() {
 		var st face.Status
 		if p != nil {
 			st = p.Recheck()
@@ -206,12 +221,66 @@ func (c *Controller) RecheckFaces() {
 		}
 		c.faces.mu.Lock()
 		c.faces.status, c.faces.probed = st, true
+		c.faces.checking = false
+		c.faces.checkedAt = time.Now()
 		c.faces.mu.Unlock()
+		c.setToast(recheckToast(st))
 		c.bumpPeople()
 		if st.Working && FacesEnabled() {
 			c.StartFaces()
 		}
 	}()
+}
+
+// recheckToast is the one-line result of a Recheck.
+func recheckToast(st face.Status) string {
+	switch {
+	case st.Working:
+		return "Face helper OK"
+	case st.BinaryPath == "":
+		return "Face helper not installed"
+	default:
+		return "Face helper broken: " + st.Error
+	}
+}
+
+// FaceChecking reports whether a Recheck probe is in flight and when the
+// last one finished (zero before the first).
+func (c *Controller) FaceChecking() (bool, time.Time) {
+	c.faces.mu.Lock()
+	defer c.faces.mu.Unlock()
+	return c.faces.checking, c.faces.checkedAt
+}
+
+// LastFacePass summarises the last finished detection pass ("" before one).
+func (c *Controller) LastFacePass() string {
+	c.faces.mu.Lock()
+	defer c.faces.mu.Unlock()
+	return c.faces.lastPass
+}
+
+// FaceTask returns the running face task (detection pass or regroup), if
+// any, so Settings can show its progress and pause or stop it.
+func (c *Controller) FaceTask() (ProcessSnapshot, bool) {
+	for _, s := range c.processes.Snapshot() {
+		if s.Kind == ProcFaces {
+			return s, true
+		}
+	}
+	return ProcessSnapshot{}, false
+}
+
+// passSummary is the Settings line for a finished detection pass: how many
+// photos it went through and how many were new to the detector (the rest
+// were already fresh).
+func passSummary(at time.Time, checked, total, sent int, stopped bool) string {
+	s := at.Format("15:04") + ": "
+	if stopped {
+		s += "stopped after " + strconv.Itoa(checked) + " of " + strconv.Itoa(total) + " photos"
+	} else {
+		s += strconv.Itoa(total) + " photos checked"
+	}
+	return "Last scan " + s + ", " + strconv.Itoa(sent) + " sent for detection"
 }
 
 // StopFaces cancels the detection pass and stops the workers (window close,
@@ -292,6 +361,13 @@ func (c *Controller) detectFaces(parent context.Context) bool {
 	proc := c.processes.Begin(ctx, ProcFaces, "Detecting faces", cancel, true)
 	defer proc.End()
 	proc.SetTotal(int64(len(cands)))
+	checked, sent := 0, 0
+	defer func() {
+		sum := passSummary(time.Now(), checked, len(cands), sent, checked < len(cands))
+		c.faces.mu.Lock()
+		c.faces.lastPass = sum
+		c.faces.mu.Unlock()
+	}()
 	for n, e := range cands {
 		proc.Wait()
 		if ctx.Err() != nil {
@@ -303,12 +379,17 @@ func (c *Controller) detectFaces(parent context.Context) bool {
 			if info, err := os.Stat(thumb); err == nil {
 				// Blocking submit: this goroutine is the pass, so back-pressure
 				// paces it to the workers instead of dropping jobs.
-				if !p.SubmitBlocking(ctx, face.Job{Entry: e, ThumbPath: thumb, ThumbMod: info.ModTime().Unix()}) && ctx.Err() == nil && !p.Enabled() {
+				// false also means "already fresh": only a disabled
+				// pipeline ends the pass.
+				if p.SubmitBlocking(ctx, face.Job{Entry: e, ThumbPath: thumb, ThumbMod: info.ModTime().Unix()}) {
+					sent++
+				} else if ctx.Err() == nil && !p.Enabled() {
 					return false
 				}
 			}
 		}
-		proc.SetDone(int64(n + 1))
+		checked = n + 1
+		proc.SetDone(int64(checked))
 	}
 	return ctx.Err() == nil
 }

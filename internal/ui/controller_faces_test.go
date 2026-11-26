@@ -393,3 +393,37 @@ func TestFacesDisabledSetting(t *testing.T) {
 		t.Fatal("faces running 300ms after StartFaces with the toggle off")
 	}
 }
+
+// TestRecheckFacesFeedback is the regression for "Recheck shows nothing": the
+// probe is visible while it runs, a finished Recheck records its time and
+// toasts the result, and the pass it starts leaves a summary even when every
+// photo was already fresh (the case that used to finish silently).
+func TestRecheckFacesFeedback(t *testing.T) {
+	c := newFaceTestLibrary(t)
+	installFakeFaceHelper(t)
+	t.Cleanup(c.StopFaces)
+
+	c.RecheckFaces()
+	if checking, _ := c.FaceChecking(); !checking {
+		t.Fatal("FaceChecking() = false right after RecheckFaces, want true")
+	}
+	c.RecheckFaces() // ignored while the first probe runs
+
+	waitForFaces(t, "recheck to finish", func() bool {
+		checking, at := c.FaceChecking()
+		return !checking && !at.IsZero()
+	})
+	if msg, ok := c.Toast(); !ok || msg != "Face helper OK" {
+		t.Fatalf("Toast() = (%q, %v), want (%q, true)", msg, ok, "Face helper OK")
+	}
+	waitForFaces(t, "first scan summary", func() bool {
+		return strings.HasSuffix(c.LastFacePass(), "3 photos checked, 3 sent for detection")
+	})
+	waitForFaces(t, "detection pass to end", func() bool { return !c.FaceDetecting() })
+
+	// A second Recheck with nothing new still reports a finished scan.
+	c.RecheckFaces()
+	waitForFaces(t, "second scan summary", func() bool {
+		return strings.HasSuffix(c.LastFacePass(), "3 photos checked, 0 sent for detection")
+	})
+}

@@ -231,6 +231,8 @@ type ProcessSnapshot struct {
 	Done   int64
 	Total  int64
 	Paused bool
+	// Pausable is false for tasks started without a pause gate.
+	Pausable bool
 }
 
 // processNotifyInterval is the minimum spacing between frame-loop wakeups
@@ -408,13 +410,14 @@ func (r *ProcessRegistry) Snapshot() []ProcessSnapshot {
 		status := p.status
 		p.mu.Unlock()
 		out[i] = ProcessSnapshot{
-			ID:     p.ID,
-			Kind:   p.Kind,
-			Title:  p.Title,
-			Status: status,
-			Done:   p.done.Load(),
-			Total:  p.total.Load(),
-			Paused: p.IsPaused(),
+			ID:       p.ID,
+			Kind:     p.Kind,
+			Title:    p.Title,
+			Status:   status,
+			Done:     p.done.Load(),
+			Total:    p.total.Load(),
+			Paused:   p.IsPaused(),
+			Pausable: p.gate != nil,
 		}
 	}
 	return out
