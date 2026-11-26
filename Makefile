@@ -1,4 +1,4 @@
-.PHONY: all build install uninstall test race test-video test-py lint vuln check clean run fmt fmt-check vet
+.PHONY: all build install face-deps check-face uninstall test race test-video test-py lint vuln check clean run fmt fmt-check vet
 
 # Binaries
 APP_BIN=photo-viewer
@@ -27,9 +27,13 @@ all: build
 # -o pointing at a directory, each main package is written there under its
 # directory name: photo-viewer (the module root), pv-scan, pv-organize and
 # pv-export-favorites — the *_BIN names above.
-build:
+build: $(FACE_BIN)
 	go build -o . . ./cmd/...
-	@if [ -f "./scripts/pv-face-detect.py" ]; then install -m 0755 ./scripts/pv-face-detect.py ./$(FACE_BIN); fi
+
+# The face helper is the Python script, installed executable under its
+# command name; a file rule so check-face never tests a stale copy.
+$(FACE_BIN): scripts/pv-face-detect.py
+	install -m 0755 $< $@
 
 # Rebuilds from the current tree, then copies every binary into $(BINDIR).
 # pv-face-detect is looked up on PATH (or next to photo-viewer), so it goes
@@ -55,6 +59,30 @@ install: build
 	@command -v update-desktop-database >/dev/null 2>&1 && [ -z "$(DESTDIR)" ] && update-desktop-database -q "$(APPDIR)" || true
 	@echo "Installed to $(DESTDIR)$(BINDIR) (+ $(DESTDIR)$(APPDIR)/$(DESKTOP_FILE))"
 	@case ":$$PATH:" in *":$(BINDIR):"*) ;; *) echo "note: $(BINDIR) is not on your PATH";; esac
+	@[ -n "$(DESTDIR)" ] || $(MAKE) --no-print-directory check-face FACE_HELPER="$(BINDIR)/$(FACE_BIN)"
+
+# Runs the face helper's self-test (the same --check the GUI's Recheck runs)
+# and explains the fix when it fails. Never fails the build: faces are
+# optional, the GUI just keeps the People feature off.
+FACE_HELPER ?= ./$(FACE_BIN)
+check-face: $(FACE_BIN)
+	@if [ ! -x "$(FACE_HELPER)" ]; then echo "face helper: $(FACE_HELPER) not built"; \
+	elif out=$$("$(FACE_HELPER)" --check 2>&1); then echo "face helper: $$out"; \
+	else echo "warning: face detection stays off until the helper works:"; \
+		echo "$$out" | sed 's/^/  /'; fi
+
+# (Re)builds the Python side of face detection in a pipx venv. pip builds
+# dlib from source against the system's shared libraries (needs cmake and a
+# C++ compiler, and takes several minutes), so a system upgrade that drops
+# one of them breaks the venv with "cannot open shared object file";
+# --no-cache-dir makes the rebuild relink instead of reusing the stale wheel.
+# face_recognition_models still imports pkg_resources, which setuptools 81
+# removed, hence the pin.
+face-deps: build
+	@command -v pipx >/dev/null || { echo "face-deps: pipx not found (e.g. pacman -S python-pipx)"; exit 1; }
+	pipx install --force --pip-args=--no-cache-dir face_recognition
+	pipx inject face-recognition 'setuptools<81'
+	@$(MAKE) --no-print-directory check-face
 
 uninstall:
 	rm -f $(addprefix "$(DESTDIR)$(BINDIR)/,$(addsuffix ",$(APP_BIN) $(SCAN_BIN) $(ORGANIZE_BIN) $(EXPORT_FAV_BIN) $(FACE_BIN))) \

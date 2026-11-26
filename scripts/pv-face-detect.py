@@ -17,6 +17,32 @@ import os
 import subprocess
 import sys
 import time
+import warnings
+
+# face_recognition_models imports pkg_resources, which prints a deprecation
+# UserWarning on every start. The Go side shows this process's stderr as the
+# helper status in Settings, so keep it to real errors.
+warnings.filterwarnings("ignore", message=".*pkg_resources is deprecated.*")
+
+# One "<interpreter>: <why>" line per interpreter that could not import
+# face_recognition, so a failed --check names the real cause (a missing
+# module, or e.g. a dlib built against a since-upgraded shared library)
+# instead of only the last interpreter tried.
+_import_failures: "list[str]" = []
+
+# The one-line fix printed with every "not usable" error. `make face-deps`
+# (re)builds a pipx venv with face_recognition and a pkg_resources-providing
+# setuptools; the bare pipx line is for installs without the checkout.
+_FIX_HINT = (
+    "Fix: run `make face-deps` in the photo-viewer checkout, or\n"
+    "  pipx install --force --pip-args=--no-cache-dir face_recognition && "
+    "pipx inject face-recognition 'setuptools<81'"
+)
+
+
+def _last_line(text: str) -> str:
+    lines = [l.strip() for l in text.strip().splitlines() if l.strip()]
+    return lines[-1] if lines else ""
 
 # Probe budgets for picking a pipx venv (S3-05). A single
 # `python -c "import face_recognition"` probe may run for at most
@@ -82,14 +108,24 @@ def _can_import_face_recognition(py: str, timeout: float = _PROBE_IMPORT_TIMEOUT
     try:
         proc = subprocess.run(
             [py, "-c", "import face_recognition"],
+            env={**os.environ, "PYTHONWARNINGS": "ignore"},
             stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            text=True,
             timeout=timeout,
         )
-    except (OSError, subprocess.SubprocessError):
+    except subprocess.TimeoutExpired:
+        _import_failures.append(f"{py}: import timed out after {timeout:g}s")
         return False
-    return proc.returncode == 0
+    except (OSError, subprocess.SubprocessError) as e:
+        _import_failures.append(f"{py}: {e}")
+        return False
+    if proc.returncode != 0:
+        why = _last_line(proc.stderr) or f"exit status {proc.returncode}"
+        _import_failures.append(f"{py}: {why}")
+        return False
+    return True
 
 
 def _try_reexec_with_pipx() -> None:
@@ -115,8 +151,8 @@ def _try_reexec_with_pipx() -> None:
     try:
         import face_recognition  # noqa: F401
         return
-    except ImportError:
-        pass
+    except ImportError as e:
+        _import_failures.append(f"{sys.executable}: {e}")
     home = os.path.expanduser("~")
     bases = [
         os.path.join(home, ".local", "pipx", "venvs"),
@@ -146,24 +182,24 @@ _try_reexec_with_pipx()
 # Catch SystemExit explicitly so a broken install can't masquerade as good.
 try:
     import face_recognition  # type: ignore
-except ImportError:
+except ImportError as e:
+    if not _import_failures:  # re-exec'd, or the pipx pass never ran
+        _import_failures.append(f"{sys.executable}: {e}")
     sys.stderr.write(
-        "face_recognition not importable from "
-        + sys.executable
-        + ". Install it on this interpreter, e.g.\n"
-        + "  pip install --user face_recognition\n"
-        + "or expose your pipx venv to PATH.\n"
+        "face_recognition is not usable; tried:\n"
+        + "".join(f"  {f}\n" for f in _import_failures)
+        + _FIX_HINT
+        + "\n"
     )
     sys.exit(2)
 except SystemExit as e:
     sys.stderr.write(
         "face_recognition import aborted on "
         + sys.executable
-        + f" (SystemExit code={e.code}). "
-        + "This usually means face_recognition_models can't load its data files — "
-        + "in a pipx venv on Python 3.12+ that's most often a missing setuptools.\n"
-        + "Try: pipx inject face-recognition setuptools\n"
-        + "Or:  pip install --user setuptools face_recognition\n"
+        + f" (SystemExit code={e.code}): face_recognition_models can't load "
+        + "its data files, most often a missing setuptools (pkg_resources).\n"
+        + _FIX_HINT
+        + "\n"
     )
     sys.exit(2)
 

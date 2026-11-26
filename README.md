@@ -66,13 +66,16 @@ placeholder icon instead of a thumbnail).
 | `zenity` | Directory pickers and warning dialogs |
 | `udisksctl`, `lsblk` | SD-card detection and mounting for import |
 | `mpv`, `xdg-open` | "Open externally" (`o`) |
-| `pv-face-detect` + Python [`face_recognition`](https://github.com/ageitgey/face_recognition) | Face detection for People (GUI only); `pipx install face_recognition` |
+| `pv-face-detect` + Python [`face_recognition`](https://github.com/ageitgey/face_recognition) | Face detection for People (GUI only); `make face-deps` (pipx venv, builds dlib: needs cmake + a C++ compiler) |
 
 ## Build & run
 
 ```sh
 make build            # photo-viewer, pv-scan, pv-organize, pv-export-favorites, ./pv-face-detect
 ./photo-viewer -root /path/to/photos
+make install          # copy everything to ~/.local/bin (PREFIX=… to change) and self-test the face helper
+make face-deps        # (re)build face_recognition in a pipx venv; rerun after a system upgrade breaks dlib
+make check-face       # the helper's --check, with the reason and fix when it fails
 ```
 
 If `-root` is omitted, the current working directory is used.

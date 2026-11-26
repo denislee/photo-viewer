@@ -39,7 +39,7 @@ if [ "$1" = "-c" ]; then
             esac
             case ":$FR_OK_VENVS:" in
                 *":$name:"*) exit 0 ;;
-                *) exit 1 ;;
+                *) echo "ImportError: fake $name" >&2; exit 1 ;;
             esac ;;
     esac
     exit 0
@@ -91,7 +91,13 @@ def _run(venvs, fr_ok, extra_env=None):
             env=env, capture_output=True, text=True, timeout=30,
         )
         elapsed = time.monotonic() - started
+        global _last_stderr
+        _last_stderr = proc.stderr
         return proc.returncode, proc.stdout, elapsed
+
+
+# stderr of the most recent _run, for the tests that check the error text.
+_last_stderr = ""
 
 
 def _reexec_target(stdout):
@@ -135,6 +141,20 @@ def test_no_working_venv_degrades_to_unavailable_not_crash():
     rc, out, _ = _run(["ansible", "black"], fr_ok=[])
     assert _reexec_target(out) is None, out
     assert rc == 2, (rc, out)
+
+
+def test_unusable_error_names_every_interpreter_and_the_fix():
+    # The --check error is what Settings shows: it must give each
+    # interpreter's real import error (not just "not importable from
+    # /usr/bin/python3") and the one command that repairs the install.
+    rc, _, _ = _run(["ansible", "face-recognition"], fr_ok=[])
+    assert rc == 2, rc
+    err = _last_stderr
+    assert "face_recognition is not usable; tried:" in err, err
+    assert sys.executable + ": No module named 'face_recognition'" in err, err
+    assert "face-recognition/bin/python: ImportError: fake face-recognition" in err, err
+    assert "ansible/bin/python: ImportError: fake ansible" in err, err
+    assert "make face-deps" in err, err
 
 
 def test_no_pipx_dir_at_all_degrades_to_unavailable():
