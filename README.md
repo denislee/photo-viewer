@@ -66,7 +66,7 @@ placeholder icon instead of a thumbnail).
 | `zenity` | Directory pickers and warning dialogs |
 | `udisksctl`, `lsblk` | SD-card detection and mounting for import |
 | `mpv`, `xdg-open` | "Open externally" (`o`) |
-| `pv-face-detect` + Python [`face_recognition`](https://github.com/ageitgey/face_recognition) | Face detection for People (GUI only); `make face-deps` (pipx venv, builds dlib: needs cmake + a C++ compiler) |
+| `pv-face-detect` + Python [`face_recognition`](https://github.com/ageitgey/face_recognition) | Face detection for People (GUI only); `make face-deps` (private venv in `~/.local/share/photo-viewer/face-venv`, no pipx needed; builds dlib: needs cmake + a C++ compiler) |
 
 ## Build & run
 
@@ -74,7 +74,7 @@ placeholder icon instead of a thumbnail).
 make build            # photo-viewer, pv-scan, pv-organize, pv-export-favorites, ./pv-face-detect
 ./photo-viewer -root /path/to/photos
 make install          # copy everything to ~/.local/bin (PREFIX=… to change) and self-test the face helper
-make face-deps        # (re)build face_recognition in a pipx venv; rerun after a system upgrade breaks dlib
+make face-deps        # (re)build face_recognition in a private venv; rerun after a system upgrade breaks dlib
 make check-face       # the helper's --check, with the reason and fix when it fails
 ```
 
@@ -87,7 +87,7 @@ If `-root` is omitted, the current working directory is used.
 | `pv-scan -root DIR [-v]` | Headless scan: builds or updates the index and thumbnails without a display. Face detection is GUI-only. Ctrl-C stops cleanly. |
 | `pv-organize -src DIR -dst DIR [-dry-run]` | Moves media into `DST/YYYY/MM/DD/` by capture date (exiftool). Never overwrites: name collisions get `_1`, `_2`, …. |
 | `pv-export-favorites -root DIR -dst DIR [-flatten] [-move] [-dry-run] [-max-long-edge N] [-jpeg-quality Q] [-video-crf C]` | Copies (or moves) every favorite out of the library. With `-max-long-edge`, images and videos are re-compressed; RAW files are always copied as-is. |
-| `pv-face-detect` | Python helper (`scripts/pv-face-detect.py`, installed by `make build`) that the GUI runs as a long-lived `--server` process. `pv-face-detect --check` smoke-tests the install. It finds `face_recognition` in the current Python or in a pipx venv. |
+| `pv-face-detect` | Python helper (`scripts/pv-face-detect.py`, installed by `make build`) that the GUI runs as a long-lived `--server` process. `pv-face-detect --check` smoke-tests the install. It finds `face_recognition` in the current Python, the `make face-deps` venv, or a pipx venv. |
 
 ## Configuration
 

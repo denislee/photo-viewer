@@ -31,13 +31,21 @@ warnings.filterwarnings("ignore", message=".*pkg_resources is deprecated.*")
 _import_failures: "list[str]" = []
 
 # The one-line fix printed with every "not usable" error. `make face-deps`
-# (re)builds a pipx venv with face_recognition and a pkg_resources-providing
-# setuptools; the bare pipx line is for installs without the checkout.
+# (re)builds a private venv with face_recognition and a pkg_resources-providing
+# setuptools, using only python3's stdlib venv (no pipx needed).
 _FIX_HINT = (
-    "Fix: run `make face-deps` in the photo-viewer checkout, or\n"
-    "  pipx install --force --pip-args=--no-cache-dir face_recognition && "
-    "pipx inject face-recognition 'setuptools<81'"
+    "Fix: run `make face-deps` in the photo-viewer checkout (builds dlib into "
+    "a private venv; needs cmake and a C++ compiler)"
 )
+
+
+def _own_venv_python() -> str:
+    """The interpreter of the venv `make face-deps` builds:
+    $XDG_DATA_HOME/photo-viewer/face-venv (default ~/.local/share/...)."""
+    data = os.environ.get("XDG_DATA_HOME") or os.path.join(
+        os.path.expanduser("~"), ".local", "share"
+    )
+    return os.path.join(data, "photo-viewer", "face-venv", "bin", "python")
 
 
 def _last_line(text: str) -> str:
@@ -128,11 +136,11 @@ def _can_import_face_recognition(py: str, timeout: float = _PROBE_IMPORT_TIMEOUT
     return True
 
 
-def _try_reexec_with_pipx() -> None:
-    """If face_recognition isn't importable here, look for it inside common
-    pipx venvs and re-exec the script under an interpreter that actually has
-    it. This lets `pipx install face_recognition` work without forcing the
-    user to duplicate the package into the system Python.
+def _try_reexec_with_venv() -> None:
+    """If face_recognition isn't importable here, look for it in the venv
+    `make face-deps` builds, then in common pipx venvs, and re-exec the script
+    under an interpreter that actually has it, so it never has to be
+    installed into the system Python.
 
     Selection is deliberately careful: `os.execve` *replaces* this process, so
     execing into the wrong venv (e.g. an alphabetically-earlier `ansible` or
@@ -159,7 +167,9 @@ def _try_reexec_with_pipx() -> None:
         os.path.join(home, ".local", "share", "pipx", "venvs"),
     ]
     deadline = time.monotonic() + _PROBE_TOTAL_BUDGET
-    for py in _pipx_venv_pythons(bases):
+    own = _own_venv_python()
+    candidates = ([own] if os.path.exists(own) else []) + _pipx_venv_pythons(bases)
+    for py in candidates:
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             # Budget spent; degrade to "unavailable" rather than time out the
@@ -175,7 +185,7 @@ def _try_reexec_with_pipx() -> None:
             continue
 
 
-_try_reexec_with_pipx()
+_try_reexec_with_venv()
 
 # face_recognition's __init__ calls sys.exit(0) when its model files aren't
 # importable — the import "succeeds" silently from the OS's point of view.

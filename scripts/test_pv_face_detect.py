@@ -50,11 +50,18 @@ exit 0
 """
 
 
+# A venv name that _make_tree places where `make face-deps` builds its venv
+# ($HOME/.local/share/photo-viewer/face-venv) instead of under pipx.
+OWN_VENV = "face-venv"
+
+
 def _make_tree(home, venvs):
-    """Create fake pipx venvs (name -> bin/python) under a fake HOME."""
+    """Create fake pipx venvs (name -> bin/python) under a fake HOME;
+    OWN_VENV goes to the face-deps location instead."""
     base = os.path.join(home, ".local", "pipx", "venvs")
     for name in venvs:
-        bindir = os.path.join(base, name, "bin")
+        root = os.path.join(home, ".local", "share", "photo-viewer") if name == OWN_VENV else base
+        bindir = os.path.join(root, name, "bin")
         os.makedirs(bindir, exist_ok=True)
         py = os.path.join(bindir, "python")
         with open(py, "w") as fh:
@@ -74,6 +81,7 @@ def _run(venvs, fr_ok, extra_env=None):
         env["HOME"] = home
         env["FR_OK_VENVS"] = ":".join(fr_ok)
         env.pop("PV_FACE_REEXECED", None)
+        env.pop("XDG_DATA_HOME", None)  # the face-deps venv must come from the fake HOME
         env.pop("FR_HANG_VENVS", None)
         env.update(extra_env or {})
         # If face_recognition happens to be importable in the test runner's
@@ -155,6 +163,20 @@ def test_unusable_error_names_every_interpreter_and_the_fix():
     assert "face-recognition/bin/python: ImportError: fake face-recognition" in err, err
     assert "ansible/bin/python: ImportError: fake ansible" in err, err
     assert "make face-deps" in err, err
+    assert "pipx" not in err.split("Fix:")[1], err  # cfsc had no pipx
+
+
+def test_face_deps_venv_wins_over_pipx():
+    # The venv `make face-deps` builds is tried before any pipx venv, so it
+    # works on machines without pipx and beats a stale pipx install.
+    rc, out, _ = _run(["face-recognition", OWN_VENV], fr_ok=["face-recognition", OWN_VENV])
+    assert _reexec_target(out) == OWN_VENV, out
+
+
+def test_broken_face_deps_venv_falls_back_to_pipx():
+    rc, out, _ = _run(["face-recognition", OWN_VENV], fr_ok=["face-recognition"])
+    # A broken face-deps venv must not strand us: probing skips it.
+    assert _reexec_target(out) == "face-recognition", out
 
 
 def test_no_pipx_dir_at_all_degrades_to_unavailable():

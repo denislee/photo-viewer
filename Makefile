@@ -71,17 +71,27 @@ check-face: $(FACE_BIN)
 	else echo "warning: face detection stays off until the helper works:"; \
 		echo "$$out" | sed 's/^/  /'; fi
 
-# (Re)builds the Python side of face detection in a pipx venv. pip builds
-# dlib from source against the system's shared libraries (needs cmake and a
-# C++ compiler, and takes several minutes), so a system upgrade that drops
-# one of them breaks the venv with "cannot open shared object file";
-# --no-cache-dir makes the rebuild relink instead of reusing the stale wheel.
+# (Re)builds the Python side of face detection in a private venv
+# ($(FACE_VENV), where pv-face-detect looks first) using only python3's stdlib
+# venv, so pipx is not needed. pip builds dlib from source against the
+# system's shared libraries (needs cmake and a C++ compiler, and takes
+# several minutes), so a system upgrade that drops one of them breaks the
+# venv with "cannot open shared object file"; --clear and --no-cache-dir
+# make the rebuild relink instead of reusing the stale wheel.
 # face_recognition_models still imports pkg_resources, which setuptools 81
-# removed, hence the pin.
-face-deps: build
-	@command -v pipx >/dev/null || { echo "face-deps: pipx not found (e.g. pacman -S python-pipx)"; exit 1; }
-	pipx install --force --pip-args=--no-cache-dir face_recognition
-	pipx inject face-recognition 'setuptools<81'
+# removed, hence the pin. dlib turns CUDA on whenever it finds a toolkit, and
+# that build fails to import when the driver lags the toolkit ("CUDA driver
+# version is insufficient"); the helper runs the CPU HOG detector, so CUDA is
+# off unless DLIB_USE_CUDA=1. The last step tests the venv's own interpreter:
+# a working system Python must not mask a broken venv.
+FACE_VENV ?= $(or $(XDG_DATA_HOME),$(HOME)/.local/share)/photo-viewer/face-venv
+DLIB_USE_CUDA ?= 0
+face-deps: $(FACE_BIN)
+	@for t in cmake c++; do command -v $$t >/dev/null || { echo "face-deps: $$t not found; dlib builds from source (Arch: sudo pacman -S --needed cmake base-devel)"; exit 1; }; done
+	python3 -m venv --clear "$(FACE_VENV)"
+	DLIB_USE_CUDA=$(DLIB_USE_CUDA) CMAKE_BUILD_PARALLEL_LEVEL=$$(nproc) \
+		"$(FACE_VENV)/bin/python" -m pip install --no-cache-dir 'setuptools<81' face_recognition
+	"$(FACE_VENV)/bin/python" ./$(FACE_BIN) --check && echo
 	@$(MAKE) --no-print-directory check-face
 
 uninstall:
