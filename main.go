@@ -53,6 +53,7 @@ func main() {
 	// sort mode from it (U6-B1).
 	ui.LoadConfig()
 	ctrl := ui.NewController(abs, idx, store, cacheDir)
+	ctrl.SetIndexPath(dbPath)
 
 	go func() {
 		w := new(app.Window)

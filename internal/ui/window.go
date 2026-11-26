@@ -250,6 +250,16 @@ func wireSidebar(sidebar *Sidebar, search *FuzzySearchView, grid *Grid, viewer *
 // opens. The background actions (rebuild, favorites export) run on their own
 // goroutine so a slow disk never blocks the event loop; the config-backed
 // toggles persist through UpdateConfig.
+// linkSettingsToWebServer wires Settings' "Web server › Open" row: close
+// Settings, then open the panel through the same path as the toolbar button,
+// so only one modal is open afterwards.
+func linkSettingsToWebServer(settings *SettingsView, openWebServer func()) {
+	settings.OnOpenWebServer = func() {
+		settings.Close()
+		openWebServer()
+	}
+}
+
 func wireToolbar(toolbar *Toolbar, ctrl *Controller, imports *ImportView, dups *DuplicatesView, organize *OrganizeView, settings *SettingsView, webView *WebServerView, w *app.Window) {
 	toolbar.OnImport = func() {
 		imports.Show()
@@ -284,6 +294,7 @@ func wireToolbar(toolbar *Toolbar, ctrl *Controller, imports *ImportView, dups *
 		webView.Show()
 		w.Invalidate()
 	}
+	linkSettingsToWebServer(settings, toolbar.OnWebServer)
 	toolbar.OnFilter = func(f string) {
 		ctrl.SetFilter(f)
 	}

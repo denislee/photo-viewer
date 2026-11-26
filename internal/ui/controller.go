@@ -67,6 +67,7 @@ type Controller struct {
 	libraryRoot string
 	cacheDir    string
 	trashDir    string
+	indexPath   string // the SQLite file, for display only (SetIndexPath)
 	index       *cache.Index
 	store       *cache.ThumbStore
 
@@ -254,6 +255,17 @@ func (c *Controller) LibraryRoot() string      { return c.libraryRoot }
 func (c *Controller) Thumbs() *thumbCache      { return c.thumbs }
 func (c *Controller) Index() *cache.Index      { return c.index }
 func (c *Controller) Store() *cache.ThumbStore { return c.store }
+
+// SetIndexPath records where the index db lives (cache.Locate's dbPath) so
+// Settings › Storage can show it. Call once at startup.
+func (c *Controller) SetIndexPath(p string) { c.indexPath = p }
+
+// StoragePaths returns the resolved index db, cache and trash locations for
+// display. indexPath is "" when SetIndexPath was never called; the trash dir
+// may not exist yet (it is created on the first delete).
+func (c *Controller) StoragePaths() (indexPath, cacheDir, trashDir string) {
+	return c.indexPath, c.cacheDir, c.trashDir
+}
 
 // DirCountsWithVersion returns the cached recursive file counts for the rows
 // the sidebar is currently rendering (keys are absolute paths; values are

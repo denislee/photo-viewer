@@ -15,7 +15,15 @@ import (
 
 // Config holds the persisted user preferences, loaded from and saved to
 // ~/.config/photo-viewer/config.json.
+//
+// Fields are grouped by the Settings section that owns them. The file stays
+// flat: the JSON tags are the on-disk format and must not change (D-1 of the
+// settings reorganization; TestConfigRoundTrip guards them). A new field must
+// also be added to that test's fixture.
 type Config struct {
+	// --- Import (settings_import.go; ImportDeleteSource is shared with the
+	// import dialog, which re-reads it every time it opens) ---
+
 	InboxDir           string `json:"inbox_dir"`
 	OutboxDir          string `json:"outbox_dir"`
 	ImportDeleteSource bool   `json:"import_delete_source"`
@@ -23,6 +31,15 @@ type Config struct {
 	// attached removable devices (block-device uevents on Linux, lsblk polling
 	// elsewhere) and prompts the user to import from them.
 	SDCardAutoDetect bool `json:"sd_card_auto_detect"`
+
+	// --- Interface, set in Settings (settings_interface.go) ---
+
+	// ShowShortcutHints toggles the bottom keyboard-shortcut helper strip.
+	// Defaults to false (hidden) — power users can opt in from Settings.
+	ShowShortcutHints bool `json:"show_shortcut_hints"`
+
+	// --- Interface, remembered from the toolbar / window (not in Settings) ---
+
 	// GroupByYear toggles the sidebar treatment of YYYY-MM-DD subfolders:
 	// when true they are bucketed under collapsible YYYY headers.
 	GroupByYear bool `json:"group_by_year"`
@@ -32,13 +49,29 @@ type Config struct {
 	// GridCellDp is the persisted thumbnail cell size in dp. Zero means
 	// "use defaultCellDp". Clamped to [minCellDp, maxCellDp] on load.
 	GridCellDp int `json:"grid_cell_dp"`
-	// ShowShortcutHints toggles the bottom keyboard-shortcut helper strip.
-	// Defaults to false (hidden) — power users can opt in from Settings.
-	ShowShortcutHints bool `json:"show_shortcut_hints"`
 	// SortMode controls the grid ordering. Values: "name" (default — path
 	// ascending) or "duration" (video length descending, with non-videos
 	// pushed to the end ordered by path).
 	SortMode string `json:"sort_mode"`
+
+	// --- Face recognition (settings_faces.go) ---
+
+	// FacesDisabled turns face recognition off. Stored inverted so the
+	// default (absent key) is on, as the plan asks when the helper exists.
+	FacesDisabled bool `json:"faces_disabled"`
+	// FaceStrictness is the grouping preset: "strict" (0.50), "normal"
+	// (0.60, default) or "loose" (0.65) Euclidean. Changing it regroups.
+	FaceStrictness string `json:"face_strictness"`
+
+	// --- Export favorites (settings_export.go). "Move" is deliberately
+	// never persisted: a sticky destructive option is a surprise (D-3). ---
+
+	ExportFlatten    bool `json:"export_flatten"`
+	ExportRecompress bool `json:"export_recompress"`
+	// ExportMaxLongEdge is the recompress limit in px; 0 means the default.
+	ExportMaxLongEdge int `json:"export_max_long_edge"`
+
+	// --- Web server (webserver_view.go; linked from Settings) ---
 
 	// WebServerPort is the TCP port used by the optional HTTP server that
 	// serves the indexed library to a browser. Zero means "use the default"
@@ -49,13 +82,6 @@ type Config struct {
 	// hosts on the network can reach it. The default (false) binds to
 	// 127.0.0.1 only.
 	WebServerBindAll bool `json:"web_server_bind_all"`
-
-	// FacesDisabled turns face recognition off. Stored inverted so the
-	// default (absent key) is on, as the plan asks when the helper exists.
-	FacesDisabled bool `json:"faces_disabled"`
-	// FaceStrictness is the grouping preset: "strict" (0.50), "normal"
-	// (0.60, default) or "loose" (0.65) Euclidean. Changing it regroups.
-	FaceStrictness string `json:"face_strictness"`
 }
 
 var (

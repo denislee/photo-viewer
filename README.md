@@ -25,7 +25,7 @@ with a SQLite index, inline video playback through libmpv, and an optional web g
   Names and fixes survive re-detection, moves, delete/restore and "Rebuild index".
 - **Web server** (toolbar → Web server): serves the indexed library to a browser, with
   thumbnails, a viewer, favorites, and video, using HLS for iOS/Safari. It binds to
-  `127.0.0.1:8080` by default. Settings can change the port or bind to all interfaces, and an
+  `127.0.0.1:8080` by default. The Web server panel can change the port or bind to all interfaces, and an
   optional password turns on HTTP Basic auth with user `viewer`. The password is never written
   to disk.
 
@@ -92,11 +92,22 @@ If `-root` is omitted, the current working directory is used.
 ## Configuration
 
 GUI preferences live in `$XDG_CONFIG_HOME/photo-viewer/config.json`
-(`~/.config/photo-viewer/config.json` by default). Change them from Settings (`,`). They include
-`inbox_dir` / `outbox_dir` for Import, `import_delete_source`, `sd_card_auto_detect`,
-`group_by_year` (sidebar), `sort_mode`, `show_shortcut_hints`, `web_server_port`,
-`web_server_bind_all`, `faces_disabled` and `face_strictness` (`strict`/`normal`/`loose`;
-changing it regroups every face). Import refuses an Inbox/Outbox pair where one is inside the other.
+(`~/.config/photo-viewer/config.json` by default). Settings (`,`) is one scrollable page with
+these sections:
+
+- **Import**: `inbox_dir` / `outbox_dir` (saved when you click Apply; an Inbox/Outbox pair where
+  one is inside the other is refused), `import_delete_source`, `sd_card_auto_detect`.
+- **Interface**: `show_shortcut_hints`. `group_by_year`, `sort_mode`, zoom and sidebar width are
+  remembered from the toolbar.
+- **Face recognition**: `faces_disabled` and `face_strictness` (`strict`/`normal`/`loose`;
+  changing it regroups every face), plus scan/regroup and "Forget all face data".
+- **Export favorites**: `export_flatten`, `export_recompress`, `export_max_long_edge`. "Move
+  instead of copy" is never remembered.
+- **Storage & maintenance**: Empty Trash, and where the config, index, cache and trash live.
+- **Web server**: a link to the Web server panel, which holds `web_server_port` and
+  `web_server_bind_all`.
+
+Everything except the Inbox/Outbox paths saves as soon as you change it.
 
 Video playback renders through a headless OpenGL context and decodes on the GPU via VAAPI
 (Intel needs `intel-media-driver`, AMD `libva-mesa-driver`). Without VAAPI it decodes in
